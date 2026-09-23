@@ -48,7 +48,7 @@ cargo ndk \
     -t arm64-v8a \
     -t x86_64 \
     -o "$JNILIBS_DIR" \
-    build -p freeq-sdk-ffi --lib --release
+    build -p freeq-sdk-ffi --lib --release --features logcat-trace
 
 echo "==> Building host binary for bindgen..."
 cargo build -p freeq-sdk-ffi --lib --release

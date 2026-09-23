@@ -55,6 +55,9 @@ url = { version = "2", optional = true }
 
 [features]
 default = []
+# The Android library writes the SDK's tracing lines to logcat (tag
+# `freeq_sdk`); for development builds only, the lines carry message previews.
+logcat-trace = []
 av = ["moq-native", "moq-lite", "iroh-live", "rustls", "url"]
 
 [build-dependencies]

@@ -16,11 +16,75 @@ fn install_tracing_subscriber() {
                     tracing_subscriber::EnvFilter::new("freeq_sdk=debug,freeq_sdk_ffi=debug,info")
                 }),
             )
-            .with_writer(std::io::stderr)
+            .with_writer(trace_writer)
             .with_target(true)
             .with_ansi(false)
             .try_init();
     });
+}
+
+/// Where tracing lines go: stderr, except on Android, where stderr is dropped.
+/// With the `logcat-trace` feature (the handset development build) the lines
+/// go to logcat under the tag `freeq_sdk`; without it nothing is written,
+/// since the lines carry message previews.
+#[cfg(not(target_os = "android"))]
+fn trace_writer() -> std::io::Stderr {
+    std::io::stderr()
+}
+
+#[cfg(all(target_os = "android", feature = "logcat-trace"))]
+fn trace_writer() -> android_log::LogcatWriter {
+    android_log::LogcatWriter::default()
+}
+
+#[cfg(all(target_os = "android", not(feature = "logcat-trace")))]
+fn trace_writer() -> std::io::Sink {
+    std::io::sink()
+}
+
+#[cfg(all(target_os = "android", feature = "logcat-trace"))]
+mod android_log {
+    //! A `std::io::Write` that hands each complete line to liblog, so the
+    //! SDK's tracing output is readable with `adb logcat -s freeq_sdk`.
+    use std::ffi::CString;
+
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(
+            prio: i32,
+            tag: *const std::ffi::c_char,
+            text: *const std::ffi::c_char,
+        ) -> i32;
+    }
+
+    const ANDROID_LOG_INFO: i32 = 4;
+
+    #[derive(Default)]
+    pub struct LogcatWriter {
+        pending: Vec<u8>,
+    }
+
+    impl std::io::Write for LogcatWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.pending.extend_from_slice(buf);
+            while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = self.pending.drain(..=end).collect();
+                let text = String::from_utf8_lossy(&line[..line.len() - 1]).replace('\0', " ");
+                if let (Ok(tag), Ok(text)) = (CString::new("freeq_sdk"), CString::new(text)) {
+                    // SAFETY: both pointers are valid NUL-terminated strings
+                    // for the duration of the call, which copies them.
+                    unsafe {
+                        __android_log_write(ANDROID_LOG_INFO, tag.as_ptr(), text.as_ptr());
+                    }
+                }
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 }
 
 static RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
