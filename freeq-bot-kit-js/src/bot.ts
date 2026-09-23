@@ -34,6 +34,7 @@ import {
   type ResolveOpts,
 } from "./did-resolver.js";
 import { matchMention } from "./mention.js";
+import { RoomManager } from "./rooms.js";
 
 /** Result of `bot.checkMention(channel, text)`. */
 export type MentionResult =
@@ -154,6 +155,13 @@ export class FreeqBot {
   #started = false;
   #stopped = false;
   readonly #didResolver: DidResolver;
+  /** Channels to join once the announce sequence has landed. Ours, not the
+   *  SDK's autojoin: a JOIN that races PROVENANCE reaches a `+i` channel
+   *  before the server knows who we are. */
+  readonly #channels: string[];
+  /** Cancels the wait-for-provenance-then-JOIN in flight, if any. */
+  #cancelPendingJoin: (() => void) | null = null;
+  #rooms: RoomManager | null = null;
 
   readonly #mentionCooldownMs: number;
   readonly #mentionMatcher: MentionMatcher;
@@ -175,11 +183,13 @@ export class FreeqBot {
     didResolverCacheTtlMs: number | undefined;
     mentionCooldownMs: number;
     mentionMatcher: MentionMatcher;
+    channels: string[];
   }) {
     this.client = args.client;
     this.identity = args.identity;
     this.delegation = args.delegation;
     this.stateDir = args.stateDir;
+    this.#channels = args.channels;
     this.#actorClass = args.actorClass;
     this.#manifest = args.manifest;
     this.#heartbeatMs = args.heartbeatMs;
@@ -211,7 +221,10 @@ export class FreeqBot {
     const client = new FreeqClient({
       url: opts.url,
       nick: opts.nick,
-      channels: opts.channels,
+      // Deliberately empty: the SDK would JOIN before 'ready', i.e. before
+      // our PROVENANCE is on the wire. #announceAndHeartbeat joins them
+      // itself once the server has answered the provenance declaration.
+      channels: [],
       serverOrigin: opts.serverOrigin,
       onNickCollision: opts.onNickCollision ?? "refuse",
       sasl: {
@@ -248,7 +261,23 @@ export class FreeqBot {
       didResolverCacheTtlMs: opts.senderDidResolver?.cacheTtlMs,
       mentionCooldownMs: opts.mention?.cooldownMs ?? 60_000,
       mentionMatcher: opts.mention?.matcher ?? defaultMentionMatcher,
+      channels: (opts.channels ?? []).map((c) => c.trim()).filter((c) => c.length > 0),
     });
+  }
+
+  /** Instant rooms (docs/INSTANT-ROOMS.md): create/join E2EE rooms, hold
+   *  their group keys, act as steward. Built lazily on first use from the
+   *  bot's client, identity, state dir and server origin. */
+  get rooms(): RoomManager {
+    if (!this.#rooms) {
+      this.#rooms = new RoomManager({
+        client: this.client,
+        identity: this.identity,
+        stateDir: this.stateDir,
+        origin: this.client.serverOrigin,
+      });
+    }
+    return this.#rooms;
   }
 
   // ── Typed event delegation ─────────────────────────────────────────────
@@ -437,6 +466,7 @@ export class FreeqBot {
       this.client.off("ready", this.#readyHandler);
       this.#readyHandler = null;
     }
+    this.#cancelPendingJoin?.();
     try {
       this.client.setPresence("offline");
       this.client.raw(`QUIT :${reason}`);
@@ -473,6 +503,11 @@ export class FreeqBot {
       return;
     }
 
+    // JOIN only after the server has answered PROVENANCE (bounded wait), so
+    // a `+i` channel that our delegation admits us to sees a verified agent
+    // rather than a stranger. Re-run on every 'ready', like the announce.
+    this.#joinAfterProvenance();
+
     const beat = (): void => {
       try {
         this.client.sendHeartbeat(this.#currentState, this.#heartbeatTtlS);
@@ -482,5 +517,50 @@ export class FreeqBot {
     };
     beat();
     this.#heartbeatTimer = setInterval(beat, this.#heartbeatMs);
+  }
+
+  /** How long to wait for the server's provenance NOTICE before joining anyway. */
+  static PROVENANCE_WAIT_MS = 3_000;
+
+  #joinAfterProvenance(): void {
+    this.#cancelPendingJoin?.();
+    if (this.#channels.length === 0) return;
+
+    let done = false;
+    const joinNow = (): void => {
+      if (done) return;
+      done = true;
+      cleanup();
+      for (const ch of this.#channels) {
+        try {
+          this.client.join(ch);
+        } catch {
+          // socket gone; next 'ready' re-runs the whole sequence
+        }
+      }
+    };
+    // The server answers PROVENANCE with one NOTICE to us: "Provenance
+    // verified: …", "Provenance stored (unverified): …", "Provenance
+    // rejected: …", or one of the two malformed/unauthenticated refusals.
+    // Any of them means the declaration has been processed.
+    const onRaw = (_line: string, parsed: { command: string; params: string[] }): void => {
+      if (parsed.command !== "NOTICE") return;
+      const text = parsed.params[1] ?? "";
+      if (/^(Provenance (verified|stored|rejected)|Must be authenticated to submit provenance|Invalid provenance format)/.test(text)) {
+        joinNow();
+      }
+    };
+    const timer = setTimeout(joinNow, FreeqBot.PROVENANCE_WAIT_MS);
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      this.client.off("raw", onRaw);
+      if (this.#cancelPendingJoin === cancel) this.#cancelPendingJoin = null;
+    };
+    const cancel = (): void => {
+      done = true;
+      cleanup();
+    };
+    this.#cancelPendingJoin = cancel;
+    this.client.on("raw", onRaw);
   }
 }
