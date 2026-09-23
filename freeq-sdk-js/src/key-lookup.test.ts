@@ -975,6 +975,16 @@ describe('KeyLookup through the home server', () => {
     expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
   });
 
+  it('refreshDeviceRecords reads the PDS while the home server serves an older copy', async () => {
+    const { alice, home, fetch, resolveDid } = await homeNetwork();
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    home.frozen = true;
+    expect(await lookup.provenDeviceRecords(ALICE)).toHaveLength(1);
+
+    await alice.add('at.freeq.deviceKey', await buildDeviceRecord(await key(4), ALICE, T0));
+    expect(await lookup.refreshDeviceRecords(ALICE)).toHaveLength(2);
+  });
+
   it("dates a listing from the home server's per-DID route with its fetched_at, so it loses to a newer PDS listing", async () => {
     const { alice, home, fetch, resolveDid } = await homeNetwork();
     const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);

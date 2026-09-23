@@ -426,13 +426,14 @@ export class KeyLookup {
   }
 
   /**
-   * `did`'s proven device records listed afresh (or by a listing already in
-   * flight), for a caller that must see a record written since the last one.
+   * `did`'s proven device records listed afresh at the PDS, for a caller that
+   * must see a record written since the last listing: the home server's copy
+   * may predate it.
    */
   async refreshDeviceRecords(did: string): Promise<unknown[]> {
     await this.load();
     this.refreshed.set(did, Date.now());
-    return this.listDeviceRecords(did);
+    return this.listDeviceRecords(did, true);
   }
 
   /**
