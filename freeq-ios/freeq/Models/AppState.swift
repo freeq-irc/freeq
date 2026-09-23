@@ -25,7 +25,7 @@ private let authLog = Logger(subsystem: "at.freeq.ios", category: "auth")
 // disconnect, and logout. CHATHISTORY from the wire dedupes against the
 // hydrated state via `ChannelState.appendIfNew`.
 
-private struct CachedReactions: Codable {
+struct CachedReactions: Codable {
     let byEmoji: [String: [String]]
     init(_ r: [String: Set<String>]) {
         var d: [String: [String]] = [:]
@@ -39,7 +39,7 @@ private struct CachedReactions: Codable {
     }
 }
 
-private struct CachedMessage: Codable {
+struct CachedMessage: Codable {
     let id: String
     let from: String
     let text: String
@@ -69,7 +69,12 @@ private struct CachedMessage: Codable {
     // including the mark an invalid signature earned.
     let verdict: VerdictInfo?
 
-    init(_ m: ChatMessage) {
+    /// `settled` is the verdict the SDK settled on for this row
+    /// (`AppState.checkedVerdicts`). A signed row is mapped with whatever the
+    /// SDK had at delivery — `.pending` while the signer's key is still being
+    /// looked up — and the settled answer is filed in that map, never written
+    /// back to the row. Without it every signed row is cached as pending.
+    init(_ m: ChatMessage, settled: VerdictInfo? = nil) {
         self.id = m.id
         self.from = m.from
         self.text = m.text
@@ -84,7 +89,7 @@ private struct CachedMessage: Codable {
         self.account = m.account
         self.actRef = m.actRef
         self.coordination = m.coordination
-        self.verdict = m.verdict
+        self.verdict = settled ?? m.verdict
     }
 
     func toChatMessage() -> ChatMessage {
@@ -1674,7 +1679,7 @@ class AppState: ObservableObject {
                 name: buf.name,
                 isDM: isDM,
                 topic: buf.topic.isEmpty ? nil : buf.topic,
-                messages: tail.map(CachedMessage.init)
+                messages: tail.map { CachedMessage($0, settled: checkedVerdicts[$0.id]) }
             )
         }
         let root = BufferCacheRoot(version: BufferCacheStore.version, buffers: snapshot)
