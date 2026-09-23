@@ -207,8 +207,27 @@ async fn get_policy_chain(
 async fn join_channel(
     State(state): State<Arc<SharedState>>,
     Path(channel): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<JoinRequest>,
 ) -> impl IntoResponse {
+    // The subject is the caller, proven by the session behind the Bearer —
+    // never a DID named in the body, or anyone could mint an attestation
+    // for anyone. Checked before anything else so an unauthenticated probe
+    // learns nothing, not even whether a policy engine is running.
+    let Some(caller) = crate::web::caller_did_from_bearer(&state, &headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Bearer session required" })),
+        )
+            .into_response();
+    };
+    if caller != req.subject_did {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "subject_did must be the caller's own DID" })),
+        )
+            .into_response();
+    }
     let engine = match get_engine(&state) {
         Ok(e) => e,
         Err(e) => return e.into_response(),
@@ -938,5 +957,78 @@ fn collect_hashes_from_req(req: &super::types::Requirement, out: &mut HashSet<St
             collect_hashes_from_req(requirement, out);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod join_auth_tests {
+    //! `POST /api/v1/policy/{channel}/join` acts for the caller only. The
+    //! auth check runs before the engine lookup, so these tests need no
+    //! policy engine: passing the check lands on the engine's own error.
+    use super::*;
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+
+    fn req(subject: &str) -> Json<JoinRequest> {
+        Json(JoinRequest {
+            subject_did: subject.into(),
+            accepted_hashes: vec![],
+            credentials: vec![],
+            proofs: vec![],
+        })
+    }
+
+    fn bearer(sid: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {sid}").parse().unwrap(),
+        );
+        h
+    }
+
+    #[tokio::test]
+    async fn the_subject_must_be_the_bearer_s_own_did() {
+        let state = crate::server::test_state_with_db();
+        state
+            .session_dids
+            .lock()
+            .insert("s-a".into(), "did:plc:alice".into());
+
+        let resp = join_channel(
+            State(state.clone()),
+            Path("#gated".into()),
+            axum::http::HeaderMap::new(),
+            req("did:plc:alice"),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "no bearer");
+
+        let resp = join_channel(
+            State(state.clone()),
+            Path("#gated".into()),
+            bearer("s-a"),
+            req("did:plc:mallory"),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "someone else's DID");
+
+        let resp = join_channel(
+            State(state.clone()),
+            Path("#gated".into()),
+            bearer("s-a"),
+            req("did:plc:alice"),
+        )
+        .await
+        .into_response();
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the matching subject reaches the engine (absent here)"
+        );
     }
 }
