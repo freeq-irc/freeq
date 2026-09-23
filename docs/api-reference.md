@@ -132,6 +132,92 @@ Returns pinned messages for a channel:
 ]
 ```
 
+### Rooms
+
+Instant rooms (see `INSTANT-ROOMS.md`): end-to-end encrypted channels minted
+for one collaboration and shared as a single URL. All calls take
+`Authorization: Bearer <irc-session-id>`. Channel names may be given with or
+without the leading `#`.
+
+```
+POST /api/v1/rooms
+```
+
+Body (optional): `{ "topic": "...", "invite_ttl_secs": 604800 }`. Creates a
+`#r-<word>-<word>-<word>` channel that is `+i +E +n +t`, with the caller as
+founder and sole roster member, and one invite. Returns `201`:
+
+```json
+{
+  "channel": "#r-quiet-copper-fox",
+  "invite": "Xk3…",
+  "url": "https://irc.freeq.at/r/r-quiet-copper-fox#Xk3…",
+  "invite_expires_at": 1760000000,
+  "room": { "channel": "#r-quiet-copper-fox", "founder_did": "did:key:z…", "created_at": 1759000000, "expires_at": 1760200000 }
+}
+```
+
+Share `url`. The token after `#` is the invite; browsers and HTTP clients
+never send a fragment, so it never reaches the server. Limits: 20 rooms per
+founder per 24 h (`429`), plus the per-IP REST limiter.
+
+```
+GET /api/v1/rooms/{channel}
+```
+
+Roster member, founder or DID-op. `members[].epochs` lists the epochs that
+member already holds a sealed key for, so a steward can see who needs the
+latest one:
+
+```json
+{
+  "channel": "#r-quiet-copper-fox",
+  "topic": null,
+  "founder_did": "did:key:z…",
+  "created_at": 1759000000,
+  "last_activity": 1759001000,
+  "expires_at": 1760210600,
+  "latest_epoch": 2,
+  "members": [
+    { "did": "did:key:z…", "joined_at": 1759000000, "online": true, "epochs": [1, 2] }
+  ]
+}
+```
+
+```
+POST   /api/v1/rooms/{channel}/invites    body { "invite_ttl_secs"?, "max_uses"? }  → 201 { invite, url, invite_expires_at }
+DELETE /api/v1/rooms/{channel}/invites                                                → { revoked: n }
+POST   /api/v1/rooms/{channel}/keep                                                   → { expires_at }
+DELETE /api/v1/rooms/{channel}/members/{did}                                          → { removed: did }
+```
+
+Invites and member removal are founder/DID-op only; `keep` is open to any
+roster member and pushes `expires_at` out by the idle TTL (`--room-idle-secs`,
+default 14 days). Removing a member sets the roster row's `removed_at`, bans
+the DID, and kicks any live session; the caller then rotates the epoch. The
+founder cannot be removed.
+
+`POST /api/v1/channels/{channel}/groupkeys` changes for rooms only: an
+`epoch` above the latest stored one needs the founder or a DID-op; an `epoch`
+at or below it may be uploaded by any roster member; keys addressed to DIDs
+not on the roster are dropped and reported in `skipped`.
+
+```
+GET /r/{name}
+```
+
+The share URL's landing page (no auth). `Accept: text/markdown` returns
+markdown join instructions for an agent (`npx -y @freeq/mcp room join <full
+url>`); anything else returns HTML with the same text and an "Open in freeq"
+button that goes to `/?room={name}` keeping the fragment. Unknown names are
+`404` in both forms.
+
+Rooms are swept every 10 minutes: a room with fewer than two roster members
+is deleted after `--room-unclaimed-secs` (default 24 h), an idle room after
+its `expires_at`, and live members get a NOTICE in the last 24 h before
+expiry. Deletion removes the channel, its messages, pins, group keys, roster
+and invites.
+
 ## Authentication
 
 Most read endpoints are public. Write endpoints (upload, pin) require a web-token from the auth broker, sent as `Authorization: Bearer {token}`.

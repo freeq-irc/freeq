@@ -76,6 +76,10 @@ pub struct ChannelState {
     pub pins: Vec<PinnedMessage>,
     /// Key for this channel's private-media space.
     pub media_space_key: Option<String>,
+    /// An instant room (`docs/INSTANT-ROOMS.md`): admission is by link
+    /// invite or roster instead of `+k`/`+i`, it is always `+iE`, it never
+    /// federates, and it expires. Persisted as `channels.is_room`.
+    pub room: bool,
 }
 
 /// A pinned message reference.
@@ -924,6 +928,16 @@ pub struct SharedState {
     pub spawned_agents: Mutex<HashMap<String, SpawnedAgent>>,
     /// Per-IP rate limiter for expensive REST endpoints (OG preview, blob proxy, upload).
     pub rest_rate_limiter: crate::web::IpRateLimiter,
+    /// Instant rooms that saw a JOIN or PRIVMSG since the last sweep, with
+    /// the time of the latest one. The room sweeper flushes this into
+    /// `rooms.last_activity` / `expires_at` (`crate::rooms`), so message
+    /// traffic never costs a database write per line.
+    pub room_activity: Mutex<HashMap<String, u64>>,
+    /// The names of every instant room, mirrored from `ChannelState::room`.
+    /// Kept separately so the S2S guard (`connection::helpers::s2s_broadcast`)
+    /// can ask "is this a room?" from call sites that already hold the
+    /// `channels` lock. Maintained at load, creation and deletion.
+    pub room_names: Mutex<HashSet<String>>,
     /// Per-IP limit for the record-cache routes, apart from
     /// `rest_rate_limiter`: a cold client asks for one listing and one proof
     /// per record per account.
@@ -1993,6 +2007,11 @@ impl Server {
         };
         let db = db.map(|db| Arc::new(Mutex::new(db)));
         let record_cache = crate::record_cache::RecordCache::new(db.clone(), &self.config);
+        let room_names: HashSet<String> = channels
+            .iter()
+            .filter(|(_, ch)| ch.room)
+            .map(|(name, _)| name.clone())
+            .collect();
         let state = Arc::new(SharedState {
             server_name: self.config.server_name.clone(),
             challenge_store: ChallengeStore::new(self.config.challenge_timeout_secs),
@@ -2117,6 +2136,8 @@ impl Server {
             spawned_agents: Mutex::new(HashMap::new()),
             // 30 requests per 60-second window per IP for expensive REST endpoints
             rest_rate_limiter: crate::web::IpRateLimiter::new(30, 60),
+            room_activity: Mutex::new(HashMap::new()),
+            room_names: Mutex::new(room_names),
             // 600 requests per 60-second window per IP for the record routes
             record_rate_limiter: crate::web::IpRateLimiter::new(600, 60),
             media_store,
@@ -2554,6 +2575,7 @@ impl Server {
         crate::broker_signout::spawn(Arc::clone(&state));
         crate::record_cache::spawn(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
+        crate::rooms::spawn_room_sweeper(Arc::clone(&state));
 
         // Heartbeat expiry: check agent liveness every 15 seconds.
         // Agents that miss their TTL transition to degraded, then offline, then disconnect.
@@ -2897,6 +2919,7 @@ impl Server {
         crate::broker_signout::spawn(Arc::clone(&state));
         crate::record_cache::spawn(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
+        crate::rooms::spawn_room_sweeper(Arc::clone(&state));
 
         let handle = tokio::spawn(async move {
             loop {
@@ -2948,6 +2971,7 @@ impl Server {
         crate::broker_signout::spawn(Arc::clone(&state));
         crate::record_cache::spawn(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
+        crate::rooms::spawn_room_sweeper(Arc::clone(&state));
 
         let web_state = Arc::clone(&state);
         let router = crate::web::router(web_state);
@@ -6982,6 +7006,10 @@ pub(crate) async fn process_s2s_message(
                 let actor_classes = state.session_actor_class.lock();
                 let channel_info: Vec<crate::s2s::ChannelInfo> = channels
                     .iter()
+                    // Rooms never federate: their admission is a local
+                    // invite table a peer cannot consult, so a synced copy
+                    // would be a room nobody can be let into.
+                    .filter(|(_, ch)| !ch.room)
                     .map(|(name, ch)| {
                         let nicks: Vec<String> = ch
                             .members
@@ -8308,6 +8336,8 @@ mod s2s_adversarial_tests {
             ghost_sessions: Mutex::new(HashMap::new()),
             spawned_agents: Mutex::new(HashMap::new()),
             rest_rate_limiter: crate::web::IpRateLimiter::new(30, 60),
+            room_activity: Mutex::new(HashMap::new()),
+            room_names: Mutex::new(HashSet::new()),
             // 600 requests per 60-second window per IP for the record routes
             record_rate_limiter: crate::web::IpRateLimiter::new(600, 60),
             media_store: None,

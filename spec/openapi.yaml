@@ -94,6 +94,11 @@ tags:
     description: User and WHOIS lookups.
   - name: identity
     description: DIDs, signing keys, E2EE pre-key bundles.
+  - name: rooms
+    description: |
+      Instant rooms: end-to-end encrypted channels minted for one
+      collaboration and shared as a single URL (`/r/{name}#<token>`).
+      See docs/INSTANT-ROOMS.md.
   - name: media
     description: Upload, blob proxy, signed media, link previews.
   - name: agent-assistance
@@ -1070,6 +1075,16 @@ paths:
       tags: [identity]
       operationId: putGroupKeys
       summary: Publish wrapped group keys for an encrypted channel.
+      description: |
+        Body `{ "epoch": n, "keys": { "<member_did>": "EGK1:…" } }`.
+
+        Ordinary channels: founder or DID-op only.
+
+        Instant rooms: an `epoch` above the latest one stored (creating an
+        epoch) needs the founder or a DID-op; an `epoch` at or below the
+        latest (sealing an existing epoch to more members) is open to any
+        roster member. Keys addressed to DIDs not on the roster are dropped
+        and listed in `skipped`.
       parameters:
         - $ref: "#/components/parameters/ChannelName"
       security: [bearerAuth: []]
@@ -1080,8 +1095,214 @@ paths:
             schema:
               type: object
       responses:
-        "200": { description: Stored. }
+        "200":
+          description: Stored.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  epoch: { type: integer }
+                  stored: { type: integer }
+                  skipped:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        did: { type: string }
+                        reason: { type: string }
         "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ── rooms ────────────────────────────────────────────────────────────
+  /api/v1/rooms:
+    post:
+      tags: [rooms]
+      operationId: createRoom
+      summary: Mint an instant room.
+      description: |
+        Creates a channel `#r-<word>-<word>-<word>` that is `+i +E +n +t`
+        with the caller as founder and sole roster member, and mints one
+        invite. Share `url`; the invite token rides in its `#` fragment and
+        never reaches the server. Limits: 20 rooms per founder per 24 h,
+        plus the per-IP REST limiter.
+      security: [bearerAuth: []]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                topic: { type: string }
+                invite_ttl_secs:
+                  type: integer
+                  description: Invite lifetime; default 7 days, max 30.
+      responses:
+        "201":
+          description: The room and its first invite.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [channel, invite, url, invite_expires_at, room]
+                properties:
+                  channel: { type: string, example: "#r-quiet-copper-fox" }
+                  invite: { type: string, description: The raw token (43 chars, base64url). Shown once. }
+                  url: { type: string, example: "https://irc.freeq.at/r/r-quiet-copper-fox#Xk3…" }
+                  invite_expires_at: { type: integer, description: Unix seconds. }
+                  room:
+                    type: object
+                    properties:
+                      channel: { type: string }
+                      founder_did: { type: string }
+                      created_at: { type: integer }
+                      expires_at: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/NoDatabase" }
+  /api/v1/rooms/{name}:
+    get:
+      tags: [rooms]
+      operationId: getRoom
+      summary: A room's lifetime, roster, and who holds which epoch.
+      description: |
+        Roster members, the founder and DID-ops may read. `members[].epochs`
+        lists the epochs that member already has a sealed key for; a steward
+        seals the latest epoch to anyone whose list lacks it.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+      security: [bearerAuth: []]
+      responses:
+        "200":
+          description: The room.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  channel: { type: string }
+                  topic: { type: string, nullable: true }
+                  founder_did: { type: string }
+                  created_at: { type: integer }
+                  last_activity: { type: integer }
+                  expires_at: { type: integer }
+                  latest_epoch: { type: integer, nullable: true }
+                  members:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        did: { type: string }
+                        joined_at: { type: integer }
+                        online: { type: boolean }
+                        epochs:
+                          type: array
+                          items: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/rooms/{name}/invites:
+    post:
+      tags: [rooms]
+      operationId: createRoomInvite
+      summary: Mint a new invite for a room.
+      description: Founder or DID-op.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+      security: [bearerAuth: []]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                invite_ttl_secs: { type: integer, description: Default 7 days, max 30. }
+                max_uses: { type: integer, description: Omit for unlimited. }
+      responses:
+        "201":
+          description: The invite.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  invite: { type: string }
+                  url: { type: string }
+                  invite_expires_at: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    delete:
+      tags: [rooms]
+      operationId: revokeRoomInvites
+      summary: Revoke every invite for a room.
+      description: Founder or DID-op. Members already on the roster are unaffected.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+      security: [bearerAuth: []]
+      responses:
+        "200":
+          description: How many invites were revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revoked: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/rooms/{name}/keep:
+    post:
+      tags: [rooms]
+      operationId: keepRoom
+      summary: Push a room's expiry out by the idle TTL from now.
+      description: Any roster member.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+      security: [bearerAuth: []]
+      responses:
+        "200":
+          description: The new expiry.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  expires_at: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/rooms/{name}/members/{did}:
+    delete:
+      tags: [rooms]
+      operationId: removeRoomMember
+      summary: Remove a member from a room.
+      description: |
+        Founder or DID-op. Sets the roster row's `removed_at`, bans the DID,
+        and kicks any live session of it. The caller then rotates the epoch
+        (`POST /api/v1/channels/{name}/groupkeys` with a higher epoch); the
+        server holds no key and cannot. The founder cannot be removed.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+        - $ref: "#/components/parameters/Did"
+      security: [bearerAuth: []]
+      responses:
+        "200":
+          description: Removed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  removed: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   # ── media ────────────────────────────────────────────────────────────
   /api/v1/upload:
@@ -1724,6 +1945,10 @@ paths:
       tags: [policy]
       operationId: policyJoin
       summary: Attempt a policy-gated join, presenting credentials.
+      description: |
+        Requires a Bearer session. The body's `subject_did` must be the
+        caller's own DID (the one behind the session); any other value is
+        refused with 403.
       parameters:
         - $ref: "#/components/parameters/PolicyChannel"
       security: [bearerAuth: []]
@@ -1738,6 +1963,7 @@ paths:
           content:
             application/json:
               schema: { type: object }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
   /api/v1/policy/{channel}/check:
     post:
@@ -2030,6 +2256,9 @@ paths:
       tags: [transport]
       operationId: channelInvitePage
       summary: Shareable channel invite landing page.
+      description: |
+        Topic and member count are shown only for a discoverable channel
+        (no `+i`, `+k`, `+E` or join policy).
       parameters:
         - name: channel
           in: path
@@ -2042,6 +2271,35 @@ paths:
           content:
             text/html:
               schema: { type: string }
+  /r/{name}:
+    get:
+      tags: [rooms]
+      operationId: roomLandingPage
+      summary: An instant room's share-URL landing page.
+      description: |
+        The share URL is `/r/{name}#<token>`; the token is in the fragment
+        and never reaches the server. With `Accept: text/markdown` the page
+        is markdown telling an agent exactly how to join
+        (`npx -y @freeq/mcp room join <full url>`); otherwise it is HTML
+        carrying the same instructions and an "Open in freeq" button that
+        navigates to `/?room={name}` with the fragment preserved. An
+        unknown name is 404 in both forms.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: Room name without the leading `#`, e.g. `r-quiet-copper-fox`.
+          schema: { type: string }
+      security: [{}]
+      responses:
+        "200":
+          description: Join instructions.
+          content:
+            text/markdown:
+              schema: { type: string }
+            text/html:
+              schema: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
 
 components:
   securitySchemes:

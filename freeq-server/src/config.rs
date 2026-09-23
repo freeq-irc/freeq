@@ -175,6 +175,20 @@ pub struct ServerConfig {
     #[arg(long, default_value = "604800")]
     pub act_expiry_secs: u64,
 
+    /// How long an instant room may sit with no join and no message before
+    /// the sweeper deletes it, in seconds. Every message and every join
+    /// pushes the expiry out by this much; `POST /api/v1/rooms/{ch}/keep`
+    /// does the same on demand. Default 14 days.
+    #[arg(long, default_value = "1209600")]
+    pub room_idle_secs: u64,
+
+    /// How long an instant room with fewer than two roster members may live
+    /// before it is deleted as unclaimed, in seconds. A room whose link was
+    /// never used by anyone but its founder is noise, and the founder can
+    /// mint another in one call. Default 24 hours.
+    #[arg(long, default_value = "86400")]
+    pub room_unclaimed_secs: u64,
+
     /// How long submitted work may wait on the poster before it is deemed
     /// accepted, in seconds. Separate from the abandonment limit because it
     /// does the opposite job: that one is neutral and catches work nobody is
@@ -411,6 +425,8 @@ impl Default for ServerConfig {
             did_resolver_static: vec![],
             max_messages_per_channel: 10000,
             act_expiry_secs: 604_800,
+            room_idle_secs: 1_209_600,
+            room_unclaimed_secs: 86_400,
             act_review_secs: 1_209_600,
             act_defer_max_per_origin: 256,
             act_defer_max_total: 4096,
@@ -559,6 +575,8 @@ struct FileConfig {
     did_resolver_static: Option<MapOrPairs>,
     max_messages_per_channel: Option<usize>,
     act_expiry_secs: Option<u64>,
+    room_idle_secs: Option<u64>,
+    room_unclaimed_secs: Option<u64>,
     act_review_secs: Option<u64>,
     act_defer_max_per_origin: Option<usize>,
     act_defer_max_total: Option<usize>,
@@ -689,6 +707,8 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
         record_cache_secs,
         record_cache_prune_days,
         act_expiry_secs,
+        room_idle_secs,
+        room_unclaimed_secs,
         act_review_secs,
         act_defer_max_per_origin,
         act_defer_max_total,
@@ -757,6 +777,8 @@ mod tests {
                 act_defer_max_per_origin = 7
                 act_defer_max_total = 21
                 act_orphan_secs = 5
+                room_idle_secs = 900
+                room_unclaimed_secs = 60
                 peer_key_retry_secs = 3
                 record_cache_secs = 600
                 record_cache_prune_days = 7
@@ -774,6 +796,8 @@ mod tests {
         assert_eq!(c.act_defer_max_per_origin, 7);
         assert_eq!(c.act_defer_max_total, 21);
         assert_eq!(c.act_orphan_secs, 5);
+        assert_eq!(c.room_idle_secs, 900);
+        assert_eq!(c.room_unclaimed_secs, 60);
         assert_eq!(c.peer_key_retry_secs, 3);
         assert_eq!(c.record_cache_secs, 600);
         assert_eq!(c.record_cache_prune_days, 7);
@@ -900,5 +924,21 @@ mod tests {
         );
         let parsed: Result<super::FileConfig, _> = toml::from_str(&uncommented);
         parsed.expect("every setting in server.toml.example must be a valid config key");
+    }
+
+    /// Instant-room lifetimes: the documented defaults, and the flags that
+    /// change them.
+    #[test]
+    fn room_lifetimes_default_and_take_flags() {
+        let c = cfg(&[], None).unwrap();
+        assert_eq!(c.room_idle_secs, 1_209_600);
+        assert_eq!(c.room_unclaimed_secs, 86_400);
+        let c = cfg(
+            &["--room-idle-secs", "30", "--room-unclaimed-secs", "10"],
+            None,
+        )
+        .unwrap();
+        assert_eq!(c.room_idle_secs, 30);
+        assert_eq!(c.room_unclaimed_secs, 10);
     }
 }

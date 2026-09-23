@@ -895,7 +895,7 @@ where
             rate_tokens -= 1.0;
         }
 
-        tracing::debug!(%session_id, "<- {}", line_buf.trim());
+        tracing::debug!(%session_id, "<- {}", redact_join_key(line_buf.trim()));
 
         // Check for pending LOGIN completion (from browser OAuth callback)
         if conn.authenticated_did.is_none()
@@ -4159,6 +4159,23 @@ fn cleanup_session_state(state: &Arc<SharedState>, session_id: &str) {
     }
 }
 
+/// The wire-log line for a JOIN with its key slot masked. A room invite
+/// token rides in that slot, and a channel key always did; neither belongs
+/// in a log file, at any level.
+fn redact_join_key(line: &str) -> std::borrow::Cow<'_, str> {
+    let body = line
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(' ').map(|(_, b)| b))
+        .unwrap_or(line);
+    let mut parts = body.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(cmd), Some(target), Some(_)) if cmd.eq_ignore_ascii_case("JOIN") => {
+            std::borrow::Cow::Owned(format!("{cmd} {target} <key>"))
+        }
+        _ => std::borrow::Cow::Borrowed(line),
+    }
+}
+
 /// Remove a session from all channels. Retains channels that still have content.
 fn cleanup_channel_membership(state: &Arc<SharedState>, session_id: &str) {
     let mut channels = state.channels.lock();
@@ -4639,5 +4656,28 @@ mod retired_key_tests {
             .flatten()
             .expect("the key row");
         assert_eq!(row.removed_at, None);
+    }
+}
+
+#[cfg(test)]
+mod join_key_redaction_tests {
+    use super::redact_join_key;
+
+    #[test]
+    fn a_join_with_a_key_is_masked_and_everything_else_passes_through() {
+        assert_eq!(
+            redact_join_key("JOIN #r-a-b-c SECRET"),
+            "JOIN #r-a-b-c <key>"
+        );
+        assert_eq!(redact_join_key("join #chan key,other"), "join #chan <key>");
+        assert_eq!(
+            redact_join_key("@label=1 JOIN #chan SECRET"),
+            "JOIN #chan <key>"
+        );
+        assert_eq!(redact_join_key("JOIN #chan"), "JOIN #chan");
+        assert_eq!(
+            redact_join_key("PRIVMSG #chan :JOIN #x y"),
+            "PRIVMSG #chan :JOIN #x y"
+        );
     }
 }

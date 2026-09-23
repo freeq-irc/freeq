@@ -99,6 +99,17 @@ pub fn canonical_dm_key(did_a: &str, did_b: &str) -> String {
 }
 
 /// Database handle wrapping a SQLite connection.
+/// One `rooms` row — the lifetime record of an instant room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomRow {
+    pub channel: String,
+    pub founder_did: String,
+    pub created_at: u64,
+    pub last_activity: u64,
+    pub expires_at: u64,
+    pub warned_at: Option<u64>,
+}
+
 pub struct Db {
     conn: Connection,
     /// AES-256-GCM key for encrypting message content at rest.
@@ -795,8 +806,8 @@ impl Db {
         let did_ops_json = serde_json::to_string(&ch.did_ops.iter().collect::<Vec<_>>())
             .unwrap_or_else(|_| "[]".to_string());
         self.conn.execute(
-            "INSERT INTO channels (name, topic_text, topic_set_by, topic_set_at, topic_locked, invite_only, no_ext_msg, moderated, key, founder_did, did_ops_json, encrypted_only, media_space_key)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            "INSERT INTO channels (name, topic_text, topic_set_by, topic_set_at, topic_locked, invite_only, no_ext_msg, moderated, key, founder_did, did_ops_json, encrypted_only, media_space_key, is_room)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(name) DO UPDATE SET
                 topic_text=excluded.topic_text,
                 topic_set_by=excluded.topic_set_by,
@@ -809,7 +820,8 @@ impl Db {
                 founder_did=excluded.founder_did,
                 did_ops_json=excluded.did_ops_json,
                 encrypted_only=excluded.encrypted_only,
-                media_space_key=excluded.media_space_key",
+                media_space_key=excluded.media_space_key,
+                is_room=excluded.is_room",
             params![
                 name,
                 ch.topic.as_ref().map(|t| &t.text),
@@ -824,6 +836,7 @@ impl Db {
                 did_ops_json,
                 ch.encrypted_only as i32,
                 ch.media_space_key.as_deref(),
+                ch.room as i32,
             ],
         )?;
         Ok(())
@@ -852,7 +865,7 @@ impl Db {
         let mut channels = HashMap::new();
 
         let mut stmt = self.conn.prepare(
-            "SELECT name, topic_text, topic_set_by, topic_set_at, topic_locked, invite_only, key, no_ext_msg, moderated, founder_did, did_ops_json, encrypted_only, media_space_key
+            "SELECT name, topic_text, topic_set_by, topic_set_at, topic_locked, invite_only, key, no_ext_msg, moderated, founder_did, did_ops_json, encrypted_only, media_space_key, is_room
              FROM channels"
         )?;
         let rows = stmt.query_map([], |row| {
@@ -871,6 +884,7 @@ impl Db {
                 .unwrap_or_else(|| "[]".to_string());
             let encrypted_only: bool = row.get::<_, Option<i32>>(11)?.unwrap_or(0) != 0;
             let media_space_key: Option<String> = row.get(12)?;
+            let room: bool = row.get::<_, Option<i32>>(13)?.unwrap_or(0) != 0;
 
             let topic = match (topic_text, topic_set_by, topic_set_at) {
                 (Some(text), Some(set_by), Some(set_at)) => Some(TopicInfo {
@@ -895,6 +909,7 @@ impl Db {
                 did_ops,
                 encrypted_only,
                 media_space_key,
+                room,
                 ..Default::default()
             };
             Ok((name, ch))
@@ -2741,6 +2756,294 @@ impl Db {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
         rows.collect()
+    }
+
+    /// Newest epoch any member of `channel` has a sealed key for, or None
+    /// when no key was ever distributed. For a room this is "the current
+    /// epoch": creating a higher one is a steward act, sealing an existing
+    /// one is member work (`api_put_group_keys`).
+    pub fn latest_group_epoch(&self, channel: &str) -> SqlResult<Option<i64>> {
+        self.conn.query_row(
+            "SELECT MAX(epoch) FROM group_keys WHERE channel = ?1",
+            params![channel.to_lowercase()],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+    }
+
+    /// Every epoch each member of `channel` holds a sealed key for, so a
+    /// steward can see who still needs the current one without downloading
+    /// blobs it cannot open anyway.
+    pub fn group_key_epochs_by_member(
+        &self,
+        channel: &str,
+    ) -> SqlResult<HashMap<String, Vec<i64>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT member_did, epoch FROM group_keys WHERE channel = ?1 ORDER BY epoch ASC",
+        )?;
+        let rows = stmt.query_map(params![channel.to_lowercase()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out: HashMap<String, Vec<i64>> = HashMap::new();
+        for row in rows {
+            let (did, epoch) = row?;
+            out.entry(did).or_default().push(epoch);
+        }
+        Ok(out)
+    }
+
+    /// Drop every sealed group key for a channel. Used when a room is
+    /// deleted: the stored messages are ciphertext, so removing the keys is
+    /// what makes the deletion real.
+    pub fn delete_group_keys(&self, channel: &str) -> SqlResult<usize> {
+        self.conn.execute(
+            "DELETE FROM group_keys WHERE channel = ?1",
+            params![channel.to_lowercase()],
+        )
+    }
+
+    // ── Instant rooms (docs/INSTANT-ROOMS.md) ──────────────────────────
+    //
+    // Room names are stored lowercased with the leading '#', matching the
+    // `channels` key. Times are unix seconds.
+
+    /// File a new room. The channel row itself is saved separately via
+    /// `save_channel` (with `room = true`).
+    pub fn create_room(
+        &self,
+        channel: &str,
+        founder_did: &str,
+        now: u64,
+        expires_at: u64,
+    ) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT INTO rooms (channel, founder_did, created_at, last_activity, expires_at)
+             VALUES (?1, ?2, ?3, ?3, ?4)",
+            params![
+                channel.to_lowercase(),
+                founder_did,
+                now as i64,
+                expires_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_room(&self, channel: &str) -> SqlResult<Option<RoomRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT channel, founder_did, created_at, last_activity, expires_at, warned_at
+             FROM rooms WHERE channel = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![channel.to_lowercase()], Self::room_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_rooms(&self) -> SqlResult<Vec<RoomRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT channel, founder_did, created_at, last_activity, expires_at, warned_at
+             FROM rooms ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], Self::room_row)?;
+        rows.collect()
+    }
+
+    fn room_row(row: &rusqlite::Row<'_>) -> SqlResult<RoomRow> {
+        Ok(RoomRow {
+            channel: row.get(0)?,
+            founder_did: row.get(1)?,
+            created_at: row.get::<_, i64>(2)? as u64,
+            last_activity: row.get::<_, i64>(3)? as u64,
+            expires_at: row.get::<_, i64>(4)? as u64,
+            warned_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+        })
+    }
+
+    /// Record activity at `at`: `last_activity` and `expires_at` only ever
+    /// move forward (a late flush of an old timestamp cannot shorten a
+    /// room's life), and the expiry warning is re-armed because the expiry
+    /// it warned about no longer stands.
+    pub fn touch_room(&self, channel: &str, at: u64, expires_at: u64) -> SqlResult<()> {
+        self.conn.execute(
+            "UPDATE rooms SET
+                last_activity = MAX(last_activity, ?2),
+                expires_at    = MAX(expires_at, ?3),
+                warned_at     = CASE WHEN ?3 > expires_at THEN NULL ELSE warned_at END
+             WHERE channel = ?1",
+            params![channel.to_lowercase(), at as i64, expires_at as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_room_warned(&self, channel: &str, now: u64) -> SqlResult<()> {
+        self.conn.execute(
+            "UPDATE rooms SET warned_at = ?2 WHERE channel = ?1",
+            params![channel.to_lowercase(), now as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Remove the room's own rows (`rooms`, `room_members`, `room_invites`).
+    /// The channel, its messages, pins and group keys are separate deletes;
+    /// `crate::rooms::delete_room` runs all of them.
+    pub fn delete_room(&self, channel: &str) -> SqlResult<()> {
+        let key = channel.to_lowercase();
+        self.conn
+            .execute("DELETE FROM room_members WHERE channel = ?1", params![key])?;
+        self.conn
+            .execute("DELETE FROM room_invites WHERE channel = ?1", params![key])?;
+        self.conn
+            .execute("DELETE FROM rooms WHERE channel = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// How many rooms `did` founded at or after `since` — the per-founder
+    /// minting limit.
+    pub fn rooms_founded_since(&self, did: &str, since: u64) -> SqlResult<usize> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM rooms WHERE founder_did = ?1 AND created_at >= ?2",
+            params![did, since as i64],
+            |row| row.get::<_, i64>(0).map(|n| n as usize),
+        )
+    }
+
+    /// File an invite by its token hash. The raw token is never stored.
+    pub fn add_room_invite(
+        &self,
+        channel: &str,
+        token_hash: &str,
+        created_by: &str,
+        now: u64,
+        expires_at: u64,
+        max_uses: Option<u32>,
+    ) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT INTO room_invites (channel, token_hash, created_by, created_at, expires_at, max_uses)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                channel.to_lowercase(),
+                token_hash,
+                created_by,
+                now as i64,
+                expires_at as i64,
+                max_uses.map(|n| n as i64)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Spend one use of the invite whose hash is `token_hash`, if it admits
+    /// `channel` and is unrevoked, unexpired and under its use cap. One
+    /// UPDATE does the check and the increment together, so two joins racing
+    /// on the last use cannot both win.
+    pub fn consume_room_invite(
+        &self,
+        channel: &str,
+        token_hash: &str,
+        now: u64,
+    ) -> SqlResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE room_invites SET uses = uses + 1
+             WHERE channel = ?1 AND token_hash = ?2
+               AND revoked_at IS NULL
+               AND expires_at > ?3
+               AND (max_uses IS NULL OR uses < max_uses)",
+            params![channel.to_lowercase(), token_hash, now as i64],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Revoke every live invite for a room. Returns how many were revoked.
+    pub fn revoke_room_invites(&self, channel: &str, now: u64) -> SqlResult<usize> {
+        self.conn.execute(
+            "UPDATE room_invites SET revoked_at = ?2
+             WHERE channel = ?1 AND revoked_at IS NULL",
+            params![channel.to_lowercase(), now as i64],
+        )
+    }
+
+    /// Put `did` on the roster (or back on it after a removal). A returning
+    /// member's `joined_at` is refreshed; a member who was never removed
+    /// keeps the original.
+    pub fn upsert_room_member(&self, channel: &str, did: &str, now: u64) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT INTO room_members (channel, did, joined_at, removed_at)
+             VALUES (?1, ?2, ?3, NULL)
+             ON CONFLICT(channel, did) DO UPDATE SET
+                joined_at  = CASE WHEN removed_at IS NULL THEN joined_at ELSE excluded.joined_at END,
+                removed_at = NULL",
+            params![channel.to_lowercase(), did, now as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_room_member(&self, channel: &str, did: &str) -> SqlResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM room_members
+             WHERE channel = ?1 AND did = ?2 AND removed_at IS NULL",
+            params![channel.to_lowercase(), did],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Mark `did` removed. Returns whether they were an active member.
+    pub fn remove_room_member(&self, channel: &str, did: &str, now: u64) -> SqlResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE room_members SET removed_at = ?3
+             WHERE channel = ?1 AND did = ?2 AND removed_at IS NULL",
+            params![channel.to_lowercase(), did, now as i64],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Active roster: `(did, joined_at)` in join order.
+    pub fn room_members(&self, channel: &str) -> SqlResult<Vec<(String, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT did, joined_at FROM room_members
+             WHERE channel = ?1 AND removed_at IS NULL ORDER BY joined_at ASC, did ASC",
+        )?;
+        let rows = stmt.query_map(params![channel.to_lowercase()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })?;
+        rows.collect()
+    }
+
+    pub fn room_member_count(&self, channel: &str) -> SqlResult<usize> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM room_members WHERE channel = ?1 AND removed_at IS NULL",
+            params![channel.to_lowercase()],
+            |row| row.get::<_, i64>(0).map(|n| n as usize),
+        )
+    }
+
+    /// Drop every pin in a channel (room deletion).
+    pub fn delete_pins(&self, channel: &str) -> SqlResult<usize> {
+        self.conn.execute(
+            "DELETE FROM pins WHERE channel = ?1",
+            params![channel.to_lowercase()],
+        )
+    }
+
+    /// Forget every auto-rejoin entry for a channel (room deletion), so no
+    /// reconnecting member is put back into a channel that no longer exists.
+    pub fn delete_user_channel_rows(&self, channel: &str) -> SqlResult<usize> {
+        self.conn.execute(
+            "DELETE FROM user_channels WHERE channel = ?1",
+            params![channel.to_lowercase()],
+        )
+    }
+
+    /// Whether a channel row exists by exact name — used to keep generated
+    /// room names unique against channels that are persisted but not loaded.
+    pub fn channel_row_exists(&self, name: &str) -> SqlResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM channels WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
     }
 
     /// Load all pre-key bundles (for populating in-memory cache on startup).
@@ -11599,5 +11902,207 @@ mod replay_window_tests {
             window.iter().any(|e| e.venue.starts_with("dm:")),
             "including the direct message, which the peer receives live anyway"
         );
+    }
+}
+
+#[cfg(test)]
+mod room_db_tests {
+    //! The instant-room tables (migration 016) through `Db`.
+    use super::*;
+
+    const CH: &str = "#r-amber-fox-lake";
+    const F: &str = "did:key:zF";
+    const M: &str = "did:key:zM";
+
+    #[test]
+    fn the_room_flag_round_trips_through_the_channels_table() {
+        let db = Db::open_memory().unwrap();
+        let room = ChannelState {
+            room: true,
+            invite_only: true,
+            encrypted_only: true,
+            founder_did: Some(F.into()),
+            ..Default::default()
+        };
+        db.save_channel(CH, &room).unwrap();
+        db.save_channel("#plain", &ChannelState::default()).unwrap();
+        let loaded = db.load_channels().unwrap();
+        assert!(loaded[CH].room);
+        assert!(!loaded["#plain"].room);
+        assert!(db.channel_row_exists(CH).unwrap());
+        assert!(!db.channel_row_exists("#nope").unwrap());
+    }
+
+    #[test]
+    fn a_room_is_filed_touched_forward_only_and_listed() {
+        let db = Db::open_memory().unwrap();
+        db.create_room(CH, F, 1000, 2000).unwrap();
+        let row = db.get_room(CH).unwrap().unwrap();
+        assert_eq!(
+            row,
+            RoomRow {
+                channel: CH.into(),
+                founder_did: F.into(),
+                created_at: 1000,
+                last_activity: 1000,
+                expires_at: 2000,
+                warned_at: None,
+            }
+        );
+        assert_eq!(
+            db.get_room("#R-AMBER-FOX-LAKE").unwrap().unwrap().channel,
+            CH
+        );
+        assert!(db.get_room("#other").unwrap().is_none());
+
+        db.set_room_warned(CH, 1500).unwrap();
+        assert_eq!(db.get_room(CH).unwrap().unwrap().warned_at, Some(1500));
+
+        // A stale flush cannot pull the expiry back; a fresh one re-arms the warning.
+        db.touch_room(CH, 900, 1900).unwrap();
+        let row = db.get_room(CH).unwrap().unwrap();
+        assert_eq!(
+            (row.last_activity, row.expires_at, row.warned_at),
+            (1000, 2000, Some(1500))
+        );
+        db.touch_room(CH, 1600, 2600).unwrap();
+        let row = db.get_room(CH).unwrap().unwrap();
+        assert_eq!(
+            (row.last_activity, row.expires_at, row.warned_at),
+            (1600, 2600, None)
+        );
+
+        db.create_room("#r-b-b-b", M, 1001, 2001).unwrap();
+        let names: Vec<String> = db
+            .list_rooms()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.channel)
+            .collect();
+        assert_eq!(names, vec![CH.to_string(), "#r-b-b-b".to_string()]);
+        assert_eq!(db.rooms_founded_since(F, 1000).unwrap(), 1);
+        assert_eq!(db.rooms_founded_since(F, 1001).unwrap(), 0);
+    }
+
+    #[test]
+    fn invites_admit_while_live_under_cap_and_unrevoked() {
+        let db = Db::open_memory().unwrap();
+        db.create_room(CH, F, 1000, 2000).unwrap();
+        db.add_room_invite(CH, "hash-a", F, 1000, 1500, Some(2))
+            .unwrap();
+        db.add_room_invite(CH, "hash-b", F, 1000, 1500, None)
+            .unwrap();
+
+        assert!(
+            !db.consume_room_invite("#r-other", "hash-a", 1100).unwrap(),
+            "wrong room"
+        );
+        assert!(
+            !db.consume_room_invite(CH, "hash-zzz", 1100).unwrap(),
+            "unknown"
+        );
+        assert!(
+            !db.consume_room_invite(CH, "hash-a", 1500).unwrap(),
+            "expired at expiry"
+        );
+        assert!(db.consume_room_invite(CH, "hash-a", 1100).unwrap());
+        assert!(db.consume_room_invite(CH, "hash-a", 1100).unwrap());
+        assert!(
+            !db.consume_room_invite(CH, "hash-a", 1100).unwrap(),
+            "two uses spent"
+        );
+        for _ in 0..5 {
+            assert!(
+                db.consume_room_invite(CH, "hash-b", 1100).unwrap(),
+                "unlimited"
+            );
+        }
+        assert_eq!(db.revoke_room_invites(CH, 1200).unwrap(), 2);
+        assert_eq!(db.revoke_room_invites(CH, 1200).unwrap(), 0);
+        assert!(
+            !db.consume_room_invite(CH, "hash-b", 1100).unwrap(),
+            "revoked"
+        );
+    }
+
+    #[test]
+    fn the_roster_upserts_removes_and_counts() {
+        let db = Db::open_memory().unwrap();
+        db.create_room(CH, F, 1000, 2000).unwrap();
+        db.upsert_room_member(CH, F, 1000).unwrap();
+        db.upsert_room_member(CH, M, 1100).unwrap();
+        assert_eq!(db.room_member_count(CH).unwrap(), 2);
+        assert!(db.is_room_member(CH, M).unwrap());
+        assert_eq!(
+            db.room_members(CH).unwrap(),
+            vec![(F.to_string(), 1000), (M.to_string(), 1100)]
+        );
+        // Re-upserting a live member keeps their original joined_at.
+        db.upsert_room_member(CH, M, 1200).unwrap();
+        assert_eq!(db.room_members(CH).unwrap()[1].1, 1100);
+
+        assert!(db.remove_room_member(CH, M, 1300).unwrap());
+        assert!(
+            !db.remove_room_member(CH, M, 1300).unwrap(),
+            "already removed"
+        );
+        assert!(!db.is_room_member(CH, M).unwrap());
+        assert_eq!(db.room_member_count(CH).unwrap(), 1);
+        // Coming back through a fresh invite re-activates with a new joined_at.
+        db.upsert_room_member(CH, M, 1400).unwrap();
+        assert!(db.is_room_member(CH, M).unwrap());
+        assert_eq!(db.room_members(CH).unwrap()[1].1, 1400);
+    }
+
+    #[test]
+    fn epochs_are_read_per_member_and_deletion_clears_everything() {
+        let db = Db::open_memory().unwrap();
+        db.save_channel(
+            CH,
+            &ChannelState {
+                room: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.create_room(CH, F, 1000, 2000).unwrap();
+        db.upsert_room_member(CH, F, 1000).unwrap();
+        db.add_room_invite(CH, "h", F, 1000, 1500, None).unwrap();
+        assert_eq!(db.latest_group_epoch(CH).unwrap(), None);
+        db.save_group_key(CH, F, 1, "EGK1:a").unwrap();
+        db.save_group_key(CH, F, 3, "EGK1:c").unwrap();
+        db.save_group_key(CH, M, 1, "EGK1:b").unwrap();
+        assert_eq!(db.latest_group_epoch(CH).unwrap(), Some(3));
+        let by = db.group_key_epochs_by_member(CH).unwrap();
+        assert_eq!(by[F], vec![1, 3]);
+        assert_eq!(by[M], vec![1]);
+        db.insert_message(
+            CH,
+            "f!f@h",
+            "EG1:1:x",
+            1000,
+            &HashMap::new(),
+            Some("01MSG"),
+            Some(F),
+        )
+        .unwrap();
+        db.store_pin(CH, "01MSG", "f", 1000).unwrap();
+        db.add_user_channel(F, CH).unwrap();
+
+        db.delete_channel(CH).unwrap();
+        db.prune_messages(CH, 0).unwrap();
+        db.delete_group_keys(CH).unwrap();
+        db.delete_pins(CH).unwrap();
+        db.delete_user_channel_rows(CH).unwrap();
+        db.delete_room(CH).unwrap();
+
+        assert!(!db.channel_row_exists(CH).unwrap());
+        assert!(db.get_room(CH).unwrap().is_none());
+        assert_eq!(db.room_member_count(CH).unwrap(), 0);
+        assert!(!db.consume_room_invite(CH, "h", 1100).unwrap());
+        assert_eq!(db.latest_group_epoch(CH).unwrap(), None);
+        assert!(db.get_messages(CH, 10, None).unwrap().is_empty());
+        assert!(db.get_pins(CH).unwrap().is_empty());
+        assert!(db.get_user_channels(F).unwrap().is_empty());
     }
 }
