@@ -61,6 +61,8 @@ mod m014_revoked_broker_tokens;
 mod m015_record_cache;
 #[path = "016_signing_key_expiry.rs"]
 mod m016_signing_key_expiry;
+#[path = "017_rooms.rs"]
+mod m017_rooms;
 
 // db.rs unit tests exercise the backfill directly against hand-built rows.
 // Production reaches it only as a rung of the ladder below.
@@ -87,6 +89,7 @@ fn rungs() -> Vec<rusqlite_migration::M<'static>> {
         m014_revoked_broker_tokens::migration(),
         m015_record_cache::migration(),
         m016_signing_key_expiry::migration(),
+        m017_rooms::migration(),
     ]
 }
 

@@ -1826,9 +1826,11 @@ pub(super) fn handle_privmsg_with_multiline(
         // Channel message — enforce +n (no external messages) and +m (moderated)
         // Resolve sender DID once, before taking the channels lock.
         let sender_did = state.session_dids.lock().get(&conn.id).cloned();
+        let mut is_room = false;
         {
             let channels = state.channels.lock();
             if let Some(ch) = channels.get(target) {
+                is_room = ch.room;
                 // Founder + persistent DID-ops bypass +m.
                 let is_did_authority = sender_did.as_deref().is_some_and(|d| {
                     ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d)
@@ -1904,6 +1906,10 @@ pub(super) fn handle_privmsg_with_multiline(
                     return;
                 }
             }
+        }
+        // A message keeps a room alive. Noted in memory; the sweeper flushes.
+        if is_room && !is_notice {
+            crate::rooms::bump_activity(state, target);
         }
 
         // The id this message is filed under — the sender's own if it minted
