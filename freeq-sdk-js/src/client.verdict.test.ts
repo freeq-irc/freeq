@@ -634,6 +634,99 @@ describe('a replayed history batch', () => {
     expect(prefetch).not.toHaveBeenCalled();
   });
 
+  it('starts the checks an open batch holds when the connection ends', async () => {
+    const { lk, prefetch, keyForAt, release } = gatedLookup();
+    const s = await session(OWN_DID, lk);
+    const lines = [await signed(A, 41, 'first', { batch: 'h' }), await signed(A, 41, 'second', { batch: 'h' })];
+    s.ws.recv(':srv BATCH +h chathistory #room');
+    for (const l of lines) s.ws.recv(l.wire);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(keyForAt, 'no check while the batch is open').not.toHaveBeenCalled();
+
+    // No `BATCH -h`: the connection ends with the batch still open.
+    s.client.disconnect();
+    await until(() => prefetch.mock.calls.length > 0);
+    expect(prefetch).toHaveBeenCalledTimes(1);
+    expect(prefetch).toHaveBeenCalledWith([A]);
+
+    release();
+    await until(() => keyForAt.mock.calls.length >= 2);
+    expect(keyForAt).toHaveBeenCalledTimes(2);
+  });
+
+  it('settles a DM line an open batch held when the connection ends', async () => {
+    const { lk, release } = gatedLookup();
+    const s = await session(OWN_DID, lk);
+    // An incoming DM from A to us: its venue is built from both DIDs, and
+    // only `ownDid` tells the checker which end we are.
+    const msgid = signing.newEventId();
+    const key = await importDidKey(new Uint8Array(32).fill(41));
+    const canonical = await signing.messageCanonical({
+      from: A,
+      msgid,
+      target: signing.dmVenue(A, OWN_DID),
+      body: 'psst',
+    });
+    const sig = await key.signer(new TextEncoder().encode(canonical));
+    const pub = (await import('./did-key.js')).decodeMultibaseEd25519(key.publicKeyMultibase);
+    await hold(A, pub);
+    const tags = { batch: 'h', account: A, msgid, [signing.SIG_TAG]: `ed25519:${await signing.deriveKid(pub)}:${sig}` };
+
+    s.ws.recv(':srv BATCH +h chathistory me');
+    s.ws.recv(line(tags, 'PRIVMSG', 'me', 'psst'));
+    await new Promise((r) => setTimeout(r, 50));
+
+    // No `BATCH -h`: the connection ends with the batch still open.
+    s.client.disconnect();
+    release();
+    await settle(s, [msgid]);
+    expect(s.seen.get(msgid)?.settled?.state).toBe('device');
+  });
+
+  it('starts the checks an open batch holds when the socket drops, once', async () => {
+    const { lk, prefetch, keyForAt, release } = gatedLookup();
+    const s = await session(OWN_DID, lk);
+    const lines = [await signed(A, 41, 'first', { batch: 'h' }), await signed(A, 41, 'second', { batch: 'h' })];
+    s.ws.recv(':srv BATCH +h chathistory #room');
+    for (const l of lines) s.ws.recv(l.wire);
+    await new Promise((r) => setTimeout(r, 50));
+
+    // No `BATCH -h`, and no `disconnect()`: the socket drops on its own.
+    s.ws.close();
+    await until(() => prefetch.mock.calls.length > 0);
+    expect(prefetch).toHaveBeenCalledTimes(1);
+    expect(prefetch).toHaveBeenCalledWith([A]);
+
+    release();
+    await settle(s, lines.map((l) => l.msgid));
+    expect(keyForAt).toHaveBeenCalledTimes(2);
+    expect(lines.map((l) => s.seen.get(l.msgid)?.settled?.state)).toEqual(['device', 'device']);
+    s.client.disconnect();
+  });
+
+  it('delivers the verdict of a held check that finishes after the reconnect', async () => {
+    const { lk, prefetch, keyForAt, release } = gatedLookup();
+    const s = await session(OWN_DID, lk);
+    const lines = [await signed(A, 41, 'first', { batch: 'h' }), await signed(A, 41, 'second', { batch: 'h' })];
+    s.ws.recv(':srv BATCH +h chathistory #room');
+    for (const l of lines) s.ws.recv(l.wire);
+    await new Promise((r) => setTimeout(r, 50));
+    // The origin answers at about 1.5 s; the transport reconnects at about 1 s.
+    origin.delayMs = 1500;
+
+    s.ws.close();
+    release();
+    await until(() => MockWebSocket.instances.length === 2);
+    expect(MockWebSocket.instances.length).toBe(2);
+    for (let i = 0; i < 800 && lines.some((l) => s.seen.get(l.msgid)?.settled === undefined); i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(lines.map((l) => s.seen.get(l.msgid)?.settled?.state)).toEqual(['device', 'device']);
+    expect(prefetch).toHaveBeenCalledTimes(1);
+    expect(keyForAt).toHaveBeenCalledTimes(2);
+    s.client.disconnect();
+  }, 10_000);
+
   it('checks a line outside a batch, or in a batch never seen opened, at once', async () => {
     const { lk, prefetch } = gatedLookup();
     const s = await session(OWN_DID, lk);

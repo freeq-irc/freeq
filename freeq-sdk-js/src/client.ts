@@ -371,6 +371,10 @@ export class FreeqClient extends EventEmitter {
 
   /** Disconnect from the server. */
   disconnect(): void {
+    // A batch still open holds its lines' checks; nothing else would ever
+    // start them, and a line left pending is persisted pending by a client
+    // that caches the settled verdict.
+    this.endOpenBatches();
     this.transport?.disconnect();
     this.transport = null;
     this._nick = '';
@@ -1126,6 +1130,10 @@ export class FreeqClient extends EventEmitter {
       this.emit('disconnected', 'transport closed');
     }
 
+    // A batch left open when the socket drops never gets its `BATCH -id`.
+    // Every report, the second and late ones too; the second finds nothing.
+    if (state === 'disconnected') this.endOpenBatches();
+
     if (state === 'connected') {
       this.ackedCaps.clear();
       this.clearNickResume();
@@ -1653,27 +1661,37 @@ export class FreeqClient extends EventEmitter {
    * Finish a pending check off the receive path: `onSettled` gets the verdict
    * first, then `verdict` is emitted. Never awaited by the caller. A line in
    * an open batch other than `draft/multiline` (`batchId`, by default its
-   * `batch` tag) is held on the batch and checked when it closes.
+   * `batch` tag) is held on the batch and checked when it closes, against the
+   * DM venue and the checker read at the time it was held; its verdict goes
+   * out even when a reconnect has replaced the checker since.
    */
   private checkLater(
     delivered: Verdict | undefined,
     line: { tags: Record<string, string>; target: string; body?: string; from?: string },
     onSettled?: (verdict: Verdict) => void,
     batchId: string | undefined = line.tags['batch'],
+    held?: { ownDid: string | undefined; targetDid: string | undefined; checker: SignatureChecker },
   ): void {
-    const checker = this.checker;
+    const checker = held ? held.checker : this.checker;
     if (!checker || delivered?.state !== 'pending') return;
     const batch = batchId ? this.batches.get(batchId) : undefined;
     if (batch && batch.type !== 'draft/multiline') {
+      // A DM's venue is built from both ends, and `disconnect()` clears the
+      // session before it starts what a batch still holds; read them now.
+      const at = {
+        ownDid: this.sasl?.did ?? this._authDid ?? undefined,
+        targetDid: this.didForNick(line.target),
+        checker,
+      };
       (batch.deferredChecks ??= []).push({
         did: line.tags['account'],
-        start: () => this.checkLater(delivered, line, onSettled, ''),
+        start: () => this.checkLater(delivered, line, onSettled, '', at),
       });
       return;
     }
     const id = this.signedLineId(line.tags, line.body === undefined)!;
-    const ownDid = this.sasl?.did ?? this._authDid ?? undefined;
-    const targetDid = this.didForNick(line.target);
+    const ownDid = held ? held.ownDid : (this.sasl?.did ?? this._authDid ?? undefined);
+    const targetDid = held ? held.targetDid : this.didForNick(line.target);
     void (async () => {
       let verdict: Verdict;
       try {
@@ -1694,8 +1712,19 @@ export class FreeqClient extends EventEmitter {
         this.emit('memberDid', line.from, did);
       }
       onSettled?.(verdict);
-      if (this.checker === checker) this.emit('verdict', id, verdict);
+      if (held || this.checker === checker) this.emit('verdict', id, verdict);
     })();
+  }
+
+  /**
+   * Drop every open batch and start the checks each one holds. The batches
+   * are removed before anything starts, so a second call starts nothing.
+   * Emits neither `historyBatch` nor the held task events.
+   */
+  private endOpenBatches(): void {
+    const open = [...this.batches.values()];
+    this.batches.clear();
+    for (const batch of open) this.startDeferredChecks(batch);
   }
 
   /**
