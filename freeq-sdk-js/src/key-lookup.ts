@@ -346,7 +346,8 @@ export class KeyLookup {
   /**
    * Take the device records of `dids` from the origin, the home server, in
    * one request per 50 accounts, for the DIDs whose listing is not held
-   * inside the ttl: each account the server returns is proven from the
+   * inside the ttl, and that can have one at all (a did:key is the key, so
+   * it is never asked for): each account the server returns is proven from the
    * proofs it carries (a record whose proof is missing or fails is proven at
    * the PDS) and kept with the server's listing time. An account the server
    * leaves out is not read here; its first lookup lists it. Nothing is asked
@@ -360,6 +361,8 @@ export class KeyLookup {
     const waits: Promise<void>[] = [];
     const asked: string[] = [];
     for (const did of new Set(dids)) {
+      // A did:key has no repository to list: the DID is the key.
+      if (did.startsWith('did:key:')) continue;
       const inFlight = this.prefetching.get(did);
       if (inFlight !== undefined) {
         waits.push(inFlight);
@@ -456,9 +459,14 @@ export class KeyLookup {
   /**
    * `did`'s proven device records: the last listing while inside the ttl, if
    * it names `kid` or the DID was already listed for a lookup inside the ttl;
-   * else a listing, so a key published since is found within the ttl.
+   * else a listing, so a key published since is found within the ttl. A
+   * `did:key` has none, and is answered without a request.
    */
   private async deviceRecords(did: string, kid: string): Promise<unknown[]> {
+    // A did:key has no repository to list: the DID is the key. Answering
+    // before anything is looked up or asked for keeps the records step from
+    // making a request the server can only answer empty.
+    if (did.startsWith('did:key:')) return [];
     const last = this.records.get(did);
     const now = Date.now();
     if (last !== undefined && now - last.at < this.ttlMs) {

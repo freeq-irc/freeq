@@ -689,7 +689,7 @@ const CAROL = 'did:plc:carolcarolcarolcarolcaro';
  * as their home server answering the record routes from the same
  * repositories. Counts PDS listings and proofs, and origin key requests.
  */
-async function homeNetwork() {
+async function homeNetwork(originKeys: Record<string, Uint8Array> = {}) {
   const { stubRepo, stubHome } = await import('../test/repo-proofs.js');
   const repos = [await stubRepo(ALICE, repoKey), await stubRepo(BOB), await stubRepo(CAROL)];
   for (const [i, repo] of repos.entries()) {
@@ -714,6 +714,15 @@ async function homeNetwork() {
       const answer = await home.respond(url);
       if (answer !== undefined) return answer;
       hits.origin++;
+      // The origin's key route: one server answers both in production.
+      const prefix = '/api/v1/signing-keys/';
+      if (url.pathname.startsWith(prefix)) {
+        const [did, kid] = url.pathname.slice(prefix.length).split('/').map(decodeURIComponent);
+        const found = originKeys[`${did} ${kid}`];
+        if (found !== undefined) {
+          return Response.json({ did, kid, algorithm: 'ed25519', public_key: b64url(found) });
+        }
+      }
       return new Response('not found', { status: 404 });
     }
     return new Response('unexpected', { status: 500 });
@@ -744,6 +753,31 @@ describe('KeyLookup through the home server', () => {
     await Promise.all([lookup.prefetch([ALICE, BOB]), lookup.prefetch([BOB, ALICE])]);
     await lookup.prefetch([ALICE]);
     expect(home.hits.batch).toBe(1);
+  });
+
+  it('leaves a did:key signer out of the batch, and asks for a did:web one', async () => {
+    const { home, fetch, resolveDid } = await homeNetwork();
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    await lookup.prefetch([ALICE, 'did:key:z6MkExample', 'did:web:irc.example.com']);
+    expect(home.batches).toEqual([[ALICE, 'did:web:irc.example.com']]);
+  });
+
+  it('reads no records anywhere for a did:key signer, and takes its key from the origin', async () => {
+    const BOT = 'did:key:z6MkExampleBotSigner';
+    const botKey = await raw(7);
+    const { home, pds, hits, fetch, resolveDid } = await homeNetwork({ [`${BOT} ${await kidOf(7)}`]: botKey });
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    expect((await lookup.keyFor(BOT, await kidOf(7)))?.source).toBe('OriginServer');
+    expect(home.hits, 'no record request').toEqual(noHome);
+    expect(pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+    expect(hits.origin).toBe(1);
+  });
+
+  it('asks nothing for a batch of did:key signers alone', async () => {
+    const { home, fetch, resolveDid } = await homeNetwork();
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    await lookup.prefetch(['did:key:z6MkExample']);
+    expect(home.hits.batch).toBe(0);
   });
 
   it('lists a signer the home server left out at the PDS', async () => {
