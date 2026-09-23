@@ -22,6 +22,7 @@ import {
   deviceKeyHistory,
   fetchAccounts,
   listRecordEntries,
+  listRecordEntriesDated,
   provenRecords,
   retirementClosure,
 } from './identity-records.js';
@@ -134,6 +135,8 @@ export class KeyLookup {
   private readonly proving = new Map<string, Promise<boolean>>();
   /** One prefetch in flight per DID, so prefetches racing on an account share one request. */
   private readonly prefetching = new Map<string, Promise<void>>();
+  /** Per DID, how many times `refreshAccount` has dropped its answers. */
+  private readonly refreshes = new Map<string, number>();
   private defaultOrigin: string | null = null;
   /** The store's snapshot, taken in once before the first lookup. */
   private loaded: Promise<void> | null = null;
@@ -259,6 +262,7 @@ export class KeyLookup {
     cached: Cached | undefined,
   ): Promise<Settled> {
     const started = performance.now();
+    const refreshes = this.refreshes.get(did);
     const listed = cached === undefined;
     let settled = await this.ask(did, kid, at, cached?.records);
     for (const after of this.retryAfterMs) {
@@ -269,7 +273,9 @@ export class KeyLookup {
     }
     if (settled.other === undefined) {
       if (listed && !settled.failed) this.remember(slot, settled.records, undefined);
-    } else if (settled.other !== null || !settled.failed) {
+    } else if ((settled.other !== null || !settled.failed) && this.refreshes.get(did) === refreshes) {
+      // An account refreshed since this lookup began has dropped the answers
+      // its new records can change; one from before stays dropped.
       this.remember(slot, settled.records, settled.other);
     }
     await this.save();
@@ -398,9 +404,9 @@ export class KeyLookup {
           account.proofs,
         );
         const at = Math.min(account.fetchedAt * 1000, Date.now());
-        this.records.set(did, { records, at });
-        // A listing for key lookups, like the one `deviceRecords` makes.
-        this.refreshed.set(did, at);
+        // A listing for key lookups, like the one `deviceRecords` makes,
+        // unless a newer one is held.
+        if (this.keepListing(did, records, at) === records) this.refreshed.set(did, at);
       }),
     ).catch(() => undefined);
     if (accounts.size > 0) await this.save();
@@ -415,7 +421,8 @@ export class KeyLookup {
     await this.load();
     const last = this.records.get(did);
     if (last !== undefined && Date.now() - last.at < this.ttlMs) return last.records;
-    return this.refreshDeviceRecords(did);
+    this.refreshed.set(did, Date.now());
+    return this.listDeviceRecords(did);
   }
 
   /**
@@ -485,13 +492,18 @@ export class KeyLookup {
    * alone, since its proofs are mostly proven already, then each new
    * record's proof. Whatever it does not serve is read from the PDS. A
    * listing that fails is not kept.
+   *
+   * `direct` lists at the PDS, the home server skipped, and always starts a
+   * new listing, which lookups starting meanwhile join. Either way a listing
+   * is kept only if none newer is held (`keepListing`), and is dated from
+   * before its request.
    */
-  private listDeviceRecords(did: string): Promise<unknown[]> {
-    let pending = this.listing.get(did);
+  private listDeviceRecords(did: string, direct = false): Promise<unknown[]> {
+    let pending = direct ? undefined : this.listing.get(did);
     if (pending === undefined) {
       const started: Promise<unknown[]> = (async () => {
         const { fetch, resolveDid } = this.reader;
-        const home = this.originBase();
+        const home = direct ? null : this.originBase();
         if (home !== null && !this.records.has(did)) {
           const account = (await fetchAccounts(fetch, home, [did], DEVICE_KEY_TYPE)).get(did);
           if (account !== undefined) {
@@ -505,26 +517,31 @@ export class KeyLookup {
               this.proving,
               account.proofs,
             );
-            this.records.set(did, { records, at: Math.min(account.fetchedAt * 1000, Date.now()) });
+            const kept = this.keepListing(did, records, Math.min(account.fetchedAt * 1000, Date.now()));
             await this.save();
-            return records;
+            return kept;
           }
         }
-        const listed = await listRecordEntries(fetch, resolveDid, did, DEVICE_KEY_TYPE, home);
+        const asked = Date.now();
+        const listed = await listRecordEntriesDated(fetch, resolveDid, did, DEVICE_KEY_TYPE, home);
+        // What the home server hands over is dated with its own listing time,
+        // never later than now, as the batch route's is; a PDS listing with
+        // this client's time from before the request.
+        const at = listed.fetchedAt === null ? asked : Math.min(listed.fetchedAt * 1000, Date.now());
         const records = await provenRecords(
           fetch,
           resolveDid,
           did,
           DEVICE_KEY_TYPE,
-          listed,
+          listed.entries,
           this.proven,
           this.proving,
           undefined,
           home,
         );
-        this.records.set(did, { records, at: Date.now() });
+        const kept = this.keepListing(did, records, at);
         await this.save();
-        return records;
+        return kept;
       })().finally(() => {
         if (this.listing.get(did) === started) this.listing.delete(did);
       });
@@ -547,6 +564,43 @@ export class KeyLookup {
     if (this.cache.get(slot)?.other !== null) return;
     this.cache.delete(slot);
     this.refreshed.delete(did);
+  }
+
+  /**
+   * List `did`'s account at the PDS now, however recently it was listed:
+   * this client has just published a device key record of its own, and the
+   * home server's copy may predate it. Then drops the cached answers a new
+   * record can change — a remembered miss, and one the origin server
+   * answered — including any a lookup already running would keep. An answer
+   * found in the records stands. A listing that fails changes nothing.
+   * Never rejects.
+   */
+  async refreshAccount(did: string): Promise<void> {
+    await this.load();
+    if (did.startsWith('did:key:')) return;
+    try {
+      await this.listDeviceRecords(did, true);
+    } catch {
+      return;
+    }
+    this.refreshed.set(did, Date.now());
+    this.refreshes.set(did, (this.refreshes.get(did) ?? 0) + 1);
+    for (const [slot, cached] of this.cache) {
+      if ((JSON.parse(slot) as [string, string])[0] !== did) continue;
+      if (cached.other === null || cached.other?.source === 'OriginServer') this.cache.delete(slot);
+    }
+    await this.save();
+  }
+
+  /**
+   * Hold `records`, listed at `at`, as `did`'s listing unless a newer one is
+   * held; the listing held after, for a lookup to use.
+   */
+  private keepListing(did: string, records: unknown[], at: number): unknown[] {
+    const held = this.records.get(did);
+    if (held !== undefined && held.at > at) return held.records;
+    this.records.set(did, { records, at });
+    return records;
   }
 
   private remember(slot: string, records: unknown[], other: FoundKey | null | undefined): void {

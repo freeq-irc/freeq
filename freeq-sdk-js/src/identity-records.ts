@@ -580,20 +580,39 @@ export async function listRecordEntries(
   collection: string,
   homeBase?: string | null,
 ): Promise<ListedRecord[]> {
+  return (await listRecordEntriesDated(fetch, resolveDid, did, collection, homeBase)).entries;
+}
+
+/**
+ * `listRecordEntries`, with the home server's listing time (its
+ * `fetched_at`, unix seconds) when the home server served the listing; null
+ * when it was read from the PDS, or the server did not say.
+ */
+export async function listRecordEntriesDated(
+  fetch: Fetch,
+  resolveDid: ResolveDid,
+  did: string,
+  collection: string,
+  homeBase?: string | null,
+): Promise<{ entries: ListedRecord[]; fetchedAt: number | null }> {
   if (homeBase) {
     const path = `/api/v1/records/${encodeURIComponent(did)}/${encodeURIComponent(collection)}`;
     try {
       const answer = (await (await get(fetch, homeUrl(homeBase, path), true)).json()) as {
         records?: unknown;
+        fetched_at?: unknown;
       };
       const records = listedRecords(answer.records);
-      if (records !== null) return records;
+      if (records !== null) {
+        const fetchedAt = typeof answer.fetched_at === 'number' ? answer.fetched_at : null;
+        return { entries: records, fetchedAt };
+      }
     } catch {
       // The PDS, as without a home server.
     }
   }
   const pds = pdsEndpoint(await resolveDid(did));
-  if (pds === undefined) return [];
+  if (pds === undefined) return { entries: [], fetchedAt: null };
   const records: ListedRecord[] = [];
   let cursor: string | undefined;
   for (;;) {
@@ -618,7 +637,7 @@ export async function listRecordEntries(
     if (typeof page.cursor !== 'string' || page.records.length === 0) break;
     cursor = page.cursor;
   }
-  return records;
+  return { entries: records, fetchedAt: null };
 }
 
 /**

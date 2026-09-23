@@ -1856,6 +1856,10 @@ export class FreeqClient extends EventEmitter {
           const answer = (await resp.json()) as { uri?: unknown };
           if (typeof answer.uri === 'string') {
             await store.save({ ...stored, recordUri: answer.uri });
+            // The listing taken at connect predates this record, and so may
+            // the home server's copy. Our own lines are checked against it,
+            // so the account is listed at the PDS now.
+            await this.opts.keyLookup?.refreshAccount(did);
           }
         } else if (resp.status === 401 || resp.status === 403) {
           if (epoch === this.enrollmentEpoch) this.emit('signingKeyUnpublished');

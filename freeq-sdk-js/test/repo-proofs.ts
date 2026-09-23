@@ -155,7 +155,10 @@ export async function stubRepo(did: string, keypair?: RepoKeypair): Promise<Stub
  * not seen (left out of a batch, 404 alone); `withheld` names `collection/rkey`
  * proofs the server cannot serve (left out of `proofs`, 502 alone); `served`
  * replaces the CAR served for a `collection/rkey`. `fetchedAt` is the listing
- * time served, unix seconds; null serves the time of the answer.
+ * time served, unix seconds; null serves the time of the answer. `frozen`
+ * serves the first listing and `fetched_at` served for each (DID,
+ * collection) again on the batch, account and listing routes, as a server
+ * cache not yet refreshed does; proofs still come from the repository.
  */
 export interface StubHome {
   hits: { batch: number; account: number; listing: number; proof: number };
@@ -167,12 +170,14 @@ export interface StubHome {
   withheld: Set<string>;
   served: Map<string, Uint8Array>;
   fetchedAt: number | null;
+  frozen: boolean;
   /** Answer a record route; undefined for any other path. */
   respond(url: URL): Promise<Response | undefined>;
 }
 
 export function stubHome(repos: StubRepo[]): StubHome {
   const prefix = '/api/v1/records';
+  const frozenListings = new Map<string, { entries: ListedEntry[]; fetchedAt: number }>();
   const home: StubHome = {
     hits: { batch: 0, account: 0, listing: 0, proof: 0 },
     batches: [],
@@ -182,6 +187,7 @@ export function stubHome(repos: StubRepo[]): StubHome {
     withheld: new Set(),
     served: new Map(),
     fetchedAt: null,
+    frozen: false,
     async respond(url: URL): Promise<Response | undefined> {
       if (url.pathname !== prefix && !url.pathname.startsWith(`${prefix}/`)) return undefined;
       const parts = url.pathname.slice(prefix.length).split('/').filter(Boolean).map(decodeURIComponent);
@@ -196,22 +202,33 @@ export function stubHome(repos: StubRepo[]): StubHome {
           : (home.served.get(`${collection}/${rkey}`) ?? repo.car(collection, rkey));
       const rkeyOf = (entry: ListedEntry) => entry.uri.split('/').pop()!;
       const fetchedAt = home.fetchedAt ?? Math.floor(Date.now() / 1000);
-      const account = (repo: StubRepo, collection: string) => ({
-        did: repo.did,
-        collections: {
-          [collection]: {
-            fetched_at: fetchedAt,
-            stale: false,
-            records: repo.entries(collection),
-            proofs: repo.entries(collection).flatMap((entry) => {
-              const car = carFor(repo, collection, rkeyOf(entry));
-              return car === undefined
-                ? []
-                : [{ rkey: rkeyOf(entry), cid: entry.cid, fetched_at: fetchedAt, car: Buffer.from(car).toString('base64') }];
-            }),
+      // The listing served for (DID, collection): the first one again while frozen.
+      const listing = (repo: StubRepo, collection: string): { entries: ListedEntry[]; fetchedAt: number } => {
+        const live = { entries: repo.entries(collection), fetchedAt };
+        if (!home.frozen) return live;
+        const slot = `${repo.did} ${collection}`;
+        if (!frozenListings.has(slot)) frozenListings.set(slot, live);
+        return frozenListings.get(slot)!;
+      };
+      const account = (repo: StubRepo, collection: string) => {
+        const { entries, fetchedAt } = listing(repo, collection);
+        return {
+          did: repo.did,
+          collections: {
+            [collection]: {
+              fetched_at: fetchedAt,
+              stale: false,
+              records: entries,
+              proofs: entries.flatMap((entry) => {
+                const car = carFor(repo, collection, rkeyOf(entry));
+                return car === undefined
+                  ? []
+                  : [{ rkey: rkeyOf(entry), cid: entry.cid, fetched_at: fetchedAt, car: Buffer.from(car).toString('base64') }];
+              }),
+            },
           },
-        },
-      });
+        };
+      };
       const collection = url.searchParams.get('collection') ?? 'at.freeq.deviceKey';
       if (route === 'batch') {
         const dids = (url.searchParams.get('dids') ?? '').split(',').filter(Boolean);
@@ -226,12 +243,13 @@ export function stubHome(repos: StubRepo[]): StubHome {
       if (repo === undefined) return new Response('not found', { status: 404 });
       if (route === 'account') return Response.json(account(repo, collection));
       if (route === 'listing') {
+        const { entries, fetchedAt } = listing(repo, parts[1]!);
         return Response.json({
           did: repo.did,
           collection: parts[1],
           fetched_at: fetchedAt,
           stale: false,
-          records: repo.entries(parts[1]!),
+          records: entries,
         });
       }
       if (!repo.entries(parts[1]!).some((e) => rkeyOf(e) === parts[2])) {

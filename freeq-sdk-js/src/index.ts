@@ -107,6 +107,7 @@ export {
   foldAgentRecords,
   listRecords,
   listRecordEntries,
+  listRecordEntriesDated,
   provenRecords,
   liveDeviceKeys,
   liveAgentLinks,

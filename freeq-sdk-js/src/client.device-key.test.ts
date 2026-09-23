@@ -113,7 +113,11 @@ async function until(done: () => boolean): Promise<void> {
   for (let i = 0; i < 200 && !done(); i++) await new Promise((r) => setTimeout(r, 5));
 }
 
-async function makeClient(store: MemoryDeviceKeyStore | null, broker = true) {
+async function makeClient(
+  store: MemoryDeviceKeyStore | null,
+  broker = true,
+  keyLookup?: import('./key-lookup.js').KeyLookup,
+) {
   const { FreeqClient } = await import('./client.js');
   const client = new FreeqClient({
     url: 'wss://test/irc',
@@ -121,6 +125,7 @@ async function makeClient(store: MemoryDeviceKeyStore | null, broker = true) {
     skipInitialBrokerRefresh: true,
     ...(broker ? { brokerUrl: BROKER, brokerToken: 'BT1' } : {}),
     ...(store ? { deviceKeyStore: store } : {}),
+    ...(keyLookup ? { keyLookup } : {}),
     deviceLabel: 'Chrome',
   });
   client.setSaslCredentials({ token: 't', did: DID, pdsUrl: 'https://pds.example', method: 'oauth' });
@@ -249,6 +254,26 @@ describe('publishing the device key through the broker', () => {
 
     expect((await store.load())!.recordUri).toBe(uri);
     expect(unpublished()).toBe(0);
+  });
+
+  it("re-checks the client's own account once the key is published", async () => {
+    const uri = 'at://did:plc:alice/at.freeq.deviceKey/3kdevice';
+    enrollAnswer = { status: 200, body: { ok: true, uri, cid: 'bafy' } };
+    const { KeyLookup } = await import('./key-lookup.js');
+    const lookup = new KeyLookup(
+      { fetch: globalThis.fetch as never, resolveDid: async () => ({ id: DID }) as never },
+      null,
+      3_600_000,
+    );
+    const refresh = vi.spyOn(lookup, 'refreshAccount');
+    const store = new MemoryDeviceKeyStore(await storedKey());
+    const { client } = await makeClient(store, true, lookup);
+    await login(client);
+    await until(() => enrollCalls.length > 0);
+    await pause();
+
+    expect((await store.load())!.recordUri, 'the key was published').toBe(uri);
+    expect(refresh, 'the account it published to').toHaveBeenCalledWith(DID);
   });
 
   it('reports a session that cannot publish once per connection, and tries again next connect', async () => {

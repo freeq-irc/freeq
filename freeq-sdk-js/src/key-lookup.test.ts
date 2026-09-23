@@ -208,6 +208,22 @@ describe('KeyLookup', () => {
     expect(hits.origin).toBe(2);
   });
 
+  it('lists the account again and finds a record published since, on refreshAccount', async () => {
+    const { fetch, hits, repo } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
+    expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
+    expect(hits.pds).toBe(1);
+
+    // The client publishes its own key while the listing is held.
+    await repo.add('at.freeq.deviceKey', await buildDeviceRecord(await key(2), ALICE, T0));
+    expect(await lookup.keyFor(ALICE, await kidOf(2)), 'inside the ttl the miss stands').toBeNull();
+    expect(hits.pds, 'and nothing is listed again').toBe(1);
+
+    await lookup.refreshAccount(ALICE);
+    expect((await lookup.keyFor(ALICE, await kidOf(2)))?.source).toBe('IdentityRecord');
+    expect(hits.pds, 'one more listing').toBe(2);
+  });
+
   it('finds a key that appears at the origin after the first ask, before the ttl', async () => {
     const originKeys: Record<string, Uint8Array> = {};
     const { fetch, hits } = await network([], originKeys);
@@ -879,6 +895,105 @@ describe('KeyLookup through the home server', () => {
       expect((await second.keyFor(did, await kidOf(seed)))?.source).toBe('IdentityRecord');
     }
     expect(fetch.mock.calls.length).toBe(requests);
+  });
+
+  it('lists the PDS on refreshAccount while the home server serves an older copy', async () => {
+    const { alice, home, pds, hits, fetch, resolveDid } = await homeNetwork();
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    home.frozen = true;
+    await lookup.prefetch([ALICE]);
+
+    // The client publishes its own key; the home server's copy predates it.
+    await alice.add('at.freeq.deviceKey', await buildDeviceRecord(await key(4), ALICE, T0));
+    await lookup.refreshAccount(ALICE);
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
+    expect(pds).toEqual({ listings: 1, proofs: 1 });
+    expect(hits.origin).toBe(0);
+    expect(home.hits.batch).toBe(1);
+  });
+
+  it('replaces an origin answer for a key published since, in memory and in the store', async () => {
+    const { alice, home, hits, fetch, resolveDid } = await homeNetwork({ [`${ALICE} ${await kidOf(4)}`]: await raw(4) });
+    const store = new MemoryKeyLookupStore();
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES, store);
+    home.frozen = true;
+    await lookup.prefetch([ALICE]);
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('OriginServer');
+
+    await alice.add('at.freeq.deviceKey', await buildDeviceRecord(await key(4), ALICE, T0));
+    await lookup.refreshAccount(ALICE);
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
+
+    const second = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES, store);
+    expect((await second.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
+    expect(hits.origin).toBe(1);
+  });
+
+  it('keeps the fresh listing when an older listing through the home server lands after it', async () => {
+    const { alice, home, pds, fetch, resolveDid } = await homeNetwork();
+    home.frozen = true;
+    home.fetchedAt = Math.floor(Date.now() / 1000) - 60;
+    // The server's copy is taken before the publish.
+    await new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES).prefetch([ALICE]);
+    const listed = pds.listings;
+
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const gated = async (input: string): Promise<Response> => {
+      if (input.includes('/api/v1/records?')) await gate;
+      return fetch(input);
+    };
+    const lookup = new KeyLookup({ fetch: gated, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    const prefetched = lookup.prefetch([ALICE]);
+    await alice.add('at.freeq.deviceKey', await buildDeviceRecord(await key(4), ALICE, T0));
+    await lookup.refreshAccount(ALICE);
+    release();
+    await prefetched;
+
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
+    expect(pds.listings - listed).toBe(1);
+  });
+
+  it('does not keep an origin answer from a lookup that began before refreshAccount', async () => {
+    const { alice, home, fetch, resolveDid } = await homeNetwork({ [`${ALICE} ${await kidOf(4)}`]: await raw(4) });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const gated = async (input: string): Promise<Response> => {
+      if (input.includes('/api/v1/signing-keys/')) await gate;
+      return fetch(input);
+    };
+    const lookup = new KeyLookup({ fetch: gated, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    home.frozen = true;
+    await lookup.prefetch([ALICE]);
+
+    const first = lookup.keyFor(ALICE, await kidOf(4));
+    await alice.add('at.freeq.deviceKey', await buildDeviceRecord(await key(4), ALICE, T0));
+    await lookup.refreshAccount(ALICE);
+    release();
+    await first;
+
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
+  });
+
+  it("dates a listing from the home server's per-DID route with its fetched_at, so it loses to a newer PDS listing", async () => {
+    const { alice, home, fetch, resolveDid } = await homeNetwork();
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    home.frozen = true;
+    home.fetchedAt = Math.floor(Date.now() / 1000) - 60;
+    await lookup.prefetch([ALICE]);
+    await alice.add('at.freeq.deviceKey', await buildDeviceRecord(await key(4), ALICE, T0));
+    await lookup.refreshAccount(ALICE);
+
+    // A kid no record names; forgetting its miss lists the account again,
+    // through the per-DID route since a listing is held.
+    const absent = await kidOf(9);
+    expect(await lookup.keyFor(ALICE, absent)).toBeNull();
+    lookup.forget(ALICE, absent);
+    const listings = home.hits.listing;
+    expect(await lookup.keyFor(ALICE, absent)).toBeNull();
+    expect(home.hits.listing, 'the per-DID route').toBe(listings + 1);
+
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
   });
 
   it('asks no home server with no origin', async () => {
