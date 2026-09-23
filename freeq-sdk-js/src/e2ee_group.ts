@@ -16,6 +16,8 @@
  *    remaining members only — the departed member cannot read new epochs.
  */
 
+import type { ChannelCipher } from './channel-cipher.js';
+
 const EG1_PREFIX = 'EG1:';
 const EGK1_PREFIX = 'EGK1:';
 
@@ -202,6 +204,44 @@ export async function openBest(candidates: Array<[number, string]>, mySecret: X2
     if (state) return state;
   }
   return null;
+}
+
+// ── ChannelCipher adapter ──
+
+/**
+ * Wrap a set of group states (one per epoch we hold) as a `ChannelCipher` for
+ * `FreeqClient.setChannelCipher`. `states` is a getter so the cipher always
+ * sees the latest keys — install once, keep loading epochs.
+ *
+ * - encrypt: with the highest epoch held; `null` when none.
+ * - decrypt: by the epoch named in the wire (`parseEpoch`); `null` when we
+ *   do not hold it or the ciphertext does not open.
+ * - isCiphertext: `isGroupEncrypted` (an `EG1:` body).
+ */
+export function makeGroupCipher(states: () => GroupState[]): ChannelCipher {
+  const byEpoch = (): Map<number, GroupState> => {
+    const m = new Map<number, GroupState>();
+    for (const s of states()) m.set(s.epoch, s);
+    return m;
+  };
+  return {
+    async encrypt(plaintext: string): Promise<string | null> {
+      let best: GroupState | null = null;
+      for (const s of states()) if (!best || s.epoch > best.epoch) best = s;
+      if (!best) return null;
+      return encryptGroup(best, plaintext);
+    },
+    async decrypt(wire: string): Promise<string | null> {
+      const epoch = parseEpoch(wire);
+      if (epoch === null) return null;
+      const state = byEpoch().get(epoch);
+      if (!state) return null;
+      return decryptGroup(state, wire);
+    },
+    isCiphertext(wire: string): boolean {
+      return isGroupEncrypted(wire);
+    },
+  };
 }
 
 // ── Crypto helpers (mirror freeq-sdk-js/src/e2ee.ts) ──

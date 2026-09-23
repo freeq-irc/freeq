@@ -12,6 +12,7 @@ import { parse, prefixNick, format } from './parser.js';
 import { Transport } from './transport.js';
 import * as signing from './signing.js';
 import * as e2ee from './e2ee.js';
+import type { ChannelCipher } from './channel-cipher.js';
 import { dmPeerKey, isDid } from './address.js';
 import { prefetchProfiles } from './profiles.js';
 import { recordKeyOf, type DeviceKeyStore, type StoredDeviceKey } from './device-key.js';
@@ -203,6 +204,10 @@ export class FreeqClient extends EventEmitter {
    *  when we don't (yet) have the passphrase, so messages don't leak
    *  unencrypted into a channel the rest of the room expects encrypted. */
   private _encryptedChannels = new Set<string>();
+  /** App-supplied per-channel ciphers (lowercase channel → cipher). A cipher
+   *  is configuration, like `autoJoinChannels`: it survives reconnects, so
+   *  the disconnect reset deliberately leaves this map alone. */
+  private _channelCiphers = new Map<string, ChannelCipher>();
   /** Current AWAY reason, or null if not away. Re-asserted on
    *  reconnect so the wire and UI states don't diverge after the
    *  server forgets us during the disconnect. */
@@ -508,12 +513,18 @@ export class FreeqClient extends EventEmitter {
     const wireTarget = this.wireTargetFor(target);
     const bufKey = isChannel ? target : this.dmKey(target);
 
+    // An app-supplied cipher (instant rooms: `makeGroupCipher`) wins over
+    // the built-in ENC1 passphrase key when both are set — it is the more
+    // explicit configuration.
+    const cipher = isChannel ? this.getChannelCipher(target) : null;
+
     // +E channels require the `+encrypted` tag on every PRIVMSG —
     // refuse rather than leak plaintext into a room the rest of the
-    // members expect encrypted.
+    // members expect encrypted. A cipher satisfies the requirement.
     if (
       isChannel &&
       this._encryptedChannels.has(target.toLowerCase()) &&
+      !cipher &&
       !e2ee.hasChannelKey(target)
     ) {
       this.emit(
@@ -534,17 +545,31 @@ export class FreeqClient extends EventEmitter {
     // and no multi-device or durable-history model exists around it yet —
     // so DMs go signed-plaintext until one does. Inbound decryption stays
     // wired so anything already encrypted still reads where it can.
-    const willEncrypt = e2ee.hasChannelKey(target);
+    const willEncrypt = !!cipher || e2ee.hasChannelKey(target);
 
     // ── E2EE path ──
     if (willEncrypt) {
       const remoteDid = !isChannel ? this.remoteDidFor(target) : null;
-      const encryptFn = isChannel
-        ? () => e2ee.encryptChannel(target, text)
-        : () => e2ee.encryptMessage(remoteDid!, text, this.serverOrigin);
+      const encryptFn = cipher
+        ? () => cipher.encrypt(text).catch(() => null)
+        : isChannel
+          ? () => e2ee.encryptChannel(target, text)
+          : () => e2ee.encryptMessage(remoteDid!, text, this.serverOrigin);
 
       encryptFn().then(async (encrypted) => {
         if (!encrypted) {
+          if (cipher) {
+            // A cipher was configured for this channel and could not
+            // encrypt (no key yet, or the key store threw). Never fall
+            // back to plaintext into a room whose members expect
+            // ciphertext — say why, and drop the send.
+            this.emit(
+              'systemMessage',
+              target,
+              `Cannot send to ${target}: the channel cipher could not encrypt this message (no key available).`,
+            );
+            return;
+          }
           // Encryption failed — fall back to signed plaintext
           this.sendLegacyPlaintext(wireTarget, text, extraOpenerTags);
           return;
@@ -786,6 +811,48 @@ export class FreeqClient extends EventEmitter {
   /** Join a channel. */
   join(channel: string, key?: string): void {
     this.raw(key ? `JOIN ${channel} ${key}` : `JOIN ${channel}`);
+  }
+
+  // ── Channel ciphers ──
+
+  /**
+   * Install (or with `null`, remove) an app-owned cipher for a channel.
+   * While set, `say()` encrypts through it and tags `+encrypted`, the `+E`
+   * refusal is satisfied, and inbound ciphertext it recognises is decrypted
+   * before `message`/`historyBatch` fire. Survives reconnects.
+   */
+  setChannelCipher(channel: string, cipher: ChannelCipher | null): void {
+    const key = channel.toLowerCase();
+    if (cipher) this._channelCiphers.set(key, cipher);
+    else this._channelCiphers.delete(key);
+  }
+
+  /** The cipher installed for a channel, or null. */
+  getChannelCipher(channel: string): ChannelCipher | null {
+    return this._channelCiphers.get(channel.toLowerCase()) ?? null;
+  }
+
+  /**
+   * Decrypt an inbound channel body through the installed cipher.
+   * Returns `undefined` when no cipher claims the body (caller continues
+   * down the ENC1/plaintext branches), `null` when the cipher claimed it
+   * but could not open it, else the plaintext. A throwing cipher counts
+   * as "could not open" — one bad line must not break dispatch.
+   */
+  private async decryptViaChannelCipher(
+    channel: string,
+    wire: string,
+  ): Promise<string | null | undefined> {
+    const cipher = this.getChannelCipher(channel);
+    if (!cipher) return undefined;
+    let claims = false;
+    try { claims = cipher.isCiphertext(wire); } catch { claims = false; }
+    if (!claims) return undefined;
+    try {
+      return await cipher.decrypt(wire);
+    } catch {
+      return null;
+    }
   }
 
   /** Leave a channel. */
@@ -1989,10 +2056,18 @@ export class FreeqClient extends EventEmitter {
     let isEncryptedMsg = false;
 
     const cachedPlain = this.echoPlaintextCache.get(wireText);
+    // App-owned cipher first (instant rooms): computed once, then it either
+    // claims the body or steps aside for the ENC1/DM branches below.
+    const cipherPlain = isChannel && !(cachedPlain && isSelf)
+      ? await this.decryptViaChannelCipher(target, wireText)
+      : undefined;
     if (cachedPlain && isSelf) {
       displayText = cachedPlain.plaintext;
       isEncryptedMsg = true;
       this.echoPlaintextCache.delete(wireText);
+    } else if (cipherPlain !== undefined) {
+      if (cipherPlain !== null) { displayText = cipherPlain; isEncryptedMsg = true; }
+      else { displayText = '[encrypted message]'; isEncryptedMsg = true; }
     } else if (e2ee.isENC1(wireText) && isChannel) {
       const plain = await e2ee.decryptChannel(target, wireText);
       if (plain !== null) { displayText = plain; isEncryptedMsg = true; }
@@ -2542,10 +2617,19 @@ export class FreeqClient extends EventEmitter {
         let isEncryptedMsg = false;
 
         const cachedPlain = this.echoPlaintextCache.get(text);
+        // App-owned cipher first (instant rooms). This is also the
+        // CHATHISTORY replay path: a replayed PRIVMSG carries a `batch`
+        // tag and lands in `batch.messages` below, already decrypted.
+        const cipherPlain = isChannel && !(cachedPlain && isSelf)
+          ? await this.decryptViaChannelCipher(target, text)
+          : undefined;
         if (cachedPlain && isSelf) {
           displayText = cachedPlain.plaintext;
           isEncryptedMsg = true;
           this.echoPlaintextCache.delete(text);
+        } else if (cipherPlain !== undefined) {
+          if (cipherPlain !== null) { displayText = cipherPlain; isEncryptedMsg = true; }
+          else { displayText = '[encrypted message]'; isEncryptedMsg = true; }
         } else if (e2ee.isENC1(text) && isChannel) {
           const plain = await e2ee.decryptChannel(target, text);
           if (plain !== null) { displayText = plain; isEncryptedMsg = true; }
