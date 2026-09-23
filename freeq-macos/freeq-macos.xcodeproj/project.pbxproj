@@ -94,6 +94,7 @@
 		C5A5186C1534C70E22BC2912 /* CoordinationCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03305544EF084785B6229CD6 /* CoordinationCard.swift */; };
 		C724476B94820275BA16E55F /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B11355062BDD7B9062AC22F /* ChatView.swift */; };
 		C80F93270D880D40070F235E /* DeviceKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14412954BB0B9B7BDB3FF5F3 /* DeviceKey.swift */; };
+		892E913E44D4E88E40C0111E /* KeyLookupCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFABE390852C82640B8B34D5 /* KeyLookupCache.swift */; };
 		CAF04BC63962B2AD1BCB86FE /* FreeqAppIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99635569CD2711503B3DCF7E /* FreeqAppIntents.swift */; };
 		CB1EC774D4444A86144B5263 /* DmResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49F502D18AE018377ED62923 /* DmResolver.swift */; };
 		CCD46F07817FFF1625133C74 /* Jumbomoji.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06D79754C3E6C19E87D67F6E /* Jumbomoji.swift */; };
@@ -173,6 +174,7 @@
 		13C9D32F59D3998D69B16618 /* MediaDeviceSelection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaDeviceSelection.swift; sourceTree = "<group>"; };
 		13CDA12EAAF6604350DEAE49 /* DeviceKeyNotice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceKeyNotice.swift; sourceTree = "<group>"; };
 		14412954BB0B9B7BDB3FF5F3 /* DeviceKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceKey.swift; sourceTree = "<group>"; };
+		EFABE390852C82640B8B34D5 /* KeyLookupCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyLookupCache.swift; sourceTree = "<group>"; };
 		16659A05393DA59C0C3AC3C4 /* BrokerAuth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerAuth.swift; sourceTree = "<group>"; };
 		1A0528F19FEFD2C3985CEB60 /* ChannelPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelPolicy.swift; sourceTree = "<group>"; };
 		1B11355062BDD7B9062AC22F /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
@@ -468,6 +470,7 @@
 				03305544EF084785B6229CD6 /* CoordinationCard.swift */,
 				0BD56638DA817D921B8F261C /* DebugBridge.swift */,
 				14412954BB0B9B7BDB3FF5F3 /* DeviceKey.swift */,
+				EFABE390852C82640B8B34D5 /* KeyLookupCache.swift */,
 				13CDA12EAAF6604350DEAE49 /* DeviceKeyNotice.swift */,
 				635E43C3825BFA51AFB89DF6 /* DidDisplay.swift */,
 				49F502D18AE018377ED62923 /* DmResolver.swift */,
@@ -717,6 +720,7 @@
 				111A631DD747383DB85200BF /* DebugBridge.swift in Sources */,
 				40B19B4620E1FFA3196FBFAD /* DetailPanel.swift in Sources */,
 				C80F93270D880D40070F235E /* DeviceKey.swift in Sources */,
+				892E913E44D4E88E40C0111E /* KeyLookupCache.swift in Sources */,
 				83F240564CE8D73332F73F91 /* DeviceKeyNotice.swift in Sources */,
 				07D5F9F88AB063BD44F20162 /* DidDisplay.swift in Sources */,
 				CB1EC774D4444A86144B5263 /* DmResolver.swift in Sources */,

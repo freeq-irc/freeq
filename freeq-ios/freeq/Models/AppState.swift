@@ -1895,6 +1895,10 @@ class AppState: ObservableObject {
                 brokerToken: { [token = brokerToken] in token }
             ))
             try client?.setDeviceLabel(label: UIDevice.current.model)
+            // Before setVerifySignatures, which is what builds the lookup.
+            // Set on every connect; the file is shared by every session on
+            // this device, guests included.
+            try client?.setKeyLookupStore(store: FileKeyLookupStore())
             try client?.setVerifySignatures(on: true)
             if freshSignIn { try client?.setFreshSignIn(fresh: true) }
             // A key that made it to the account clears the dot; nothing else

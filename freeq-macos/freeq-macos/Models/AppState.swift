@@ -691,6 +691,10 @@ class AppState {
                 brokerToken: { [token = brokerToken] in token }
             ))
             try c.setDeviceLabel(label: Host.current().localizedName ?? "Mac")
+            // Before setVerifySignatures, which is what builds the lookup.
+            // Set on every connect; the file is shared by every session on
+            // this device, guests included.
+            try c.setKeyLookupStore(store: FileKeyLookupStore())
             try c.setVerifySignatures(on: true)
             if freshSignIn { try c.setFreshSignIn(fresh: true) }
             // A key that made it to the account clears the dot; nothing else

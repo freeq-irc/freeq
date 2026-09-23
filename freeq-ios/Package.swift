@@ -39,6 +39,7 @@ let package = Package(
                 // Keychain + the generated FFI protocols.
                 "DeviceKey.swift",
                 "IntelligenceService.swift",
+                "KeyLookupCache.swift",
                 "KeychainHelper.swift",
                 "NetworkMonitor.swift",
                 "Notifications.swift",

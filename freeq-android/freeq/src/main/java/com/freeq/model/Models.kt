@@ -667,6 +667,10 @@ class AppState(application: Application) : AndroidViewModel(application) {
             client?.setDeviceKeyStore(deviceKeyStore)
             client?.setEnrollment(BrokerEnrollment({ authBrokerBase }, { brokerToken }))
             client?.setDeviceLabel(android.os.Build.MODEL)
+            // Before setVerifySignatures, which is what builds the lookup.
+            // Set on every connect; the file is shared by every session on
+            // this device, guests included.
+            client?.setKeyLookupStore(AndroidKeyLookupStore(bufferCacheDir))
             client?.setVerifySignatures(true)
             if (freshSignIn) client?.setFreshSignIn(true)
             // A key that made it to the account clears the dot; nothing else

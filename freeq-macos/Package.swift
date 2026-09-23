@@ -34,6 +34,7 @@ let package = Package(
                 // Keychain + the generated FFI protocols.
                 "DeviceKey.swift",
                 "E2eeManager.swift",
+                "KeyLookupCache.swift",
             ],
             sources: [
                 "AudioLevelMeter.swift",
