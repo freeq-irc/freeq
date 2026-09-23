@@ -6,6 +6,12 @@ options:
   xcodeVersion: "16.0"
   createIntermediateGroups: true
 
+# A local signing identity for development builds, read only when
+# FREEQ_LOCAL_SIGNING is set at generate time; see Local.yml.example.
+include:
+  - path: Local.yml
+    enable: ${FREEQ_LOCAL_SIGNING}
+
 settings:
   base:
     SWIFT_VERSION: "5.10"

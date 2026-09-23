@@ -13,3 +13,6 @@ xcuserdata/
 # macOS noise
 .DS_Store
 build/dist/
+
+# Local signing identity (see Local.yml.example)
+Local.yml

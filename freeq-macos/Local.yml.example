@@ -1,0 +1,10 @@
+# Copy to Local.yml to sign local builds with a stable identity, so the
+# Keychain stops prompting for each stored item after every rebuild. Read
+# only when FREEQ_LOCAL_SIGNING=true is set for `xcodegen generate`; the
+# committed project and CI never see it. Create the certificate in Keychain
+# Access: Certificate Assistant, Create a Certificate, name "Freeq Dev",
+# Self Signed Root, type Code Signing.
+settings:
+  base:
+    CODE_SIGN_IDENTITY: Freeq Dev
+    CODE_SIGN_STYLE: Manual
