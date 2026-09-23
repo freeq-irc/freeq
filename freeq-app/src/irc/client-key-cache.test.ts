@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 /**
- * Each connect() builds a new key lookup on the signed-in account's IndexedDB
- * snapshot, so a key an earlier connect's lookup found is answered with no
- * request.
+ * Each connect() builds a new key lookup on the browser's one IndexedDB
+ * snapshot, guest or signed in, so a key an earlier connect's lookup found is
+ * answered with no request.
  */
 import 'fake-indexeddb/auto';
 import { IDBFactory } from 'fake-indexeddb';
@@ -118,6 +118,37 @@ describe('the key lookup across connects', () => {
     // Uint8Array of another realm under jsdom.
     expect([again?.source, again?.retiredAt]).toEqual([found!.source, found!.retiredAt]);
     expect(Array.from(again!.publicKey)).toEqual(Array.from(found!.publicKey));
+    expect(requests).toEqual([]);
+  });
+
+  it('keeps what a guest found, for the guest and for an account', async () => {
+    const kid = await kidOf(KEY);
+    bridge.setSaslCredentials('', '', '', '');
+    bridge.connect('wss://test/irc', 'guest', []);
+    const guest = MockFreeqClient.latest!.opts.keyLookup!;
+    const found = await guest.keyFor(SIGNER, kid);
+    expect(found?.source).toBe('OriginServer');
+
+    requests = [];
+    bridge.connect('wss://test/irc', 'guest', []);
+    expect(await MockFreeqClient.latest!.opts.keyLookup!.keyFor(SIGNER, kid)).toBeTruthy();
+    expect(requests).toEqual([]);
+
+    bridge.setSaslCredentials('t', 'did:plc:me', '', 'web-token');
+    bridge.connect('wss://test/irc', 'me', []);
+    expect(await MockFreeqClient.latest!.opts.keyLookup!.keyFor(SIGNER, kid)).toBeTruthy();
+    expect(requests).toEqual([]);
+  });
+
+  it('gives a guest what an account found', async () => {
+    const kid = await kidOf(KEY);
+    bridge.connect('wss://test/irc', 'me', []);
+    expect(await MockFreeqClient.latest!.opts.keyLookup!.keyFor(SIGNER, kid)).toBeTruthy();
+
+    requests = [];
+    bridge.setSaslCredentials('', '', '', '');
+    bridge.connect('wss://test/irc', 'guest', []);
+    expect(await MockFreeqClient.latest!.opts.keyLookup!.keyFor(SIGNER, kid)).toBeTruthy();
     expect(requests).toEqual([]);
   });
 });

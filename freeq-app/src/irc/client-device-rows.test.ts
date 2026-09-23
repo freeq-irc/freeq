@@ -94,7 +94,7 @@ describe('the Devices rows', () => {
     const pair = (await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])) as CryptoKeyPair;
     const record = await buildDeviceRecord(await recordKeyOf(pair), DID, '2026-01-02T00:00:00.000Z', 'Work laptop');
     // What an earlier page load's lookup kept for this account, a minute ago.
-    await new IndexedDbKeyLookupStore(DID).save({
+    await new IndexedDbKeyLookupStore().save({
       keys: [],
       records: [[DID, { records: [record], at: Date.now() - 60_000 }]],
       proven: [],

@@ -1,6 +1,6 @@
 /**
  * The key lookup's IndexedDB snapshot: found keys, proven records and proven
- * CIDs come back as saved, per signed-in account.
+ * CIDs come back as saved, one snapshot for the whole browser.
  */
 import 'fake-indexeddb/auto';
 import { IDBFactory } from 'fake-indexeddb';
@@ -32,19 +32,23 @@ const snapshot: KeyLookupSnapshot = {
 };
 
 describe('IndexedDbKeyLookupStore', () => {
-  it('holds nothing for an account with no snapshot', async () => {
-    expect(await new IndexedDbKeyLookupStore('did:plc:me').load()).toBeNull();
+  it('holds nothing before a snapshot is saved', async () => {
+    expect(await new IndexedDbKeyLookupStore().load()).toBeNull();
   });
 
   it('gives back the found keys, proven records and proven CIDs it saved', async () => {
-    await new IndexedDbKeyLookupStore('did:plc:me').save(snapshot);
-    const loaded = await new IndexedDbKeyLookupStore('did:plc:me').load();
+    await new IndexedDbKeyLookupStore().save(snapshot);
+    const loaded = await new IndexedDbKeyLookupStore().load();
     expect(loaded).toEqual(snapshot);
     expect(loaded!.keys[1]![1].other!.publicKey).toBeInstanceOf(Uint8Array);
   });
 
-  it('never gives one account the snapshot another saved', async () => {
-    await new IndexedDbKeyLookupStore('did:plc:me').save(snapshot);
-    expect(await new IndexedDbKeyLookupStore('did:plc:other').load()).toBeNull();
+  it('is one snapshot however many stores are built on it', async () => {
+    const first = { ...snapshot, proven: ['bafyreifirst'] };
+    await new IndexedDbKeyLookupStore().save(first);
+    expect(await new IndexedDbKeyLookupStore().load()).toEqual(first);
+    const second = { ...snapshot, proven: ['bafyreisecond'] };
+    await new IndexedDbKeyLookupStore().save(second);
+    expect(await new IndexedDbKeyLookupStore().load()).toEqual(second);
   });
 });

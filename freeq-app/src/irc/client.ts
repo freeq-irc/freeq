@@ -272,15 +272,15 @@ export async function deviceRowsFrom(
   return found.map((f) => f.row);
 }
 
-/** A key lookup asking this page's origin; for a signed-in account (`did`
- *  set) it keeps what it found in IndexedDB across page loads. */
-function newKeyLookup(did: string): KeyLookup {
+/** A key lookup asking this page's origin; it keeps what it found in the
+ *  browser's one shared IndexedDB snapshot across page loads. */
+function newKeyLookup(): KeyLookup {
   return new KeyLookup(
     { fetch: (target: string) => fetch(target), resolveDid: makeDidResolver() },
     window.location.origin,
     60 * 60 * 1000,
     undefined,
-    did ? new IndexedDbKeyLookupStore(did) : undefined,
+    new IndexedDbKeyLookupStore(),
   );
 }
 
@@ -288,7 +288,7 @@ function newKeyLookup(did: string): KeyLookup {
 let accountKeyLookup: { did: string; lookup: KeyLookup } | null = null;
 
 function keyLookupFor(did: string): KeyLookup {
-  if (accountKeyLookup?.did !== did) accountKeyLookup = { did, lookup: newKeyLookup(did) };
+  if (accountKeyLookup?.did !== did) accountKeyLookup = { did, lookup: newKeyLookup() };
   return accountKeyLookup.lookup;
 }
 
@@ -539,8 +539,8 @@ export function connect(url: string, desiredNick: string, channels?: string[], f
   // send. A guest signs nothing and publishes nothing, so neither is set up
   // for one.
   const deviceKeyStore = saslState.did ? chosenStoreFor(saslState.did) : undefined;
-  // A signed-in account's lookup keeps what it found across page loads.
-  const keyLookup = newKeyLookup(saslState.did);
+  // Every lookup, a guest's too, keeps what it found across page loads.
+  const keyLookup = newKeyLookup();
   if (saslState.did) accountKeyLookup = { did: saslState.did, lookup: keyLookup };
 
   client = new FreeqClient({
