@@ -57,12 +57,23 @@ internal object BufferCache {
      * [displayNameFor] resolves a buffer name to its human label
      * (`AppState.displayNameForKey`); the label is stored only when it
      * differs from the name, i.e. for DID-keyed DM buffers.
+     *
+     * [settledVerdict] gives the verdict the SDK settled on for a message id
+     * (`SignatureVerdict.of`). A signed row is mapped with whatever the SDK
+     * had at delivery — PENDING while the signer's key is still being looked
+     * up — and the settled answer arrives later as a `Verdict` event, filed
+     * in the map and never written back to the row. Without asking for it
+     * here every signed row would be persisted as PENDING, and a launch that
+     * restores the channel never re-checks it.
      */
     fun snapshot(
         buffers: List<ChannelState>,
         displayNameFor: (String) -> String = { it },
+        settledVerdict: (String) -> FfiVerdict? = { null },
     ): List<CachedBuffer> = buffers.map { buf ->
-        val persistable = buf.messages.filterNot { isLocallyMintedId(it.id) }
+        val persistable = buf.messages
+            .filterNot { isLocallyMintedId(it.id) }
+            .map { m -> settledVerdict(m.id)?.let { m.copy(verdict = it) } ?: m }
         CachedBuffer(
             name = buf.name,
             isDM = !(buf.name.startsWith("#") || buf.name.startsWith("&")),

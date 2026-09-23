@@ -749,7 +749,11 @@ class AppState(application: Application) : AndroidViewModel(application) {
     fun flushBuffersToCache() {
         BufferCache.save(
             bufferCacheDir,
-            BufferCache.snapshot(channels + dmBuffers, ::displayNameForKey),
+            BufferCache.snapshot(
+                channels + dmBuffers,
+                ::displayNameForKey,
+                SignatureVerdict::of,
+            ),
         )
     }
 

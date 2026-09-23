@@ -232,6 +232,92 @@ class BufferCacheTest {
         assertNull(restored.single().messages.single().verdict)
     }
 
+    // ── the settled verdict ──
+    //
+    // A signed row is mapped with whatever the SDK had at delivery, which for
+    // a key still being looked up is PENDING; the settled answer arrives
+    // later as a `Verdict` event and is filed in `SignatureVerdict`, never on
+    // the row. The snapshot has to ask for it, or every signed row is
+    // persisted as PENDING and a restored launch never re-checks it.
+
+    private fun device(sentence: String = "Signed on the sender\u2019s device.") = FfiVerdict(
+        state = com.freeq.ffi.VerdictState.DEVICE,
+        layer = com.freeq.ffi.KeyLayer.VOUCHED,
+        kid = "kid-settled",
+        keySource = "identity-record",
+        sentence = sentence,
+    )
+
+    private fun pending() = FfiVerdict(
+        state = com.freeq.ffi.VerdictState.PENDING,
+        layer = null,
+        kid = "kid-settled",
+        keySource = null,
+        sentence = "Checking this signature\u2026",
+    )
+
+    @Test fun a_settled_verdict_replaces_the_pending_one_the_row_was_mapped_with() {
+        val row = msg("01PENDING").copy(isSigned = true, verdict = pending())
+        val settled = mapOf("01PENDING" to device())
+
+        val snapshot = BufferCache.snapshot(
+            listOf(channel("#freeq", row)),
+            settledVerdict = { settled[it] },
+        )
+        assertEquals(
+            com.freeq.ffi.VerdictState.DEVICE,
+            snapshot.single().messages.single().verdict?.state,
+        )
+
+        val restored = BufferCache.decode(BufferCache.encode(snapshot))!!
+        val back = restored.single().messages.single().verdict!!
+        assertEquals(com.freeq.ffi.VerdictState.DEVICE, back.state)
+        assertEquals(com.freeq.ffi.KeyLayer.VOUCHED, back.layer)
+        assertEquals("identity-record", back.keySource)
+        assertEquals(RowSignatureMark.of(device()), RowSignatureMark.of(back))
+    }
+
+    @Test fun a_row_with_no_settled_verdict_keeps_its_own() {
+        val row = msg("01OWN").copy(
+            isSigned = true,
+            verdict = FfiVerdict(
+                state = com.freeq.ffi.VerdictState.INVALID,
+                layer = null,
+                kid = "kid-1",
+                keySource = "identity-record",
+                sentence = "This message is signed, but the signature doesn\u2019t check out.",
+            ),
+        )
+        val restored = BufferCache.decode(
+            BufferCache.encode(
+                BufferCache.snapshot(
+                    listOf(channel("#freeq", row)),
+                    settledVerdict = { null },
+                )
+            )
+        )!!
+        assertEquals(
+            com.freeq.ffi.VerdictState.INVALID,
+            restored.single().messages.single().verdict?.state,
+        )
+    }
+
+    @Test fun a_settled_verdict_is_written_for_a_row_that_carried_none() {
+        val row = msg("01NONE").copy(isSigned = true, verdict = null)
+        val restored = BufferCache.decode(
+            BufferCache.encode(
+                BufferCache.snapshot(
+                    listOf(channel("#freeq", row)),
+                    settledVerdict = { if (it == "01NONE") device() else null },
+                )
+            )
+        )!!
+        assertEquals(
+            com.freeq.ffi.VerdictState.DEVICE,
+            restored.single().messages.single().verdict?.state,
+        )
+    }
+
     @Test fun round_trip_preserves_a_deleted_message() {
         val ch = channel("#freeq", msg("01A").copy(isDeleted = true, text = ""))
         val restored = BufferCache.decode(BufferCache.encode(BufferCache.snapshot(listOf(ch))))!!
@@ -249,9 +335,10 @@ class BufferCacheTest {
     // ── display label for DID-keyed threads ──
 
     @Test fun snapshot_captures_the_resolved_label_for_a_did_keyed_buffer() {
-        val snap = BufferCache.snapshot(listOf(channel("did:key:z6Mkabc", msg("01A")))) { key ->
-            if (key == "did:key:z6Mkabc") "echo-bot" else key
-        }
+        val snap = BufferCache.snapshot(
+            listOf(channel("did:key:z6Mkabc", msg("01A"))),
+            displayNameFor = { key -> if (key == "did:key:z6Mkabc") "echo-bot" else key },
+        )
         assertEquals("echo-bot", snap.single().displayName)
     }
 
@@ -260,18 +347,23 @@ class BufferCacheTest {
         // nothing worth persisting — the compacted form is recomputable.
         val identity = BufferCache.snapshot(listOf(channel("did:key:z6Mkabc", msg("01A"))))
         assertNull(identity.single().displayName)
-        val compacted = BufferCache.snapshot(listOf(channel("did:key:z6Mkabc", msg("01A")))) {
-            DidDisplay.shorten(it)
-        }
+        val compacted = BufferCache.snapshot(
+            listOf(channel("did:key:z6Mkabc", msg("01A"))),
+            displayNameFor = { DidDisplay.shorten(it) },
+        )
         assertNull(compacted.single().displayName)
-        val plainNick = BufferCache.snapshot(listOf(channel("guest123", msg("01A")))) { it }
+        val plainNick =
+            BufferCache.snapshot(listOf(channel("guest123", msg("01A"))), displayNameFor = { it })
         assertNull(plainNick.single().displayName)
     }
 
     @Test fun round_trip_preserves_the_display_label() {
         val restored = BufferCache.decode(
             BufferCache.encode(
-                BufferCache.snapshot(listOf(channel("did:key:z6Mkabc", msg("01A")))) { "echo-bot" }
+                BufferCache.snapshot(
+                    listOf(channel("did:key:z6Mkabc", msg("01A"))),
+                    displayNameFor = { "echo-bot" },
+                )
             )
         )!!
         assertEquals("echo-bot", restored.single().displayName)
