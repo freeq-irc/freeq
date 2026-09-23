@@ -15,6 +15,7 @@
 import { openDB, type IDBPDatabase } from 'idb';
 import * as ratchet from './ratchet.js';
 import * as x3dh from './x3dh.js';
+import type { X25519Secret } from './e2ee_group.js';
 import { log } from "./log.js";
 
 // ── Constants ──
@@ -398,6 +399,17 @@ export async function decryptChannel(channel: string, wire: string): Promise<str
     }
     return null;
   }
+}
+
+/**
+ * The X25519 identity pair this browser publishes as `identity_key` in its
+ * pre-key bundle, in the raw form `e2ee_group.openSealed` accepts — so the
+ * web app can open a group key a room steward sealed to it. `null` until
+ * `initialize` has run (Node, or before login).
+ */
+export function getIdentityX25519Secret(): X25519Secret | null {
+  if (!identityKeys) return null;
+  return { secret: identityKeys.secretKey, publicKey: identityKeys.publicKey };
 }
 
 /** Fetch a pre-key bundle for a remote user. */
