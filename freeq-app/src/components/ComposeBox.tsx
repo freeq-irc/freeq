@@ -103,6 +103,10 @@ export function ComposeBox() {
   const replyTo = useStore((s) => s.replyTo);
   const editingMsg = useStore((s) => s.editingMsg);
   const ch = channels.get(activeChannel.toLowerCase());
+  // An instant room we cannot read yet: nothing typed here can be sent
+  // (the SDK refuses plaintext into +E), so say so instead of dropping it.
+  const room = useStore((s) => s.rooms.get(activeChannel.toLowerCase()));
+  const roomLocked = !!room?.isRoom && !room.hasKey;
 
   // Dismiss the mobile overflow menu.
   useEffect(() => {
@@ -424,6 +428,10 @@ export function ComposeBox() {
 
     const trimmed = text.trim();
     if (!trimmed) return;
+    if (roomLocked && !trimmed.startsWith('/')) {
+      useStore.getState().addSystemMessage(activeChannel, 'Waiting for a member to seal the room key to you — nothing can be sent until then.');
+      return;
+    }
     setHistory((h) => [...h.slice(-100), trimmed]);
     setHistoryPos(-1);
 
@@ -456,7 +464,7 @@ export function ComposeBox() {
     setText('');
     setAutocomplete(null);
     if (inputRef.current) inputRef.current.style.height = 'auto';
-  }, [text, activeChannel, ch, pendingUpload, doUpload, editingMsg, replyTo, markdownMode]);
+  }, [text, activeChannel, ch, pendingUpload, doUpload, editingMsg, replyTo, markdownMode, roomLocked]);
 
   const onKeyDown = (e: KeyboardEvent) => {
     // Tab completion
@@ -625,7 +633,7 @@ export function ComposeBox() {
     }
   };
 
-  const canSend = activeChannel !== 'server' || text.startsWith('/');
+  const canSend = (activeChannel !== 'server' || text.startsWith('/')) && (!roomLocked || text.startsWith('/'));
 
   const canAttach = !!authDid && activeChannel !== 'server';
   const actions: ComposeAction[] = [
@@ -937,6 +945,10 @@ export function ComposeBox() {
                 ? 'Add a caption (optional)...'
                 : activeChannel === 'server'
                   ? 'Type /help for commands...'
+                  : roomLocked
+                    ? room?.waiting
+                      ? '🔒 Waiting for a member to seal the room key to you…'
+                      : '🔒 No room key yet — nothing can be sent'
                   : ch?.isEncrypted
                     ? `🔒 Message ${displayNameForKey(ch?.name || activeChannel)} (encrypted)`
                     : `Message ${displayNameForKey(ch?.name || activeChannel)}`

@@ -1,8 +1,27 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { connect, setSaslCredentials, SESSION_EXPIRED_LINE } from '../irc/client';
+import { loadPendingRoom } from '../lib/room-link';
 import { useStore } from '../store';
 
 type LoginMode = 'at-proto' | 'guest';
+
+/**
+ * A channel from an invite link must reach the connect even when a saved
+ * joined-channels list (which reflects real PART/JOIN state and wins over
+ * the typed list) exists: merge it in rather than let the saved list
+ * replace it.
+ */
+function mergeIntoSavedJoined(ch: string) {
+  try {
+    const raw = localStorage.getItem('freeq-joined-channels');
+    if (!raw) return;
+    const list = JSON.parse(raw);
+    if (!Array.isArray(list)) return;
+    if (!list.some((c) => typeof c === 'string' && c.toLowerCase() === ch.toLowerCase())) {
+      localStorage.setItem('freeq-joined-channels', JSON.stringify([...list, ch]));
+    }
+  } catch { /* ignore */ }
+}
 
 function AuthStep({ done, active, label }: { done?: boolean; active?: boolean; label: string }) {
   return (
@@ -150,6 +169,7 @@ export function ConnectScreen() {
       const result = [...merged].join(',');
       // Persist through OAuth redirect
       localStorage.setItem(LS_CHANNELS, result);
+      mergeIntoSavedJoined(ch);
       return result;
     }
     return localStorage.getItem(LS_CHANNELS) || '#freeq';
@@ -180,6 +200,10 @@ export function ConnectScreen() {
   const [error, setError] = useState('');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [oauthPending, setOauthPending] = useState(false);
+  // An instant-room invite parked by main.tsx (survives the OAuth redirect).
+  // Rooms are end-to-end encrypted, so a guest — who has no identity to
+  // seal a key to — cannot join one: the guest tab says so.
+  const [pendingRoom] = useState(() => loadPendingRoom());
   const [autoConnecting, setAutoConnecting] = useState(false);
   const handleRef = useRef<HTMLInputElement>(null);
   const nickRef = useRef<HTMLInputElement>(null);
@@ -492,6 +516,17 @@ export function ConnectScreen() {
           </div>
         </div>
 
+        {pendingRoom && (
+          <div
+            data-testid="room-invite-banner"
+            className="mb-4 bg-accent/10 border border-accent/20 rounded-lg px-3 py-2.5 text-xs text-fg leading-relaxed"
+          >
+            <span className="text-success">🔒</span> You've been invited to an end-to-end encrypted room{' '}
+            <span className="font-mono font-semibold">{pendingRoom.channel}</span> — sign in to join.
+            <div className="text-fg-dim mt-1">Rooms need an identity to seal the key to, so guests can't join.</div>
+          </div>
+        )}
+
         {/* Mode tabs */}
         <div className="flex gap-1 bg-bg rounded-lg p-1 mb-4">
           <button
@@ -505,12 +540,14 @@ export function ConnectScreen() {
             AT Protocol
           </button>
           <button
-            onClick={() => setMode('guest')}
+            onClick={() => { if (!pendingRoom) setMode('guest'); }}
+            disabled={!!pendingRoom}
+            title={pendingRoom ? 'Encrypted rooms need an identity — sign in to join' : undefined}
             className={`flex-1 py-2 text-sm font-semibold rounded-lg transition-colors ${
               mode === 'guest'
                 ? 'bg-bg-tertiary text-fg-muted'
                 : 'text-fg-dim hover:text-fg-muted'
-            }`}
+            } disabled:opacity-40 disabled:cursor-not-allowed`}
           >
             Guest
           </button>
