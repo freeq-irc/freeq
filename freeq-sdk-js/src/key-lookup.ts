@@ -35,9 +35,13 @@ export type KeySource = 'IdentityRecord' | 'DidDocument' | 'OriginServer';
 export interface FoundKey {
   publicKey: Uint8Array;
   source: KeySource;
-  /** When the key was retired, unix seconds: by a retirement in the signer's
-   *  records, or the date the origin server says it was removed. */
+  /** When the key was retired, unix seconds: by a retirement or the expiry
+   *  in the signer's records, or the date the origin server says it was
+   *  removed. Only a date at or before the instant asked about. */
   retiredAt: number | null;
+  /** When the key stops counting, unix seconds: its record's expiry, told
+   *  whether or not it has passed. Only the records give one. */
+  expiresAt: number | null;
 }
 
 /** What the identity-record reader needs: an HTTP GET and a DID resolver. */
@@ -344,7 +348,12 @@ export class KeyLookup {
         continue;
       }
       if (key === null || key.length !== 32 || (await deriveKid(key)) !== kid) continue;
-      return { records, other: { publicKey: key, source, retiredAt }, failed, failure };
+      return {
+        records,
+        other: { publicKey: key, source, retiredAt, expiresAt: null },
+        failed,
+        failure,
+      };
     }
     return { records, other: null, failed, failure };
   }
@@ -657,6 +666,8 @@ async function fromRecords(
     source: 'IdentityRecord',
     // Unix seconds, like the origin's removal date.
     retiredAt: retired ? Math.floor(match.retiredAt!.getTime() / 1000) : null,
+    // Not filtered by `at`: the date the key will expire, too.
+    expiresAt: Math.floor(match.expiresAt.getTime() / 1000),
   };
 }
 

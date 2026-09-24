@@ -92,7 +92,9 @@ const readsRecords = (url: string) =>
 describe('the Devices rows', () => {
   it('come from the records the key lookup holds, with no listing and no proof', async () => {
     const pair = (await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])) as CryptoKeyPair;
-    const record = await buildDeviceRecord(await recordKeyOf(pair), DID, '2026-01-02T00:00:00.000Z', 'Work laptop');
+    // Ten days ago, inside the key's lifetime.
+    const createdAt = new Date(Date.now() - 10 * 24 * 3_600_000).toISOString();
+    const record = await buildDeviceRecord(await recordKeyOf(pair), DID, createdAt, 'Work laptop');
     // What an earlier page load's lookup kept for this account, a minute ago.
     await new IndexedDbKeyLookupStore().save({
       keys: [],
@@ -117,10 +119,11 @@ describe('the Devices rows', () => {
       return { key, record: await buildDeviceRecord(key, DID, createdAt, label) };
     };
     // The active key is the oldest, so a cap on the whole list would drop it.
-    const active = await device('Desktop', '2026-01-01T00:00:00.000Z');
+    const daysAgo = (days: number) => new Date(Date.now() - days * 24 * HOUR_MS).toISOString();
+    const active = await device('Desktop', daysAgo(10));
     const records: unknown[] = [active.record];
     for (let i = 1; i <= 6; i++) {
-      const gone = await device(`Phone ${i}`, `2026-01-0${i + 1}T00:00:00.000Z`);
+      const gone = await device(`Phone ${i}`, daysAgo(10 - i));
       // Phone 6 is the newest key and the most recently signed out.
       const retiredAt = new Date(Date.now() - (7 - i) * HOUR_MS).toISOString();
       records.push(gone.record, await buildDeviceRetirement(gone.key, DID, gone.record.kid, retiredAt));

@@ -4301,18 +4301,32 @@ mod retired_key_tests {
         }
     }
 
+    /// `hours` before one instant fixed for the test run, so records built
+    /// twice match and a key made then is inside its lifetime now.
+    fn hours_ago(hours: i64) -> String {
+        static NOW: std::sync::LazyLock<chrono::DateTime<chrono::Utc>> =
+            std::sync::LazyLock::new(chrono::Utc::now);
+        (*NOW - chrono::TimeDelta::hours(hours))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    /// When the fixture keys were made.
+    fn made_on() -> String {
+        hours_ago(48)
+    }
+
+    /// When a fixture retirement was written.
+    fn retired_on() -> String {
+        hours_ago(24)
+    }
+
     fn device_records(key: &ed25519_dalek::SigningKey, retired: bool) -> Vec<serde_json::Value> {
         let signer = freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&key.to_bytes()).unwrap();
         let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
         let mut records = vec![
             serde_json::to_value(
-                freeq_sdk::identity_records::build_device_record(
-                    &signer,
-                    DID,
-                    "2026-01-01T00:00:00Z",
-                    None,
-                )
-                .unwrap(),
+                freeq_sdk::identity_records::build_device_record(&signer, DID, &made_on(), None)
+                    .unwrap(),
             )
             .unwrap(),
         ];
@@ -4323,7 +4337,7 @@ mod retired_key_tests {
                         &signer,
                         DID,
                         &kid,
-                        "2026-03-01T00:00:00Z",
+                        &retired_on(),
                     )
                     .unwrap(),
                 )
@@ -4376,7 +4390,7 @@ mod retired_key_tests {
             .with_db(|db| db.get_signing_key_row(DID, &kid))
             .flatten()
             .expect("the key row");
-        let retired_at = chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+        let retired_at = chrono::DateTime::parse_from_rfc3339(&retired_on())
             .unwrap()
             .timestamp();
         assert_eq!(row.removed_at, Some(retired_at));
@@ -4423,13 +4437,8 @@ mod retired_key_tests {
         let key = freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&[signer; 32]).unwrap();
         let kid = freeq_sdk::sigtag::derive_kid(&signing_key(target).verifying_key());
         serde_json::to_value(
-            freeq_sdk::identity_records::build_device_retirement(
-                &key,
-                DID,
-                &kid,
-                "2026-03-01T00:00:00Z",
-            )
-            .unwrap(),
+            freeq_sdk::identity_records::build_device_retirement(&key, DID, &kid, &retired_on())
+                .unwrap(),
         )
         .unwrap()
     }
@@ -4481,7 +4490,7 @@ mod retired_key_tests {
     }
 
     #[tokio::test]
-    async fn a_live_key_among_fifty_registers_without_a_proof() {
+    async fn a_live_key_among_fifty_registers_proving_only_its_own_record() {
         let (state, listings, proofs) =
             state_counting(Arc::new(parking_lot::Mutex::new(fifty_keys(43)))).await;
 
@@ -4497,8 +4506,8 @@ mod retired_key_tests {
         assert!(still_answers(&mut client).await);
         assert_eq!(
             count(&proofs),
-            0,
-            "no retirement names the key, so no proof can change the answer"
+            1,
+            "no retirement names the key; its own record carries its expiry"
         );
         assert!(state.revoked_token_hashes.lock().is_empty());
     }
@@ -4565,7 +4574,7 @@ mod retired_key_tests {
             .with_db(|db| db.get_signing_key_row(DID, &kid))
             .flatten()
             .expect("the key row");
-        let retired_at = chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+        let retired_at = chrono::DateTime::parse_from_rfc3339(&retired_on())
             .unwrap()
             .timestamp();
         assert_eq!(row.removed_at, Some(retired_at));

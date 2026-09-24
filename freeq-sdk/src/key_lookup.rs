@@ -36,9 +36,17 @@ pub enum KeySource {
 pub struct FoundKey {
     pub public_key: [u8; 32],
     pub source: KeySource,
-    /// When the key was retired, unix seconds: by a retirement in the signer's
-    /// records, or the date the origin server says it was removed.
+    /// When the key was retired, unix seconds: by a retirement or the expiry
+    /// in the signer's records, or the date the origin server says it was
+    /// removed. Only a date at or before the instant asked about.
     pub retired_at: Option<i64>,
+    /// When the key was made, unix seconds: its record's `createdAt`. Only
+    /// the records give one.
+    pub created_at: Option<i64>,
+    /// When the key stops counting, unix seconds: its record's expiry, told
+    /// whether or not it has passed at the instant asked about. Only the
+    /// records give one.
+    pub expires_at: Option<i64>,
 }
 
 /// Looks keys up by (DID, kid), caching each answer for `ttl`: a key found,
@@ -289,6 +297,8 @@ impl<P: ClientProvider> KeyLookup<P> {
                 public_key: key,
                 source,
                 retired_at,
+                created_at: None,
+                expires_at: None,
             }),
             Ok(_) => None,
             Err(e) => {
@@ -505,6 +515,9 @@ fn in_records(
         source: KeySource::IdentityRecord,
         // Unix seconds, like the origin's removal date.
         retired_at: key.retired_at.filter(|r| *r <= at).map(|r| r.timestamp()),
+        created_at: Some(key.created_at.timestamp()),
+        // Not filtered by `at`: a caller files the date the key will expire.
+        expires_at: Some(key.expires_at.timestamp()),
     })
 }
 
@@ -701,8 +714,34 @@ mod tests {
         }
     }
 
+    /// A day ago, so a key made then is live now and for the next 89 days.
+    fn recent() -> String {
+        (Utc::now() - chrono::TimeDelta::days(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    /// A key record of ALICE's made a day ago.
     fn device_record(seed: u8) -> serde_json::Value {
-        serde_json::to_value(build_device_record(&key(seed), ALICE, T0, None).unwrap()).unwrap()
+        device_record_on(seed, &recent())
+    }
+
+    fn device_record_on(seed: u8, created_at: &str) -> serde_json::Value {
+        serde_json::to_value(build_device_record(&key(seed), ALICE, created_at, None).unwrap())
+            .unwrap()
+    }
+
+    /// The dates a key record made at `created_at` gives a found key.
+    fn dates_of(created_at: &str) -> FoundKey {
+        let made = DateTime::parse_from_rfc3339(created_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        FoundKey {
+            public_key: [0; 32],
+            source: KeySource::IdentityRecord,
+            retired_at: None,
+            created_at: Some(made.timestamp()),
+            expires_at: Some((made + crate::identity_records::KEY_LIFETIME).timestamp()),
+        }
     }
 
     #[tokio::test]
@@ -740,6 +779,7 @@ mod tests {
                 public_key: raw(1),
                 source: KeySource::IdentityRecord,
                 retired_at: None,
+                ..dates_of(&recent())
             })
         );
         assert_eq!(origin.hits(), 0);
@@ -759,6 +799,8 @@ mod tests {
                 public_key: raw(2),
                 source: KeySource::OriginServer,
                 retired_at: None,
+                created_at: None,
+                expires_at: None,
             })
         );
         assert_eq!(origin.hits(), 1);
@@ -813,6 +855,8 @@ mod tests {
                 public_key: raw(4),
                 source: KeySource::DidDocument,
                 retired_at: None,
+                created_at: None,
+                expires_at: None,
             })
         );
         assert_eq!(origin.hits(), 0);
@@ -1016,6 +1060,7 @@ mod tests {
                 public_key: raw(2),
                 source: KeySource::IdentityRecord,
                 retired_at: None,
+                ..dates_of(&recent())
             })
         );
         let proofs = {
@@ -1084,7 +1129,7 @@ mod tests {
             build_device_retirement(&key(1), ALICE, &kid_of(1), "2026-03-01T00:00:00Z").unwrap(),
         )
         .unwrap();
-        let pds = pds(vec![device_record(1), retirement]).await;
+        let pds = pds(vec![device_record_on(1, T0), retirement]).await;
         let keys = lookup(vec![alice_on(&pds)], None, HOUR);
         let at = |s: &str| {
             chrono::DateTime::parse_from_rfc3339(s)
@@ -1101,6 +1146,7 @@ mod tests {
                 public_key: raw(1),
                 source: KeySource::IdentityRecord,
                 retired_at: None,
+                ..dates_of(T0)
             })
         );
         assert_eq!(
@@ -1111,6 +1157,7 @@ mod tests {
                 public_key: raw(1),
                 source: KeySource::IdentityRecord,
                 retired_at: Some(at("2026-03-01T00:00:00Z").timestamp()),
+                ..dates_of(T0)
             }),
             "after its retirement the records still name the key, with the date"
         );
@@ -1131,7 +1178,7 @@ mod tests {
             build_device_retirement(&key(1), ALICE, &kid_of(1), "2026-03-01T00:00:00Z").unwrap(),
         )
         .unwrap();
-        let pds = pds(vec![device_record(1), retirement]).await;
+        let pds = pds(vec![device_record_on(1, T0), retirement]).await;
         // The origin still holds the same key and knows nothing of the retirement.
         let origin = origin(vec![(ALICE, kid_of(1), raw(1))]).await;
         let at = |s: &str| {
@@ -1149,6 +1196,7 @@ mod tests {
                 public_key: raw(1),
                 source: KeySource::IdentityRecord,
                 retired_at: Some(at("2026-03-01T00:00:00Z").timestamp()),
+                ..dates_of(T0)
             })
         );
         assert_eq!(origin.hits(), 0);
@@ -1206,6 +1254,8 @@ mod tests {
                 public_key: raw(2),
                 source: KeySource::OriginServer,
                 retired_at: Some(1_780_000_000),
+                created_at: None,
+                expires_at: None,
             })
         );
     }

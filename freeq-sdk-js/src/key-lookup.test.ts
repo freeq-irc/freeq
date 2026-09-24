@@ -10,6 +10,7 @@ import { type DidKey, decodeMultibaseEd25519, importDidKey } from './did-key.js'
 import {
   type DidDocument,
   buildDeviceRecord,
+  KEY_LIFETIME_MS,
   buildDeviceRetirement,
   clearHostPauses,
 } from './identity-records.js';
@@ -18,10 +19,25 @@ import { deriveKid } from './signing.js';
 
 const ALICE = 'did:plc:k2n3e2vsihf3farequ44t5j7';
 const WEB_SIGNER = 'did:web:bot.example.com';
-const T0 = '2026-01-01T00:00:00Z';
 const PDS = 'https://pds.example';
 const ORIGIN = 'https://origin.example';
 const HOUR = 3_600_000;
+/** Real now when the file loads; the fake clocks are set relative to it. */
+const NOW = Date.now();
+/** Two days before NOW: a key made then is live at every clock set here. */
+const T0 = new Date(NOW - 48 * HOUR).toISOString();
+/** A fixed date, for the tests that ask at fixed instants. */
+const JAN = '2026-01-01T00:00:00Z';
+
+/** When a key made at `createdAt` expires by default, unix seconds. */
+function expiryOf(createdAt: string): number {
+  return Math.floor((Date.parse(createdAt) + KEY_LIFETIME_MS) / 1000);
+}
+
+/** `minutes` after NOW. */
+function clock(minutes: number): Date {
+  return new Date(NOW + minutes * 60_000);
+}
 /** Retry delays for tests that are not about retries. */
 const NO_RETRIES: number[] = [];
 
@@ -117,6 +133,7 @@ describe('KeyLookup', () => {
       publicKey: await raw(1),
       source: 'IdentityRecord',
       retiredAt: null,
+      expiresAt: expiryOf(T0),
     });
     expect(hits.origin).toBe(0);
   });
@@ -131,6 +148,7 @@ describe('KeyLookup', () => {
       publicKey: await raw(2),
       source: 'OriginServer',
       retiredAt: null,
+      expiresAt: null,
     });
     expect(hits.origin).toBe(1);
   });
@@ -168,6 +186,7 @@ describe('KeyLookup', () => {
       publicKey: await raw(4),
       source: 'DidDocument',
       retiredAt: null,
+      expiresAt: null,
     });
     expect(hits.origin).toBe(0);
   });
@@ -194,16 +213,16 @@ describe('KeyLookup', () => {
 
   it('finds a key that appears after a miss once the ttl passes', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
+    vi.setSystemTime(clock(0));
     const originKeys: Record<string, Uint8Array> = {};
     const { fetch, hits } = await network([], originKeys);
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
     expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
 
     originKeys[`${ALICE} ${await kidOf(2)}`] = await raw(2);
-    vi.setSystemTime(new Date('2026-09-11T00:59:00Z'));
+    vi.setSystemTime(clock(59));
     expect(await lookup.keyFor(ALICE, await kidOf(2)), 'inside the ttl the miss stands').toBeNull();
-    vi.setSystemTime(new Date('2026-09-11T01:01:00Z'));
+    vi.setSystemTime(clock(61));
     expect((await lookup.keyFor(ALICE, await kidOf(2)))?.source).toBe('OriginServer');
     expect(hits.origin).toBe(2);
   });
@@ -245,7 +264,7 @@ describe('KeyLookup', () => {
 
   it('asks for a key absent on every ask four times, then again only after the ttl', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
+    vi.setSystemTime(clock(0));
     const { fetch, hits } = await network([]);
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, [20, 60, 150]);
     const kid = await kidOf(2);
@@ -254,10 +273,10 @@ describe('KeyLookup', () => {
     expect(performance.now() - started).toBeGreaterThanOrEqual(145);
     expect([hits.pds, hits.origin], 'one listing, the retries at the origin only').toEqual([1, 4]);
 
-    vi.setSystemTime(new Date('2026-09-11T00:59:00Z'));
+    vi.setSystemTime(clock(59));
     expect(await lookup.keyFor(ALICE, kid)).toBeNull();
     expect([hits.pds, hits.origin], 'inside the ttl the miss stands').toEqual([1, 4]);
-    vi.setSystemTime(new Date('2026-09-11T01:01:00Z'));
+    vi.setSystemTime(clock(61));
     expect(await lookup.keyFor(ALICE, kid)).toBeNull();
     expect([hits.pds, hits.origin], 'after the ttl, a new lookup: one listing and its retries').toEqual([2, 8]);
   });
@@ -296,22 +315,23 @@ describe('KeyLookup', () => {
 
   it('answers a kid the held listing lacks from it inside the ttl, and finds a key published since after it', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
+    vi.setSystemTime(clock(0));
     const { fetch, hits, repo } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
     expect((await lookup.keyFor(ALICE, await kidOf(1)))?.source).toBe('IdentityRecord');
     expect([hits.pds, hits.proofs]).toEqual([1, 1]);
 
     await repo.add('at.freeq.deviceKey', await buildDeviceRecord(await key(2), ALICE, T0));
-    vi.setSystemTime(new Date('2026-09-11T00:10:00Z'));
+    vi.setSystemTime(clock(10));
     expect(await lookup.keyFor(ALICE, await kidOf(2)), 'inside the ttl the held listing stands').toBeNull();
     expect([hits.pds, hits.proofs, hits.origin]).toEqual([1, 1, 1]);
 
-    vi.setSystemTime(new Date('2026-09-11T01:11:00Z'));
+    vi.setSystemTime(clock(71));
     expect(await lookup.keyFor(ALICE, await kidOf(2))).toEqual({
       publicKey: await raw(2),
       source: 'IdentityRecord',
       retiredAt: null,
+      expiresAt: expiryOf(T0),
     });
     expect([hits.pds, hits.proofs, hits.origin], 'one more listing, the new record proven').toEqual([2, 2, 1]);
   });
@@ -352,22 +372,22 @@ describe('KeyLookup', () => {
 
   it('makes no request for a second lookup inside the ttl, and asks again after it', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
+    vi.setSystemTime(clock(0));
     const { fetch, hits } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR);
     const first = await lookup.keyFor(ALICE, await kidOf(1));
     expect(hits.pds).toBe(1);
-    vi.setSystemTime(new Date('2026-09-11T00:59:00Z'));
+    vi.setSystemTime(clock(59));
     expect(await lookup.keyFor(ALICE, await kidOf(1))).toEqual(first);
     expect(hits.pds).toBe(1);
-    vi.setSystemTime(new Date('2026-09-11T01:01:00Z'));
+    vi.setSystemTime(clock(61));
     expect(await lookup.keyFor(ALICE, await kidOf(1))).toEqual(first);
     expect(hits.pds).toBe(2);
   });
 
   it('gives the held listing as proven device records inside the ttl, and lists afresh on a refresh', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
+    vi.setSystemTime(clock(0));
     const { fetch, hits, repo } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR, NO_RETRIES);
     expect(await lookup.provenDeviceRecords(ALICE)).toHaveLength(1);
@@ -375,22 +395,22 @@ describe('KeyLookup', () => {
 
     await repo.add(
       'at.freeq.deviceKey',
-      await buildDeviceRetirement(await key(1), ALICE, await kidOf(1), '2026-09-11T00:10:00Z'),
+      await buildDeviceRetirement(await key(1), ALICE, await kidOf(1), clock(10).toISOString()),
     );
-    vi.setSystemTime(new Date('2026-09-11T00:30:00Z'));
+    vi.setSystemTime(clock(30));
     expect(await lookup.provenDeviceRecords(ALICE), 'inside the ttl the held listing stands').toHaveLength(1);
     expect([hits.pds, hits.proofs]).toEqual([1, 1]);
     expect(await lookup.refreshDeviceRecords(ALICE), 'a refresh lists afresh').toHaveLength(2);
     expect([hits.pds, hits.proofs]).toEqual([2, 2]);
 
-    vi.setSystemTime(new Date('2026-09-11T01:31:00Z'));
+    vi.setSystemTime(clock(91));
     expect(await lookup.provenDeviceRecords(ALICE)).toHaveLength(2);
     expect(hits.pds, 'past the ttl, a listing').toBe(3);
   });
 
   it('folds the records at the time asked, from one listing', async () => {
     const { fetch, hits } = await network([
-      await buildDeviceRecord(await key(1), ALICE, T0),
+      await buildDeviceRecord(await key(1), ALICE, JAN),
       await buildDeviceRetirement(await key(1), ALICE, await kidOf(1), '2026-03-01T00:00:00Z'),
     ]);
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR);
@@ -403,9 +423,29 @@ describe('KeyLookup', () => {
       publicKey: await raw(1),
       source: 'IdentityRecord',
       retiredAt: Date.parse('2026-03-01T00:00:00Z') / 1000,
+      expiresAt: expiryOf(JAN),
     });
     expect(await lookup.keyForAt(ALICE, kid, new Date('2025-12-01T00:00:00Z'))).toBeNull();
     expect(hits.pds).toBe(1);
+  });
+
+  it('carries the expiry its record names, whether or not it has passed', async () => {
+    const { fetch } = await network([await buildDeviceRecord(await key(1), ALICE, JAN)]);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR);
+    const kid = await kidOf(1);
+    const expiresAt = Date.parse('2026-04-01T00:00:00Z') / 1000;
+    expect(await lookup.keyForAt(ALICE, kid, new Date('2026-02-01T00:00:00Z'))).toEqual({
+      publicKey: await raw(1),
+      source: 'IdentityRecord',
+      retiredAt: null,
+      expiresAt,
+    });
+    expect(await lookup.keyForAt(ALICE, kid, new Date('2026-05-01T00:00:00Z'))).toEqual({
+      publicKey: await raw(1),
+      source: 'IdentityRecord',
+      retiredAt: expiresAt,
+      expiresAt,
+    });
   });
 
   it('reads a key the records retire from the records, with its date, and never asks the origin', async () => {
@@ -413,7 +453,7 @@ describe('KeyLookup', () => {
     // The origin still holds the same key and knows nothing of the retirement.
     const { fetch, hits } = await network(
       [
-        await buildDeviceRecord(await key(1), ALICE, T0),
+        await buildDeviceRecord(await key(1), ALICE, JAN),
         await buildDeviceRetirement(await key(1), ALICE, kid, '2026-03-01T00:00:00Z'),
       ],
       { [`${ALICE} ${kid}`]: await raw(1) },
@@ -423,6 +463,7 @@ describe('KeyLookup', () => {
       publicKey: await raw(1),
       source: 'IdentityRecord',
       retiredAt: Date.parse('2026-03-01T00:00:00Z') / 1000,
+      expiresAt: expiryOf(JAN),
     });
     expect(hits.origin).toBe(0);
   });
@@ -460,6 +501,7 @@ describe('KeyLookup', () => {
       publicKey: key2,
       source: 'OriginServer',
       retiredAt: 1_780_000_000,
+      expiresAt: null,
     });
   });
 
@@ -498,7 +540,7 @@ describe('KeyLookup with a store', () => {
 
   it('does not fetch a proof another lookup on the same store checked', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
+    vi.setSystemTime(clock(0));
     const { fetch, hits, repo } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
     const store = new MemoryKeyLookupStore();
     const first = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR, NO_RETRIES, store);
@@ -507,14 +549,14 @@ describe('KeyLookup with a store', () => {
 
     await repo.add('at.freeq.deviceKey', await buildDeviceRecord(await key(2), ALICE, T0));
     const second = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR, NO_RETRIES, store);
-    vi.setSystemTime(new Date('2026-09-11T01:01:00Z'));
+    vi.setSystemTime(clock(61));
     expect((await second.keyFor(ALICE, await kidOf(2)))?.source).toBe('IdentityRecord');
     expect([hits.pds, hits.proofs], 'one more listing past the ttl, only the new record proven').toEqual([2, 2]);
   });
 
   it('answers an unknown key from the stored listing inside the ttl, and lists once past it', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
+    vi.setSystemTime(clock(0));
     const { fetch, hits } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
     const store = new MemoryKeyLookupStore();
     const first = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
@@ -523,11 +565,11 @@ describe('KeyLookup with a store', () => {
 
     // A reload: a new lookup on the same store.
     const second = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
-    vi.setSystemTime(new Date('2026-09-11T00:30:00Z'));
+    vi.setSystemTime(clock(30));
     expect(await second.keyFor(ALICE, await kidOf(3))).toBeNull();
     expect(hits.pds, 'inside the ttl, no listing').toBe(1);
 
-    vi.setSystemTime(new Date('2026-09-11T01:01:00Z'));
+    vi.setSystemTime(clock(61));
     expect(await second.keyFor(ALICE, await kidOf(4))).toBeNull();
     expect(await second.keyFor(ALICE, await kidOf(5))).toBeNull();
     expect(hits.pds, 'past the ttl, one listing').toBe(2);
@@ -535,7 +577,7 @@ describe('KeyLookup with a store', () => {
 
   it('lists again after the ttl and carries a retirement onto a stored key', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
+    vi.setSystemTime(clock(0));
     const kid = await kidOf(1);
     const { fetch, hits, repo } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
     const store = new MemoryKeyLookupStore();
@@ -544,17 +586,18 @@ describe('KeyLookup with a store', () => {
 
     await repo.add(
       'at.freeq.deviceKey',
-      await buildDeviceRetirement(await key(1), ALICE, kid, '2026-09-11T00:30:00Z'),
+      await buildDeviceRetirement(await key(1), ALICE, kid, clock(30).toISOString()),
     );
     const second = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR, NO_RETRIES, store);
-    vi.setSystemTime(new Date('2026-09-11T00:59:00Z'));
+    vi.setSystemTime(clock(59));
     expect((await second.keyFor(ALICE, kid))?.retiredAt, 'inside the ttl the stored listing stands').toBeNull();
     expect(hits.pds).toBe(1);
-    vi.setSystemTime(new Date('2026-09-11T01:01:00Z'));
+    vi.setSystemTime(clock(61));
     expect(await second.keyFor(ALICE, kid)).toEqual({
       publicKey: await raw(1),
       source: 'IdentityRecord',
-      retiredAt: Date.parse('2026-09-11T00:30:00Z') / 1000,
+      retiredAt: Math.floor(clock(30).getTime() / 1000),
+      expiresAt: expiryOf(T0),
     });
     expect(hits.pds).toBe(2);
   });
@@ -649,14 +692,14 @@ describe('makeDidResolver', () => {
 
   it('resolves a did once inside the ttl and again past it', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
+    vi.setSystemTime(clock(0));
     const { fetch, hits } = await plcNetwork();
     const resolve = makeDidResolver({ fetch });
     expect((await resolve(ALICE)).id).toBe(ALICE);
-    vi.setSystemTime(new Date('2026-09-11T00:59:00Z'));
+    vi.setSystemTime(clock(59));
     expect((await resolve(ALICE)).id).toBe(ALICE);
     expect(hits.plc, 'inside the ttl the copy is used').toBe(1);
-    vi.setSystemTime(new Date('2026-09-11T01:01:00Z'));
+    vi.setSystemTime(clock(61));
     expect((await resolve(ALICE)).id).toBe(ALICE);
     expect(hits.plc).toBe(2);
   });
@@ -834,14 +877,14 @@ describe('KeyLookup through the home server', () => {
 
   it('re-lists a held account past the hour with one home listing request and no proof request', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(new Date('2026-09-22T00:00:00Z'));
+    vi.setSystemTime(clock(0));
     const { home, pds, fetch, resolveDid } = await homeNetwork();
     const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
     await lookup.prefetch([ALICE]);
     expect((await lookup.keyFor(ALICE, await kidOf(1)))?.source).toBe('IdentityRecord');
     expect(home.hits).toEqual({ ...noHome, batch: 1 });
 
-    vi.setSystemTime(new Date('2026-09-22T01:01:00Z'));
+    vi.setSystemTime(clock(61));
     expect((await lookup.keyFor(ALICE, await kidOf(1)))?.source).toBe('IdentityRecord');
     expect(home.hits).toEqual({ ...noHome, batch: 1, listing: 1 });
     expect(pds).toEqual({ listings: 0, proofs: 0 });
@@ -849,9 +892,9 @@ describe('KeyLookup through the home server', () => {
 
   it('keeps the server listing time, so a copy an hour old is listed again at once', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(new Date('2026-09-22T01:00:00Z'));
+    vi.setSystemTime(clock(60));
     const { home, fetch, resolveDid } = await homeNetwork();
-    home.fetchedAt = Date.parse('2026-09-21T23:59:00Z') / 1000;
+    home.fetchedAt = clock(-1).getTime() / 1000;
     const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
     await lookup.prefetch([ALICE]);
     await lookup.prefetch([ALICE]);
@@ -861,12 +904,13 @@ describe('KeyLookup through the home server', () => {
   it('proves the retirement closure through one home listing and the single-proof route', async () => {
     const { alice, home, pds, fetch, resolveDid } = await homeNetwork();
     const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
-    expect(await lookup.provenRetirementClosure(ALICE, await kidOf(1))).toEqual([]);
-    expect(home.hits).toEqual({ ...noHome, listing: 1 });
+    // Nothing retires the key, but its own record carries its expiry.
+    expect(await lookup.provenRetirementClosure(ALICE, await kidOf(1))).toHaveLength(1);
+    expect(home.hits).toEqual({ ...noHome, listing: 1, proof: 1 });
 
     await alice.add(
       'at.freeq.deviceKey',
-      await buildDeviceRetirement(await key(1), ALICE, await kidOf(1), '2026-09-01T00:00:00Z'),
+      await buildDeviceRetirement(await key(1), ALICE, await kidOf(1), clock(0).toISOString()),
     );
     expect(await lookup.provenRetirementClosure(ALICE, await kidOf(1))).toHaveLength(2);
     expect(home.hits).toEqual({ ...noHome, listing: 2, proof: 2 });

@@ -1,5 +1,5 @@
 {
-  "description": "Identity records a person publishes in their own AT Protocol repository. `at.freeq.deviceKey` announces a signing key a device holds, or retires one; `at.freeq.agentKey` announces a bot the account claims as its own, or retires that claim. `bindingSig` is an ed25519 signature, base64url without padding, over the UTF-8 bytes of the JCS (RFC 8785) canonical form of the record with its `bindingSig` field removed, and `signedBytes` is that canonical form. This is the recipe every freeq document signature uses: chat documents (freeq-sdk/src/chatsig.rs), task events (freeq-sdk/src/act.rs), the bot certificate (freeq-bot-id/src/main.rs, verified in freeq-server/src/connection/provenance.rs and minted in TypeScript by freeq-bot-kit-js/src/delegation.ts) and policy credentials (freeq-server/src/policy/credentials.rs). Absent fields are absent rather than null, so they are not in the canonical form, and `kid` is base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16]). `cid` is the record's CID as an AT Protocol repository names it: CID v1, dag-cbor codec, SHA-256 of the record's DAG-CBOR encoding. Every implementation must rebuild each vector's `record`, `signedBytes`, `bindingSig` and `cid` from its `seed`, and must fold each case's records at its `at` into exactly `liveDeviceKids` and `liveAgentDids`.",
+  "description": "Identity records a person publishes in their own AT Protocol repository. `at.freeq.deviceKey` announces a signing key a device holds, or retires one; `at.freeq.agentKey` announces a bot the account claims as its own, or retires that claim. `bindingSig` is an ed25519 signature, base64url without padding, over the UTF-8 bytes of the JCS (RFC 8785) canonical form of the record with its `bindingSig` field removed, and `signedBytes` is that canonical form. This is the recipe every freeq document signature uses: chat documents (freeq-sdk/src/chatsig.rs), task events (freeq-sdk/src/act.rs), the bot certificate (freeq-bot-id/src/main.rs, verified in freeq-server/src/connection/provenance.rs and minted in TypeScript by freeq-bot-kit-js/src/delegation.ts) and policy credentials (freeq-server/src/policy/credentials.rs). Absent fields are absent rather than null, so they are not in the canonical form, and `kid` is base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16]). `cid` is the record's CID as an AT Protocol repository names it: CID v1, dag-cbor codec, SHA-256 of the record's DAG-CBOR encoding. A device key record carries `expiresAt`, RFC 3339: the key is not live from that instant, nor from an earlier retirement that counts, and a retirement it signs at or after that instant does not count. A record without `expiresAt` expires 90 days after its `createdAt`; a record whose `expiresAt` is present but not an RFC 3339 string is dropped. A builder given no expiry writes `createdAt` plus 90 days with milliseconds and `Z`, as `2026-04-01T00:00:00.000Z`; a vector's top-level `expiresAt` is the value its record carries. Every implementation must rebuild each vector's `record`, `signedBytes`, `bindingSig` and `cid` from its `seed`, and must fold each case's records at its `at` into exactly `liveDeviceKids` and `liveAgentDids`.",
   "folds": [
     {
       "agentRecords": [],
@@ -7,9 +7,10 @@
       "deviceRecords": [
         {
           "$type": "at.freeq.deviceKey",
-          "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
+          "bindingSig": "29f9ChjpETpT5qrFHkCe_sxO4w5-4_XxLW8bw55AmKOsslQMJy1YoidYn-WOuXV5jYHhnfHBQZ61Q_3hBipcAg",
           "createdAt": "2026-01-01T00:00:00Z",
           "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "expiresAt": "2026-04-01T00:00:00.000Z",
           "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
           "label": "laptop",
           "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
@@ -33,18 +34,20 @@
       "deviceRecords": [
         {
           "$type": "at.freeq.deviceKey",
-          "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
+          "bindingSig": "29f9ChjpETpT5qrFHkCe_sxO4w5-4_XxLW8bw55AmKOsslQMJy1YoidYn-WOuXV5jYHhnfHBQZ61Q_3hBipcAg",
           "createdAt": "2026-01-01T00:00:00Z",
           "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "expiresAt": "2026-04-01T00:00:00.000Z",
           "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
           "label": "laptop",
           "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
         },
         {
           "$type": "at.freeq.deviceKey",
-          "bindingSig": "IkbKafCg-2zpSN4r2vZAL3jHigECPaYjOb9XSOL81grow4YXIA7YC-DVvzmAXaY7EEF-UOZ2M9Jqyzprd5SIDQ",
+          "bindingSig": "wK0fZcJVu6QcwDYn0iO-kZTq1U10cGeGSqL9ANqfLpAJ5HNiaauGldagluTy5IviKA3m6fM7eV-TbXfJLK1JBQ",
           "createdAt": "2026-01-01T00:00:00Z",
           "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "expiresAt": "2026-04-01T00:00:00.000Z",
           "kid": "ajgD1fBZkCocba-8m6Rykg",
           "label": "phone",
           "publicKeyMultibase": "z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH"
@@ -70,9 +73,10 @@
       "deviceRecords": [
         {
           "$type": "at.freeq.deviceKey",
-          "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
+          "bindingSig": "29f9ChjpETpT5qrFHkCe_sxO4w5-4_XxLW8bw55AmKOsslQMJy1YoidYn-WOuXV5jYHhnfHBQZ61Q_3hBipcAg",
           "createdAt": "2026-01-01T00:00:00Z",
           "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "expiresAt": "2026-04-01T00:00:00.000Z",
           "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
           "label": "laptop",
           "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
@@ -98,17 +102,19 @@
       "deviceRecords": [
         {
           "$type": "at.freeq.deviceKey",
-          "bindingSig": "itLKtLV2hW_k5vA5yP1ebZFm4xr0VgLia4osEJ0Surx0wYQ4QQVOEAIwUqtNS8J8WPbOdi7K1pQsRbteP3ujAQ",
+          "bindingSig": "361rOQw9hN-gUa7oen5a8G2EabYJ30XvXGOPAFkih-eZFr1wXASSIRxjc0vQ_ovUCz4dZk-MUhjyve3_Wcq9Aw",
           "createdAt": "2026-01-01T00:00:00Z",
           "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "expiresAt": "2026-04-01T00:00:00.000Z",
           "kid": "ti6Gf6LzOv5i1daxZC4WIQ",
           "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
         },
         {
           "$type": "at.freeq.deviceKey",
-          "bindingSig": "IkbKafCg-2zpSN4r2vZAL3jHigECPaYjOb9XSOL81grow4YXIA7YC-DVvzmAXaY7EEF-UOZ2M9Jqyzprd5SIDQ",
+          "bindingSig": "wK0fZcJVu6QcwDYn0iO-kZTq1U10cGeGSqL9ANqfLpAJ5HNiaauGldagluTy5IviKA3m6fM7eV-TbXfJLK1JBQ",
           "createdAt": "2026-01-01T00:00:00Z",
           "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "expiresAt": "2026-04-01T00:00:00.000Z",
           "kid": "ajgD1fBZkCocba-8m6Rykg",
           "label": "phone",
           "publicKeyMultibase": "z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH"
@@ -136,9 +142,10 @@
       "deviceRecords": [
         {
           "$type": "at.freeq.deviceKey",
-          "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
+          "bindingSig": "29f9ChjpETpT5qrFHkCe_sxO4w5-4_XxLW8bw55AmKOsslQMJy1YoidYn-WOuXV5jYHhnfHBQZ61Q_3hBipcAg",
           "createdAt": "2026-01-01T00:00:00Z",
           "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "expiresAt": "2026-04-01T00:00:00.000Z",
           "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
           "label": "laptop",
           "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
@@ -167,9 +174,10 @@
       "deviceRecords": [
         {
           "$type": "at.freeq.deviceKey",
-          "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
+          "bindingSig": "29f9ChjpETpT5qrFHkCe_sxO4w5-4_XxLW8bw55AmKOsslQMJy1YoidYn-WOuXV5jYHhnfHBQZ61Q_3hBipcAg",
           "createdAt": "2026-01-01T00:00:00Z",
           "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "expiresAt": "2026-04-01T00:00:00.000Z",
           "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
           "label": "laptop",
           "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
@@ -211,9 +219,10 @@
       "deviceRecords": [
         {
           "$type": "at.freeq.deviceKey",
-          "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
+          "bindingSig": "io3BY4BN3xLfhfoj-ovetY7Cs2b4Q1Rt5iGUPQLfFpSyVL3zFGN4N7E0Eo5j6sQUfC1PzUeDfvbkgJcxlEpxAQ",
           "createdAt": "2026-01-01T00:00:00Z",
           "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "expiresAt": "2027-01-01T00:00:00Z",
           "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
           "label": "laptop",
           "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
@@ -224,29 +233,148 @@
         "NHUPmL1Z_PyUbaRaqr6TOw"
       ],
       "name": "agent-link-retired"
+    },
+    {
+      "agentRecords": [],
+      "at": "2026-04-01T00:00:00Z",
+      "deviceRecords": [
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "29f9ChjpETpT5qrFHkCe_sxO4w5-4_XxLW8bw55AmKOsslQMJy1YoidYn-WOuXV5jYHhnfHBQZ61Q_3hBipcAg",
+          "createdAt": "2026-01-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "expiresAt": "2026-04-01T00:00:00.000Z",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+          "label": "laptop",
+          "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+        }
+      ],
+      "liveAgentDids": [],
+      "liveDeviceKids": [],
+      "name": "device-key-past-its-default-expiry"
+    },
+    {
+      "agentRecords": [],
+      "at": "2026-03-01T00:00:00Z",
+      "deviceRecords": [
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "85lEhnx8pGTF-9o6x0_koy0KmI-K0NTWxXyZufiIdIoN5-kKWjYWXf4bZ7Cp7BkbtvwCJYwHt38BW2H4jdstBQ",
+          "createdAt": "2026-01-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "expiresAt": "2026-02-01T00:00:00Z",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+          "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+        }
+      ],
+      "liveAgentDids": [],
+      "liveDeviceKids": [],
+      "name": "device-key-with-an-earlier-expiry"
+    },
+    {
+      "agentRecords": [],
+      "at": "2026-12-01T00:00:00Z",
+      "deviceRecords": [
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "io3BY4BN3xLfhfoj-ovetY7Cs2b4Q1Rt5iGUPQLfFpSyVL3zFGN4N7E0Eo5j6sQUfC1PzUeDfvbkgJcxlEpxAQ",
+          "createdAt": "2026-01-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "expiresAt": "2027-01-01T00:00:00Z",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+          "label": "laptop",
+          "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+        }
+      ],
+      "liveAgentDids": [],
+      "liveDeviceKids": [
+        "NHUPmL1Z_PyUbaRaqr6TOw"
+      ],
+      "name": "device-key-with-a-later-expiry"
+    },
+    {
+      "agentRecords": [],
+      "at": "2026-03-01T00:00:00Z",
+      "deviceRecords": [
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "85lEhnx8pGTF-9o6x0_koy0KmI-K0NTWxXyZufiIdIoN5-kKWjYWXf4bZ7Cp7BkbtvwCJYwHt38BW2H4jdstBQ",
+          "createdAt": "2026-01-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "expiresAt": "2026-02-01T00:00:00Z",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+          "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+        },
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "wK0fZcJVu6QcwDYn0iO-kZTq1U10cGeGSqL9ANqfLpAJ5HNiaauGldagluTy5IviKA3m6fM7eV-TbXfJLK1JBQ",
+          "createdAt": "2026-01-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "expiresAt": "2026-04-01T00:00:00.000Z",
+          "kid": "ajgD1fBZkCocba-8m6Rykg",
+          "label": "phone",
+          "publicKeyMultibase": "z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH"
+        },
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "z1pvJK4ccYaNRXesWHTIV5sQNti6rb5rDjF79s0HPRdih0NFKyqfrwMTuxcQL2mZGnDJwSuOlR2eDM_Dyl38AA",
+          "createdAt": "2026-03-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+          "revokes": "ajgD1fBZkCocba-8m6Rykg"
+        }
+      ],
+      "liveAgentDids": [],
+      "liveDeviceKids": [
+        "ajgD1fBZkCocba-8m6Rykg"
+      ],
+      "name": "retirement-signed-by-an-expired-key"
     }
   ],
   "vectors": [
     {
-      "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
-      "cid": "bafyreicdezns4ac3uic6ywgpjhleduvbvh6vsribkvcunze454k7speymq",
+      "bindingSig": "29f9ChjpETpT5qrFHkCe_sxO4w5-4_XxLW8bw55AmKOsslQMJy1YoidYn-WOuXV5jYHhnfHBQZ61Q_3hBipcAg",
+      "cid": "bafyreihlo77suc6xyksi5sv3jrcyj2lriplzbfpwlac6oueb53d4d6skie",
       "createdAt": "2026-01-01T00:00:00Z",
       "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+      "expiresAt": "2026-04-01T00:00:00.000Z",
       "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
       "label": "laptop",
       "name": "device-key",
       "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
       "record": {
         "$type": "at.freeq.deviceKey",
-        "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
+        "bindingSig": "29f9ChjpETpT5qrFHkCe_sxO4w5-4_XxLW8bw55AmKOsslQMJy1YoidYn-WOuXV5jYHhnfHBQZ61Q_3hBipcAg",
         "createdAt": "2026-01-01T00:00:00Z",
         "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "expiresAt": "2026-04-01T00:00:00.000Z",
         "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
         "label": "laptop",
         "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
       },
       "seed": "0101010101010101010101010101010101010101010101010101010101010101",
-      "signedBytes": "{\"$type\":\"at.freeq.deviceKey\",\"createdAt\":\"2026-01-01T00:00:00Z\",\"did\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kid\":\"NHUPmL1Z_PyUbaRaqr6TOw\",\"label\":\"laptop\",\"publicKeyMultibase\":\"z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX\"}"
+      "signedBytes": "{\"$type\":\"at.freeq.deviceKey\",\"createdAt\":\"2026-01-01T00:00:00Z\",\"did\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"expiresAt\":\"2026-04-01T00:00:00.000Z\",\"kid\":\"NHUPmL1Z_PyUbaRaqr6TOw\",\"label\":\"laptop\",\"publicKeyMultibase\":\"z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX\"}"
+    },
+    {
+      "bindingSig": "NOnVsG3qLGdt8hVi_ohTNh412PMo-4j04_Ub-UxKLb2Sui_sgWfpHczvSmmOp5akCStP4QGDI8eIZiSZUKNaDQ",
+      "cid": "bafyreif2lfs4llwzidsqraw5yciqqoudpytjk3sx2mwjvzimob4rpgz3xq",
+      "createdAt": "2026-01-01T00:00:00Z",
+      "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+      "expiresAt": "2027-01-01T00:00:00Z",
+      "kid": "ajgD1fBZkCocba-8m6Rykg",
+      "name": "device-key-with-its-own-expiry",
+      "publicKeyMultibase": "z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+      "record": {
+        "$type": "at.freeq.deviceKey",
+        "bindingSig": "NOnVsG3qLGdt8hVi_ohTNh412PMo-4j04_Ub-UxKLb2Sui_sgWfpHczvSmmOp5akCStP4QGDI8eIZiSZUKNaDQ",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "expiresAt": "2027-01-01T00:00:00Z",
+        "kid": "ajgD1fBZkCocba-8m6Rykg",
+        "publicKeyMultibase": "z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH"
+      },
+      "seed": "0202020202020202020202020202020202020202020202020202020202020202",
+      "signedBytes": "{\"$type\":\"at.freeq.deviceKey\",\"createdAt\":\"2026-01-01T00:00:00Z\",\"did\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"expiresAt\":\"2027-01-01T00:00:00Z\",\"kid\":\"ajgD1fBZkCocba-8m6Rykg\",\"publicKeyMultibase\":\"z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH\"}"
     },
     {
       "bindingSig": "shnHAKFIPLuZs4D25c35_NazHZ6p_YDl7n_kyKIY_Z2XlZfw8yTeQjFyzb6EeBPzgTSS7INEgKA0OoeE_ttZAg",

@@ -15,12 +15,14 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { type DidKey, decodeMultibaseEd25519, importDidKey } from './did-key.js';
 import {
   DEVICE_KEY_TYPE,
+  KEY_LIFETIME_MS,
   type DidDocument,
   buildAgentRecord,
   buildAgentRetirement,
   buildDeviceRecord,
   buildDeviceRetirement,
   clearHostPauses,
+  deviceKeyHistory,
   fetchAccounts,
   foldAgentRecords,
   foldDeviceRecords,
@@ -30,6 +32,7 @@ import {
   liveDeviceKeys,
   provenRecords,
   recordCid,
+  retirementClosure,
   setPauseClock,
   verifyProof,
   verifyRecord,
@@ -41,6 +44,10 @@ const T0 = '2026-01-01T00:00:00Z';
 const T1 = '2026-02-01T00:00:00Z';
 const T2 = '2026-03-01T00:00:00Z';
 const T3 = '2026-04-01T00:00:00Z';
+/** Past the default expiry of a key created at T0, before `LATER`. */
+const T4 = '2026-12-01T00:00:00Z';
+/** An `expiresAt` later than the default: honoured, with no cap. */
+const LATER = '2027-01-01T00:00:00Z';
 
 beforeAll(() => {
   Object.defineProperty(globalThis, 'crypto', {
@@ -118,6 +125,7 @@ describe('device key fold', () => {
       'bindingSig',
       'createdAt',
       'did',
+      'expiresAt',
       'kid',
       'publicKeyMultibase',
     ]);
@@ -135,10 +143,12 @@ describe('device key fold', () => {
       '2026-01-01',
       'Jan 1 2026',
     ]) {
-      const record = await buildDeviceRecord(k1, ALICE, createdAt);
+      // An expiry given outright, since the builder cannot count one from
+      // a date it cannot read.
+      const record = await buildDeviceRecord(k1, ALICE, createdAt, undefined, LATER);
       expect(await liveKids([record], T2)).toEqual([]);
     }
-    const leapDay = await buildDeviceRecord(k1, ALICE, '2024-02-29T00:00:00Z');
+    const leapDay = await buildDeviceRecord(k1, ALICE, '2024-02-29T00:00:00Z', undefined, LATER);
     expect(await liveKids([leapDay], T2)).toHaveLength(1);
   });
 
@@ -205,6 +215,88 @@ describe('agent link fold', () => {
     ];
     expect(await liveAgents(devices, links, '2026-02-15T00:00:00Z')).toEqual([agent]);
     expect(await liveAgents(devices, links, T3)).toEqual([]);
+  });
+});
+
+describe('device key expiry', () => {
+  it('lasts 90 days by default', () => {
+    expect(KEY_LIFETIME_MS).toBe(90 * 24 * 60 * 60 * 1000);
+  });
+
+  it('is written by the builder as the Rust builder writes it, and never on a retirement', async () => {
+    const k1 = await key(1);
+    const record = (await buildDeviceRecord(k1, ALICE, T0)) as unknown as Record<string, unknown>;
+    expect(record.expiresAt).toBe('2026-04-01T00:00:00.000Z');
+    const retirement = await buildDeviceRetirement(k1, ALICE, await kidOf(k1), T1);
+    expect('expiresAt' in retirement).toBe(false);
+  });
+
+  it('ends a key at its default expiry', async () => {
+    const records = [await buildDeviceRecord(await key(1), ALICE, T0)];
+    expect(await liveKids(records, '2026-03-31T23:59:59Z')).toHaveLength(1);
+    expect(await liveKids(records, T3)).toEqual([]);
+  });
+
+  it('ends a key at an earlier expiry its record names', async () => {
+    const records = [await buildDeviceRecord(await key(1), ALICE, T0, undefined, T1)];
+    expect(await liveKids(records, T2)).toEqual([]);
+  });
+
+  it('honours a later expiry without a cap', async () => {
+    const k1 = await key(1);
+    const records = [await buildDeviceRecord(k1, ALICE, T0, 'laptop', LATER)];
+    expect(await liveKids(records, T4)).toEqual([await kidOf(k1)]);
+  });
+
+  it('does not count a retirement signed by an expired key', async () => {
+    const [k1, k2] = [await key(1), await key(2)];
+    const records = [
+      await buildDeviceRecord(k1, ALICE, T0, undefined, T1),
+      await buildDeviceRecord(k2, ALICE, T0),
+      await buildDeviceRetirement(k1, ALICE, await kidOf(k2), T2),
+    ];
+    expect(await liveKids(records, T2)).toEqual([await kidOf(k2)]);
+  });
+
+  it('names the expiry in the history and retires the key at it', async () => {
+    const [k1, k2, k3] = [await key(1), await key(2), await key(3)];
+    const history = await deviceKeyHistory(ALICE, [
+      await buildDeviceRecord(k1, ALICE, T0),
+      await buildDeviceRecord(k2, ALICE, T0, undefined, LATER),
+      await buildDeviceRecord(k3, ALICE, T0),
+      await buildDeviceRetirement(k3, ALICE, await kidOf(k3), T1),
+    ]);
+    const of = async (k: DidKey) => {
+      const kid = await kidOf(k);
+      return history.find((h) => h.kid === kid)!;
+    };
+    expect((await of(k1)).expiresAt).toEqual(new Date(T3));
+    expect((await of(k1)).retiredAt).toEqual(new Date(T3));
+    expect((await of(k2)).expiresAt).toEqual(new Date(LATER));
+    expect((await of(k2)).retiredAt).toEqual(new Date(LATER));
+    // A retirement before the expiry is the date that counts.
+    expect((await of(k3)).expiresAt).toEqual(new Date(T3));
+    expect((await of(k3)).retiredAt).toEqual(new Date(T1));
+  });
+
+  it('drops a record whose expiry is not an RFC 3339 string', async () => {
+    const k1 = await key(1);
+    for (const expiresAt of ['next spring', '2026-13-01T00:00:00Z', '']) {
+      const record = await buildDeviceRecord(k1, ALICE, T0, undefined, expiresAt);
+      expect(await deviceKeyHistory(ALICE, [record]), expiresAt).toEqual([]);
+    }
+    const numeric = { ...(await buildDeviceRecord(k1, ALICE, T0)), expiresAt: 1_775_001_600 };
+    expect(await deviceKeyHistory(ALICE, [numeric])).toEqual([]);
+  });
+
+  it("keeps a key's own record in its retirement closure when nothing retires it", async () => {
+    const [k1, k2] = [await key(1), await key(2)];
+    const own = await buildDeviceRecord(k1, ALICE, T0);
+    const other = await buildDeviceRecord(k2, ALICE, T0);
+    const closure = retirementClosure(ALICE, await kidOf(k1), [own, other], (r) => r);
+    expect(closure).toEqual([own]);
+    const [decided] = await deviceKeyHistory(ALICE, closure);
+    expect(decided!.retiredAt).toEqual(new Date(T3));
   });
 });
 

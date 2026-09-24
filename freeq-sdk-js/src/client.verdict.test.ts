@@ -479,7 +479,8 @@ describe('checking received signatures', () => {
   it('is published for a key in the signer’s records', async () => {
     const m = await signedMessage(26, 'from my own device');
     const { lookup: records } = await signerRecordsLookup([
-      await buildDeviceRecord(m.key, SIGNER, '2026-01-01T00:00:00Z'),
+      // A day ago, inside the key's lifetime.
+      await buildDeviceRecord(m.key, SIGNER, new Date(Date.now() - 86_400_000).toISOString()),
     ]);
     const s = await session(OWN_DID, records);
     expect((await s.lineFor([m.wire], m.msgid)).settled).toEqual({

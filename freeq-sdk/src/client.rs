@@ -9113,12 +9113,29 @@ mod device_key_tests {
         assert!(store.saves.lock().is_empty());
     }
 
-    const RETIRED: &str = "2026-09-12T10:00:00.000Z";
+    /// `hours` before one instant fixed for the test run, so records built
+    /// twice match and a key made then is inside its lifetime now.
+    fn hours_ago(hours: i64) -> String {
+        static NOW: std::sync::LazyLock<chrono::DateTime<chrono::Utc>> =
+            std::sync::LazyLock::new(chrono::Utc::now);
+        (*NOW - chrono::TimeDelta::hours(hours))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    /// When the tester's keys were made.
+    fn made() -> String {
+        hours_ago(48)
+    }
+
+    /// When a retirement of one of them was written.
+    fn retired() -> String {
+        hours_ago(24)
+    }
 
     fn record_for(seed: u8) -> serde_json::Value {
         let key = crate::crypto::PrivateKey::ed25519_from_bytes(&[seed; 32]).unwrap();
         serde_json::to_value(
-            crate::identity_records::build_device_record(&key, "did:plc:tester", CREATED, None)
+            crate::identity_records::build_device_record(&key, "did:plc:tester", &made(), None)
                 .unwrap(),
         )
         .unwrap()
@@ -9130,8 +9147,13 @@ mod device_key_tests {
             &ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key(),
         );
         serde_json::to_value(
-            crate::identity_records::build_device_retirement(&key, "did:plc:tester", &kid, RETIRED)
-                .unwrap(),
+            crate::identity_records::build_device_retirement(
+                &key,
+                "did:plc:tester",
+                &kid,
+                &retired(),
+            )
+            .unwrap(),
         )
         .unwrap()
     }
@@ -9295,15 +9317,15 @@ mod device_key_tests {
     }
 
     #[tokio::test]
-    async fn checked_cold_a_key_nothing_retires_is_kept_without_a_proof() {
+    async fn checked_cold_a_key_nothing_retires_is_kept_proving_only_its_own_record() {
         let (lookup, _, proofs) = lookup_counting(repo_holding(&fifty_keys())).await;
         let store = MemoryStore::holding(11, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
         replace_retired_device_key(true, Some(store.as_ref()), &lookup, "did:plc:tester").await;
         assert!(store.saves.lock().is_empty());
         assert_eq!(
             count(&proofs),
-            0,
-            "no retirement names the key, so no proof can change the answer"
+            1,
+            "no retirement names the key; its own record carries its expiry"
         );
         assert_eq!(
             lookup
@@ -9322,7 +9344,7 @@ mod device_key_tests {
         let mut repo = repo_holding(&fifty_keys());
         repo.add(
             crate::identity_records::DEVICE_KEY_TYPE,
-            &retirement_by(107, 11, RETIRED),
+            &retirement_by(107, 11, &retired()),
         );
         let (lookup, _, proofs) = lookup_counting(repo).await;
         let store = MemoryStore::holding(11, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
@@ -9348,7 +9370,7 @@ mod device_key_tests {
         let mut repo = repo_holding(&fifty_keys());
         repo.add_forged(
             crate::identity_records::DEVICE_KEY_TYPE,
-            &retirement_by(103, 11, RETIRED),
+            &retirement_by(103, 11, &retired()),
             &record_for(11),
         );
         let (lookup, _, proofs) = lookup_counting(repo).await;
@@ -9361,15 +9383,17 @@ mod device_key_tests {
     #[tokio::test]
     async fn checked_cold_a_retirement_signed_by_a_key_already_retired_keeps_the_key_as_the_full_fold_does()
      {
-        let signer_gone = retirement_by(111, 111, "2026-09-11T12:00:00.000Z");
-        let late = retirement_by(111, 11, RETIRED);
+        let signer_gone = retirement_by(111, 111, &hours_ago(46));
+        let late = retirement_by(111, 11, &retired());
         let mut all = fifty_keys();
         all.extend([signer_gone.clone(), late.clone()]);
         let kid = crate::sigtag::derive_kid(
             &ed25519_dalek::SigningKey::from_bytes(&[11; 32]).verifying_key(),
         );
         let full = crate::identity_records::device_key_history("did:plc:tester", &all);
-        assert_eq!(full.iter().find(|k| k.kid == kid).unwrap().retired_at, None);
+        let key = full.iter().find(|k| k.kid == kid).unwrap();
+        // Only its expiry, which is still ahead.
+        assert_eq!(key.retired_at, Some(key.expires_at));
 
         let (lookup, _, proofs) = lookup_counting(repo_holding(&all)).await;
         let store = MemoryStore::holding(11, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
@@ -10195,7 +10219,8 @@ mod verdict_tests {
             crate::identity_records::build_device_record(
                 &crate::crypto::PrivateKey::ed25519_from_bytes(&[26; 32]).unwrap(),
                 SIGNER,
-                "2026-01-01T00:00:00Z",
+                &(chrono::Utc::now() - chrono::TimeDelta::days(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 None,
             )
             .unwrap(),

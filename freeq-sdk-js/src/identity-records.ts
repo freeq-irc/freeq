@@ -28,6 +28,13 @@ export const DEVICE_KEY_TYPE = 'at.freeq.deviceKey';
 export const AGENT_KEY_TYPE = 'at.freeq.agentKey';
 
 /**
+ * How long a published device key counts when its record names no
+ * `expiresAt`: readers treat it as retired this long after its `createdAt`.
+ * The record rules' default, never changed by any server's configuration.
+ */
+export const KEY_LIFETIME_MS = 90 * 24 * 60 * 60 * 1000;
+
+/**
  * An `at.freeq.deviceKey` entry: either a key the account publishes
  * (`publicKeyMultibase`) or a retirement of one (`revokes`), never both.
  */
@@ -39,6 +46,11 @@ export interface DeviceKeyRecord {
   /** The key id of the key that signed this entry. */
   kid: string;
   createdAt: string;
+  /**
+   * When the key stops counting, RFC 3339. Absent, it is `createdAt` plus
+   * `KEY_LIFETIME_MS`. Retirements carry none.
+   */
+  expiresAt?: string;
   label?: string;
   bindingSig: string;
 }
@@ -94,19 +106,31 @@ export function recordSignedBytes(record: object): Uint8Array {
 
 // ─── the builders ───────────────────────────────────────────────────────
 
-/** Announce `key` as a signing key of `did`. */
+/**
+ * Announce `key` as a signing key of `did`. It stops counting at `expiresAt`,
+ * written as given; absent, `KEY_LIFETIME_MS` after `createdAt`, which must
+ * then be an RFC 3339 instant.
+ */
 export async function buildDeviceRecord(
   key: Pick<DidKey, 'publicKeyMultibase' | 'signer'>,
   did: string,
   createdAt: string,
   label?: string,
+  expiresAt?: string,
 ): Promise<DeviceKeyRecord> {
+  let expiry = expiresAt;
+  if (expiry === undefined) {
+    const created = parseInstant(createdAt);
+    if (created === null) throw new Error('createdAt is not an RFC 3339 instant');
+    expiry = new Date(created + KEY_LIFETIME_MS).toISOString();
+  }
   const unsigned = {
     $type: DEVICE_KEY_TYPE,
     did,
     publicKeyMultibase: key.publicKeyMultibase,
     kid: await kidOf(key),
     createdAt,
+    expiresAt: expiry,
     ...(label === undefined ? {} : { label }),
   };
   return { ...unsigned, bindingSig: await key.signer(recordSignedBytes(unsigned)) };
@@ -180,6 +204,7 @@ interface Candidate {
   publicKeyMultibase: string;
   publicKey: Uint8Array;
   createdAt: number;
+  expiresAt: number;
   retiredAt: number | null;
   record: unknown;
 }
@@ -220,14 +245,21 @@ export interface DeviceKeyHistory {
   kid: string;
   publicKeyMultibase: string;
   createdAt: Date;
+  /** When the key stops counting: its record's `expiresAt`, or `createdAt` plus `KEY_LIFETIME_MS`. */
+  expiresAt: Date;
+  /**
+   * When the key stopped counting: its expiry, or an earlier retirement. A key
+   * retired by expiry has `retiredAt` equal to `expiresAt`.
+   */
   retiredAt: Date | null;
   record: unknown;
 }
 
 /**
- * Every checked device key of `did`, earliest first, each with the date of
- * the retirement that counts for it, if any. Retirements the fold ignores
- * (wrong signer, dated before the key) are not reflected.
+ * Every checked device key of `did`, earliest first, each with its expiry and
+ * the date it stopped counting: the expiry, or an earlier retirement that
+ * counts. Retirements the fold ignores (wrong signer, dated before the key,
+ * signed by a key already retired or expired) are not reflected.
  */
 export async function deviceKeyHistory(
   did: string,
@@ -237,6 +269,7 @@ export async function deviceKeyHistory(
     kid: k.kid,
     publicKeyMultibase: k.publicKeyMultibase,
     createdAt: new Date(k.createdAt),
+    expiresAt: new Date(k.expiresAt),
     retiredAt: k.retiredAt === null ? null : new Date(k.retiredAt),
     record: k.record,
   }));
@@ -244,9 +277,9 @@ export async function deviceKeyHistory(
 
 /**
  * The entries of `did`'s device key records that decide whether key `kid` is
- * retired: none when no entry retires `kid`; otherwise the retirements of
- * `kid`, and, repeatedly, of each key that signed one of those, with the key
- * records of every such key. `deviceKeyHistory` over these gives `kid` the
+ * retired: `kid`'s own key record, which carries its expiry; the retirements
+ * of `kid`, and, repeatedly, of each key that signed one of those; and the
+ * key records of every such key. `deviceKeyHistory` over these gives `kid` the
  * `retiredAt` it gives over all of `entries`, and over any subset of them
  * holding these, so a caller need prove only these to decide it.
  */
@@ -266,7 +299,6 @@ export function retirementClosure<T>(
       revokes: typeof raw.revokes === 'string' ? raw.revokes : undefined,
     };
   });
-  if (!named.some((n) => n?.revokes === kid)) return [];
   const kids = new Set([kid]);
   for (let grew = true; grew; ) {
     grew = false;
@@ -355,7 +387,7 @@ export async function foldAgentRecords(
 
 /**
  * Every device key record of one account, checked, each carrying the
- * retirement that ended it. Both folds read the account's key history from
+ * retirement that ended it: its expiry, or an earlier retirement. Both folds read the account's key history from
  * here, so they cannot disagree about who was live when.
  */
 async function deviceState(did: string, records: unknown[]): Promise<Candidate[]> {
@@ -366,11 +398,17 @@ async function deviceState(did: string, records: unknown[]): Promise<Candidate[]
     const record = parseRecord(value, DEVICE_KEY_TYPE, did, [
       'publicKeyMultibase',
       'revokes',
+      'expiresAt',
       'label',
     ]);
     if (!record) continue;
     const createdAt = parseInstant(record.createdAt);
     if (createdAt === null) continue;
+    // An `expiresAt` that is present must be an instant: a record whose
+    // expiry cannot be read is dropped, never given the default.
+    const expiresAt =
+      record.expiresAt === undefined ? createdAt + KEY_LIFETIME_MS : parseInstant(record.expiresAt);
+    if (expiresAt === null) continue;
     if (record.publicKeyMultibase !== undefined && record.revokes === undefined) {
       let publicKey: Uint8Array;
       try {
@@ -388,7 +426,11 @@ async function deviceState(did: string, records: unknown[]): Promise<Candidate[]
         publicKeyMultibase: record.publicKeyMultibase,
         publicKey,
         createdAt,
-        retiredAt: null,
+        expiresAt,
+        // The expiry is the latest a key can be retired, and it holds before
+        // any retirement is weighed, so a retirement signed by an expired key
+        // does not count.
+        retiredAt: expiresAt,
         record: value,
       });
     } else if (record.publicKeyMultibase === undefined && record.revokes !== undefined) {
@@ -445,6 +487,7 @@ interface ParsedRecord {
   publicKeyMultibase?: string;
   agentDid?: string;
   revokes?: string;
+  expiresAt?: string;
   label?: string;
 }
 

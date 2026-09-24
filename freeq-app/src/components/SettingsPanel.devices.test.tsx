@@ -84,11 +84,15 @@ import { formatTime } from './MessageList';
 import * as client from '../irc/client';
 import { useStore } from '../store';
 
-const THIS_CREATED = '2026-01-02T00:00:00.000Z';
-const OTHER_CREATED = '2026-02-03T00:00:00.000Z';
-const GONE_CREATED = '2026-01-05T00:00:00.000Z';
-// Recent, since a signed-out row is listed for 24 hours after its retirement.
 const HOUR_MS = 60 * 60 * 1000;
+/** `days` before now: a key made then is inside its 90-day lifetime. */
+function daysAgo(days: number): string {
+  return new Date(Date.now() - days * 24 * HOUR_MS).toISOString();
+}
+const THIS_CREATED = daysAgo(10);
+const OTHER_CREATED = daysAgo(5);
+const GONE_CREATED = daysAgo(8);
+// Recent, since a signed-out row is listed for 24 hours after its retirement.
 const GONE_RETIRED = new Date(Date.now() - HOUR_MS).toISOString();
 
 /** A signing key and the record announcing it, as the account would hold them. */
@@ -204,7 +208,7 @@ describe('the Devices list', () => {
     const here = { kid: thisDevice.kid, createdAt: THIS_CREATED, published: true };
     seam.rows = await client.deviceRowsFrom(DID, records, here);
     // A device that signed in after the cached listing was taken.
-    const late = await aDevice('Private window', '2026-03-01T00:00:00.000Z');
+    const late = await aDevice('Private window', daysAgo(3));
     seam.refreshed = await client.deviceRowsFrom(DID, [...records, late.record], here);
     let release!: () => void;
     seam.holdRefresh = new Promise<void>((resolve) => {
@@ -259,8 +263,10 @@ describe('the Devices list', () => {
   });
 
   it('writes a date as a short month and day and the 24-hour time', async () => {
-    const created = '2026-03-04T20:22:00';
-    const laptop = await aDevice('Late laptop', new Date(created).toISOString());
+    // Three days ago at 20:22 local time.
+    const created = new Date(Date.now() - 3 * 24 * HOUR_MS);
+    created.setHours(20, 22, 0, 0);
+    const laptop = await aDevice('Late laptop', created.toISOString());
     seam.rows = await client.deviceRowsFrom(
       DID,
       [...records, laptop.record],
@@ -279,13 +285,8 @@ describe('the Devices list', () => {
 
   it('dates a signed-out device by the retirement that counts, not an ignored earlier one', async () => {
     // Signed by a key the account never published, so every client ignores it.
-    const stranger = await aDevice('Stranger', '2026-01-01T00:00:00.000Z');
-    const ignored = await buildDeviceRetirement(
-      stranger.key,
-      DID,
-      goneDevice.kid,
-      '2026-02-01T00:00:00.000Z',
-    );
+    const stranger = await aDevice('Stranger', daysAgo(9));
+    const ignored = await buildDeviceRetirement(stranger.key, DID, goneDevice.kid, daysAgo(7));
     const rows = await client.deviceRowsFrom(DID, [...records, ignored], {
       kid: thisDevice.kid,
       createdAt: THIS_CREATED,

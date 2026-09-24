@@ -26,7 +26,7 @@ use atrium_repo::blockstore::{AsyncBlockStoreRead, CarStore, DAG_CBOR, SHA2_256}
 use atrium_repo::{Multihash, Repository};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -37,6 +37,11 @@ pub const DEVICE_KEY_TYPE: &str = "at.freeq.deviceKey";
 
 /// Record type for a bot an account claims as its own, and for retiring one.
 pub const AGENT_KEY_TYPE: &str = "at.freeq.agentKey";
+
+/// How long a published device key counts when its record names no
+/// `expiresAt`: readers treat it as retired this long after its `createdAt`.
+/// The record rules' default, never changed by any server's configuration.
+pub const KEY_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::days(90);
 
 /// An `at.freeq.deviceKey` entry: either a key the account publishes
 /// (`publicKeyMultibase`) or a retirement of one (`revokes`), never both.
@@ -53,6 +58,10 @@ pub struct DeviceKeyRecord {
     /// The key id of the key that signed this entry.
     pub kid: String,
     pub created_at: String,
+    /// When the key stops counting, RFC 3339. Absent, it is `createdAt` plus
+    /// `KEY_LIFETIME`. Retirements carry none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     pub binding_sig: String,
@@ -118,11 +127,26 @@ pub fn record_signed_bytes<T: Serialize>(record: &T) -> Vec<u8> {
 
 // ─── the builders ───────────────────────────────────────────────────────
 
-/// Announce `key` as a signing key of `did`.
+/// Announce `key` as a signing key of `did`, expiring `KEY_LIFETIME` after
+/// `created_at`, which must be an RFC 3339 instant.
 pub fn build_device_record(
     key: &PrivateKey,
     did: &str,
     created_at: &str,
+    label: Option<&str>,
+) -> Result<DeviceKeyRecord> {
+    let created = parse_instant(created_at).context("createdAt is not an RFC 3339 instant")?;
+    let expires_at = default_expiry(created).to_rfc3339_opts(SecondsFormat::Millis, true);
+    build_device_record_with_expiry(key, did, created_at, &expires_at, label)
+}
+
+/// Announce `key` as a signing key of `did` that stops counting at
+/// `expires_at`, written as given.
+pub fn build_device_record_with_expiry(
+    key: &PrivateKey,
+    did: &str,
+    created_at: &str,
+    expires_at: &str,
     label: Option<&str>,
 ) -> Result<DeviceKeyRecord> {
     let raw = ed25519_public_bytes(key)?;
@@ -133,6 +157,7 @@ pub fn build_device_record(
         revokes: None,
         kid: derive_kid_bytes(&raw),
         created_at: created_at.to_string(),
+        expires_at: Some(expires_at.to_string()),
         label: label.map(str::to_string),
         binding_sig: String::new(),
     };
@@ -156,6 +181,7 @@ pub fn build_device_retirement(
         revokes: Some(revokes_kid.to_string()),
         kid: derive_kid_bytes(&raw),
         created_at: created_at.to_string(),
+        expires_at: None,
         label: None,
         binding_sig: String::new(),
     };
@@ -217,6 +243,7 @@ struct Candidate {
     public_key_multibase: String,
     public_key: PublicKey,
     created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
     retired_at: Option<DateTime<Utc>>,
     record: serde_json::Value,
 }
@@ -257,13 +284,19 @@ pub struct DeviceKeyHistory {
     pub kid: String,
     pub public_key_multibase: String,
     pub created_at: DateTime<Utc>,
+    /// When the key stops counting: its record's `expiresAt`, or `createdAt`
+    /// plus `KEY_LIFETIME`.
+    pub expires_at: DateTime<Utc>,
+    /// When the key stopped counting: its expiry, or an earlier retirement.
+    /// A key retired by expiry has `retired_at == Some(expires_at)`.
     pub retired_at: Option<DateTime<Utc>>,
     pub record: serde_json::Value,
 }
 
-/// Every checked device key of `did`, earliest first, each with the date of
-/// the retirement that counts for it, if any. Retirements the fold ignores
-/// (wrong signer, dated before the key) are not reflected.
+/// Every checked device key of `did`, earliest first, each with its expiry and
+/// the date it stopped counting: the expiry, or an earlier retirement that
+/// counts. Retirements the fold ignores (wrong signer, dated before the key,
+/// signed by a key already retired or expired) are not reflected.
 pub fn device_key_history(did: &str, records: &[serde_json::Value]) -> Vec<DeviceKeyHistory> {
     device_state(did, records)
         .into_iter()
@@ -271,6 +304,7 @@ pub fn device_key_history(did: &str, records: &[serde_json::Value]) -> Vec<Devic
             kid: k.kid,
             public_key_multibase: k.public_key_multibase,
             created_at: k.created_at,
+            expires_at: k.expires_at,
             retired_at: k.retired_at,
             record: k.record,
         })
@@ -278,9 +312,9 @@ pub fn device_key_history(did: &str, records: &[serde_json::Value]) -> Vec<Devic
 }
 
 /// The entries of `did`'s device key records that decide whether key `kid` is
-/// retired: none when no entry retires `kid`; otherwise the retirements of
-/// `kid`, and, repeatedly, of each key that signed one of those, with the key
-/// records of every such key. `device_key_history` over these gives `kid` the
+/// retired: `kid`'s own key record, which carries its expiry; the retirements
+/// of `kid`, and, repeatedly, of each key that signed one of those; and the
+/// key records of every such key. `device_key_history` over these gives `kid` the
 /// `retired_at` it gives over all of `entries`, and over any subset of them
 /// holding these, so a caller need prove only these to decide it.
 pub fn retirement_closure<T>(
@@ -302,13 +336,6 @@ pub fn retirement_closure<T>(
             })
         })
         .collect();
-    if !named
-        .iter()
-        .flatten()
-        .any(|(_, revokes)| revokes.as_deref() == Some(kid))
-    {
-        return Vec::new();
-    }
     let mut kids = std::collections::HashSet::from([kid]);
     loop {
         let before = kids.len();
@@ -415,14 +442,14 @@ pub fn fold_agent_records(
 }
 
 /// Every device key record of one account, checked, each carrying the
-/// retirement that ended it. Both folds read the account's key history from
+/// retirement that ended it: its expiry, or an earlier retirement. Both folds read the account's key history from
 /// here, so they cannot disagree about who was live when.
 fn device_state(did: &str, records: &[serde_json::Value]) -> Vec<Candidate> {
     let mut keys: Vec<Candidate> = Vec::new();
     let mut retirements: Vec<(DeviceKeyRecord, DateTime<Utc>, &serde_json::Value)> = Vec::new();
 
     for value in records {
-        let Some((record, created_at)) = parse_device(value, did) else {
+        let Some((record, created_at, expires_at)) = parse_device(value, did) else {
             continue;
         };
         match (
@@ -446,7 +473,11 @@ fn device_state(did: &str, records: &[serde_json::Value]) -> Vec<Candidate> {
                     public_key_multibase: multibase.to_string(),
                     public_key,
                     created_at,
-                    retired_at: None,
+                    expires_at,
+                    // The expiry is the latest a key can be retired, and it
+                    // holds before any retirement is weighed, so a retirement
+                    // signed by an expired key does not count.
+                    retired_at: Some(expires_at),
                     record: value.clone(),
                 });
             }
@@ -508,13 +539,29 @@ fn signer_live_at<'a>(
         .map(|d| &d.public_key)
 }
 
-fn parse_device(value: &serde_json::Value, did: &str) -> Option<(DeviceKeyRecord, DateTime<Utc>)> {
+/// A device record of `did`, its date, and its expiry.
+fn parse_device(
+    value: &serde_json::Value,
+    did: &str,
+) -> Option<(DeviceKeyRecord, DateTime<Utc>, DateTime<Utc>)> {
     let record: DeviceKeyRecord = serde_json::from_value(value.clone()).ok()?;
     if record.record_type != DEVICE_KEY_TYPE || record.did != did {
         return None;
     }
     let created_at = parse_instant(&record.created_at)?;
-    Some((record, created_at))
+    // An `expiresAt` that is present must be an instant: a record whose
+    // expiry cannot be read is dropped, never given the default.
+    let expires_at = match record.expires_at.as_deref() {
+        Some(text) => parse_instant(text)?,
+        None => default_expiry(created_at),
+    };
+    Some((record, created_at, expires_at))
+}
+
+/// When a key created at `created_at` stops counting if its record names no
+/// `expiresAt`.
+fn default_expiry(created_at: DateTime<Utc>) -> DateTime<Utc> {
+    created_at + KEY_LIFETIME
 }
 
 fn parse_agent(value: &serde_json::Value, did: &str) -> Option<(AgentKeyRecord, DateTime<Utc>)> {
@@ -1114,6 +1161,10 @@ mod tests {
     const T1: &str = "2026-02-01T00:00:00Z";
     const T2: &str = "2026-03-01T00:00:00Z";
     const T3: &str = "2026-04-01T00:00:00Z";
+    /// Past the default expiry of a key created at T0, before `LATER`.
+    const T4: &str = "2026-12-01T00:00:00Z";
+    /// An `expiresAt` later than the default: honoured, with no cap.
+    const LATER: &str = "2027-01-01T00:00:00Z";
 
     fn key(seed: u8) -> PrivateKey {
         PrivateKey::ed25519_from_bytes(&[seed; 32]).unwrap()
@@ -1311,6 +1362,16 @@ mod tests {
         let mut mismatched_kid = value(&build_device_record(&key(1), ALICE, T0, None).unwrap());
         mismatched_kid["kid"] = json!(kid_of(3));
 
+        // Key 1 with an `expiresAt` of its own: past the default, and before it.
+        let k1_lasting = value(
+            &build_device_record_with_expiry(&key(1), ALICE, T0, LATER, Some("laptop")).unwrap(),
+        );
+        let k1_short =
+            value(&build_device_record_with_expiry(&key(1), ALICE, T0, T1, None).unwrap());
+        // Signed by key 1 after its own expiry at T1.
+        let retirement_by_expired =
+            value(&build_device_retirement(&key(1), ALICE, &kid_of(2), T2).unwrap());
+
         let link_t1 =
             value(&build_agent_record(&key(1), ALICE, &agent, T1, Some("helper")).unwrap());
         let link_t2 = value(&build_agent_record(&key(1), ALICE, &agent, T2, None).unwrap());
@@ -1344,7 +1405,7 @@ mod tests {
             FoldCase {
                 name: "device-key-whose-kid-does-not-match",
                 at: T2,
-                device_records: vec![mismatched_kid, k2_record],
+                device_records: vec![mismatched_kid, k2_record.clone()],
                 agent_records: vec![],
                 live_device_kids: vec![kid_of(2)],
                 live_agent_dids: vec![],
@@ -1365,12 +1426,46 @@ mod tests {
                 live_device_kids: vec![],
                 live_agent_dids: vec![],
             },
+            // The signing key outlives the default by its own `expiresAt`, so
+            // the link is retired while that key is still live.
             FoldCase {
                 name: "agent-link-retired",
                 at: T3,
-                device_records: vec![k1_record],
+                device_records: vec![k1_lasting.clone()],
                 agent_records: vec![link_t1, link_retirement],
                 live_device_kids: vec![kid_of(1)],
+                live_agent_dids: vec![],
+            },
+            FoldCase {
+                name: "device-key-past-its-default-expiry",
+                at: T3,
+                device_records: vec![k1_record],
+                agent_records: vec![],
+                live_device_kids: vec![],
+                live_agent_dids: vec![],
+            },
+            FoldCase {
+                name: "device-key-with-an-earlier-expiry",
+                at: T2,
+                device_records: vec![k1_short.clone()],
+                agent_records: vec![],
+                live_device_kids: vec![],
+                live_agent_dids: vec![],
+            },
+            FoldCase {
+                name: "device-key-with-a-later-expiry",
+                at: T4,
+                device_records: vec![k1_lasting],
+                agent_records: vec![],
+                live_device_kids: vec![kid_of(1)],
+                live_agent_dids: vec![],
+            },
+            FoldCase {
+                name: "retirement-signed-by-an-expired-key",
+                at: T2,
+                device_records: vec![k1_short, k2_record, retirement_by_expired],
+                agent_records: vec![],
+                live_device_kids: vec![kid_of(2)],
                 live_agent_dids: vec![],
             },
         ]
@@ -1427,6 +1522,71 @@ mod tests {
         run_fold_case("agent-link-retired");
     }
 
+    #[test]
+    fn a_key_past_its_default_expiry_is_not_live() {
+        run_fold_case("device-key-past-its-default-expiry");
+    }
+
+    #[test]
+    fn a_key_is_retired_at_an_earlier_expiry_it_names() {
+        run_fold_case("device-key-with-an-earlier-expiry");
+    }
+
+    #[test]
+    fn a_later_expiry_is_honoured_without_a_cap() {
+        run_fold_case("device-key-with-a-later-expiry");
+    }
+
+    #[test]
+    fn a_retirement_signed_by_an_expired_key_does_not_count() {
+        run_fold_case("retirement-signed-by-an-expired-key");
+    }
+
+    #[test]
+    fn a_built_record_expires_the_key_lifetime_after_its_date_in_milliseconds() {
+        let record = value(&build_device_record(&key(1), ALICE, T0, None).unwrap());
+        // The JS builder writes `toISOString()`; both must write these characters.
+        assert_eq!(record["expiresAt"], "2026-04-01T00:00:00.000Z");
+        let retirement = value(&build_device_retirement(&key(1), ALICE, &kid_of(1), T1).unwrap());
+        assert!(retirement.get("expiresAt").is_none());
+    }
+
+    #[test]
+    fn the_history_names_the_expiry_and_retires_the_key_at_it() {
+        let records = [
+            value(&build_device_record(&key(1), ALICE, T0, None).unwrap()),
+            value(&build_device_record_with_expiry(&key(2), ALICE, T0, LATER, None).unwrap()),
+            value(&build_device_record(&key(3), ALICE, T0, None).unwrap()),
+            value(&build_device_retirement(&key(3), ALICE, &kid_of(3), T1).unwrap()),
+        ];
+        let history = device_key_history(ALICE, &records);
+        let of = |seed| history.iter().find(|k| k.kid == kid_of(seed)).unwrap();
+        assert_eq!(of(1).expires_at, instant(T3));
+        assert_eq!(of(1).retired_at, Some(instant(T3)));
+        assert_eq!(of(2).expires_at, instant(LATER));
+        assert_eq!(of(2).retired_at, Some(instant(LATER)));
+        // A retirement before the expiry is the date that counts.
+        assert_eq!(of(3).expires_at, instant(T3));
+        assert_eq!(of(3).retired_at, Some(instant(T1)));
+    }
+
+    #[test]
+    fn a_record_whose_expiry_is_not_an_rfc_3339_string_is_dropped() {
+        for expires_at in ["next spring", "2026-13-01T00:00:00Z", ""] {
+            let record = value(
+                &build_device_record_with_expiry(&key(1), ALICE, T0, expires_at, None).unwrap(),
+            );
+            assert!(
+                device_key_history(ALICE, &[record]).is_empty(),
+                "{expires_at:?} was kept"
+            );
+        }
+        // A value that is not a string fails the parse, signed or not.
+        let mut numeric = value(&build_device_record(&key(1), ALICE, T0, None).unwrap());
+        numeric["expiresAt"] = json!(1_775_001_600);
+        assert!(device_key_history(ALICE, &[numeric]).is_empty());
+    }
+
     // ─── the shared vectors ─────────────────────────────────────────────
 
     fn vector_entry(name: &str, seed: u8, record: serde_json::Value) -> serde_json::Value {
@@ -1446,6 +1606,9 @@ mod tests {
         if let Some(label) = record.get("label") {
             entry["label"] = label.clone();
         }
+        if let Some(expires_at) = record.get("expiresAt") {
+            entry["expiresAt"] = expires_at.clone();
+        }
         entry
     }
 
@@ -1456,6 +1619,11 @@ mod tests {
                 "device-key",
                 1,
                 value(&build_device_record(&key(1), ALICE, T0, Some("laptop")).unwrap()),
+            ),
+            vector_entry(
+                "device-key-with-its-own-expiry",
+                2,
+                value(&build_device_record_with_expiry(&key(2), ALICE, T0, LATER, None).unwrap()),
             ),
             vector_entry(
                 "device-retirement-signed-by-the-retired-key",
@@ -1498,7 +1666,7 @@ mod tests {
 
     fn build_fixtures_json() -> serde_json::Value {
         json!({
-            "description": "Identity records a person publishes in their own AT Protocol repository. `at.freeq.deviceKey` announces a signing key a device holds, or retires one; `at.freeq.agentKey` announces a bot the account claims as its own, or retires that claim. `bindingSig` is an ed25519 signature, base64url without padding, over the UTF-8 bytes of the JCS (RFC 8785) canonical form of the record with its `bindingSig` field removed, and `signedBytes` is that canonical form. This is the recipe every freeq document signature uses: chat documents (freeq-sdk/src/chatsig.rs), task events (freeq-sdk/src/act.rs), the bot certificate (freeq-bot-id/src/main.rs, verified in freeq-server/src/connection/provenance.rs and minted in TypeScript by freeq-bot-kit-js/src/delegation.ts) and policy credentials (freeq-server/src/policy/credentials.rs). Absent fields are absent rather than null, so they are not in the canonical form, and `kid` is base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16]). `cid` is the record's CID as an AT Protocol repository names it: CID v1, dag-cbor codec, SHA-256 of the record's DAG-CBOR encoding. Every implementation must rebuild each vector's `record`, `signedBytes`, `bindingSig` and `cid` from its `seed`, and must fold each case's records at its `at` into exactly `liveDeviceKids` and `liveAgentDids`.",
+            "description": "Identity records a person publishes in their own AT Protocol repository. `at.freeq.deviceKey` announces a signing key a device holds, or retires one; `at.freeq.agentKey` announces a bot the account claims as its own, or retires that claim. `bindingSig` is an ed25519 signature, base64url without padding, over the UTF-8 bytes of the JCS (RFC 8785) canonical form of the record with its `bindingSig` field removed, and `signedBytes` is that canonical form. This is the recipe every freeq document signature uses: chat documents (freeq-sdk/src/chatsig.rs), task events (freeq-sdk/src/act.rs), the bot certificate (freeq-bot-id/src/main.rs, verified in freeq-server/src/connection/provenance.rs and minted in TypeScript by freeq-bot-kit-js/src/delegation.ts) and policy credentials (freeq-server/src/policy/credentials.rs). Absent fields are absent rather than null, so they are not in the canonical form, and `kid` is base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16]). `cid` is the record's CID as an AT Protocol repository names it: CID v1, dag-cbor codec, SHA-256 of the record's DAG-CBOR encoding. A device key record carries `expiresAt`, RFC 3339: the key is not live from that instant, nor from an earlier retirement that counts, and a retirement it signs at or after that instant does not count. A record without `expiresAt` expires 90 days after its `createdAt`; a record whose `expiresAt` is present but not an RFC 3339 string is dropped. A builder given no expiry writes `createdAt` plus 90 days with milliseconds and `Z`, as `2026-04-01T00:00:00.000Z`; a vector's top-level `expiresAt` is the value its record carries. Every implementation must rebuild each vector's `record`, `signedBytes`, `bindingSig` and `cid` from its `seed`, and must fold each case's records at its `at` into exactly `liveDeviceKids` and `liveAgentDids`.",
             "vectors": vectors(),
             "folds": folds(),
         })
@@ -1603,7 +1771,7 @@ mod tests {
         let spec: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(fixtures_path()).unwrap()).unwrap();
         let cases = spec["folds"].as_array().unwrap();
-        assert_eq!(cases.len(), 7);
+        assert_eq!(cases.len(), 11);
         for case in cases {
             let name = case["name"].as_str().unwrap();
             let device = case["deviceRecords"].as_array().unwrap();
@@ -1669,10 +1837,10 @@ mod tests {
             value(&build_device_retirement(&key(signer), ALICE, &kid_of(target), at).unwrap())
         };
         let unrelated = vec![device(1), device(2), device(3), device(4), retire(4, 4, T1)];
-        assert!(
-            retirement_closure(ALICE, &kid_of(1), unrelated.clone(), |r| r).is_empty(),
-            "nothing retires key 1"
-        );
+        // Nothing retires key 1, but its own record carries its expiry.
+        let closure = retirement_closure(ALICE, &kid_of(1), unrelated.clone(), |r| r);
+        assert_eq!(closure, vec![device(1)]);
+        assert_eq!(retired_at(&closure, &kid_of(1)), Some(instant(T3)));
 
         let mut by_live = unrelated.clone();
         by_live.push(retire(2, 1, T2));
@@ -1693,8 +1861,9 @@ mod tests {
                 retire(3, 2, T1)
             ]
         );
-        assert_eq!(retired_at(&closure, &kid_of(1)), None);
-        assert_eq!(retired_at(&by_retired, &kid_of(1)), None);
+        // Key 2 was retired before it signed, so key 1 ends at its expiry.
+        assert_eq!(retired_at(&closure, &kid_of(1)), Some(instant(T3)));
+        assert_eq!(retired_at(&by_retired, &kid_of(1)), Some(instant(T3)));
     }
 
     // ─── reading from a PDS ─────────────────────────────────────────────

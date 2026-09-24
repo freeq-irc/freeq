@@ -159,9 +159,18 @@ async function rawPublicB64(keyPair: CryptoKeyPair): Promise<string> {
   return btoa(String.fromCharCode(...raw)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
+/** Real now when the file loads; the test dates count back from it. */
+const NOW = Date.now();
+
+/** `hours` before NOW, as a record writes it. */
+function hoursAgo(hours: number): string {
+  return new Date(NOW - hours * 3_600_000).toISOString();
+}
+
+/** A key made two days ago, inside its lifetime. */
 async function storedKey(recordUri?: string): Promise<StoredDeviceKey> {
   const keyPair = (await crypto.subtle.generateKey('Ed25519', false, ['sign', 'verify'])) as CryptoKeyPair;
-  return { keyPair, createdAt: '2026-09-11T10:00:00.000Z', ...(recordUri ? { recordUri } : {}) };
+  return { keyPair, createdAt: hoursAgo(48), ...(recordUri ? { recordUri } : {}) };
 }
 
 describe('a device key store', () => {
@@ -330,7 +339,7 @@ describe('publishing the device key through the broker', () => {
 });
 
 describe('a stored key the account has retired', () => {
-  const RETIRED = '2026-09-12T10:00:00.000Z';
+  const RETIRED = hoursAgo(24);
 
   const KEY_TYPE = 'at.freeq.deviceKey';
   type StubRepo = Awaited<ReturnType<typeof import('../test/repo-proofs.js')['stubRepo']>>;
@@ -502,14 +511,14 @@ describe('a stored key the account has retired', () => {
       return { repo, values, ownEntry, others, storedKid };
     }
 
-    it('presents the stored key and fetches no proof when nothing retires it', async () => {
+    it('presents the stored key and proves only its own record when nothing retires it', async () => {
       const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
       const { repo } = await account(stored);
       const store = new MemoryDeviceKeyStore(stored);
       const { client, lookup, proofs } = await clientReading(store, repo, true);
       const ws = await login(client);
       expect(msgsigOf(ws)).toBe(await rawPublicB64(stored.keyPair));
-      expect(proofs(), 'no retirement names the key, so no proof can change the answer').toBe(0);
+      expect(proofs(), 'no retirement names the key; its own record carries its expiry').toBe(1);
 
       // The check stored nothing as the account's listing.
       expect(await lookup.provenDeviceRecords(DID)).toHaveLength(50);
@@ -558,7 +567,7 @@ describe('a stored key the account has retired', () => {
       const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
       const { repo, values, others, storedKid } = await account(stored);
       const signer = others[11]!;
-      const signerGone = await buildDeviceRetirement(signer.key, DID, signer.kid, '2026-09-11T12:00:00.000Z');
+      const signerGone = await buildDeviceRetirement(signer.key, DID, signer.kid, hoursAgo(46));
       const late = await buildDeviceRetirement(signer.key, DID, storedKid, RETIRED);
       await repo.add(KEY_TYPE, signerGone);
       await repo.add(KEY_TYPE, late);
@@ -567,7 +576,8 @@ describe('a stored key the account has retired', () => {
       const ws = await login(client);
 
       const full = (await deviceKeyHistory(DID, [...values, signerGone, late])).find((k) => k.kid === storedKid);
-      expect(full?.retiredAt).toBeNull();
+      // Only its expiry, which is still ahead.
+      expect(full?.retiredAt).toEqual(full?.expiresAt);
       expect(msgsigOf(ws)).toBe(await rawPublicB64(stored.keyPair));
       expect((await store.load())!.keyPair).toBe(stored.keyPair);
       expect(proofs()).toBe(4);

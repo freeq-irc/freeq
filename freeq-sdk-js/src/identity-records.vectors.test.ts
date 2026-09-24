@@ -44,6 +44,7 @@ interface Vector {
   kid: string;
   did: string;
   createdAt: string;
+  expiresAt?: string;
   label?: string;
   signedBytes: string;
   bindingSig: string;
@@ -83,7 +84,7 @@ async function rebuild(v: Vector): Promise<Record<string, string>> {
   const key = await importDidKey(fromHex(v.seed));
   const r = v.record;
   if (r.$type === DEVICE_KEY_TYPE && r.publicKeyMultibase !== undefined) {
-    return buildDeviceRecord(key, v.did, v.createdAt, v.label);
+    return buildDeviceRecord(key, v.did, v.createdAt, v.label, v.expiresAt);
   }
   if (r.$type === DEVICE_KEY_TYPE) {
     return buildDeviceRetirement(key, v.did, r.revokes!, v.createdAt);
@@ -96,10 +97,17 @@ async function rebuild(v: Vector): Promise<Record<string, string>> {
 
 describe('identity record vectors', () => {
   it('has vectors and folds to check (a silently empty contract is no contract)', () => {
-    expect(spec.vectors.length).toBe(5);
-    expect(spec.folds.length).toBe(7);
+    expect(spec.vectors.length).toBe(6);
+    expect(spec.folds.length).toBe(11);
     expect(spec.description).toContain(DEVICE_KEY_TYPE);
     expect(spec.description).toContain(AGENT_KEY_TYPE);
+  });
+
+  it('writes the default expiry the Rust builder writes', async () => {
+    // `rebuild` passes each vector's expiry; this builds one without it.
+    const v = spec.vectors.find((x) => x.name === 'device-key')!;
+    const key = await importDidKey(fromHex(v.seed));
+    expect(await buildDeviceRecord(key, v.did, v.createdAt, v.label)).toStrictEqual(v.record);
   });
 
   for (const v of spec.vectors) {
