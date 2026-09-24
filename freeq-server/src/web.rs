@@ -658,14 +658,61 @@ fn warn_about_unmounted_verifiers(state: &Arc<SharedState>) {
     }
 }
 
+// ── The client's address ───────────────────────────────────────────────
+
+/// The address of the client behind a request, which per-address limits are
+/// keyed by: the TCP peer's, unless the peer is this machine's own proxy.
+///
+/// A peer on a loopback address is a proxy in front of this server (nginx on
+/// the deploy), and every client would otherwise share its one address; its
+/// `X-Real-IP`, else the last `X-Forwarded-For` entry (the address the proxy
+/// saw), names the client. Any other peer is the client itself, and its
+/// headers are ignored, so a remote client cannot choose its own address.
+pub(crate) struct ClientIp(pub std::net::IpAddr);
+
+/// See [`ClientIp`].
+pub(crate) fn client_ip(
+    peer: std::net::SocketAddr,
+    headers: &axum::http::HeaderMap,
+) -> std::net::IpAddr {
+    let peer_ip = peer.ip().to_canonical();
+    if !peer_ip.is_loopback() {
+        return peer_ip;
+    }
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    header("x-real-ip")
+        .and_then(|v| v.trim().parse().ok())
+        .or_else(|| {
+            header("x-forwarded-for")
+                .and_then(|v| v.rsplit(',').next())
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(peer_ip)
+}
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ClientIp {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|info| info.0)
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok(ClientIp(client_ip(peer, &parts.headers)))
+    }
+}
+
 // ── WebSocket handler ──────────────────────────────────────────────────
 
 async fn ws_upgrade(
     ws: WebSocketUpgrade,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    ClientIp(ip): ClientIp,
     State(state): State<Arc<SharedState>>,
 ) -> impl IntoResponse {
-    let ip = addr.ip();
     // Per-IP connection limit for WebSocket (same limit as TCP)
     const MAX_CONNS_PER_IP: u32 = 20;
     {
@@ -971,11 +1018,11 @@ const MAX_BATCH_KEYS: usize = 50;
 /// duplicates are dropped), or an item without a `/`; on the record routes'
 /// limiter.
 async fn api_signing_keys_batch(
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    ClientIp(ip): ClientIp,
     State(state): State<Arc<SharedState>>,
     axum::extract::Query(query): axum::extract::Query<SigningKeysQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if !state.record_rate_limiter.check(addr.ip()) {
+    if !state.record_rate_limiter.check(ip) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     let named: Vec<&str> = query
@@ -1045,13 +1092,13 @@ async fn api_signing_keys_batch(
 /// when the PDS could not be read and the last copy is served; 502 when
 /// there is no copy to serve.
 async fn api_record_listing(
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    ClientIp(ip): ClientIp,
     State(state): State<Arc<SharedState>>,
     axum::extract::Path((did, collection)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // A seen account can be asked for over and over, and a miss costs a
     // request to its PDS; the record routes have their own budget.
-    if !state.record_rate_limiter.check(addr.ip()) {
+    if !state.record_rate_limiter.check(ip) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     let did = urlencoding::decode(&did).unwrap_or(std::borrow::Cow::Borrowed(&did));
@@ -1082,12 +1129,12 @@ async fn api_record_listing(
 /// otherwise, or as for the listing route); 502 when the proof cannot be
 /// fetched or does not check.
 async fn api_record_proof(
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    ClientIp(ip): ClientIp,
     State(state): State<Arc<SharedState>>,
     axum::extract::Path((did, collection, rkey)): axum::extract::Path<(String, String, String)>,
 ) -> Result<axum::response::Response, StatusCode> {
     use axum::response::IntoResponse;
-    if !state.record_rate_limiter.check(addr.ip()) {
+    if !state.record_rate_limiter.check(ip) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     let did = urlencoding::decode(&did).unwrap_or(std::borrow::Cow::Borrowed(&did));
@@ -1128,12 +1175,12 @@ struct RecordsQuery {
 /// left out of `proofs`, and the client reads that one from the PDS. 404 and
 /// 502 as the listing route.
 async fn api_records_account(
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    ClientIp(ip): ClientIp,
     State(state): State<Arc<SharedState>>,
     axum::extract::Path(did): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<RecordsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if !state.record_rate_limiter.check(addr.ip()) {
+    if !state.record_rate_limiter.check(ip) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     let did = urlencoding::decode(&did).unwrap_or(std::borrow::Cow::Borrowed(&did));
@@ -1152,11 +1199,11 @@ const MAX_BATCH_DIDS: usize = 50;
 /// `?collection=`. An account with nothing served (not seen here, or no copy
 /// and an unreadable PDS) is left out. 400 for no DIDs or more than 50.
 async fn api_records_batch(
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    ClientIp(ip): ClientIp,
     State(state): State<Arc<SharedState>>,
     axum::extract::Query(query): axum::extract::Query<RecordsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if !state.record_rate_limiter.check(addr.ip()) {
+    if !state.record_rate_limiter.check(ip) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     let named: Vec<&str> = query
@@ -3403,7 +3450,7 @@ mod media_space_gate_tests {
 /// segment; the trailing filename gives clients the extension they use to
 /// decide how to render, exactly like the private-store capability URLs.
 async fn api_space_media(
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    ClientIp(ip): ClientIp,
     State(state): State<Arc<SharedState>>,
     Path((encoded_ref, _filename)): Path<(String, String)>,
     headers: axum::http::HeaderMap,
@@ -3411,7 +3458,7 @@ async fn api_space_media(
     // A public channel's media URL needs no bearer, and a miss costs two
     // round trips against the *uploader's* PDS. Meter it like every other
     // expensive REST route.
-    if !state.rest_rate_limiter.check(addr.ip()) {
+    if !state.rest_rate_limiter.check(ip) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     let Some(mgr) = state.media_space.clone() else {
@@ -5109,12 +5156,12 @@ fn mobile_nick_from_handle(handle: &str) -> String {
 /// Server proxies the upload to the user's PDS using their stored OAuth credentials.
 /// Returns JSON: `{ "url": "...", "content_type": "...", "size": N }`.
 async fn api_upload(
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    ClientIp(ip): ClientIp,
     State(state): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     mut multipart: axum::extract::Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if !state.rest_rate_limiter.check(addr.ip()) {
+    if !state.rest_rate_limiter.check(ip) {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             "Rate limit exceeded".to_string(),
@@ -5919,12 +5966,12 @@ struct OgQuery {
 /// and sandbox CSP headers that prevent browser/AVPlayer playback.
 /// Supports Range requests for video seeking / AVPlayer compatibility.
 async fn api_blob_proxy(
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    ClientIp(ip): ClientIp,
     State(state): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if !state.rest_rate_limiter.check(addr.ip()) {
+    if !state.rest_rate_limiter.check(ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
     }
     let Some(url) = q.get("url") else {
@@ -6036,12 +6083,12 @@ async fn api_blob_proxy(
 /// it was posted to) is the grant. Bytes are decrypted from disk and streamed
 /// with HTTP Range support for video/audio seeking.
 async fn api_media_serve(
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    ClientIp(ip): ClientIp,
     State(state): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     axum::extract::Path((id, sig, _filename)): axum::extract::Path<(String, String, String)>,
 ) -> impl IntoResponse {
-    if !state.rest_rate_limiter.check(addr.ip()) {
+    if !state.rest_rate_limiter.check(ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
     }
     let Some(store) = state.media_store.as_ref() else {
@@ -6146,11 +6193,11 @@ fn parse_single_range(header: &str, total: u64) -> Option<(u64, u64)> {
 /// Fetch OpenGraph metadata from a URL and return as JSON.
 /// Avoids clients leaking browsing data to third-party proxy services.
 async fn api_og_preview(
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    ClientIp(ip): ClientIp,
     State(state): State<Arc<SharedState>>,
     Query(q): Query<OgQuery>,
 ) -> impl IntoResponse {
-    if !state.rest_rate_limiter.check(addr.ip()) {
+    if !state.rest_rate_limiter.check(ip) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({"error": "Rate limit exceeded"})),
@@ -6861,10 +6908,11 @@ mod orphan_view_tests {
 
 #[cfg(test)]
 mod record_route_tests {
+    use super::ClientIp;
     use super::{
         RecordsQuery, api_record_listing, api_record_proof, api_records_account, api_records_batch,
     };
-    use axum::extract::{ConnectInfo, Path, State};
+    use axum::extract::{Path, State};
     use axum::http::StatusCode;
     use freeq_sdk::identity_records::{DEVICE_KEY_TYPE, record_cid, verify_proof};
     use std::collections::HashMap;
@@ -6872,8 +6920,8 @@ mod record_route_tests {
 
     const DID: &str = "did:plc:recordroutetest";
 
-    fn caller() -> ConnectInfo<std::net::SocketAddr> {
-        ConnectInfo("127.0.0.1:1".parse().unwrap())
+    fn caller() -> ClientIp {
+        ClientIp("127.0.0.1".parse().unwrap())
     }
 
     fn device_record(seed: u8) -> serde_json::Value {
@@ -7606,14 +7654,15 @@ mod signing_key_endpoint_tests {
 
 #[cfg(test)]
 mod signing_keys_batch_tests {
+    use super::ClientIp;
     use super::{SigningKeysQuery, api_signing_keys_batch};
     use crate::server::{SharedState, test_state_with_db};
-    use axum::extract::{ConnectInfo, Query, State};
+    use axum::extract::{Query, State};
     use axum::http::StatusCode;
     use std::sync::Arc;
 
-    fn caller() -> ConnectInfo<std::net::SocketAddr> {
-        ConnectInfo("127.0.0.1:1".parse().unwrap())
+    fn caller() -> ClientIp {
+        ClientIp("127.0.0.1".parse().unwrap())
     }
 
     async fn batch(
@@ -7857,6 +7906,111 @@ mod signing_keys_batch_tests {
         let set = get("/api/v1/signing-keys/did:plc:enc".to_string()).await;
         assert_eq!(set["did"], "did:plc:enc");
         assert!(set["keys"].is_array());
+    }
+}
+
+#[cfg(test)]
+mod client_address_tests {
+    use crate::server::test_state_with_db;
+
+    /// Serve `state`'s router on loopback, as the server does behind nginx.
+    async fn serve(state: std::sync::Arc<crate::server::SharedState>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = super::router(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+        addr
+    }
+
+    /// The status of one batch key request that names `real_ip` as the client.
+    async fn status_as(addr: std::net::SocketAddr, real_ip: &str) -> u16 {
+        reqwest::Client::new()
+            .get(format!(
+                "http://{addr}/api/v1/signing-keys?keys=did:plc:a/k"
+            ))
+            .header("X-Real-IP", real_ip)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    /// What the extractor reads from a request from `peer` with `headers`.
+    async fn extracted(peer: &str, headers: &[(&str, &str)]) -> std::net::IpAddr {
+        use axum::extract::FromRequestParts;
+        let mut request = axum::http::Request::builder().uri("/");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let mut request = request.body(()).unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo::<std::net::SocketAddr>(
+                peer.parse().unwrap(),
+            ));
+        let (mut parts, ()) = request.into_parts();
+        super::ClientIp::from_request_parts(&mut parts, &())
+            .await
+            .unwrap()
+            .0
+    }
+
+    #[tokio::test]
+    async fn a_remote_peers_address_headers_are_ignored() {
+        let ip = extracted(
+            "203.0.113.5:40000",
+            &[
+                ("x-real-ip", "198.51.100.7"),
+                ("x-forwarded-for", "198.51.100.8"),
+            ],
+        )
+        .await;
+        assert_eq!(ip, "203.0.113.5".parse::<std::net::IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_loopback_peer_names_the_client_by_x_real_ip_else_the_last_forwarded_entry() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(
+            extracted("127.0.0.1:1", &[("x-real-ip", "198.51.100.7")]).await,
+            ip("198.51.100.7")
+        );
+        assert_eq!(
+            extracted("[::1]:1", &[("x-forwarded-for", "10.0.0.9, 198.51.100.8")]).await,
+            ip("198.51.100.8")
+        );
+        assert_eq!(
+            extracted("127.0.0.1:1", &[("x-real-ip", "nonsense")]).await,
+            ip("127.0.0.1")
+        );
+        assert_eq!(extracted("127.0.0.1:1", &[]).await, ip("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn a_local_proxys_client_address_is_the_one_limited() {
+        let state = test_state_with_db();
+        let spent: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        for _ in 0..600 {
+            assert!(state.record_rate_limiter.check(spent));
+        }
+        let addr = serve(state).await;
+        assert_eq!(
+            status_as(addr, "198.51.100.7").await,
+            429,
+            "that client's budget is spent"
+        );
+        assert_eq!(
+            status_as(addr, "198.51.100.8").await,
+            200,
+            "another client's is not"
+        );
     }
 }
 
