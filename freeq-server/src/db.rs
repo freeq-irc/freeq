@@ -2978,6 +2978,30 @@ impl Db {
         )
     }
 
+    /// Every `did:web:` key on file with an expiry, other than `own_did`'s,
+    /// as `(did, row)`: the keys whose own host may still exempt them.
+    pub fn did_web_keys_with_expiry(
+        &self,
+        own_did: &str,
+    ) -> SqlResult<Vec<(String, SigningKeyRow)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kid, pubkey, registered_at,
+                    COALESCE(last_seen_at, registered_at), removed_at, source, expires_at, did
+             FROM signing_keys
+             WHERE did LIKE 'did:web:%' AND did != ?1 AND expires_at IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![own_did], |row| {
+            Ok(Self::signing_key_row(row)?.map(|key| (row.get::<_, String>(7), key)))
+        })?;
+        let mut keys = Vec::new();
+        for row in rows {
+            if let Some((did, key)) = row? {
+                keys.push((did?, key));
+            }
+        }
+        Ok(keys)
+    }
+
     /// The DID's most-recently-used signing key (raw 32-byte ed25519 public
     /// key), or None.
     ///

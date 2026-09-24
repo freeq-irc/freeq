@@ -2301,6 +2301,13 @@ impl Server {
         let web_addr = self.config.web_addr.clone();
         let state = self.build_state()?;
 
+        // Another server's key copied before its own keys were exempt carries
+        // an expiry; ask each such key's own host once, off the startup path.
+        {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { crate::peer_keys::confirm_own_host_keys(&state).await });
+        }
+
         // Recover active AV sessions from DB (survive server restarts)
         {
             let recovered = state
