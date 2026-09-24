@@ -310,6 +310,7 @@ pub fn router(state: Arc<SharedState>) -> Router {
             axum::routing::post(api_device_sign_out),
         )
         .route("/api/v1/signing-key", get(api_signing_key))
+        .route("/api/v1/signing-keys", get(api_signing_keys_batch))
         .route("/api/v1/signing-keys/{did}", get(api_did_signing_key))
         .route(
             "/api/v1/signing-keys/{did}/{kid}",
@@ -950,6 +951,85 @@ async fn api_did_signing_key_by_kid(
         }))),
         None => Err(axum::http::StatusCode::NOT_FOUND),
     }
+}
+
+/// `?keys=` on the batch key route.
+#[derive(Debug, Default, serde::Deserialize)]
+struct SigningKeysQuery {
+    keys: Option<String>,
+}
+
+/// Most keys one batch key request may name.
+const MAX_BATCH_KEYS: usize = 50;
+
+/// GET /api/v1/signing-keys?keys=did/kid,… — up to 50 keys by (DID, kid), each
+/// with its public key and dates, in the order asked. A key this server does
+/// not hold is left out; expired and retired keys are answered with their
+/// dates. A `did:web:` key it does not hold is fetched from that DID's own
+/// document first (at most five a request, a miss remembered for
+/// `--peer-key-retry-secs`). 400 for no keys, more than 50 (counted before
+/// duplicates are dropped), or an item without a `/`; on the record routes'
+/// limiter.
+async fn api_signing_keys_batch(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<Arc<SharedState>>,
+    axum::extract::Query(query): axum::extract::Query<SigningKeysQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !state.record_rate_limiter.check(addr.ip()) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let named: Vec<&str> = query
+        .keys
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .collect();
+    if named.is_empty() || named.len() > MAX_BATCH_KEYS {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut asked: Vec<(String, String)> = Vec::with_capacity(named.len());
+    for item in named {
+        // A DID holds no `/`, so the first one ends it.
+        let Some((did, kid)) = item.split_once('/') else {
+            return Err(StatusCode::BAD_REQUEST);
+        };
+        let pair = (did.to_string(), kid.to_string());
+        if !asked.contains(&pair) {
+            asked.push(pair);
+        }
+    }
+    let row = |did: &str, kid: &str| {
+        state
+            .with_db(|db| db.get_signing_key_row(did, kid))
+            .flatten()
+    };
+    let missing_servers: Vec<(String, String)> = asked
+        .iter()
+        .filter(|(did, kid)| did.starts_with("did:web:") && row(did, kid).is_none())
+        .cloned()
+        .collect();
+    if !missing_servers.is_empty() {
+        crate::peer_keys::fetch_missing_server_keys(&state, missing_servers).await;
+    }
+    use base64::Engine;
+    let keys: Vec<serde_json::Value> = asked
+        .iter()
+        .filter_map(|(did, kid)| {
+            let r = row(did, kid)?;
+            Some(serde_json::json!({
+                "did": did,
+                "kid": kid,
+                "public_key": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r.pubkey),
+                "registered_at": r.registered_at,
+                "last_seen_at": r.last_seen_at,
+                "removed_at": r.removed_at,
+                "expires_at": r.expires_at,
+            }))
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "keys": keys })))
 }
 
 /// GET /api/v1/records/{did}/{collection} — an account's identity records as
@@ -7521,6 +7601,262 @@ mod signing_key_endpoint_tests {
         assert_eq!(out.0["registered_at"], 1_000);
         assert_eq!(out.0["expires_at"], 2_000);
         assert!(out.0["removed_at"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod signing_keys_batch_tests {
+    use super::{SigningKeysQuery, api_signing_keys_batch};
+    use crate::server::{SharedState, test_state_with_db};
+    use axum::extract::{ConnectInfo, Query, State};
+    use axum::http::StatusCode;
+    use std::sync::Arc;
+
+    fn caller() -> ConnectInfo<std::net::SocketAddr> {
+        ConnectInfo("127.0.0.1:1".parse().unwrap())
+    }
+
+    async fn batch(
+        state: &Arc<SharedState>,
+        keys: Option<&str>,
+    ) -> Result<serde_json::Value, StatusCode> {
+        api_signing_keys_batch(
+            caller(),
+            State(state.clone()),
+            Query(SigningKeysQuery {
+                keys: keys.map(str::to_string),
+            }),
+        )
+        .await
+        .map(|json| json.0)
+    }
+
+    fn kid(key: &[u8; 32]) -> String {
+        freeq_sdk::act::derive_kid_bytes(key)
+    }
+
+    /// (did, kid) of each key in an answer, in order.
+    fn pairs(answer: &serde_json::Value) -> Vec<(String, String)> {
+        answer["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| {
+                (
+                    k["did"].as_str().unwrap().to_string(),
+                    k["kid"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn answers_in_the_order_asked_and_leaves_out_what_it_does_not_hold() {
+        let state = test_state_with_db();
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        state.with_db(|db| {
+            db.save_signing_key_from("did:plc:a", &a, "local-session", 10, Some(4_000_000_000))?;
+            db.save_signing_key_from("did:plc:b", &b, "local-session", 20, None)
+        });
+        let asked = format!(
+            "did:plc:b/{}, did:plc:a/nosuchkid,did:plc:a/{},did:plc:b/{}",
+            kid(&b),
+            kid(&a),
+            kid(&b)
+        );
+        let answer = batch(&state, Some(&asked)).await.unwrap();
+        assert_eq!(
+            pairs(&answer),
+            vec![
+                ("did:plc:b".to_string(), kid(&b)),
+                ("did:plc:a".to_string(), kid(&a)),
+            ]
+        );
+        let first = &answer["keys"][0];
+        assert_eq!(first["registered_at"], 20);
+        assert!(first["expires_at"].is_null());
+        assert!(first["removed_at"].is_null());
+        assert!(first["last_seen_at"].is_i64());
+        use base64::Engine;
+        assert_eq!(
+            first["public_key"],
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+        );
+        assert_eq!(answer["keys"][1]["expires_at"], 4_000_000_000i64);
+    }
+
+    #[tokio::test]
+    async fn answers_an_expired_and_a_retired_key_with_their_dates() {
+        let state = test_state_with_db();
+        let (expired, retired) = ([3u8; 32], [4u8; 32]);
+        state.with_db(|db| {
+            db.save_signing_key_from("did:plc:c", &expired, "local-session", 10, Some(20))?;
+            db.save_signing_key_from(
+                "did:plc:c",
+                &retired,
+                "local-session",
+                10,
+                Some(4_000_000_000),
+            )?;
+            db.retire_signing_key("did:plc:c", &kid(&retired), 15)
+        });
+        let answer = batch(
+            &state,
+            Some(&format!(
+                "did:plc:c/{},did:plc:c/{}",
+                kid(&expired),
+                kid(&retired)
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer["keys"][0]["expires_at"], 20);
+        assert_eq!(answer["keys"][1]["removed_at"], 15);
+    }
+
+    #[tokio::test]
+    async fn fifty_is_the_most_and_a_malformed_ask_is_a_bad_request() {
+        let state = test_state_with_db();
+        let fifty: Vec<String> = (0..50).map(|i| format!("did:plc:x{i}/k")).collect();
+        assert!(batch(&state, Some(&fifty.join(","))).await.is_ok());
+        // Counted before duplicates are dropped.
+        let fifty_one = vec!["did:plc:same/k"; 51].join(",");
+        assert_eq!(
+            batch(&state, Some(&fifty_one)).await.unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+        for keys in [None, Some(""), Some(","), Some("did:plc:noslash")] {
+            assert_eq!(
+                batch(&state, keys).await.unwrap_err(),
+                StatusCode::BAD_REQUEST,
+                "{keys:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shares_the_record_routes_limiter() {
+        let state = test_state_with_db();
+        for _ in 0..600 {
+            assert!(
+                state
+                    .record_rate_limiter
+                    .check("127.0.0.1".parse().unwrap())
+            );
+        }
+        assert_eq!(
+            batch(&state, Some("did:plc:a/k")).await.unwrap_err(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    fn server_document(did: &str, key: &ed25519_dalek::SigningKey) -> freeq_sdk::did::DidDocument {
+        let key_id = format!("{did}#freeq");
+        freeq_sdk::did::DidDocument {
+            id: did.to_string(),
+            also_known_as: vec![],
+            verification_method: vec![freeq_sdk::did::VerificationMethod {
+                id: key_id.clone(),
+                method_type: "Multikey".to_string(),
+                controller: did.to_string(),
+                public_key_multibase: Some(
+                    freeq_sdk::crypto::PublicKey::Ed25519(key.verifying_key()).to_multibase(),
+                ),
+            }],
+            authentication: vec![],
+            assertion_method: vec![freeq_sdk::did::StringOrMap::Reference(key_id)],
+            service: vec![],
+        }
+    }
+
+    fn state_resolving(docs: Vec<freeq_sdk::did::DidDocument>) -> Arc<SharedState> {
+        crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            freeq_sdk::did::DidResolver::static_map(
+                docs.into_iter().map(|d| (d.id.clone(), d)).collect(),
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn fetches_a_servers_key_it_lacks_from_the_servers_document() {
+        let did = "did:web:batch-peer.example";
+        let key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let state = state_resolving(vec![server_document(did, &key)]);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+
+        let answer = batch(&state, Some(&format!("{did}/{kid}"))).await.unwrap();
+        assert_eq!(pairs(&answer), vec![(did.to_string(), kid.clone())]);
+        assert!(answer["keys"][0]["expires_at"].is_null());
+        let row = state
+            .with_db(|db| db.get_signing_key_row(did, &kid))
+            .flatten()
+            .expect("filed");
+        assert_eq!(row.source.as_deref(), Some("did-document"));
+    }
+
+    #[tokio::test]
+    async fn a_miss_is_not_fetched_again_inside_the_window() {
+        let did = "did:web:batch-nobody.example";
+        let state = state_resolving(vec![]);
+        let asked = format!("{did}/somekid");
+        assert!(pairs(&batch(&state, Some(&asked)).await.unwrap()).is_empty());
+        assert!(pairs(&batch(&state, Some(&asked)).await.unwrap()).is_empty());
+        assert_eq!(crate::peer_keys::document_fetches(did), 1);
+    }
+
+    #[tokio::test]
+    async fn fetches_at_most_five_documents_a_request() {
+        let state = state_resolving(vec![]);
+        let dids: Vec<String> = (0..7)
+            .map(|i| format!("did:web:batch-cap{i}.example"))
+            .collect();
+        let asked: Vec<String> = dids.iter().map(|d| format!("{d}/k")).collect();
+        batch(&state, Some(&asked.join(","))).await.unwrap();
+        let fetched: usize = dids
+            .iter()
+            .map(|d| crate::peer_keys::document_fetches(d))
+            .sum();
+        assert_eq!(fetched, 5);
+    }
+
+    /// Over HTTP, through the real router: a URL-encoded DID is read, and the
+    /// route does not collide with `/api/v1/signing-key` or `/{did}`.
+    #[tokio::test]
+    async fn the_route_is_its_own_and_reads_an_encoded_did() {
+        let state = test_state_with_db();
+        let key = [6u8; 32];
+        state
+            .with_db(|db| db.save_signing_key_from("did:plc:enc", &key, "local-session", 10, None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = super::router(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+        let get = |path: String| async move {
+            reqwest::get(format!("http://{addr}{path}"))
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        };
+        let batch = get(format!(
+            "/api/v1/signing-keys?keys=did%3Aplc%3Aenc%2F{}",
+            kid(&key)
+        ))
+        .await;
+        assert_eq!(batch["keys"][0]["did"], "did:plc:enc", "{batch}");
+        let server = get("/api/v1/signing-key".to_string()).await;
+        assert_eq!(server["tag"], "+freeq.at/sig");
+        let set = get("/api/v1/signing-keys/did:plc:enc".to_string()).await;
+        assert_eq!(set["did"], "did:plc:enc");
+        assert!(set["keys"].is_array());
     }
 }
 

@@ -842,6 +842,50 @@ paths:
               schema:
                 type: object
         "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/signing-keys:
+    get:
+      tags: [identity]
+      operationId: getSigningKeysBatch
+      summary: Up to 50 signing keys by DID and key id.
+      description: |
+        Each key asked for that this server holds, once, in the order asked,
+        with its public key and dates; expired and retired keys are answered
+        too. A key it does not hold is left out, not an error. For a
+        `did:web:` key it does not hold, the server first reads that DID's
+        own document (at most five a request; a miss is remembered for
+        `--peer-key-retry-secs`). Shares the record routes' rate limit.
+      parameters:
+        - name: keys
+          in: query
+          required: true
+          description: |
+            Comma-separated `did/kid` pairs, at most 50 before duplicates are
+            dropped; the first `/` in each ends the DID.
+          schema: { type: string }
+      security: [{}]
+      responses:
+        "200":
+          description: The keys held.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        did: { type: string }
+                        kid: { type: string }
+                        public_key: { type: string }
+                        registered_at: { type: integer }
+                        last_seen_at: { type: integer }
+                        removed_at: { type: [integer, "null"] }
+                        expires_at: { type: [integer, "null"] }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
   /api/v1/signing-keys/{did}:
     get:
       tags: [identity]

@@ -86,6 +86,12 @@ GET /api/v1/signing-keys/{did}/{kid}
 
 Returns the one key that identity registered under `kid`, with the same window fields. This is the lookup a verifier uses when a signature names its kid: the key stays fetchable after the session that made it ends, after it is retired and after it expires, with those dates. An unknown kid is a 404.
 
+```
+GET /api/v1/signing-keys?keys={did}/{kid},{did}/{kid},…
+```
+
+Returns up to 50 keys in one request, each as `{did, kid, public_key, registered_at, last_seen_at, removed_at, expires_at}` under `keys`, in the order asked. A key this server does not hold is left out; expired and retired keys are answered with their dates. For a `did:web:` key it does not hold, the server first reads that DID's own document (at most five a request; a miss is not asked again for `--peer-key-retry-secs`). More than 50 pairs (counted before duplicates are dropped), none, or a pair without a `/` is a 400. It shares the record routes' rate limit (429).
+
 ### Blob Proxy
 
 ```

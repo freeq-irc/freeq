@@ -54,6 +54,16 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 static LOOKUPS: LazyLock<Mutex<HashMap<(String, String), Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// How many times the batch key route asked `key_for` about a DID (tests).
+#[cfg(test)]
+static DOCUMENT_FETCHES: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn document_fetches(did: &str) -> usize {
+    DOCUMENT_FETCHES.lock().get(did).copied().unwrap_or(0)
+}
+
 /// The HTTP clients the record lookup uses: SSRF-checked in the running
 /// server, a plain shared client in tests, whose stub servers are on loopback.
 pub(crate) enum LookupClients {
@@ -228,51 +238,7 @@ fn start_lookup(state: &Arc<SharedState>, bases: Vec<String>, did: &str, kid: &s
         let (did, kid) = entry;
         match state.key_lookup.key_for(&did, &kid).await {
             Ok(Some(found)) => {
-                let source = match found.source {
-                    KeySource::IdentityRecord => "identity-record",
-                    KeySource::DidDocument => "did-document",
-                    KeySource::OriginServer => "origin-server",
-                };
-                let now = chrono::Utc::now().timestamp();
-                let (dates, retired_at) = match found.source {
-                    // A published key keeps its record's dates. A key the
-                    // records retire is filed retired, and no peer is then
-                    // asked for a live copy; one they only let expire is not
-                    // stamped, since an expiry is not a retirement.
-                    KeySource::IdentityRecord => (
-                        KeyDates {
-                            registered_at: found.created_at.unwrap_or(now),
-                            expires_at: found.expires_at,
-                        },
-                        found
-                            .retired_at
-                            .filter(|at| found.expires_at.is_none_or(|exp| *at < exp)),
-                    ),
-                    // Its own document's key: its owner rotates it.
-                    KeySource::DidDocument => (
-                        KeyDates {
-                            registered_at: now,
-                            expires_at: None,
-                        },
-                        None,
-                    ),
-                    KeySource::OriginServer => (
-                        KeyDates {
-                            registered_at: now,
-                            expires_at: Some(now + crate::key_expiry::lifetime_secs(&state)),
-                        },
-                        None,
-                    ),
-                };
-                key_landed(
-                    &state,
-                    &did,
-                    &kid,
-                    &found.public_key,
-                    source,
-                    dates,
-                    retired_at,
-                );
+                file_found(&state, &did, &kid, &found);
                 return;
             }
             Ok(None) => {}
@@ -309,6 +275,119 @@ fn start_lookup(state: &Arc<SharedState>, bases: Vec<String>, did: &str, kid: &s
     });
 }
 
+/// File a key `key_for` found, with the dates and retirement its source
+/// gives it.
+fn file_found(
+    state: &Arc<SharedState>,
+    did: &str,
+    kid: &str,
+    found: &freeq_sdk::key_lookup::FoundKey,
+) {
+    let source = match found.source {
+        KeySource::IdentityRecord => "identity-record",
+        KeySource::DidDocument => "did-document",
+        KeySource::OriginServer => "origin-server",
+    };
+    let now = chrono::Utc::now().timestamp();
+    let (dates, retired_at) = match found.source {
+        // A published key keeps its record's dates. A key the records retire
+        // is filed retired, and no peer is then asked for a live copy; one
+        // they only let expire is not stamped, since an expiry is not a
+        // retirement.
+        KeySource::IdentityRecord => (
+            KeyDates {
+                registered_at: found.created_at.unwrap_or(now),
+                expires_at: found.expires_at,
+            },
+            found
+                .retired_at
+                .filter(|at| found.expires_at.is_none_or(|exp| *at < exp)),
+        ),
+        // Its own document's key: its owner rotates it.
+        KeySource::DidDocument => (
+            KeyDates {
+                registered_at: now,
+                expires_at: None,
+            },
+            None,
+        ),
+        KeySource::OriginServer => (
+            KeyDates {
+                registered_at: now,
+                expires_at: Some(now + crate::key_expiry::lifetime_secs(state)),
+            },
+            None,
+        ),
+    };
+    key_landed(
+        state,
+        did,
+        kid,
+        &found.public_key,
+        source,
+        dates,
+        retired_at,
+    );
+}
+
+/// Most `did:web:` documents one batch key request fetches.
+const MAX_BATCH_FETCHES: usize = 5;
+
+/// For the batch key route: look up `did:web:` keys the database does not
+/// hold, the signer's records first and then its own document, and file any
+/// found. A pair inside the remembered-miss window is skipped, and each pair
+/// asked enters it; at most five are asked, concurrently, all under one
+/// [`FETCH_TIMEOUT`]. Returns when they are filed or the time is up.
+pub(crate) async fn fetch_missing_server_keys(
+    state: &Arc<SharedState>,
+    pairs: Vec<(String, String)>,
+) {
+    let chosen: Vec<(String, String)> = {
+        let retry_after = Duration::from_secs(state.config.peer_key_retry_secs);
+        let mut lookups = LOOKUPS.lock();
+        lookups.retain(|_, at| at.elapsed() < retry_after);
+        let mut chosen = Vec::new();
+        for pair in pairs {
+            if chosen.len() == MAX_BATCH_FETCHES {
+                break;
+            }
+            if lookups.contains_key(&pair) {
+                continue;
+            }
+            lookups.insert(pair.clone(), Instant::now());
+            chosen.push(pair);
+        }
+        chosen
+    };
+    if chosen.is_empty() {
+        return;
+    }
+    let mut fetches = tokio::task::JoinSet::new();
+    for (did, kid) in chosen {
+        #[cfg(test)]
+        {
+            *DOCUMENT_FETCHES.lock().entry(did.clone()).or_default() += 1;
+        }
+        let state = state.clone();
+        fetches.spawn(async move {
+            match state.key_lookup.key_for(&did, &kid).await {
+                Ok(Some(found)) => file_found(&state, &did, &kid, &found),
+                Ok(None) => {}
+                Err(e) => tracing::debug!(
+                    did = %did, kid = %kid, error = %e,
+                    "Could not fetch a server's key from its document"
+                ),
+            }
+        });
+    }
+    let all = async { while fetches.join_next().await.is_some() {} };
+    if tokio::time::timeout(FETCH_TIMEOUT, all).await.is_err() {
+        // Dropping the set cancels what is still running; those pairs stay
+        // remembered as misses for the window.
+        tracing::debug!("A batch key request's document fetches ran out of time");
+    }
+}
+
 /// When a filed key was first seen and when it expires, unix seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KeyDates {
@@ -318,7 +397,7 @@ pub(crate) struct KeyDates {
 }
 
 /// File a key that answered a lookup and release what was waiting on it.
-fn key_landed(
+pub(crate) fn key_landed(
     state: &Arc<SharedState>,
     did: &str,
     kid: &str,
