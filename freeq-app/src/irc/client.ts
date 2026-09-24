@@ -191,8 +191,9 @@ export interface DeviceRow {
   kid: string;
   /** The record's label, or the kid shortened. */
   name: string;
-  state: 'active' | 'signedOut' | 'unpublished';
-  /** Active: when the key was published. Signed out: when it was retired. */
+  state: 'active' | 'signedOut' | 'expired' | 'unpublished';
+  /** Active: when the key was published. Signed out: when it was retired.
+   *  Expired: when it expired. */
   date?: string;
   thisDevice: boolean;
 }
@@ -239,19 +240,22 @@ export async function deviceRowsFrom(
     if (!active && !retired) continue;
     if (retired && now - key.retiredAt!.getTime() > SIGNED_OUT_LISTED_MS) continue;
     const since = key.createdAt.toISOString();
+    // Retired by its expiry, not by a retirement: listed and counted like a
+    // signed-out device, under its own words.
+    const expired = retired && key.retiredAt!.getTime() === key.expiresAt.getTime();
     (active ? found : signedOut).push({
       since,
       row: {
         kid: key.kid,
         name: typeof label === 'string' && label !== '' ? label : shortKid(key.kid),
-        state: active ? 'active' : 'signedOut',
+        state: active ? 'active' : expired ? 'expired' : 'signedOut',
         date: active ? since : key.retiredAt!.toISOString(),
         thisDevice: key.kid === here.kid,
       },
     });
   }
 
-  // A signed-out row's date is its retirement.
+  // A signed-out row's date is its retirement, an expired row's its expiry.
   signedOut.sort((a, b) => b.row.date!.localeCompare(a.row.date!));
   found.push(...signedOut.slice(0, SIGNED_OUT_LISTED_MAX));
 
@@ -1408,6 +1412,13 @@ function wireEvents(c: FreeqClient) {
     if (/^MSGSIG KEY_RETIRED\b/.test(text)) {
       disconnect();
       s().setAuthError('This device was signed out from another device. Sign in again to continue.');
+      return;
+    }
+    // The server refused this device's key as expired; the SDK has marked it,
+    // so the sign-in that follows makes a new one.
+    if (/^MSGSIG KEY_EXPIRED\b/.test(text)) {
+      disconnect();
+      s().setAuthError("This device's signing key has expired. Sign in again to continue.");
       return;
     }
     // A refusal is an answer. Resolving it here rather than waiting out the

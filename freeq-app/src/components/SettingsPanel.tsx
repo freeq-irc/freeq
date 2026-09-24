@@ -239,6 +239,7 @@ function day(iso?: string): string {
 function metaLine(row: DeviceRow): string {
   if (row.state === 'unpublished') return 'Key not published · this device';
   if (row.state === 'signedOut') return `Signed out · ${day(row.date)}`;
+  if (row.state === 'expired') return `Expired · ${day(row.date)}`;
   return `Active · since ${day(row.date)}`;
 }
 
@@ -353,7 +354,10 @@ export function DevicesSection() {
           className="flex items-center justify-between text-sm gap-2"
         >
           <span className="flex items-center gap-2 min-w-0">
-            <span aria-hidden className={row.state === 'signedOut' ? 'opacity-40' : ''}>
+            <span
+              aria-hidden
+              className={row.state === 'signedOut' || row.state === 'expired' ? 'opacity-40' : ''}
+            >
               {'💻'}
             </span>
             <span className="min-w-0">

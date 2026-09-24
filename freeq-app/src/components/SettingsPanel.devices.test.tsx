@@ -262,6 +262,29 @@ describe('the Devices list', () => {
     expect(screen.queryByText('Old tablet')).toBeNull();
   });
 
+  it('lists a device whose key expired as expired, dimmed, for 24 hours after its expiry', async () => {
+    // Made 90 days and an hour ago: its key expired an hour ago.
+    const expiring = await aDevice('Old laptop', new Date(Date.now() - (90 * 24 + 1) * HOUR_MS).toISOString());
+    const expiredAt = new Date(Date.parse(expiring.record.createdAt) + 90 * 24 * HOUR_MS).toISOString();
+    const longGone = await aDevice('Older laptop', new Date(Date.now() - (92 * 24) * HOUR_MS).toISOString());
+    seam.rows = await client.deviceRowsFrom(DID, [...records, expiring.record, longGone.record], {
+      kid: thisDevice.kid,
+      createdAt: THIS_CREATED,
+      published: true,
+    });
+    panel();
+    await waitFor(() => screen.getByText('Old laptop'));
+
+    expect(rowMeta('Old laptop')).toBe(`Expired · ${day(expiredAt)}`);
+    expect(screen.queryByText('Older laptop')).toBeNull();
+    // A real retirement keeps its own words.
+    expect(rowMeta('Old phone')).toMatch(/^Signed out · /);
+    // Dimmed as a signed-out row is, and offering nothing.
+    const row = screen.getByText('Old laptop').closest('[data-device-row]')!;
+    expect(row.querySelector('[aria-hidden]')!.className).toContain('opacity-40');
+    expect(screen.getAllByRole('button', { name: 'Sign out' })).toHaveLength(1);
+  });
+
   it('writes a date as a short month and day and the 24-hour time', async () => {
     // Three days ago at 20:22 local time.
     const created = new Date(Date.now() - 3 * 24 * HOUR_MS);

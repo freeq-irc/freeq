@@ -18,6 +18,9 @@ export interface StoredDeviceKey {
   createdAt: string;
   /** The `at://` URI of the record that publishes the key, once written. */
   recordUri?: string;
+  /** The server refused the key as expired: the next fresh sign-in replaces
+   *  it, whatever its dates say. */
+  refused?: boolean;
 }
 
 /** Where a device keeps its signing key between connects. */
@@ -50,6 +53,7 @@ interface PairEntry {
   keyPair: CryptoKeyPair;
   createdAt: string;
   recordUri?: string;
+  refused?: boolean;
 }
 
 /** The private key wrapped under an AES-KW key that cannot be read out. */
@@ -60,6 +64,7 @@ interface WrappedEntry {
   wrappingKey: CryptoKey;
   createdAt: string;
   recordUri?: string;
+  refused?: boolean;
 }
 
 function openKeys(): Promise<IDBPDatabase> {
@@ -89,11 +94,21 @@ export class IndexedDbDeviceKeyStore implements DeviceKeyStore {
       const entry = (await db.get(STORE, this.name)) as PairEntry | WrappedEntry | undefined;
       if (entry?.kind === 'pair') {
         this.storage = 'pair';
-        return { keyPair: entry.keyPair, createdAt: entry.createdAt, recordUri: entry.recordUri };
+        return {
+          keyPair: entry.keyPair,
+          createdAt: entry.createdAt,
+          recordUri: entry.recordUri,
+          ...(entry.refused ? { refused: true } : {}),
+        };
       }
       if (entry?.kind === 'wrapped') {
         this.storage = 'wrapped';
-        return { keyPair: await unwrap(entry), createdAt: entry.createdAt, recordUri: entry.recordUri };
+        return {
+          keyPair: await unwrap(entry),
+          createdAt: entry.createdAt,
+          recordUri: entry.recordUri,
+          ...(entry.refused ? { refused: true } : {}),
+        };
       }
       return await this.create(db);
     } finally {
@@ -106,9 +121,15 @@ export class IndexedDbDeviceKeyStore implements DeviceKeyStore {
     try {
       const entry = (await db.get(STORE, this.name)) as PairEntry | WrappedEntry | undefined;
       // A wrapped key cannot be stored as a pair here, so it keeps its
-      // wrapping; only the date and the URI change.
+      // wrapping; only the date, the URI and the refused flag change.
       if (entry?.kind === 'wrapped' && (await samePublicKey(entry.publicKey, key.keyPair))) {
-        await db.put(STORE, { ...entry, createdAt: key.createdAt, recordUri: key.recordUri }, this.name);
+        const kept: WrappedEntry = {
+          ...entry,
+          createdAt: key.createdAt,
+          recordUri: key.recordUri,
+          refused: key.refused,
+        };
+        await db.put(STORE, kept, this.name);
         return;
       }
       const pair: PairEntry = {
@@ -116,6 +137,7 @@ export class IndexedDbDeviceKeyStore implements DeviceKeyStore {
         keyPair: key.keyPair,
         createdAt: key.createdAt,
         recordUri: key.recordUri,
+        refused: key.refused,
       };
       await db.put(STORE, pair, this.name);
       this.storage = 'pair';

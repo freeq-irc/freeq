@@ -89,6 +89,16 @@ describe('IndexedDbDeviceKeyStore', () => {
     expect(await signsAndVerifies(again!.keyPair)).toBe(true);
   });
 
+  it("keeps a refused key's flag through a save and a load", async () => {
+    const store = new IndexedDbDeviceKeyStore('did:plc:refused');
+    const made = await store.load();
+    expect(made!.refused).toBeUndefined();
+    await store.save({ ...made!, refused: true });
+    const again = await new IndexedDbDeviceKeyStore('did:plc:refused').load();
+    expect(again!.refused).toBe(true);
+    expect(await kidOf(again!.keyPair)).toBe(await kidOf(made!.keyPair));
+  });
+
   it('keeps one key per name', async () => {
     const a = await new IndexedDbDeviceKeyStore('did:plc:a').load();
     const b = await new IndexedDbDeviceKeyStore('did:plc:b').load();
@@ -124,5 +134,13 @@ describe('IndexedDbDeviceKeyStore', () => {
     expect(await kidOf(again!.keyPair)).toBe(await kidOf(made!.keyPair));
     expect(again!.recordUri).toBe(uri);
     expect(await signsAndVerifies(again!.keyPair)).toBe(true);
+
+    // A refused wrapped key keeps its wrapping and its flag.
+    await second.save({ ...again!, refused: true });
+    const third = new IndexedDbDeviceKeyStore();
+    const refused = await third.load();
+    expect(third.storage).toBe('wrapped');
+    expect(refused!.refused).toBe(true);
+    expect(refused!.recordUri).toBe(uri);
   });
 });

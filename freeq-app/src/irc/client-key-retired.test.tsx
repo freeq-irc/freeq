@@ -58,6 +58,7 @@ vi.mock('@freeq/sdk', () => ({
 }));
 
 const SIGNED_OUT = 'This device was signed out from another device. Sign in again to continue.';
+const EXPIRED = "This device's signing key has expired. Sign in again to continue.";
 
 const bridge = await import('./client');
 const { useStore } = await import('../store');
@@ -106,5 +107,22 @@ describe('a signing key the server refuses', () => {
 
     render(<ConnectScreen />);
     expect(screen.getByText(SIGNED_OUT)).toBeTruthy();
+  });
+
+  it('says the key expired, and shows the sign-in screen, when the server refuses an expired key', () => {
+    localStorage.setItem('freeq-broker-token', 'BT');
+    bridge.setSaslCredentials('WT', 'did:plc:me', '', 'web-token');
+    bridge.connect('wss://test/irc', 'me', []);
+    const c = MockFreeqClient.latest!;
+    c.emit('connectionStateChanged', 'connected');
+    c.emit('registered', 'me');
+
+    c.emit('serverFail', `MSGSIG KEY_EXPIRED ${EXPIRED}`);
+    c.emit('connectionStateChanged', 'disconnected');
+
+    expect(c.disconnects).toBe(1);
+    expect(useStore.getState().authError).toBe(EXPIRED);
+    render(<ConnectScreen />);
+    expect(screen.getByText(EXPIRED)).toBeTruthy();
   });
 });

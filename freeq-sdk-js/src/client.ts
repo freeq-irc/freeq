@@ -15,7 +15,7 @@ import * as e2ee from './e2ee.js';
 import { dmPeerKey, isDid } from './address.js';
 import { prefetchProfiles } from './profiles.js';
 import { recordKeyOf, type DeviceKeyStore, type StoredDeviceKey } from './device-key.js';
-import { buildDeviceRecord, deviceKeyHistory } from './identity-records.js';
+import { KEY_LIFETIME_MS, buildDeviceRecord, deviceKeyHistory } from './identity-records.js';
 import { KeyLookup, makeDidResolver } from './key-lookup.js';
 import { SignatureChecker, firstLook, sigTagKid, type Verdict } from './verdict.js';
 import type {
@@ -185,6 +185,9 @@ export class FreeqClient extends EventEmitter {
   /** A stored device key the account does not have yet, published once
    *  `MSGSIG` is on the wire. */
   private pendingEnrollment: StoredDeviceKey | null = null;
+  /** The stored device key this connect presented in MSGSIG; null when it
+   *  fell back to a session key. */
+  private presentedDeviceKey: CryptoKeyPair | null = null;
   /** Set once a connect has used `freshSignIn`, so a reconnect does not. */
   private freshSignInUsed = false;
   /** Bumped on every new connection, so a publish answered after a
@@ -1758,6 +1761,7 @@ export class FreeqClient extends EventEmitter {
   private async presentDeviceKey(): Promise<string | null> {
     const store = this.opts.deviceKeyStore!;
     this.pendingEnrollment = null;
+    this.presentedDeviceKey = null;
     // Only the first connect of a client made right after a sign-in.
     const freshSignIn = this.opts.freshSignIn === true && !this.freshSignInUsed;
     this.freshSignInUsed = true;
@@ -1773,6 +1777,7 @@ export class FreeqClient extends EventEmitter {
         await store.save(stored);
       }
       const pubkey = await this.signing.useKeyPair(stored.keyPair);
+      this.presentedDeviceKey = stored.keyPair;
       if (!stored.recordUri) this.pendingEnrollment = stored;
       else void this.relistIfVouched(stored);
       return pubkey;
@@ -1803,16 +1808,54 @@ export class FreeqClient extends EventEmitter {
     }
   }
 
+  /** Save the stored device key marked refused, when it is the key this
+   *  connect presented; a session key the client fell back to leaves it as
+   *  it is. A store that fails leaves it as it was. */
+  private async markDeviceKeyRefused(): Promise<void> {
+    const store = this.opts.deviceKeyStore;
+    if (!store || this.presentedDeviceKey === null) return;
+    try {
+      const stored = await store.load();
+      if (stored && !stored.refused && (await samePublicKey(stored.keyPair, this.presentedDeviceKey))) {
+        await store.save({ ...stored, refused: true });
+      }
+    } catch (e) {
+      log.warn('[freeq-sdk] could not mark the refused device key:', e);
+    }
+  }
+
   /**
-   * Right after a new sign-in, replace a stored key the account's records have
-   * retired with a new one, saved with no record URI so this connect publishes
-   * it. Bounded, so a slow account provider cannot hold up signing; a failed
-   * read keeps the stored key.
+   * Right after a new sign-in, replace a stored key with a new one, saved with
+   * no record URI so this connect publishes it, when the server refused it as
+   * expired, when it is past its lifetime by its own date, or when the
+   * account's records retired it or let it expire. Reading the records is
+   * bounded, so a slow account provider cannot hold up signing; a failed read
+   * keeps the stored key.
    */
   private async replaceRetiredKey(
     store: DeviceKeyStore,
     stored: StoredDeviceKey,
   ): Promise<StoredDeviceKey> {
+    const replace = async (): Promise<StoredDeviceKey> => {
+      const keyPair = (await crypto.subtle.generateKey('Ed25519', false, [
+        'sign',
+        'verify',
+      ])) as CryptoKeyPair;
+      const replacement: StoredDeviceKey = { keyPair, createdAt: new Date().toISOString() };
+      await store.save(replacement);
+      return replacement;
+    };
+    // Refused by the server as expired, or past its lifetime by its own date:
+    // replaced without asking the account. The flag is what makes a server
+    // with a shorter lifetime, or a clock ahead of this one, still converge.
+    if (stored.refused || Date.parse(stored.createdAt) + KEY_LIFETIME_MS <= Date.now()) {
+      try {
+        return await replace();
+      } catch (e) {
+        log.warn('[freeq-sdk] could not replace the expired device key:', e);
+        return stored;
+      }
+    }
     const did = this.sasl?.did;
     if (!did) return stored;
     // Records count only once their repository proof checks, through the
@@ -1830,14 +1873,9 @@ export class FreeqClient extends EventEmitter {
       const retired = (await deviceKeyHistory(did, records)).some(
         (k) => k.kid === kid && k.retiredAt !== null && k.retiredAt.getTime() <= now,
       );
+      // Retired, or expired by its record.
       if (!retired) return stored;
-      const keyPair = (await crypto.subtle.generateKey('Ed25519', false, [
-        'sign',
-        'verify',
-      ])) as CryptoKeyPair;
-      const replacement: StoredDeviceKey = { keyPair, createdAt: new Date().toISOString() };
-      await store.save(replacement);
-      return replacement;
+      return replace();
     };
     let timer: ReturnType<typeof setTimeout> | undefined;
     const giveUp = new Promise<StoredDeviceKey>((resolve) => {
@@ -2782,6 +2820,14 @@ export class FreeqClient extends EventEmitter {
         // that target stays one behind for the rest of the connection and
         // every later batch is labelled with the request before it.
         if (msg.params[0] === 'CHATHISTORY') this.dropRefusedHistoryRequest(msg.params);
+        // The server refused this device's key as expired. The stored key is
+        // marked first, so the next fresh sign-in replaces it whatever its
+        // dates say: an app disconnects as soon as it hears of this.
+        if (msg.params[0] === 'MSGSIG' && msg.params[1] === 'KEY_EXPIRED') {
+          const text = msg.params.join(' ');
+          void this.markDeviceKeyRefused().finally(() => this.emit('serverFail', text));
+          break;
+        }
         // IRCv3 FAIL — surface to the app. A silent server rejection is
         // indistinguishable from a client bug at the UI (and has cost
         // real debugging time); the app renders these as system messages.
@@ -4414,4 +4460,15 @@ function mintEventId(): string {
   const r1 = Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, '0');
   const r2 = Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, '0');
   return millis + r1 + r2;
+}
+
+/** Whether two key pairs hold the same public key. */
+async function samePublicKey(a: CryptoKeyPair, b: CryptoKeyPair): Promise<boolean> {
+  if (a === b) return true;
+  const [ra, rb] = await Promise.all([
+    crypto.subtle.exportKey('raw', a.publicKey),
+    crypto.subtle.exportKey('raw', b.publicKey),
+  ]);
+  const [x, y] = [new Uint8Array(ra), new Uint8Array(rb)];
+  return x.length === y.length && x.every((v, i) => v === y[i]);
 }

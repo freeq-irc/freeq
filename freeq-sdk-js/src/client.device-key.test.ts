@@ -446,6 +446,81 @@ describe('a stored key the account has retired', () => {
     return { client, lookup, listings: () => listings, proofs: () => proofs };
   }
 
+  const EXPIRED_WORDS = "This device's signing key has expired. Sign in again to continue.";
+
+  it('marks its stored key refused on KEY_EXPIRED before the app hears of it', async () => {
+    const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+    const { record } = await recordsOf(stored);
+    const store = new MemoryDeviceKeyStore(stored);
+    const { client } = await clientReading(store, await repoHolding(record));
+    const heard: (boolean | undefined)[] = [];
+    client.on('serverFail', () => heard.push((store as unknown as { key: StoredDeviceKey }).key.refused));
+    const ws = await login(client);
+    ws.recv(`:srv FAIL MSGSIG KEY_EXPIRED :${EXPIRED_WORDS}`);
+    await until(() => heard.length > 0);
+    expect(heard).toEqual([true]);
+    const kept = (await store.load())!;
+    expect(kept.keyPair, 'the same key, marked').toBe(stored.keyPair);
+    client.disconnect();
+  });
+
+  it('leaves its stored key unmarked when KEY_EXPIRED refuses a session key it fell back to', async () => {
+    const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+    const { record } = await recordsOf(stored);
+    const store = new MemoryDeviceKeyStore(stored);
+    // The store cannot be read on connect, so the client signs with a session key.
+    const load = store.load.bind(store);
+    let loads = 0;
+    store.load = async () => {
+      if (loads++ === 0) throw new Error('store unavailable');
+      return load();
+    };
+    const { client } = await clientReading(store, await repoHolding(record));
+    let heard = false;
+    client.on('serverFail', () => (heard = true));
+    const ws = await login(client);
+    expect(msgsigOf(ws)).not.toBe(await rawPublicB64(stored.keyPair));
+    ws.recv(`:srv FAIL MSGSIG KEY_EXPIRED :${EXPIRED_WORDS}`);
+    await until(() => heard);
+    await pause();
+    expect((await load())!.refused).toBeUndefined();
+    client.disconnect();
+  });
+
+  it('presents a new key at the next fresh sign-in after KEY_EXPIRED, whatever its dates', async () => {
+    const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+    const { record } = await recordsOf(stored);
+    const repo = await repoHolding(record);
+    const store = new MemoryDeviceKeyStore(stored);
+    const first = await clientReading(store, repo);
+    const ws = await login(first.client);
+    ws.recv(`:srv FAIL MSGSIG KEY_EXPIRED :${EXPIRED_WORDS}`);
+    await until(() => (store as unknown as { key: StoredDeviceKey }).key.refused === true);
+    first.client.disconnect();
+
+    const again = await clientReading(store, repo, true);
+    const next = await login(again.client);
+    expect(msgsigOf(next)).not.toBe(await rawPublicB64(stored.keyPair));
+    const replaced = (await store.load())!;
+    expect(replaced.keyPair).not.toBe(stored.keyPair);
+    expect(replaced.refused).toBeUndefined();
+    expect(replaced.recordUri).toBeUndefined();
+    again.client.disconnect();
+  });
+
+  it('replaces a stored key past its lifetime at a fresh sign-in', async () => {
+    const keyPair = (await crypto.subtle.generateKey('Ed25519', false, ['sign', 'verify'])) as CryptoKeyPair;
+    // Made 91 days ago: past its lifetime by its own date, with nothing
+    // published to say so.
+    const old: StoredDeviceKey = { keyPair, createdAt: hoursAgo(91 * 24), recordUri: 'at://x/at.freeq.deviceKey/3o' };
+    const store = new MemoryDeviceKeyStore(old);
+    const { client } = await clientReading(store, await repoHolding(), true);
+    const ws = await login(client);
+    expect(msgsigOf(ws)).not.toBe(await rawPublicB64(keyPair));
+    expect((await store.load())!.keyPair).not.toBe(keyPair);
+    client.disconnect();
+  });
+
   it('is replaced right after a new sign-in when the key lookup holds a listing from before the retirement', async () => {
     const old = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3old');
     const { record, retirement } = await recordsOf(old);
