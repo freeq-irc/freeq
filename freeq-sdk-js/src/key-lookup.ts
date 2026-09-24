@@ -231,8 +231,14 @@ export class KeyLookup {
    * is thrown only if no later source finds the key. A miss is remembered only
    * when no source failed, since a failed source did not say it lacks the key.
    * Asks for one (did, kid) while a lookup for it runs await that lookup.
+   * `retry: false` settles a fresh line's miss without the retry delays.
    */
-  async keyForAt(did: string, kid: string, at: Date): Promise<FoundKey | null> {
+  async keyForAt(
+    did: string,
+    kid: string,
+    at: Date,
+    options: { retry?: boolean } = {},
+  ): Promise<FoundKey | null> {
     await this.load();
     const slot = JSON.stringify([did, kid]);
     for (;;) {
@@ -251,7 +257,7 @@ export class KeyLookup {
 
       let pending = this.inFlight.get(slot);
       if (pending === undefined) {
-        const started: Promise<Settled> = this.settle(slot, did, kid, at, cached).finally(() => {
+        const started: Promise<Settled> = this.settle(slot, did, kid, at, cached, options.retry !== false).finally(() => {
           if (this.inFlight.get(slot) === started) this.inFlight.delete(slot);
         });
         this.inFlight.set(slot, started);
@@ -279,13 +285,14 @@ export class KeyLookup {
     kid: string,
     at: Date,
     cached: Cached | undefined,
+    retry: boolean,
   ): Promise<Settled> {
     const started = performance.now();
     const refreshes = this.refreshes.get(did);
     const listed = cached === undefined;
     let settled = await this.ask(did, kid, at, cached?.records);
     // Only a line signed just now is asked about again.
-    const retries = Date.now() - at.getTime() <= FRESH_LINE_MS ? this.retryAfterMs : [];
+    const retries = retry && Date.now() - at.getTime() <= FRESH_LINE_MS ? this.retryAfterMs : [];
     for (const after of retries) {
       const missed = settled.other === null && !settled.failed && this.originBase() !== null;
       if (!missed) break;
@@ -671,12 +678,21 @@ export class KeyLookup {
    * The DID's refresh time goes too, or the next lookup would answer a kid
    * the held listing lacks from that listing and never see a record
    * published since — which is what a caller forgetting a miss is after.
+   * `relist: false` keeps it, for a caller whose miss was listed just now.
    */
-  forget(did: string, kid: string): void {
+  forget(did: string, kid: string, options: { relist?: boolean } = {}): void {
     const slot = JSON.stringify([did, kid]);
     if (this.cache.get(slot)?.other !== null) return;
     this.cache.delete(slot);
-    this.refreshed.delete(did);
+    if (options.relist !== false) this.refreshed.delete(did);
+  }
+
+  /** Whether a miss for `(did, kid)` is remembered inside the ttl. Reads the
+   *  stored snapshot first. */
+  async holdsMiss(did: string, kid: string): Promise<boolean> {
+    await this.load();
+    const hit = this.cache.get(JSON.stringify([did, kid]));
+    return hit !== undefined && hit.other === null && Date.now() - hit.at < this.ttlMs;
   }
 
   /**

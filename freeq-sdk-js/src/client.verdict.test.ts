@@ -143,13 +143,13 @@ const stubFetch = async (input: string): Promise<Response> => {
   return Response.json({ did, kid, public_key: b64url(held.key), removed_at: held.removedAt ?? null });
 };
 
-function lookup(documents: DidDocument[] = []): KeyLookup {
+function lookup(documents: DidDocument[] = [], retryAfterMs?: readonly number[]): KeyLookup {
   const resolveDid = async (did: string): Promise<DidDocument> => {
     const doc = documents.find((d) => d.id === did);
     if (!doc) throw new Error(`unknown DID ${did}`);
     return doc;
   };
-  return new KeyLookup({ fetch: stubFetch, resolveDid }, ORIGIN, 3_600_000);
+  return new KeyLookup({ fetch: stubFetch, resolveDid }, ORIGIN, 3_600_000, retryAfterMs);
 }
 
 beforeEach(() => {
@@ -806,5 +806,120 @@ describe('a replayed history batch', () => {
     await settle(s, [live.msgid, orphan.msgid]);
     expect(prefetch).not.toHaveBeenCalled();
     expect([live, orphan].map((l) => s.seen.get(l.msgid)?.settled?.state)).toEqual(['device', 'device']);
+  });
+});
+
+// ── a line a peer server signed ─────────────────────────────────────────
+
+describe('a line a peer server signed', () => {
+  const SENDER = 'did:plc:relayedsender';
+  const PEER = 'peer.example';
+  const PEER_DID = `did:web:${PEER}`;
+
+  /** A line from SENDER signed with `seed`'s key, tagged with `peer` as its origin when given. */
+  async function relayed(seed: number, body: string, peer?: string) {
+    const msgid = signing.newEventId();
+    const key = await importDidKey(new Uint8Array(32).fill(seed));
+    const canonical = await signing.messageCanonical({ from: SENDER, msgid, target: '#room', body });
+    const sig = await key.signer(new TextEncoder().encode(canonical));
+    const pub = (await import('./did-key.js')).decodeMultibaseEd25519(key.publicKeyMultibase);
+    const kid = await signing.deriveKid(pub);
+    const tags: Record<string, string> = { account: SENDER, msgid, [signing.SIG_TAG]: `ed25519:${kid}:${sig}` };
+    if (peer !== undefined) tags['+freeq.at/origin'] = peer;
+    return { wire: line(tags, 'PRIVMSG', '#room', body), msgid, kid };
+  }
+
+  /** The peer server's did:web document, naming `seed`'s key. */
+  async function peerDocument(seed: number): Promise<DidDocument> {
+    const key = await importDidKey(new Uint8Array(32).fill(seed));
+    return {
+      id: PEER_DID,
+      verificationMethod: [
+        { id: `${PEER_DID}#freeq`, type: 'Multikey', controller: PEER_DID, publicKeyMultibase: key.publicKeyMultibase },
+      ],
+      service: [],
+    };
+  }
+
+  it("reads as the server's when the peer server's own key signed it", async () => {
+    const m = await relayed(51, 'relayed', PEER);
+    const s = await session(OWN_DID, lookup([await peerDocument(51)]));
+    expect((await s.lineFor([m.wire], m.msgid)).settled).toEqual({ state: 'server', kid: m.kid });
+  });
+
+  it("stays unverifiable when the peer server's key is not the one that signed", async () => {
+    const m = await relayed(52, 'relayed', PEER);
+    const s = await session(OWN_DID, lookup([await peerDocument(51)]));
+    expect((await s.lineFor([m.wire], m.msgid)).settled).toEqual({ state: 'unverifiable', kid: m.kid });
+  });
+
+  it('stays unverifiable when an origin tag names a server whose key did not sign it', async () => {
+    // Signed by some key of the sender's own, tagged with a server it never passed through.
+    const m = await relayed(53, 'not relayed at all', PEER);
+    const s = await session(OWN_DID, lookup([await peerDocument(51)]));
+    expect((await s.lineFor([m.wire], m.msgid)).settled?.state).toBe('unverifiable');
+  });
+
+  it("remembers a missing server key like any miss", async () => {
+    // The sender resolves to a PDS holding no records, so its miss is a
+    // miss too, not a failure asked again.
+    const sender: DidDocument = {
+      id: SENDER,
+      service: [{ id: '#atproto_pds', type: 'AtprotoPersonalDataServer', serviceEndpoint: PDS }],
+    };
+    // Short retries: the first line's sender miss is asked again, as any
+    // fresh line's is, before it is remembered.
+    const lk = lookup([await peerDocument(51), sender], [10, 20, 30]);
+    const first = await relayed(52, 'one', PEER);
+    const second = await relayed(52, 'two', PEER);
+    const s = await session(OWN_DID, lk);
+    await s.lineFor([first.wire], first.msgid);
+    const asked = origin.batchReads;
+    expect((await s.lineFor([second.wire], second.msgid)).settled?.state).toBe('unverifiable');
+    expect(origin.batchReads, 'the second line asks nothing').toBe(asked);
+  });
+
+  /** The sender's document: a PDS holding no records, so a miss under the
+   *  sender is a miss, not a failure. */
+  const senderDocument = (): DidDocument => ({
+    id: SENDER,
+    service: [{ id: '#atproto_pds', type: 'AtprotoPersonalDataServer', serviceEndpoint: PDS }],
+  });
+
+  /** Wait up to `ms` for `id` to settle. */
+  async function settledWithin(s: Awaited<ReturnType<typeof session>>, id: string, ms: number) {
+    for (let waited = 0; waited < ms && s.seen.get(id)?.settled === undefined; waited += 20) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    return s.seen.get(id)?.settled;
+  }
+
+  it('still retries a federated user\'s key that reaches the server after the line', async () => {
+    const m = await relayed(54, 'from a federated user', PEER);
+    const s = await session(OWN_DID, lookup([await peerDocument(51), senderDocument()]));
+    // The server copies the key from the peer 2.5 s after the line arrives.
+    const key = await importDidKey(new Uint8Array(32).fill(54));
+    const pub = (await import('./did-key.js')).decodeMultibaseEd25519(key.publicKeyMultibase);
+    setTimeout(() => void hold(SENDER, pub), 2_500);
+    s.ws.recv(m.wire);
+    expect(await settledWithin(s, m.msgid, 12_000)).toEqual({
+      state: 'device',
+      layer: 'vouched',
+      kid: m.kid,
+      keySource: 'OriginServer',
+    });
+  }, 20_000);
+
+  it('gives a server-signed relayed line the server verdict without waiting out the retries', async () => {
+    const m = await relayed(51, 'signed by the peer', PEER);
+    const s = await session(OWN_DID, lookup([await peerDocument(51), senderDocument()]));
+    s.ws.recv(m.wire);
+    expect(await settledWithin(s, m.msgid, 1_500)).toEqual({ state: 'server', kid: m.kid });
+  });
+
+  it('is not looked up under a server without the tag', async () => {
+    const m = await relayed(51, 'no tag');
+    const s = await session(OWN_DID, lookup([await peerDocument(51)]));
+    expect((await s.lineFor([m.wire], m.msgid)).settled?.state).toBe('unverifiable');
   });
 });

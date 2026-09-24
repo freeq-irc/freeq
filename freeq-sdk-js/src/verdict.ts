@@ -70,6 +70,9 @@ export interface Signed {
   /** The id the signature covers: what a late verdict is filed under, and
    *  whose ULID time dates the signature. */
   msgid: string;
+  /** A chat line's `+freeq.at/origin`: the peer server it was relayed from,
+   *  whose own key may have signed it on the sender's behalf. */
+  origin?: string;
   doc:
     | { kind: 'chat'; canonical: string }
     | { kind: 'act'; tags: Record<string, string>; venue: string; id: string };
@@ -170,7 +173,18 @@ export async function firstLook(line: Line): Promise<FirstLook> {
       return unverifiable;
     }
   }
-  return { kind: 'check', signed: { did, kid, sigTag, msgid, doc: { kind: 'chat', canonical } } };
+  const origin = tags['+freeq.at/origin'];
+  return {
+    kind: 'check',
+    signed: {
+      did,
+      kid,
+      sigTag,
+      msgid,
+      ...(origin ? { origin } : {}),
+      doc: { kind: 'chat', canonical },
+    },
+  };
 }
 
 /** The mutation a TAGMSG's tags describe, read as the server reads them. */
@@ -236,11 +250,41 @@ export class SignatureChecker {
     if (serverKey !== undefined) return serverVerdict(signed, serverKey);
 
     const atMs = signing.msgidTimestampMs(signed.msgid) ?? Date.now();
+    // A host name only: it becomes a did:web.
+    const origin = signed.origin !== undefined && /^[A-Za-z0-9.-]+$/.test(signed.origin) ? signed.origin : null;
+    const at = new Date(atMs);
+    const lookup = async (did: string, retry: boolean) => {
+      try {
+        return await this.lookup.keyForAt(did, signed.kid, at, { retry });
+      } catch {
+        return null;
+      }
+    };
     let found = null;
-    try {
-      found = await this.lookup.keyForAt(signed.did, signed.kid, new Date(atMs));
-    } catch {
-      found = null;
+    if (origin === null) {
+      found = await lookup(signed.did, true);
+    } else {
+      // Every relayed line carries its origin, whether the sender or the peer
+      // server signed it. The sender is asked first without the retry delays,
+      // so a line the server signed is not held up by them.
+      const missedBefore = await this.lookup.holdsMiss(signed.did, signed.kid);
+      found = await lookup(signed.did, false);
+      if (found === null) {
+        // The peer server's own key, which signs on a sender's behalf. The kid
+        // is a hash of the key, so neither a wrong key nor a forged tag can
+        // make a line verify here. No retries: the origin reads a server's
+        // document itself before it answers.
+        const byServer = await lookup(`did:web:${origin}`, false);
+        if (byServer !== null) return serverVerdict(signed, byServer.publicKey);
+        // Not the server's: the sender's key, which the origin may still be
+        // fetching from the peer. Its miss from just now is dropped and it is
+        // asked again with the retries a line that just arrived gets; a miss
+        // remembered from an earlier line stands.
+        if (!missedBefore) {
+          this.lookup.forget(signed.did, signed.kid, { relist: false });
+          found = await lookup(signed.did, true);
+        }
+      }
     }
     if (found !== null) {
       const ok = await checkSigned(signed, found.publicKey);
