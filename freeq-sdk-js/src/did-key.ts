@@ -204,6 +204,16 @@ export async function generateDidKey(): Promise<DidKey> {
  * safe (env var, secrets file).
  */
 export async function importDidKey(seed: Uint8Array): Promise<DidKey> {
+  return wrapKeypair(await importDidKeyPair(seed));
+}
+
+/**
+ * The Web Crypto key pair of the did:key a 32-byte ed25519 seed makes: what a
+ * bot hands the client as its stored signing key, so it signs its messages
+ * with the did:key itself. The private key is extractable, as `importDidKey`'s
+ * is, so `exportSeed` keeps working.
+ */
+export async function importDidKeyPair(seed: Uint8Array): Promise<CryptoKeyPair> {
   if (seed.length !== 32) {
     throw new Error(`ed25519 seed must be 32 bytes, got ${seed.length}`);
   }
@@ -234,7 +244,7 @@ export async function importDidKey(seed: Uint8Array): Promise<DidKey> {
     true,
     ['verify'],
   );
-  return wrapKeypair({ privateKey, publicKey } as CryptoKeyPair);
+  return { privateKey, publicKey } as CryptoKeyPair;
 }
 
 async function wrapKeypair(kp: CryptoKeyPair): Promise<DidKey> {

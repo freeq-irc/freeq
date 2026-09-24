@@ -85,6 +85,7 @@ export type { ATProfile } from './profiles.js';
 export {
   generateDidKey,
   importDidKey,
+  importDidKeyPair,
   decodeMultibaseEd25519,
   verifyEd25519,
 } from './did-key.js';

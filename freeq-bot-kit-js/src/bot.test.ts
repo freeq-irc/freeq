@@ -1094,3 +1094,55 @@ describe("session signing opt-out", () => {
     await bot.stop({ drainMs: 0 });
   });
 });
+
+describe("FreeqBot message signing key", () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "freeq-bot-kit-bot-"));
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const CAPS = "message-tags server-time freeq.at/msgsig sasl";
+
+  /** One connect of the bot named `test-bot` under `root`; the key its MSGSIG
+   *  names, and the did:key's own public key, both base64url. */
+  async function connectOnce(): Promise<{ sent: string; own: string }> {
+    const { FreeqBot } = await import("./bot.js");
+    const { decodeMultibaseEd25519 } = await import("@freeq/sdk");
+    const bot = await FreeqBot.create({
+      name: "test-bot",
+      ownerDid: "did:plc:owner",
+      nick: "test-bot",
+      url: "wss://test/irc",
+      root,
+    });
+    const startPromise = bot.start();
+    await flushAsync();
+    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    ws.recv(`:srv CAP * LS :${CAPS}`);
+    await flushAsync();
+    ws.recv(`:srv CAP * ACK :${CAPS}`);
+    await flushAsync();
+    ws.recv(":srv 903 test-bot :SASL authentication successful");
+    await flushAsync();
+    ws.recv(":srv 001 test-bot :Welcome");
+    for (let i = 0; i < 200 && !ws.sent.some((l) => l.startsWith("MSGSIG ")); i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    ws.recv(":srv 376 test-bot :End of MOTD");
+    await startPromise;
+    const line = ws.sent.find((l) => l.startsWith("MSGSIG "));
+    await bot.stop();
+    const own = Buffer.from(decodeMultibaseEd25519(bot.identity.didKey.publicKeyMultibase)).toString("base64url");
+    return { sent: (line ?? "").slice("MSGSIG ".length).trim(), own };
+  }
+
+  it("presents the did:key's own public key on every connect", async () => {
+    const first = await connectOnce();
+    const second = await connectOnce();
+    expect(first.sent).toBe(first.own);
+    expect(second.sent).toBe(first.sent);
+  });
+});

@@ -20,6 +20,8 @@
 
 import {
   FreeqClient,
+  MemoryDeviceKeyStore,
+  importDidKeyPair,
   type FreeqEvents,
   type NickCollisionPolicy,
   type TransportState,
@@ -221,11 +223,15 @@ export class FreeqBot {
         token: "",
         pdsUrl: "",
       },
-      // The SDK's default per-session MSGSIG key stays on: a bot signs its
-      // messages and mutations like every other client. (The did:key the bot
-      // authenticates with is a separate concern — signing with it directly
-      // is the DID-document-anchored model, not built yet.)
+      // The bot signs its messages and mutations with its did:key itself:
+      // held as the client's stored device key, it is what MSGSIG registers
+      // on every connect, so the server keeps one key per bot, exempt from
+      // expiry as a did:key's own. Nothing is published (no broker).
       autoMsgSig: opts.autoMsgSig,
+      deviceKeyStore: new MemoryDeviceKeyStore({
+        keyPair: await importDidKeyPair(await identity.didKey.exportSeed()),
+        createdAt: new Date().toISOString(),
+      }),
     });
 
     const defaultMentionMatcher: MentionMatcher = (text, nick) => {
