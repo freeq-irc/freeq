@@ -714,10 +714,11 @@ mod tests {
         }
     }
 
-    /// A day ago, so a key made then is live now and for the next 89 days.
+    /// A day before one instant fixed for the test run, so records built
+    /// twice match and a key made then is live now and for the next 89 days.
     fn recent() -> String {
-        (Utc::now() - chrono::TimeDelta::days(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        static NOW: std::sync::LazyLock<chrono::DateTime<Utc>> = std::sync::LazyLock::new(Utc::now);
+        (*NOW - chrono::TimeDelta::days(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
     }
 
     /// A key record of ALICE's made a day ago.
