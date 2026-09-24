@@ -74,6 +74,10 @@ interface Origin {
   recordsReads: number;
   batchReads: number;
   kidReads: number;
+  /** The DIDs each records request named, one entry per DID, in the order asked. */
+  recordsAsked: string[];
+  /** The `did/kid` items each batch key request named, one list per request. */
+  keysAsked: string[][];
 }
 
 let origin: Origin;
@@ -99,9 +103,13 @@ const stubFetch = async (input: string): Promise<Response> => {
     });
   }
   if (url.origin !== ORIGIN) return new Response('unexpected', { status: 500 });
+  if (url.pathname.startsWith('/api/v1/records/')) {
+    origin.recordsAsked.push(decodeURIComponent(url.pathname.slice('/api/v1/records/'.length).split('/')[0]!));
+  }
   if (url.pathname === '/api/v1/records' && origin.recordRoutes) {
     origin.recordsReads++;
     const dids = (url.searchParams.get('dids') ?? '').split(',');
+    origin.recordsAsked.push(...dids);
     return Response.json({
       accounts: dids.map((did) => ({
         did,
@@ -115,6 +123,7 @@ const stubFetch = async (input: string): Promise<Response> => {
   if (url.pathname.startsWith('/api/v1/records')) return new Response('not found', { status: 404 });
   if (url.pathname === '/api/v1/signing-keys') {
     origin.batchReads++;
+    origin.keysAsked.push((url.searchParams.get('keys') ?? '').split(','));
     if (origin.delayMs > 0) await new Promise((r) => setTimeout(r, origin.delayMs));
     const keys = (url.searchParams.get('keys') ?? '').split(',').flatMap((item) => {
       const at = item.indexOf('/');
@@ -166,6 +175,8 @@ beforeEach(() => {
     recordsReads: 0,
     batchReads: 0,
     kidReads: 0,
+    recordsAsked: [],
+    keysAsked: [],
   };
   vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 404 })));
 });
@@ -693,6 +704,24 @@ describe('a replayed history batch', () => {
     expect(origin.kidReads, 'no key asked on its own').toBe(0);
   });
 
+  it('sends one key request when two batches naming the same key close together', async () => {
+    origin.recordRoutes = true;
+    const s = await session(OWN_DID, lookup());
+    const one = await signed(A, 41, 'first', { batch: 'h1' });
+    const two = await signed(A, 41, 'second', { batch: 'h2' });
+    s.ws.recv(':srv BATCH +h1 chathistory #room');
+    s.ws.recv(one.wire);
+    s.ws.recv(':srv BATCH +h2 chathistory #room');
+    s.ws.recv(two.wire);
+    s.ws.recv(':srv BATCH -h1');
+    s.ws.recv(':srv BATCH -h2');
+    await settle(s, [one.msgid, two.msgid]);
+
+    expect([one, two].map((l) => s.seen.get(l.msgid)?.settled?.state)).toEqual(['device', 'device']);
+    expect(origin.batchReads, 'keys').toBe(1);
+    expect(origin.kidReads, 'no key asked on its own').toBe(0);
+  });
+
   it('prefetches nothing for a batch with no signed line', async () => {
     const { lk, prefetch } = gatedLookup();
     const s = await session(OWN_DID, lk);
@@ -915,6 +944,31 @@ describe('a line a peer server signed', () => {
     const s = await session(OWN_DID, lookup([await peerDocument(51), senderDocument()]));
     s.ws.recv(m.wire);
     expect(await settledWithin(s, m.msgid, 1_500)).toEqual({ state: 'server', kid: m.kid });
+  });
+
+  it('prefetches a relayed line in a history batch under the peer server too, in one request', async () => {
+    origin.recordRoutes = true;
+    const m = await relayed(51, 'signed by the peer', PEER);
+    const key = await importDidKey(new Uint8Array(32).fill(51));
+    await hold(PEER_DID, (await import('./did-key.js')).decodeMultibaseEd25519(key.publicKeyMultibase));
+    const s = await session(OWN_DID, lookup([await peerDocument(51), senderDocument()]));
+    const inBatch = m.wire.replace('@', '@batch=h;');
+    s.ws.recv(':srv BATCH +h chathistory #room');
+    s.ws.recv(inBatch);
+    s.ws.recv(':srv BATCH -h');
+    expect(await settledWithin(s, m.msgid, 2_000)).toEqual({ state: 'server', kid: m.kid });
+
+    expect(origin.keysAsked).toEqual([[`${SENDER}/${m.kid}`, `${PEER_DID}/${m.kid}`]]);
+    expect(origin.kidReads, 'no key asked on its own').toBe(0);
+  });
+
+  it('asks for no device records of a peer server', async () => {
+    origin.recordRoutes = true;
+    const m = await relayed(51, 'signed by the peer', PEER);
+    const s = await session(OWN_DID, lookup([await peerDocument(51), senderDocument()]));
+    s.ws.recv(m.wire);
+    expect(await settledWithin(s, m.msgid, 1_500)).toEqual({ state: 'server', kid: m.kid });
+    expect(origin.recordsAsked).not.toContain(PEER_DID);
   });
 
   it('is not looked up under a server without the tag', async () => {

@@ -16,8 +16,8 @@ import { dmPeerKey, isDid } from './address.js';
 import { prefetchProfiles } from './profiles.js';
 import { recordKeyOf, type DeviceKeyStore, type StoredDeviceKey } from './device-key.js';
 import { KEY_LIFETIME_MS, buildDeviceRecord, deviceKeyHistory } from './identity-records.js';
-import { KeyLookup, makeDidResolver } from './key-lookup.js';
-import { SignatureChecker, firstLook, sigTagKid, type Verdict } from './verdict.js';
+import { KeyLookup, type KeyPair, makeDidResolver } from './key-lookup.js';
+import { SignatureChecker, firstLook, originServerDid, sigTagKid, type Verdict } from './verdict.js';
 import type {
   IRCMessage, Message, Member, AvSession, AvParticipant,
   FreeqClientOptions, SaslCredentials, Batch, TransportState,
@@ -1690,6 +1690,7 @@ export class FreeqClient extends EventEmitter {
       (batch.deferredChecks ??= []).push({
         did: line.tags['account'],
         kid: (sigTag && sigTagKid(sigTag)) || undefined,
+        server: originServerDid(line.tags['+freeq.at/origin']) ?? undefined,
         start: () => this.checkLater(delivered, line, onSettled, '', at),
       });
       return;
@@ -1735,16 +1736,17 @@ export class FreeqClient extends EventEmitter {
   /**
    * Start the checks held on a closed batch, once its signers' records are
    * prefetched in one request (see `KeyLookup.prefetch`), then the keys the
-   * records did not answer in one more (`KeyLookup.prefetchKeys`). Off the
-   * receive path.
+   * records did not answer in one more (`KeyLookup.prefetchKeys`). A relayed
+   * line's key is asked under its peer server too, where the line's check
+   * looks for it next. Off the receive path.
    */
   private startDeferredChecks(batch: Batch): void {
     const held = batch.deferredChecks;
     if (!held?.length) return;
     const dids = [...new Set(held.map((h) => h.did).filter((d): d is string => !!d && isDid(d)))];
-    const pairs = held
+    const pairs: KeyPair[] = held
       .filter((h) => !!h.did && isDid(h.did) && !!h.kid)
-      .map((h): [string, string] => [h.did!, h.kid!]);
+      .flatMap((h): KeyPair[] => [[h.did!, h.kid!], ...(h.server ? [[h.server, h.kid!, true] as KeyPair] : [])]);
     const lookup = this.opts.keyLookup;
     void (async () => {
       if (lookup && dids.length > 0) await lookup.prefetch(dids).catch(() => undefined);

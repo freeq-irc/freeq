@@ -128,6 +128,10 @@ export const MISS_RETRY_AFTER_MS: readonly number[] = [2_000, 6_000, 15_000];
  */
 export const FRESH_LINE_MS = 120_000;
 
+/** A key to prefetch: its DID and kid, and whether the DID is a server's,
+ *  which has no device records. */
+export type KeyPair = [did: string, kid: string, server?: boolean];
+
 /** Most keys one request to the origin's batch key route names. */
 export const MAX_KEYS_PER_REQUEST = 50;
 
@@ -160,6 +164,9 @@ export class KeyLookup {
   private readonly proving = new Map<string, Promise<boolean>>();
   /** One prefetch in flight per DID, so prefetches racing on an account share one request. */
   private readonly prefetching = new Map<string, Promise<void>>();
+  /** One batch key request in flight per (DID, kid), so prefetches racing on
+   *  a key share one request. */
+  private readonly prefetchingKeys = new Map<string, Promise<void>>();
   /** Per DID, how many times `refreshAccount` has dropped its answers. */
   private readonly refreshes = new Map<string, number>();
   private defaultOrigin: string | null = null;
@@ -301,12 +308,14 @@ export class KeyLookup {
    * when no source failed, since a failed source did not say it lacks the key.
    * Asks for one (did, kid) while a lookup for it runs await that lookup.
    * `retry: false` settles a fresh line's miss without the retry delays.
+   * `server: true` names a server's DID, which has no device records: none
+   * are listed.
    */
   async keyForAt(
     did: string,
     kid: string,
     at: Date,
-    options: { retry?: boolean } = {},
+    options: { retry?: boolean; server?: boolean } = {},
   ): Promise<FoundKey | null> {
     await this.load();
     const slot = JSON.stringify([did, kid]);
@@ -326,7 +335,15 @@ export class KeyLookup {
 
       let pending = this.inFlight.get(slot);
       if (pending === undefined) {
-        const started: Promise<Settled> = this.settle(slot, did, kid, at, cached, options.retry !== false).finally(() => {
+        const started: Promise<Settled> = this.settle(
+          slot,
+          did,
+          kid,
+          at,
+          cached,
+          options.retry !== false,
+          options.server === true,
+        ).finally(() => {
           if (this.inFlight.get(slot) === started) this.inFlight.delete(slot);
         });
         this.inFlight.set(slot, started);
@@ -355,11 +372,12 @@ export class KeyLookup {
     at: Date,
     cached: Cached | undefined,
     retry: boolean,
+    server: boolean,
   ): Promise<Settled> {
     const started = performance.now();
     const refreshes = this.refreshes.get(did);
     const listed = cached === undefined;
-    let settled = await this.ask(did, kid, at, cached?.records);
+    let settled = await this.ask(did, kid, at, cached?.records ?? (server ? [] : undefined));
     // Only a line signed just now is asked about again.
     const retries = retry && Date.now() - at.getTime() <= FRESH_LINE_MS ? this.retryAfterMs : [];
     for (const after of retries) {
@@ -452,23 +470,27 @@ export class KeyLookup {
   }
 
   /**
-   * Ask the origin's batch key route for the keys of `pairs` ([DID, kid]), in
-   * one request per 50, for the pairs no answer is held for: not a key found,
-   * not a miss inside the ttl, not a key the DID's held records name. A key
-   * the origin answers is kept as its answer; a pair it leaves out is kept as
-   * a miss only when the DID's records are held (or it is a did:key, which
-   * has none). A request that fails, or is answered 429 or 5xx, keeps nothing,
-   * since it said nothing about the keys. Against a server without the route
-   * (a 404) nothing is asked. Never fails.
+   * Ask the origin's batch key route for the keys of `pairs`, in one request
+   * per 50, for the pairs no answer is held for: not a key found, not a miss
+   * inside the ttl, not a key the DID's held records name. A pair another
+   * prefetch is asking for is not asked again; its answer is waited for. A
+   * key the origin answers is kept as its answer; a pair it leaves out is
+   * kept as a miss only when the DID's records are held (or it is a did:key
+   * or a server's DID, which have none). A request that fails, or is
+   * answered 429 or 5xx, keeps nothing, since it said nothing about the keys.
+   * Against a server without the route (a 404) nothing is asked. Never fails.
    */
-  async prefetchKeys(pairs: [string, string][]): Promise<void> {
+  async prefetchKeys(pairs: KeyPair[]): Promise<void> {
     await this.load();
     const base = this.originBase();
     if (base === null || this.batchRouteMissing) return;
     const now = Date.now();
-    const asked: [string, string][] = [];
+    const asked: KeyPair[] = [];
     const seen = new Set<string>();
-    for (const [did, kid] of pairs) {
+    const waits = new Set<Promise<void>>();
+    let done!: () => void;
+    const mine = new Promise<void>((resolve) => (done = resolve));
+    for (const [did, kid, server] of pairs) {
       const slot = JSON.stringify([did, kid]);
       if (seen.has(slot) || this.inFlight.has(slot)) continue;
       seen.add(slot);
@@ -476,10 +498,31 @@ export class KeyLookup {
       if (hit !== undefined && hit.other !== undefined && (hit.other !== null || now - hit.at < this.ttlMs)) {
         continue;
       }
-      const held = this.records.get(did)?.records ?? hit?.records;
+      const held = server ? undefined : (this.records.get(did)?.records ?? hit?.records);
       if (held !== undefined && (await fromRecords(did, kid, held, new Date(now))) !== null) continue;
-      asked.push([did, kid]);
+      // Read after the await above, so a prefetch that began meanwhile is seen.
+      const other = this.prefetchingKeys.get(slot);
+      if (other !== undefined) {
+        waits.add(other);
+        continue;
+      }
+      this.prefetchingKeys.set(slot, mine);
+      asked.push([did, kid, server]);
     }
+    try {
+      await this.askBatchRoute(base, asked);
+    } finally {
+      for (const [did, kid] of asked) {
+        const slot = JSON.stringify([did, kid]);
+        if (this.prefetchingKeys.get(slot) === mine) this.prefetchingKeys.delete(slot);
+      }
+      done();
+    }
+    await Promise.all(waits);
+  }
+
+  /** `prefetchKeys`' requests for the pairs it asks. */
+  private async askBatchRoute(base: string, asked: KeyPair[]): Promise<void> {
     let kept = false;
     for (let i = 0; i < asked.length; i += MAX_KEYS_PER_REQUEST) {
       const chunk = asked.slice(i, i + MAX_KEYS_PER_REQUEST);
@@ -491,17 +534,17 @@ export class KeyLookup {
       } catch {
         continue;
       }
-      for (const [did, kid] of chunk) {
+      for (const [did, kid, server] of chunk) {
         const slot = JSON.stringify([did, kid]);
         const answer = answered.get(slot);
-        const records = this.records.get(did)?.records ?? [];
+        const records = server ? [] : (this.records.get(did)?.records ?? []);
         let other: FoundKey | null = null;
         if (answer?.key && answer.key.length === 32 && (await deriveKid(answer.key)) === kid) {
           other = { publicKey: answer.key, source: 'OriginServer', retiredAt: answer.retiredAt, expiresAt: null };
         }
         // A miss counts only when the account's records were read: without
         // them, the line's own lookup lists the account.
-        if (other === null && !this.records.has(did) && !did.startsWith('did:key:')) continue;
+        if (other === null && !server && !this.records.has(did) && !did.startsWith('did:key:')) continue;
         this.remember(slot, records, other);
         kept = true;
       }
@@ -516,7 +559,7 @@ export class KeyLookup {
    */
   private async fromBatchRoute(
     base: string,
-    pairs: [string, string][],
+    pairs: KeyPair[],
   ): Promise<Map<string, OriginAnswer> | null> {
     const keys = pairs.map(([did, kid]) => `${encodeURIComponent(did)}/${encodeURIComponent(kid)}`).join(',');
     const res = await this.reader.fetch(`${base.replace(/\/+$/, '')}/api/v1/signing-keys?keys=${keys}`);

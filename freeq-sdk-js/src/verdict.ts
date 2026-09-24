@@ -250,18 +250,17 @@ export class SignatureChecker {
     if (serverKey !== undefined) return serverVerdict(signed, serverKey);
 
     const atMs = signing.msgidTimestampMs(signed.msgid) ?? Date.now();
-    // A host name only: it becomes a did:web.
-    const origin = signed.origin !== undefined && /^[A-Za-z0-9.-]+$/.test(signed.origin) ? signed.origin : null;
+    const server = originServerDid(signed.origin);
     const at = new Date(atMs);
-    const lookup = async (did: string, retry: boolean) => {
+    const lookup = async (did: string, retry: boolean, isServer = false) => {
       try {
-        return await this.lookup.keyForAt(did, signed.kid, at, { retry });
+        return await this.lookup.keyForAt(did, signed.kid, at, { retry, server: isServer });
       } catch {
         return null;
       }
     };
     let found = null;
-    if (origin === null) {
+    if (server === null) {
       found = await lookup(signed.did, true);
     } else {
       // Every relayed line carries its origin, whether the sender or the peer
@@ -274,7 +273,7 @@ export class SignatureChecker {
         // is a hash of the key, so neither a wrong key nor a forged tag can
         // make a line verify here. No retries: the origin reads a server's
         // document itself before it answers.
-        const byServer = await lookup(`did:web:${origin}`, false);
+        const byServer = await lookup(server, false, true);
         if (byServer !== null) return serverVerdict(signed, byServer.publicKey);
         // Not the server's: the sender's key, which the origin may still be
         // fetching from the peer. Its miss from just now is dropped and it is
@@ -337,6 +336,15 @@ export class SignatureChecker {
       if (key?.length === 32) this.serverKeys.set(await signing.deriveKid(key), key);
     }
   }
+}
+
+/**
+ * The did:web of the peer server a relayed line's `+freeq.at/origin` names,
+ * whose own key may have signed it; null without one, or for a value that is
+ * not a host name.
+ */
+export function originServerDid(origin: string | undefined): string | null {
+  return origin !== undefined && /^[A-Za-z0-9.-]+$/.test(origin) ? `did:web:${origin}` : null;
 }
 
 async function serverVerdict(signed: Signed, key: Uint8Array): Promise<Verdict> {

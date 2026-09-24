@@ -226,9 +226,10 @@ export interface Batch {
   /**
    * Signature checks of the signed lines in this batch, held until it closes
    * so its signers' records, then their keys, are prefetched in one request
-   * each first. `did` is the line's `account` tag, `kid` its signature's.
+   * each first. `did` is the line's `account` tag, `kid` its signature's,
+   * `server` the did:web of the peer server a relayed line names.
    */
-  deferredChecks?: Array<{ did?: string; kid?: string; start: () => void }>;
+  deferredChecks?: Array<{ did?: string; kid?: string; server?: string; start: () => void }>;
   /**
    * History batches only: the rows the server sent — one per PRIVMSG
    * directly in the batch, one per `draft/multiline` batch nested in it.
