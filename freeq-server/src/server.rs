@@ -1773,10 +1773,11 @@ impl Server {
         let db = match &self.config.db_path {
             Some(path) => {
                 tracing::info!("Opening database: {path} (encryption at rest: enabled)");
-                Some(
-                    Db::open_encrypted(path, db_encryption_key)
-                        .map_err(|e| anyhow::anyhow!("Failed to open database: {e}"))?,
-                )
+                let db = Db::open_encrypted(path, db_encryption_key)
+                    .map_err(|e| anyhow::anyhow!("Failed to open database: {e}"))?;
+                // Keys filed under this server's own DID never expire.
+                db.set_own_did(&server_did(&self.config.server_name));
+                Some(db)
             }
             None => None,
         };
@@ -2127,6 +2128,18 @@ impl Server {
         register_server_signing_key(&state);
         if let Some(old) = rotated_out {
             retire_rotated_signing_key(&state, &old);
+        }
+        // Keys whose owner rotates them never expire: this server's own,
+        // current and rotated, and any taken from a DID document. Whatever
+        // dated them (migration 16, an older build), they are cleared here.
+        if let Some(cleared) =
+            state.with_db(|db| db.exempt_own_and_document_keys(&server_did(&state.server_name)))
+            && cleared > 0
+        {
+            tracing::info!(
+                cleared,
+                "Cleared the expiry of keys whose owner rotates them"
+            );
         }
         Ok(state)
     }
@@ -2552,6 +2565,7 @@ impl Server {
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
         spawn_act_defer_retry_sweep(Arc::clone(&state));
         crate::broker_signout::spawn(Arc::clone(&state));
+        crate::key_expiry::spawn(Arc::clone(&state));
         crate::record_cache::spawn(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
@@ -2895,6 +2909,7 @@ impl Server {
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
         spawn_act_defer_retry_sweep(Arc::clone(&state));
         crate::broker_signout::spawn(Arc::clone(&state));
+        crate::key_expiry::spawn(Arc::clone(&state));
         crate::record_cache::spawn(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
@@ -2946,6 +2961,7 @@ impl Server {
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
         spawn_act_defer_retry_sweep(Arc::clone(&state));
         crate::broker_signout::spawn(Arc::clone(&state));
+        crate::key_expiry::spawn(Arc::clone(&state));
         crate::record_cache::spawn(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
@@ -17909,6 +17925,53 @@ mod signing_key_rotation_tests {
             "a plain start keeps it"
         );
         assert_eq!(key_file(dir.path()), new.to_bytes().to_vec());
+    }
+
+    /// Every start clears the expiry of this server's own keys, current and
+    /// rotated, and of every key taken from a DID document, whatever dated
+    /// them; any other key keeps its expiry.
+    #[test]
+    fn a_start_leaves_own_and_document_keys_without_an_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = start(dir.path(), false);
+        let own = server_did("rotation-test");
+        let old_kid = kid_of(&first.msg_signing_key);
+        let own_row = |state: &Arc<SharedState>, kid: &str| {
+            state
+                .with_db(|db| db.get_signing_key_row(&own, kid))
+                .flatten()
+                .expect("filed")
+        };
+        assert_eq!(own_row(&first, &old_kid).expires_at, None, "a fresh key");
+        drop(first);
+
+        // Dated the way migration 16 dates the rows it finds.
+        let (peer, user) = ([5u8; 32], [6u8; 32]);
+        {
+            let db = crate::db::Db::open(dir.path().join("irc.db")).unwrap();
+            assert!(
+                db.set_signing_key_expiry(&own, &old_kid, Some(1_000))
+                    .unwrap()
+            );
+            db.save_signing_key_from("did:web:peer.example", &peer, "did-document", 1, Some(2))
+                .unwrap();
+            db.save_signing_key_from("did:plc:user", &user, "local-session", 1, Some(3))
+                .unwrap();
+        }
+
+        let rotated = start(dir.path(), true);
+        let new_kid = kid_of(&rotated.msg_signing_key);
+        assert_eq!(own_row(&rotated, &old_kid).expires_at, None, "rotated");
+        assert_eq!(own_row(&rotated, &new_kid).expires_at, None, "current");
+        let expiry = |did: &str, key: &[u8; 32]| {
+            rotated
+                .with_db(|db| db.get_signing_key_row(did, &freeq_sdk::act::derive_kid_bytes(key)))
+                .flatten()
+                .unwrap()
+                .expires_at
+        };
+        assert_eq!(expiry("did:web:peer.example", &peer), None);
+        assert_eq!(expiry("did:plc:user", &user), Some(3));
     }
 
     #[test]

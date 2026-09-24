@@ -795,15 +795,16 @@ async fn api_signing_key(State(state): State<Arc<SharedState>>) -> Json<serde_js
     let pubkey_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.as_bytes());
     let kid = freeq_sdk::sigtag::derive_kid(&vk);
     // When the key was first filed in this server's own store; null without one.
-    let registered_at = state
+    let row = state
         .with_db(|db| db.get_signing_key_row(&crate::server::server_did(&state.server_name), &kid))
-        .flatten()
-        .map(|row| row.registered_at);
+        .flatten();
     Json(serde_json::json!({
         "algorithm": "ed25519",
         "public_key": pubkey_b64,
         "kid": kid,
-        "registered_at": registered_at,
+        "registered_at": row.as_ref().map(|row| row.registered_at),
+        // A server's own key never expires; null.
+        "expires_at": row.and_then(|row| row.expires_at),
         // Where this server's whole key set is published, under the name it
         // files its own keys by rather than the host a client connected to.
         "did": crate::server::server_did(&state.server_name),
@@ -864,6 +865,9 @@ async fn did_document(State(state): State<Arc<SharedState>>) -> Json<serde_json:
 /// while a key was live stays good after the owner retires it, and one made
 /// afterwards does not.
 ///
+/// Only unexpired keys are listed: an expired key is left out, a retired one
+/// stays with its date. `/{did}/{kid}` still answers an expired key.
+///
 /// A DID with no keys is 200 with a null `public_key` and an empty set:
 /// "this identity has registered nothing" is an answer, not a missing page.
 async fn api_did_signing_key(
@@ -873,9 +877,13 @@ async fn api_did_signing_key(
     use base64::Engine;
     let b64 = |k: &[u8; 32]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(k);
     let did_decoded = urlencoding::decode(&did).unwrap_or(std::borrow::Cow::Borrowed(&did));
-    let rows = state
+    let now = chrono::Utc::now().timestamp();
+    let rows: Vec<crate::db::SigningKeyRow> = state
         .with_db(|db| db.get_signing_key_set(did_decoded.as_ref()))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|row| !row.expired_at(now))
+        .collect();
 
     // The most recently used key its owner has not retired. Rows arrive
     // newest registration first, so taking only a strictly later last_seen_at
@@ -897,6 +905,7 @@ async fn api_did_signing_key(
                 "registered_at": r.registered_at,
                 "last_seen_at": r.last_seen_at,
                 "removed_at": r.removed_at,
+                "expires_at": r.expires_at,
             })
         })
         .collect();
@@ -914,7 +923,8 @@ async fn api_did_signing_key(
 /// Per-DID, per-kid signing key: the exact historical key the DID registered
 /// under `kid`, from the durable store. This is the lookup a verifier uses when
 /// a signature names its kid — the key stays available after the signer's
-/// session ends, unlike `/{did}` which is the current one.
+/// session ends, after it is retired and after it expires, with those dates,
+/// unlike `/{did}` which lists only unexpired keys.
 async fn api_did_signing_key_by_kid(
     State(state): State<Arc<SharedState>>,
     axum::extract::Path((did, kid)): axum::extract::Path<(String, String)>,
@@ -935,7 +945,8 @@ async fn api_did_signing_key_by_kid(
             "source": "key-store",
             "registered_at": row.registered_at,
             "last_seen_at": row.last_seen_at,
-            "removed_at": row.removed_at
+            "removed_at": row.removed_at,
+            "expires_at": row.expires_at
         }))),
         None => Err(axum::http::StatusCode::NOT_FOUND),
     }
@@ -2237,7 +2248,7 @@ fn classify_message_signature(
     };
 
     let server_vk = state.msg_signing_key.verifying_key();
-    let (key, removed_at, key_source) = if kid == freeq_sdk::sigtag::derive_kid(&server_vk) {
+    let (key, ended_at, key_source) = if kid == freeq_sdk::sigtag::derive_kid(&server_vk) {
         (
             Some((server_vk, "server-key")),
             None,
@@ -2249,7 +2260,14 @@ fn classify_message_signature(
                 .with_db(|db| db.get_signing_key_row(did, kid))
                 .flatten()
         });
-        let removed_at = row.as_ref().and_then(|r| r.removed_at);
+        // When the key stopped counting: its retirement or its expiry,
+        // whichever came first.
+        let ended_at = row
+            .as_ref()
+            .and_then(|r| match (r.removed_at, r.expires_at) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            });
         let key_source = row
             .as_ref()
             .and_then(|r| r.source.clone())
@@ -2257,7 +2275,7 @@ fn classify_message_signature(
         let key = row
             .and_then(|r| ed25519_dalek::VerifyingKey::from_bytes(&r.pubkey).ok())
             .map(|vk| (vk, "client-session-key"));
-        (key, removed_at, key_source)
+        (key, ended_at, key_source)
     };
     let Some((vk, which)) = key else {
         return ("unverifiable", "unverifiable-unknown-key", None, None);
@@ -2268,13 +2286,14 @@ fn classify_message_signature(
     let client_public_key = (which == "client-session-key")
         .then(|| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.as_bytes()));
 
-    // A key its owner retired cannot vouch for a message made after the
-    // retirement, however well the bytes check out — that is what retiring a
-    // key is for. An id we cannot date falls through to the signature check:
-    // the bytes are then the only thing there is to judge it by.
-    if let Some(removed_at) = removed_at {
+    // A key its owner retired, or one past its expiry, cannot vouch for a
+    // message made at or after that moment, however well the bytes check out —
+    // that is what retiring a key is for. An id we cannot date falls through
+    // to the signature check: the bytes are then the only thing there is to
+    // judge it by.
+    if let Some(ended_at) = ended_at {
         let signed_at = crate::msgid::timestamp_ms(msgid).map(|ms| (ms / 1000) as i64);
-        if signed_at.is_some_and(|at| at > removed_at) {
+        if signed_at.is_some_and(|at| at >= ended_at) {
             return ("invalid", "key-retired", client_public_key, key_source);
         }
     }
@@ -7444,6 +7463,65 @@ mod signing_key_endpoint_tests {
         assert_eq!(by_kid.0["removed_at"], 4_000);
         assert_eq!(by_kid.0["public_key"], b64(&retired));
     }
+
+    /// An expired key leaves the list, and is never the current key, while
+    /// a retired one stays listed with its date; every key names its expiry.
+    #[tokio::test]
+    async fn the_list_leaves_out_an_expired_key_and_keeps_a_retired_one() {
+        let state = test_state_with_db();
+        let did = "did:plc:expiredlist";
+        let (live, retired, expired) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let retired_kid = freeq_sdk::act::derive_kid_bytes(&retired);
+        let expired_kid = freeq_sdk::act::derive_kid_bytes(&expired);
+        let now = chrono::Utc::now().timestamp();
+        state
+            .with_db(|db| {
+                db.save_signing_key_from(did, &live, "local-session", now - 20, Some(now + 3_600))?;
+                db.save_signing_key_from(
+                    did,
+                    &retired,
+                    "local-session",
+                    now - 10,
+                    Some(now + 3_600),
+                )?;
+                assert!(db.retire_signing_key(did, &retired_kid, now - 5)?);
+                // Seen most recently, so recency alone would make it current.
+                db.save_signing_key_from(did, &expired, "local-session", now, Some(now - 1))?;
+                Ok(())
+            })
+            .expect("db present");
+
+        let out = api_did_signing_key(State(state.clone()), Path(did.to_string())).await;
+        assert_eq!(out.0["public_key"], b64(&live));
+        let keys = out.0["keys"].as_array().expect("keys is a list");
+        let kids: Vec<&str> = keys.iter().map(|k| k["kid"].as_str().unwrap()).collect();
+        assert!(!kids.contains(&expired_kid.as_str()), "{kids:?}");
+        assert!(kids.contains(&retired_kid.as_str()), "{kids:?}");
+        assert_eq!(keys.len(), 2);
+        for key in keys {
+            assert_eq!(key["expires_at"], now + 3_600, "{key}");
+        }
+    }
+
+    /// The per-kid route still answers an expired key, with its dates, so a
+    /// line it signed while it was live can be checked.
+    #[tokio::test]
+    async fn the_per_kid_route_answers_an_expired_key_with_its_dates() {
+        let state = test_state_with_db();
+        let did = "did:plc:expiredkid";
+        let key = [4u8; 32];
+        let kid = freeq_sdk::act::derive_kid_bytes(&key);
+        state
+            .with_db(|db| db.save_signing_key_from(did, &key, "origin-server", 1_000, Some(2_000)))
+            .expect("db present");
+        let out = api_did_signing_key_by_kid(State(state), Path((did.to_string(), kid)))
+            .await
+            .expect("an expired key is still answered");
+        assert_eq!(out.0["public_key"], b64(&key));
+        assert_eq!(out.0["registered_at"], 1_000);
+        assert_eq!(out.0["expires_at"], 2_000);
+        assert!(out.0["removed_at"].is_null());
+    }
 }
 
 #[cfg(test)]
@@ -7469,6 +7547,12 @@ mod server_signing_key_tests {
         assert_eq!(out.0["kid"], kid);
         assert_eq!(out.0["registered_at"], row.registered_at);
         assert_eq!(out.0["did"], did, "the DID the key set is published under");
+        // The server's own key never expires, and says so.
+        assert!(
+            out.0.get("expires_at").is_some_and(|v| v.is_null()),
+            "{}",
+            out.0
+        );
     }
 }
 
@@ -7894,6 +7978,76 @@ mod signature_verdict_tests {
         );
     }
 
+    /// The verdict for MSGID's signature by a key whose row was filed with
+    /// `removed_at` and `expires_at`.
+    fn verdict_with(
+        removed_at: Option<i64>,
+        expires_at: Option<i64>,
+    ) -> (&'static str, &'static str) {
+        let state = test_state_with_db();
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let kid = freeq_sdk::act::derive_kid_bytes(key.verifying_key().as_bytes());
+        state
+            .with_db(|db| {
+                db.save_signing_key_from(
+                    DID,
+                    key.verifying_key().as_bytes(),
+                    "local-session",
+                    MSGID_AT - 86_400,
+                    expires_at,
+                )?;
+                if let Some(at) = removed_at {
+                    assert!(db.retire_signing_key(DID, &kid, at)?);
+                }
+                Ok(())
+            })
+            .expect("test state has a database");
+        let (verdict, by, _, _) = classify_message_signature(
+            &state,
+            MSGID,
+            Some(DID),
+            Some(&doc().canonical()),
+            Some(&doc().sign(&key)),
+        );
+        (verdict, by)
+    }
+
+    /// A signature made at or after a key's retirement is invalid, one made
+    /// before it valid.
+    #[test]
+    fn a_signature_at_or_after_the_retirement_is_invalid() {
+        assert_eq!(
+            verdict_with(Some(MSGID_AT - 1), None),
+            ("invalid", "key-retired")
+        );
+        assert_eq!(
+            verdict_with(Some(MSGID_AT), None),
+            ("invalid", "key-retired")
+        );
+        assert_eq!(
+            verdict_with(Some(MSGID_AT + 1), None),
+            ("valid", "client-session-key")
+        );
+    }
+
+    /// The same edge for a key's expiry.
+    #[test]
+    fn a_signature_at_or_after_the_expiry_is_invalid() {
+        assert_eq!(
+            verdict_with(None, Some(MSGID_AT - 1)),
+            ("invalid", "key-retired")
+        );
+        assert_eq!(
+            verdict_with(None, Some(MSGID_AT)),
+            ("invalid", "key-retired")
+        );
+        assert_eq!(
+            verdict_with(None, Some(MSGID_AT + 1)),
+            ("valid", "client-session-key")
+        );
+        assert_eq!(verdict_with(None, None), ("valid", "client-session-key"));
+    }
+
     /// Retirement is not retroactive: a signature made while the key was live
     /// stays good after its owner stops using it.
     #[test]
@@ -7930,7 +8084,15 @@ mod signature_verdict_tests {
             let state = test_state_with_db();
             let key = SigningKey::from_bytes(&[9u8; 32]);
             state
-                .with_db(|db| db.save_signing_key_from(DID, key.verifying_key().as_bytes(), source))
+                .with_db(|db| {
+                    db.save_signing_key_from(
+                        DID,
+                        key.verifying_key().as_bytes(),
+                        source,
+                        chrono::Utc::now().timestamp(),
+                        None,
+                    )
+                })
                 .expect("test state has a database");
             let (verdict, _, _, key_source) = classify_message_signature(
                 &state,
@@ -7976,10 +8138,17 @@ mod signature_verdict_tests {
             crate::migrations::migration_ladder()
                 .to_version(&mut conn, 12)
                 .unwrap();
+            // Filed an hour before the message, so the expiry migration 16
+            // gives it is after the message.
             conn.execute(
                 "INSERT INTO signing_keys (did, kid, pubkey, registered_at, last_seen_at)
-                 VALUES (?1, ?2, ?3, 0, 0)",
-                rusqlite::params![DID, kid, &key.verifying_key().as_bytes()[..]],
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                rusqlite::params![
+                    DID,
+                    kid,
+                    &key.verifying_key().as_bytes()[..],
+                    MSGID_AT - 3_600
+                ],
             )
             .unwrap();
         }
@@ -8006,7 +8175,13 @@ mod signature_verdict_tests {
         let known = SigningKey::from_bytes(&[9u8; 32]);
         state
             .with_db(|db| {
-                db.save_signing_key_from(DID, known.verifying_key().as_bytes(), "identity-record")
+                db.save_signing_key_from(
+                    DID,
+                    known.verifying_key().as_bytes(),
+                    "identity-record",
+                    chrono::Utc::now().timestamp(),
+                    None,
+                )
             })
             .expect("test state has a database");
         let stranger = SigningKey::from_bytes(&[11u8; 32]);

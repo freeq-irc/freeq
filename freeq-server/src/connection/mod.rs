@@ -172,6 +172,18 @@ pub(crate) fn file_session_signing_key(
     }
     let vk = ed25519_dalek::VerifyingKey::from_bytes(bytes.as_slice().try_into().unwrap())
         .map_err(|_| ("INVALID_KEY", "Invalid ed25519 public key"))?;
+    let kid = freeq_sdk::sigtag::derive_kid(&vk);
+
+    // A key on file past its expiry is refused before anything is written, so
+    // the caller's FAIL is the last word it gets for it.
+    let now = chrono::Utc::now().timestamp();
+    let expired = state
+        .with_db(|db| db.get_signing_key_row(did, &kid))
+        .flatten()
+        .is_some_and(|row| row.expired_at(now));
+    if expired {
+        return Err(("KEY_EXPIRED", KEY_EXPIRED_WORDS));
+    }
 
     state
         .session_msg_keys
@@ -181,9 +193,12 @@ pub(crate) fn file_session_signing_key(
         .did_msg_keys
         .lock()
         .insert(did.to_string(), pubkey_b64.to_string());
-    let did_for_db = did.to_string();
-    state.with_db(|db| db.save_signing_key(&did_for_db, &bytes));
-    let kid = freeq_sdk::sigtag::derive_kid(&vk);
+    // First seen now, expiring a lifetime from now until the account's record
+    // for the key says otherwise (`refuse_if_retired`).
+    let expires_at = now + crate::key_expiry::lifetime_secs(state);
+    state.with_db(|db| {
+        db.save_signing_key_from(did, &bytes, "local-session", now, Some(expires_at))
+    });
     // The login token behind this key, so signing the device out can end it.
     if let Some(token) = broker_token {
         state
@@ -209,10 +224,35 @@ pub(crate) fn file_session_signing_key(
     Ok(())
 }
 
-/// Refuse a just-registered key that the account's records retire: say so,
-/// stamp the retirement on the key row, end the login token this connection
-/// came in on, and close the connection, so the device signs in again and
-/// makes a new key.
+/// What a device whose signing key has expired is told.
+pub(crate) const KEY_EXPIRED_WORDS: &str =
+    "This device's signing key has expired. Sign in again to continue.";
+
+/// After the caller has sent `FAIL MSGSIG KEY_EXPIRED` for a key refused at
+/// registration: end the login token this connection came in on and close
+/// it. Spawned, so the FAIL already queued goes out first.
+pub(crate) fn close_for_expired_key(
+    state: &Arc<SharedState>,
+    session_id: &str,
+    broker_token: Option<&str>,
+) {
+    let state = Arc::clone(state);
+    let (session_id, token) = (session_id.to_string(), broker_token.map(str::to_string));
+    tokio::spawn(async move {
+        if let Some(token) = token {
+            end_login_token(&state, &token).await;
+        }
+        close_session(&state, &session_id, "Signing key expired");
+    });
+}
+
+/// Refuse a just-registered key that the account's records retire or let
+/// expire: say so, end the login token this connection came in on, and close
+/// the connection, so the device signs in again and makes a new key. A
+/// retirement is stamped on the key row; an expiry is not a retirement.
+///
+/// Whenever the records hold the key, its row takes the records' expiry,
+/// earlier or later than the one it was filed with.
 async fn refuse_if_retired(
     state: &Arc<SharedState>,
     session_id: &str,
@@ -230,15 +270,36 @@ async fn refuse_if_retired(
         }
     };
     let now = chrono::Utc::now();
-    let Some(retired_at) = freeq_sdk::identity_records::device_key_history(did, &records)
+    let Some(key) = freeq_sdk::identity_records::device_key_history(did, &records)
         .into_iter()
         .find(|k| k.kid == kid)
-        .and_then(|k| k.retired_at)
-        .filter(|at| *at <= now)
-        .map(|at| at.timestamp())
     else {
         return;
     };
+    // The published key's row follows its record (a key published after its
+    // last registration keeps the local date until it connects again).
+    state.with_db(|db| db.set_signing_key_expiry(did, kid, Some(key.expires_at.timestamp())));
+    let Some(retired_at) = key.retired_at.filter(|at| *at <= now) else {
+        return;
+    };
+    if retired_at == key.expires_at {
+        let reply = irc::Message::from_server(
+            &state.server_name,
+            "FAIL",
+            vec!["MSGSIG", "KEY_EXPIRED", KEY_EXPIRED_WORDS],
+        );
+        if let Some(tx) = state.connections.lock().get(session_id) {
+            let _ = tx.try_send(format!("{reply}\r\n"));
+        }
+        state.session_msg_keys.lock().remove(session_id);
+        if let Some(token) = broker_token {
+            end_login_token(state, token).await;
+        }
+        close_session(state, session_id, "Signing key expired");
+        tracing::info!(session = %session_id, %did, %kid, "Refused an expired signing key");
+        return;
+    }
+    let retired_at = retired_at.timestamp();
     let reply = irc::Message::from_server(
         &state.server_name,
         "FAIL",
@@ -1484,6 +1545,13 @@ where
                                 vec!["MSGSIG", code, detail],
                             );
                             send(&state, &session_id, format!("{reply}\r\n"));
+                            if code == "KEY_EXPIRED" {
+                                close_for_expired_key(
+                                    &state,
+                                    &session_id,
+                                    conn.broker_token.as_deref(),
+                                );
+                            }
                         }
                     }
                 }
@@ -4223,6 +4291,25 @@ mod retired_key_tests {
 
     impl Client {
         async fn signed_in(state: &Arc<SharedState>, broker_token: &str) -> Client {
+            Self::signing_in(state, broker_token, None).await
+        }
+
+        /// Signed in, sending `before_welcome` after 903 and before CAP END,
+        /// so it is filed at registration; then not waiting for 001, since
+        /// the server may close the connection first.
+        async fn offering_at_registration(
+            state: &Arc<SharedState>,
+            broker_token: &str,
+            before_welcome: &str,
+        ) -> Client {
+            Self::signing_in(state, broker_token, Some(before_welcome)).await
+        }
+
+        async fn signing_in(
+            state: &Arc<SharedState>,
+            broker_token: &str,
+            before_welcome: Option<&str>,
+        ) -> Client {
             state.web_auth_tokens.lock().insert(
                 "WT-RETIRED-KEY".to_string(),
                 (
@@ -4263,11 +4350,27 @@ mod retired_key_tests {
             c.rx(|l| l.split_whitespace().nth(1) == Some("903"))
                 .await
                 .expect("903");
+            if let Some(line) = before_welcome {
+                c.tx(line).await;
+                c.tx("CAP END").await;
+                return c;
+            }
             c.tx("CAP END").await;
             c.rx(|l| l.split_whitespace().nth(1) == Some("001"))
                 .await
                 .expect("001");
             c
+        }
+
+        /// Every line until the server closes the connection.
+        async fn rest(&mut self) -> Vec<String> {
+            let lines = std::sync::Mutex::new(Vec::new());
+            self.rx(|l| {
+                lines.lock().unwrap().push(l.to_string());
+                false
+            })
+            .await;
+            lines.into_inner().unwrap()
         }
 
         async fn tx(&mut self, line: &str) {
@@ -4647,6 +4750,280 @@ mod retired_key_tests {
             .with_db(|db| db.get_signing_key_row(DID, &kid))
             .flatten()
             .expect("the key row");
+        assert_eq!(row.removed_at, None);
+    }
+    // ── expired keys ─────────────────────────────────────────────────
+
+    const EXPIRED_WORDS: &str = "This device's signing key has expired. Sign in again to continue.";
+
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    /// A key record of `key` made `made` and expiring at `expires_at`.
+    fn record_expiring(
+        key: &ed25519_dalek::SigningKey,
+        made: &str,
+        expires_at: &str,
+    ) -> serde_json::Value {
+        let signer = freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&key.to_bytes()).unwrap();
+        serde_json::to_value(
+            freeq_sdk::identity_records::build_device_record_with_expiry(
+                &signer, DID, made, expires_at, None,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn at(secs: i64) -> String {
+        chrono::DateTime::from_timestamp(secs, 0)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    /// The FAIL, then the close, and no `MSGSIG OK` among `lines`.
+    fn refused_as_expired(lines: &[String]) {
+        let fail = lines
+            .iter()
+            .position(|l| l.contains("FAIL MSGSIG KEY_EXPIRED"))
+            .unwrap_or_else(|| panic!("no KEY_EXPIRED FAIL in {lines:?}"));
+        assert!(lines[fail].contains(EXPIRED_WORDS), "{}", lines[fail]);
+        let error = lines
+            .iter()
+            .position(|l| l.starts_with("ERROR"))
+            .unwrap_or_else(|| panic!("no ERROR in {lines:?}"));
+        assert!(fail < error, "the FAIL comes before the close: {lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("MSGSIG OK")), "{lines:?}");
+    }
+
+    /// A state holding `key`'s row for DID, first seen long ago and expired a
+    /// minute ago, and no records.
+    async fn state_holding_an_expired_row(
+        key: &ed25519_dalek::SigningKey,
+    ) -> (Arc<SharedState>, i64) {
+        let resolver = crate::peer_keys::stub_pds_resolver(DID, vec![]).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            resolver,
+        );
+        let seen = now() - 100 * 24 * 3600;
+        state.with_db(|db| {
+            db.save_signing_key_from(
+                DID,
+                key.verifying_key().as_bytes(),
+                "local-session",
+                seen,
+                Some(now() - 60),
+            )
+        });
+        let last_seen = state
+            .with_db(|db| {
+                db.get_signing_key_row(DID, &freeq_sdk::sigtag::derive_kid(&key.verifying_key()))
+            })
+            .flatten()
+            .unwrap()
+            .last_seen_at;
+        (state, last_seen)
+    }
+
+    /// Nothing about `key` was written: its row is as it was, and no session
+    /// or login token holds it.
+    fn nothing_written(state: &Arc<SharedState>, key: &ed25519_dalek::SigningKey, last_seen: i64) {
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let row = state
+            .with_db(|db| db.get_signing_key_row(DID, &kid))
+            .flatten()
+            .unwrap();
+        assert_eq!(row.last_seen_at, last_seen, "last_seen_at did not move");
+        assert_eq!(row.removed_at, None, "an expiry is not a retirement");
+        assert!(state.session_msg_keys.lock().is_empty());
+        assert!(!state.did_msg_keys.lock().contains_key(DID));
+        assert!(
+            !state
+                .device_key_tokens
+                .lock()
+                .contains_key(&(DID.to_string(), kid))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_key_registering_again_is_refused_before_anything_is_written() {
+        let key = signing_key(60);
+        let (state, last_seen) = state_holding_an_expired_row(&key).await;
+        // Registration may land in the same second as the expired row was
+        // filed; wait so a moved last_seen_at would show.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let mut client = Client::signed_in(&state, "BT-EXPIRED-AGAIN").await;
+        client.tx(&msgsig_line(&key)).await;
+        refused_as_expired(&client.rest().await);
+
+        nothing_written(&state, &key, last_seen);
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-EXPIRED-AGAIN"))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_key_offered_before_registration_is_refused_the_same_way() {
+        let key = signing_key(61);
+        let (state, last_seen) = state_holding_an_expired_row(&key).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let mut client =
+            Client::offering_at_registration(&state, "BT-EXPIRED-EARLY", &msgsig_line(&key)).await;
+        refused_as_expired(&client.rest().await);
+
+        nothing_written(&state, &key, last_seen);
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-EXPIRED-EARLY"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_its_record_let_expire_is_refused_as_expired_and_keeps_no_retirement() {
+        let key = signing_key(62);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let expired = now() - 3600;
+        let resolver = crate::peer_keys::stub_pds_resolver(
+            DID,
+            vec![record_expiring(
+                &key,
+                &at(now() - 10 * 24 * 3600),
+                &at(expired),
+            )],
+        )
+        .await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            resolver,
+        );
+
+        let mut client = Client::signed_in(&state, "BT-RECORD-EXPIRED").await;
+        client.tx(&msgsig_line(&key)).await;
+        let lines = client.rest().await;
+        let fail = lines
+            .iter()
+            .find(|l| l.contains("FAIL MSGSIG"))
+            .unwrap_or_else(|| panic!("no FAIL in {lines:?}"));
+        assert!(fail.contains("KEY_EXPIRED"), "{fail}");
+        assert!(fail.contains(EXPIRED_WORDS), "{fail}");
+        assert!(lines.last().unwrap().starts_with("ERROR"), "{lines:?}");
+
+        let row = state
+            .with_db(|db| db.get_signing_key_row(DID, &kid))
+            .flatten()
+            .unwrap();
+        assert_eq!(row.expires_at, Some(expired));
+        assert_eq!(row.removed_at, None);
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-RECORD-EXPIRED"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_published_keys_row_takes_its_records_expiry_earlier_or_later() {
+        for (seed, expires_at) in [(63u8, now() + 24 * 3600), (64, now() + 400 * 24 * 3600)] {
+            let key = signing_key(seed);
+            let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+            let resolver = crate::peer_keys::stub_pds_resolver(
+                DID,
+                vec![record_expiring(&key, &made_on(), &at(expires_at))],
+            )
+            .await;
+            let state = crate::server::test_state_with_resolver(
+                crate::config::ServerConfig::default(),
+                resolver,
+            );
+
+            let mut client = Client::signed_in(&state, "BT-FOLLOWS-RECORD").await;
+            client.tx(&msgsig_line(&key)).await;
+            client
+                .rx(|l| l.contains("MSGSIG OK"))
+                .await
+                .expect("the key is registered");
+            let mut filed = None;
+            for _ in 0..100 {
+                filed = state
+                    .with_db(|db| db.get_signing_key_row(DID, &kid))
+                    .flatten()
+                    .and_then(|r| r.expires_at);
+                if filed == Some(expires_at) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(filed, Some(expires_at), "seed {seed}");
+            assert!(still_answers(&mut client).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unpublished_key_is_filed_to_expire_the_configured_lifetime_from_now() {
+        let key = signing_key(65);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let resolver = crate::peer_keys::stub_pds_resolver(DID, vec![]).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig {
+                signing_key_lifetime_days: 1,
+                ..Default::default()
+            },
+            resolver,
+        );
+        let mut client = Client::signed_in(&state, "BT-UNPUBLISHED").await;
+        client.tx(&msgsig_line(&key)).await;
+        client
+            .rx(|l| l.contains("MSGSIG OK"))
+            .await
+            .expect("the key is registered");
+        let row = state
+            .with_db(|db| db.get_signing_key_row(DID, &kid))
+            .flatten()
+            .unwrap();
+        assert_eq!(row.expires_at, Some(row.registered_at + 24 * 3600));
+    }
+
+    #[tokio::test]
+    async fn the_sweeper_closes_a_session_whose_key_expires_once() {
+        let key = signing_key(66);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let resolver = crate::peer_keys::stub_pds_resolver(DID, vec![]).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            resolver,
+        );
+        let mut client = Client::signed_in(&state, "BT-SWEPT").await;
+        client.tx(&msgsig_line(&key)).await;
+        client
+            .rx(|l| l.contains("MSGSIG OK"))
+            .await
+            .expect("the key is registered");
+        assert_eq!(crate::key_expiry::sweep(&state).await, 0, "not expired yet");
+
+        state.with_db(|db| db.set_signing_key_expiry(DID, &kid, Some(now() - 1)));
+        assert_eq!(crate::key_expiry::sweep(&state).await, 1);
+        assert_eq!(crate::key_expiry::sweep(&state).await, 0, "refused once");
+        refused_as_expired(&client.rest().await);
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-SWEPT"))
+        );
+        let row = state
+            .with_db(|db| db.get_signing_key_row(DID, &kid))
+            .flatten()
+            .unwrap();
         assert_eq!(row.removed_at, None);
     }
 }

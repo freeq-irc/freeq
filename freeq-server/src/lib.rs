@@ -17,6 +17,7 @@ pub mod db;
 pub mod events;
 pub mod irc;
 pub mod iroh;
+pub mod key_expiry;
 pub mod manifest;
 pub mod mcp;
 pub mod media_space;

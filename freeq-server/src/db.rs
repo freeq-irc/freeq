@@ -104,6 +104,25 @@ pub struct Db {
     /// AES-256-GCM key for encrypting message content at rest.
     /// Derived from the server's signing key. If None, messages stored as plaintext.
     encryption_key: Option<[u8; 32]>,
+    /// This server's own DID (`did:web:<server name>`), whose keys never
+    /// expire. Set once at startup; unset in a database with no server.
+    own_did: std::sync::OnceLock<String>,
+}
+
+/// The record rules' default key lifetime in seconds: what migration 16 and
+/// the legacy conversion date existing rows by, since neither can read the
+/// server's configured lifetime.
+pub const DEFAULT_KEY_LIFETIME_SECS: i64 = 90 * 24 * 60 * 60;
+
+/// Whether `pubkey` is the key a `did:key:` DID is made of: a bot's own key,
+/// which its owner rotates and which never expires here.
+pub(crate) fn is_did_key_own_key(did: &str, pubkey: &[u8]) -> bool {
+    did.strip_prefix("did:key:")
+        .and_then(|multibase| freeq_sdk::crypto::PublicKey::from_multibase(multibase).ok())
+        .is_some_and(|key| match key {
+            freeq_sdk::crypto::PublicKey::Ed25519(vk) => vk.as_bytes().as_slice() == pubkey,
+            _ => false,
+        })
 }
 
 /// A persisted reaction row.
@@ -119,11 +138,15 @@ pub struct ReactionRow {
 
 /// One row of a DID's signing key history, with both edges of its window.
 ///
-/// `registered_at` is when the key was first seen and never moves;
-/// `last_seen_at` moves every time the key is registered again. `removed_at`
-/// is the owner's retirement of the key, NULL while the key is live.
-/// `source` is where the key came from (`local-session`, `origin-server`,
-/// `identity-record`, `did-document`); NULL for a row older than the column.
+/// `registered_at` is when the key was first seen here (for a key copied from
+/// the signer's records, the record's `createdAt`; for a peer's copy, the
+/// peer's date) and never moves; `last_seen_at` moves every time the key is
+/// registered again. `removed_at` is the owner's retirement of the key, NULL
+/// while the key is live. `expires_at` is when the key stops counting, NULL
+/// for a key that never expires (this server's own, another server's own, a
+/// bot's did:key). `source` is where the key came from (`local-session`,
+/// `origin-server`, `identity-record`, `did-document`); NULL for a row older
+/// than the column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SigningKeyRow {
     pub kid: String,
@@ -132,6 +155,14 @@ pub struct SigningKeyRow {
     pub last_seen_at: i64,
     pub removed_at: Option<i64>,
     pub source: Option<String>,
+    pub expires_at: Option<i64>,
+}
+
+impl SigningKeyRow {
+    /// Whether the key has reached its expiry at `now` (unix seconds).
+    pub fn expired_at(&self, now: i64) -> bool {
+        self.expires_at.is_some_and(|at| at <= now)
+    }
 }
 
 /// One account's filed listing of one collection. `entries_json` is the
@@ -442,6 +473,7 @@ impl Db {
         let mut db = Self {
             conn,
             encryption_key: None,
+            own_did: std::sync::OnceLock::new(),
         };
         db.init()?;
         Ok(db)
@@ -453,6 +485,7 @@ impl Db {
         let mut db = Self {
             conn,
             encryption_key: Some(key),
+            own_did: std::sync::OnceLock::new(),
         };
         db.init()?;
         Ok(db)
@@ -464,6 +497,7 @@ impl Db {
         let mut db = Self {
             conn,
             encryption_key: None,
+            own_did: std::sync::OnceLock::new(),
         };
         db.init()?;
         Ok(db)
@@ -475,6 +509,7 @@ impl Db {
         let mut db = Self {
             conn,
             encryption_key: Some(key),
+            own_did: std::sync::OnceLock::new(),
         };
         db.init()?;
         Ok(db)
@@ -500,6 +535,7 @@ impl Db {
         let mut db = Self {
             conn,
             encryption_key: None,
+            own_did: std::sync::OnceLock::new(),
         };
         db.init()?;
         Ok(db)
@@ -551,18 +587,22 @@ impl Db {
                  last_seen_at   INTEGER,
                  removed_at     INTEGER,
                  source         TEXT,
+                 expires_at     INTEGER,
                  PRIMARY KEY (did, kid)
              );",
         )?;
         for (did, pubkey, registered_at) in legacy {
             let kid = freeq_sdk::act::derive_kid_bytes(&pubkey);
+            // Dated as migration 16 dates a row it finds.
+            let expires_at = (!is_did_key_own_key(&did, &pubkey))
+                .then_some(registered_at + DEFAULT_KEY_LIFETIME_SECS);
             // last_seen_at = registered_at: a converted row has one stamp on
             // file, and it is the best evidence for both edges of the window.
             tx.execute(
                 "INSERT OR IGNORE INTO signing_keys
-                     (did, kid, pubkey, registered_at, last_seen_at)
-                 VALUES (?1, ?2, ?3, ?4, ?4)",
-                params![did, kid, pubkey, registered_at],
+                     (did, kid, pubkey, registered_at, last_seen_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                params![did, kid, pubkey, registered_at, expires_at],
             )?;
         }
         tx.commit()?;
@@ -2765,33 +2805,89 @@ impl Db {
     //   • PROVENANCE FreeqBotDelegation/v1 cert verification
     //   • (future) cross-session signature checks for offline signers
 
-    /// Record a client message-signing key for a DID, keyed by its kid.
-    /// Append-only: re-registering a *different* key adds a row (history);
-    /// re-registering the *same* key is idempotent. `pubkey` must be 32 bytes.
-    pub fn save_signing_key(&self, did: &str, pubkey: &[u8]) -> SqlResult<()> {
-        self.save_signing_key_from(did, pubkey, "local-session")
+    /// Name this server's own DID, whose keys never expire. Only the first
+    /// call counts.
+    pub fn set_own_did(&self, did: &str) {
+        let _ = self.own_did.set(did.to_string());
     }
 
-    /// [`Db::save_signing_key`], naming where the key came from. The source is
-    /// set when the key is first filed and never changed after.
-    pub fn save_signing_key_from(&self, did: &str, pubkey: &[u8], source: &str) -> SqlResult<()> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+    /// Record a client message-signing key for a DID, keyed by its kid, first
+    /// seen now and never expiring. Append-only: re-registering a *different*
+    /// key adds a row (history); re-registering the *same* key is idempotent.
+    /// `pubkey` must be 32 bytes.
+    pub fn save_signing_key(&self, did: &str, pubkey: &[u8]) -> SqlResult<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.save_signing_key_from(did, pubkey, "local-session", now, None)
+    }
+
+    /// [`Db::save_signing_key`], naming where the key came from, when it was
+    /// first seen, and when it expires. The source and both dates are set when
+    /// the key is first filed and never changed after; only `last_seen_at`
+    /// moves, to now.
+    ///
+    /// Whoever files it, this server's own keys and a did:key's own key never
+    /// expire: their `expires_at` is NULL.
+    pub fn save_signing_key_from(
+        &self,
+        did: &str,
+        pubkey: &[u8],
+        source: &str,
+        registered_at: i64,
+        expires_at: Option<i64>,
+    ) -> SqlResult<()> {
+        let now = chrono::Utc::now().timestamp();
         let kid = freeq_sdk::act::derive_kid_bytes(pubkey);
+        let exempt =
+            self.own_did.get().is_some_and(|own| own == did) || is_did_key_own_key(did, pubkey);
+        let expires_at = expires_at.filter(|_| !exempt);
         // Append-only: a new (did, kid) is inserted, never overwriting a
-        // different key, and both edges of its window start at now.
-        // Re-registering an *existing* kid moves only last_seen_at, so
-        // registered_at keeps saying when the key was first seen while
-        // "latest" (`get_signing_key`) still tracks the most recently used key.
+        // different key. Re-registering an *existing* kid moves only
+        // last_seen_at, so registered_at keeps saying when the key was first
+        // seen while "latest" (`get_signing_key`) still tracks the most
+        // recently used key.
         self.conn.execute(
-            "INSERT INTO signing_keys (did, kid, pubkey, registered_at, last_seen_at, source)
-             VALUES (?1, ?2, ?3, ?4, ?4, ?5)
+            "INSERT INTO signing_keys
+                 (did, kid, pubkey, registered_at, last_seen_at, source, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(did, kid) DO UPDATE SET last_seen_at = excluded.last_seen_at",
-            params![did, kid, pubkey, now as i64, source],
+            params![did, kid, pubkey, registered_at, now, source, expires_at],
         )?;
         Ok(())
+    }
+
+    /// Set when a key on file expires, earlier or later than before, or never
+    /// (None). Returns whether a row changed. The exemptions hold here too:
+    /// this server's own keys and a did:key's own key stay NULL.
+    pub fn set_signing_key_expiry(
+        &self,
+        did: &str,
+        kid: &str,
+        expires_at: Option<i64>,
+    ) -> SqlResult<bool> {
+        if self.own_did.get().is_some_and(|own| own == did) {
+            return Ok(false);
+        }
+        let Some(row) = self.get_signing_key_row(did, kid)? else {
+            return Ok(false);
+        };
+        let expires_at = expires_at.filter(|_| !is_did_key_own_key(did, &row.pubkey));
+        let changed = self.conn.execute(
+            "UPDATE signing_keys SET expires_at = ?3 WHERE did = ?1 AND kid = ?2",
+            params![did, kid, expires_at],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Clear the expiry of every key whose owner rotates it: every key filed
+    /// under `own_did` (this server's, current and rotated) and every key
+    /// taken from a DID document (another server's own key, or a did:web
+    /// user's). Idempotent; run at every start. Returns the rows changed.
+    pub fn exempt_own_and_document_keys(&self, own_did: &str) -> SqlResult<usize> {
+        self.conn.execute(
+            "UPDATE signing_keys SET expires_at = NULL
+             WHERE (did = ?1 OR source = 'did-document') AND expires_at IS NOT NULL",
+            params![own_did],
+        )
     }
 
     /// The DID's most-recently-used signing key (raw 32-byte ed25519 public
@@ -2830,7 +2926,7 @@ impl Db {
     pub fn get_signing_key_set(&self, did: &str) -> SqlResult<Vec<SigningKeyRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT kid, pubkey, registered_at,
-                    COALESCE(last_seen_at, registered_at), removed_at, source
+                    COALESCE(last_seen_at, registered_at), removed_at, source, expires_at
              FROM signing_keys WHERE did = ?1
              ORDER BY registered_at DESC, rowid DESC",
         )?;
@@ -2848,7 +2944,7 @@ impl Db {
     pub fn get_signing_key_row(&self, did: &str, kid: &str) -> SqlResult<Option<SigningKeyRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT kid, pubkey, registered_at,
-                    COALESCE(last_seen_at, registered_at), removed_at, source
+                    COALESCE(last_seen_at, registered_at), removed_at, source, expires_at
              FROM signing_keys WHERE did = ?1 AND kid = ?2",
         )?;
         let mut rows = stmt.query_map(params![did, kid], Self::signing_key_row)?;
@@ -2872,6 +2968,7 @@ impl Db {
             last_seen_at: row.get(3)?,
             removed_at: row.get(4)?,
             source: row.get(5)?,
+            expires_at: row.get(6)?,
         }))
     }
 
@@ -8198,6 +8295,115 @@ mod tests {
         let kid = freeq_sdk::act::derive_kid_bytes(&key);
         assert_eq!(db.get_signing_key_by_kid(did, &kid).unwrap(), Some(key));
         assert_eq!(db.get_signing_key(did).unwrap(), Some(key));
+        // Dated as migration 16 dates a row it finds.
+        let row = db.get_signing_key_row(did, &kid).unwrap().unwrap();
+        assert_eq!(row.expires_at, Some(DEFAULT_KEY_LIFETIME_SECS));
+    }
+
+    #[test]
+    fn a_filed_key_keeps_its_dates_when_it_registers_again() {
+        let db = Db::open_memory().unwrap();
+        let key = [8u8; 32];
+        let kid = freeq_sdk::act::derive_kid_bytes(&key);
+        db.save_signing_key_from("did:plc:dates", &key, "origin-server", 1_000, Some(2_000))
+            .unwrap();
+        db.save_signing_key_from("did:plc:dates", &key, "local-session", 5_000, Some(9_000))
+            .unwrap();
+        let row = db
+            .get_signing_key_row("did:plc:dates", &kid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.registered_at, 1_000);
+        assert_eq!(row.expires_at, Some(2_000));
+        assert_eq!(row.source.as_deref(), Some("origin-server"));
+        assert!(row.last_seen_at > 2_000, "only last_seen_at moved");
+    }
+
+    #[test]
+    fn this_servers_keys_never_expire_whoever_files_them() {
+        let db = Db::open_memory().unwrap();
+        db.set_own_did("did:web:irc.example");
+        let key = [9u8; 32];
+        let kid = freeq_sdk::act::derive_kid_bytes(&key);
+        db.save_signing_key_from("did:web:irc.example", &key, "identity-record", 1, Some(2))
+            .unwrap();
+        assert_eq!(
+            db.get_signing_key_row("did:web:irc.example", &kid)
+                .unwrap()
+                .unwrap()
+                .expires_at,
+            None
+        );
+        assert!(
+            !db.set_signing_key_expiry("did:web:irc.example", &kid, Some(3))
+                .unwrap()
+        );
+        // Another server's did:web is not exempt at insert.
+        db.save_signing_key_from("did:web:other.example", &key, "origin-server", 1, Some(2))
+            .unwrap();
+        assert_eq!(
+            db.get_signing_key_row("did:web:other.example", &kid)
+                .unwrap()
+                .unwrap()
+                .expires_at,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn a_did_keys_own_key_never_expires_and_a_session_key_under_it_does() {
+        let db = Db::open_memory().unwrap();
+        let bot = ed25519_dalek::SigningKey::from_bytes(&[10; 32]);
+        let did = format!(
+            "did:key:{}",
+            freeq_sdk::crypto::PublicKey::Ed25519(bot.verifying_key()).to_multibase()
+        );
+        let own = bot.verifying_key().to_bytes();
+        let session = [11u8; 32];
+        db.save_signing_key_from(&did, &own, "local-session", 1, Some(2))
+            .unwrap();
+        db.save_signing_key_from(&did, &session, "local-session", 1, Some(2))
+            .unwrap();
+        let expiry = |key: &[u8; 32]| {
+            db.get_signing_key_row(&did, &freeq_sdk::act::derive_kid_bytes(key))
+                .unwrap()
+                .unwrap()
+                .expires_at
+        };
+        assert_eq!(expiry(&own), None);
+        assert_eq!(expiry(&session), Some(2));
+        db.set_signing_key_expiry(&did, &freeq_sdk::act::derive_kid_bytes(&own), Some(5))
+            .unwrap();
+        assert_eq!(expiry(&own), None, "not even by an update");
+    }
+
+    #[test]
+    fn a_keys_expiry_moves_earlier_or_later() {
+        let db = Db::open_memory().unwrap();
+        let key = [12u8; 32];
+        let kid = freeq_sdk::act::derive_kid_bytes(&key);
+        db.save_signing_key_from("did:plc:moves", &key, "local-session", 1, Some(5_000))
+            .unwrap();
+        let expiry = || {
+            db.get_signing_key_row("did:plc:moves", &kid)
+                .unwrap()
+                .unwrap()
+                .expires_at
+        };
+        assert!(
+            db.set_signing_key_expiry("did:plc:moves", &kid, Some(3_000))
+                .unwrap()
+        );
+        assert_eq!(expiry(), Some(3_000));
+        assert!(
+            db.set_signing_key_expiry("did:plc:moves", &kid, Some(8_000))
+                .unwrap()
+        );
+        assert_eq!(expiry(), Some(8_000));
+        assert!(
+            !db.set_signing_key_expiry("did:plc:moves", "nosuchkid", Some(1))
+                .unwrap()
+        );
     }
 
     #[test]
@@ -8303,14 +8509,26 @@ mod tests {
         let key = [5u8; 32];
         let kid = freeq_sdk::act::derive_kid_bytes(&key);
 
-        db.save_signing_key_from(did, &key, "identity-record")
-            .unwrap();
+        db.save_signing_key_from(
+            did,
+            &key,
+            "identity-record",
+            chrono::Utc::now().timestamp(),
+            None,
+        )
+        .unwrap();
         let row = db.get_signing_key_row(did, &kid).unwrap().expect("on file");
         assert_eq!(row.source.as_deref(), Some("identity-record"));
 
         // The same key seen again, from anywhere: the first source stands.
-        db.save_signing_key_from(did, &key, "origin-server")
-            .unwrap();
+        db.save_signing_key_from(
+            did,
+            &key,
+            "origin-server",
+            chrono::Utc::now().timestamp(),
+            None,
+        )
+        .unwrap();
         db.save_signing_key(did, &key).unwrap();
         let row = db.get_signing_key_row(did, &kid).unwrap().expect("on file");
         assert_eq!(row.source.as_deref(), Some("identity-record"));

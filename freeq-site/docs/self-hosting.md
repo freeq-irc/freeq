@@ -172,6 +172,7 @@ freeq-server --config /etc/freeq/server.toml
 | `--auth-broker-url` / `AUTH_BROKER_URL` | Base URL of the standalone auth broker; a device sign-out deletes its session there (read only with `BROKER_SHARED_SECRET`) |
 | `--record-cache-secs` / `RECORD_CACHE_SECS` | How long a signer's identity-record listing is served from the cache before the PDS is listed again (default: 3600) |
 | `--record-cache-prune-days` / `RECORD_CACHE_PRUNE_DAYS` | How long a signer's cached records and proofs are kept once nobody asks about them (default: 30) |
+| `--signing-key-lifetime-days` / `SIGNING_KEY_LIFETIME_DAYS` | How long a signing key this server files lasts before it expires, counted from when it was first seen; a connection whose key expires is closed and the device signs in again. A key published in the account's records follows its record instead, and this server's own keys, other servers' own keys and a bot's did:key never expire (default: 90) |
 | `GITHUB_CLIENT_ID` | GitHub OAuth for credential verifier |
 | `GITHUB_CLIENT_SECRET` | GitHub OAuth secret |
 

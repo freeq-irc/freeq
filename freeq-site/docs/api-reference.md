@@ -70,7 +70,7 @@ Verify a message's cryptographic signature. Returns the signing key, signature, 
 GET /api/v1/signing-key
 ```
 
-Returns the server's ed25519 public key (base64url-encoded) used for message attestation. `kid` is the key's id, and `registered_at` is when this server first filed the key in its own key store, in seconds since the epoch, or `null` for a server running without a database. `did` is the name the server files its own keys under, `did:web:<server-name>`; the server's whole key set, current and retired, is at `/api/v1/signing-keys/{did}` for that value.
+Returns the server's ed25519 public key (base64url-encoded) used for message attestation. `kid` is the key's id, and `registered_at` is when this server first filed the key in its own key store, in seconds since the epoch, or `null` for a server running without a database. `expires_at` is `null`: a server's own keys never expire. `did` is the name the server files its own keys under, `did:web:<server-name>`; the server's whole key set, current and retired, is at `/api/v1/signing-keys/{did}` for that value.
 
 ### Signing Keys by DID
 
@@ -78,13 +78,13 @@ Returns the server's ed25519 public key (base64url-encoded) used for message att
 GET /api/v1/signing-keys/{did}
 ```
 
-Returns the signing keys an identity has registered. `public_key` is the key it is signing with now — the most recently used key its owner has not retired — or `null` if it has registered none. `keys` lists every key, newest registration first: `kid`, `public_key`, `registered_at`, `last_seen_at`, and `removed_at`, which is `null` while the key is live and otherwise the time its owner retired it. Times are seconds since the epoch. A DID with no keys is a 200 with a null `public_key` and an empty list, not a 404.
+Returns the live signing keys an identity has registered: a key past its expiry is left out, and a retired key stays, with its date. `public_key` is the key it is signing with now — the most recently used key its owner has not retired and that has not expired — or `null` if there is none. `keys` lists each key, newest registration first: `kid`, `public_key`, `registered_at`, `last_seen_at`, `removed_at`, which is `null` while the key is not retired and otherwise the time its owner retired it, and `expires_at`, when the key stops counting, or `null` for a key that never expires (a server's own key, a bot's did:key). `registered_at` is when this server first saw the key; for a key copied from the signer's identity records it is the record's `createdAt`, and for a key copied from a peer server it is the peer's date, or the time of the copy when the peer sent none. Every key expires 90 days after `registered_at` by default (`--signing-key-lifetime-days`), except that a key published in the account's records follows its record's expiry. Times are seconds since the epoch. A DID with no keys is a 200 with a null `public_key` and an empty list, not a 404.
 
 ```
 GET /api/v1/signing-keys/{did}/{kid}
 ```
 
-Returns the one key that identity registered under `kid`, with the same window fields. This is the lookup a verifier uses when a signature names its kid: the key stays fetchable after the session that made it ends. An unknown kid is a 404.
+Returns the one key that identity registered under `kid`, with the same window fields. This is the lookup a verifier uses when a signature names its kid: the key stays fetchable after the session that made it ends, after it is retired and after it expires, with those dates. An unknown kid is a 404.
 
 ### Blob Proxy
 

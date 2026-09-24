@@ -715,6 +715,75 @@ async fn provenance_freeq_bot_delegation_key_retired_before_cert() {
     server_handle.abort();
 }
 
+/// File `key` under `did` as a device key expiring at `expires_at`. A did:key
+/// creator's own key never expires, so the key under test is another one.
+fn file_expiring_key(db_path: &str, did: &str, key: &ed25519_dalek::SigningKey, expires_at: i64) {
+    let db = freeq_server::db::Db::open(db_path).unwrap();
+    db.save_signing_key_from(
+        did,
+        key.verifying_key().as_bytes(),
+        "local-session",
+        CERT_CREATED_AT - 86_400,
+        Some(expires_at),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn provenance_freeq_bot_delegation_key_expired_before_cert() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("expired.db");
+    let db_path = db_path.to_str().unwrap();
+    let (addr, server_handle) = start_test_server_with_db_file(empty_resolver(), db_path).await;
+
+    let (creator_did, _) = register_creator_msgsig(addr, "creator").await;
+    // The cert is signed by a key that expired an hour before it was made.
+    let device = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    file_expiring_key(db_path, &creator_did, &device, CERT_CREATED_AT - 3_600);
+
+    let (bot_did, handle, mut events) = connect_did_key(addr, "expiredbot").await;
+    let cert = build_signed_cert(&bot_did, &creator_did, &device);
+    handle.submit_provenance(&cert).await.unwrap();
+
+    expect_raw_line(
+        &mut events,
+        2000,
+        "Provenance stored (unverified)",
+        "cert signed by an expired key stored unverified",
+    )
+    .await;
+
+    handle.quit(None).await.unwrap();
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn provenance_freeq_bot_delegation_key_expiring_after_cert_verifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("expires-later.db");
+    let db_path = db_path.to_str().unwrap();
+    let (addr, server_handle) = start_test_server_with_db_file(empty_resolver(), db_path).await;
+
+    let (creator_did, _) = register_creator_msgsig(addr, "creator").await;
+    let device = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    file_expiring_key(db_path, &creator_did, &device, CERT_CREATED_AT + 3_600);
+
+    let (bot_did, handle, mut events) = connect_did_key(addr, "expireslaterbot").await;
+    let cert = build_signed_cert(&bot_did, &creator_did, &device);
+    handle.submit_provenance(&cert).await.unwrap();
+
+    expect_raw_line(
+        &mut events,
+        2000,
+        "Provenance verified",
+        "cert made while the key was live verifies",
+    )
+    .await;
+
+    handle.quit(None).await.unwrap();
+    server_handle.abort();
+}
+
 #[tokio::test]
 async fn provenance_freeq_bot_delegation_key_retired_after_cert_still_verifies() {
     let dir = tempfile::tempdir().unwrap();

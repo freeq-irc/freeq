@@ -122,8 +122,8 @@ pub(super) fn verify_provenance(
         }
     };
 
-    // The cert says when it was made, so a key retired before that date is not
-    // a candidate — its owner had withdrawn it by then. A key retired later
+    // The cert says when it was made, so a key retired or expired before that
+    // date is not a candidate — its owner had withdrawn it by then. A key retired later
     // still is: the cert was made while it was live, and retiring a key does
     // not undo what it signed beforehand. An undated cert cannot be judged
     // this way at all, so it is not verified.
@@ -137,9 +137,11 @@ pub(super) fn verify_provenance(
             "Cert created_at is not RFC 3339",
         ));
     };
+    // An expiry counts like a retirement: a key past it had stopped counting.
     let candidate_keys: Vec<[u8; 32]> = registered
         .iter()
         .filter(|row| row.removed_at.is_none_or(|removed| removed > created_at))
+        .filter(|row| row.expires_at.is_none_or(|expires| expires > created_at))
         .map(|row| row.pubkey)
         .collect();
     if candidate_keys.is_empty() {

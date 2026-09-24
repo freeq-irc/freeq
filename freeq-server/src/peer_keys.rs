@@ -233,12 +233,46 @@ fn start_lookup(state: &Arc<SharedState>, bases: Vec<String>, did: &str, kid: &s
                     KeySource::DidDocument => "did-document",
                     KeySource::OriginServer => "origin-server",
                 };
-                // A key the signer's records retire is filed retired, and no
-                // peer is then asked for a live copy.
-                let retired_at = found
-                    .retired_at
-                    .filter(|_| found.source == KeySource::IdentityRecord);
-                key_landed(&state, &did, &kid, &found.public_key, source, retired_at);
+                let now = chrono::Utc::now().timestamp();
+                let (dates, retired_at) = match found.source {
+                    // A published key keeps its record's dates. A key the
+                    // records retire is filed retired, and no peer is then
+                    // asked for a live copy; one they only let expire is not
+                    // stamped, since an expiry is not a retirement.
+                    KeySource::IdentityRecord => (
+                        KeyDates {
+                            registered_at: found.created_at.unwrap_or(now),
+                            expires_at: found.expires_at,
+                        },
+                        found
+                            .retired_at
+                            .filter(|at| found.expires_at.is_none_or(|exp| *at < exp)),
+                    ),
+                    // Its own document's key: its owner rotates it.
+                    KeySource::DidDocument => (
+                        KeyDates {
+                            registered_at: now,
+                            expires_at: None,
+                        },
+                        None,
+                    ),
+                    KeySource::OriginServer => (
+                        KeyDates {
+                            registered_at: now,
+                            expires_at: Some(now + crate::key_expiry::lifetime_secs(&state)),
+                        },
+                        None,
+                    ),
+                };
+                key_landed(
+                    &state,
+                    &did,
+                    &kid,
+                    &found.public_key,
+                    source,
+                    dates,
+                    retired_at,
+                );
                 return;
             }
             Ok(None) => {}
@@ -249,8 +283,17 @@ fn start_lookup(state: &Arc<SharedState>, bases: Vec<String>, did: &str, kid: &s
         }
         for base in &bases {
             match fetch_key(base, &did, &kid).await {
-                Ok(pubkey) => {
-                    key_landed(&state, &did, &kid, &pubkey, "origin-server", None);
+                Ok(peer) => {
+                    let dates = peer_copy_dates(&peer, crate::key_expiry::lifetime_secs(&state));
+                    key_landed(
+                        &state,
+                        &did,
+                        &kid,
+                        &peer.pubkey,
+                        "origin-server",
+                        dates,
+                        None,
+                    );
                     return;
                 }
                 Err(e) => tracing::debug!(
@@ -266,6 +309,14 @@ fn start_lookup(state: &Arc<SharedState>, bases: Vec<String>, did: &str, kid: &s
     });
 }
 
+/// When a filed key was first seen and when it expires, unix seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeyDates {
+    pub registered_at: i64,
+    /// None: the key never expires.
+    pub expires_at: Option<i64>,
+}
+
 /// File a key that answered a lookup and release what was waiting on it.
 fn key_landed(
     state: &Arc<SharedState>,
@@ -273,12 +324,15 @@ fn key_landed(
     kid: &str,
     pubkey: &[u8; 32],
     source: &str,
+    dates: KeyDates,
     retired_at: Option<i64>,
 ) {
     // Append-only and keyed by (did, kid), the same store a local registration
     // writes to. The kid is a hash of the key bytes, so a fetched key cannot
     // displace a different key already on file under that id.
-    state.with_db(|db| db.save_signing_key_from(did, pubkey, source));
+    state.with_db(|db| {
+        db.save_signing_key_from(did, pubkey, source, dates.registered_at, dates.expires_at)
+    });
     // Stamped before anything parked on the key is judged against it.
     if let Some(retired_at) = retired_at {
         state.with_db(|db| db.retire_signing_key(did, kid, retired_at));
@@ -297,7 +351,34 @@ fn key_landed(
 /// key server could answer any request with a key of its choosing and every
 /// signature by that key would verify — the kid is what binds the answer to
 /// the question.
-async fn fetch_key(base: &str, did: &str, kid: &str) -> anyhow::Result<[u8; 32]> {
+/// The dates a peer's copy of a key is filed with. An expiry the peer sent,
+/// a date or null, is kept as sent: its null is its own exemption, trusted.
+/// Without one, the key expires `lifetime` after the peer's `registered_at`,
+/// or, from a peer that sends no dates, after now, when this server copied it.
+fn peer_copy_dates(peer: &PeerKey, lifetime: i64) -> KeyDates {
+    let now = chrono::Utc::now().timestamp();
+    let registered_at = peer.registered_at.unwrap_or(now);
+    let expires_at = match peer.expires_at {
+        Some(sent) => sent,
+        None => Some(registered_at + lifetime),
+    };
+    KeyDates {
+        registered_at,
+        expires_at,
+    }
+}
+
+/// A key a peer's key server answered, with the dates it sent.
+struct PeerKey {
+    pubkey: [u8; 32],
+    /// The peer's `registered_at`, if it sent one.
+    registered_at: Option<i64>,
+    /// The peer's `expires_at`: None when it sent none (a server from before
+    /// expiries), `Some(None)` when it sent null (a key it never expires).
+    expires_at: Option<Option<i64>>,
+}
+
+async fn fetch_key(base: &str, did: &str, kid: &str) -> anyhow::Result<PeerKey> {
     use base64::Engine;
 
     let url = format!(
@@ -327,7 +408,19 @@ async fn fetch_key(base: &str, did: &str, kid: &str) -> anyhow::Result<[u8; 32]>
         freeq_sdk::sigtag::derive_kid_bytes(&bytes) == kid,
         "key server answered with a key that does not hash to the requested kid"
     );
-    Ok(bytes)
+    Ok(PeerKey {
+        pubkey: bytes,
+        registered_at: body.get("registered_at").and_then(|v| v.as_i64()),
+        // Only a JSON null means "never"; a value that is neither null nor an
+        // integer is read as none sent, so the lifetime rule applies.
+        expires_at: body.get("expires_at").and_then(|v| {
+            if v.is_null() {
+                Some(None)
+            } else {
+                v.as_i64().map(Some)
+            }
+        }),
+    })
 }
 
 /// A PDS on a loopback port listing `records` as `did`'s device keys, and a
@@ -967,6 +1060,12 @@ mod tests {
             source_of(&state, did, &kid).as_deref(),
             Some("did-document")
         );
+        // Another server's own key: its owner rotates it, so it never expires.
+        let row = state
+            .with_db(|db| db.get_signing_key_row(did, &kid))
+            .flatten()
+            .unwrap();
+        assert_eq!(row.expires_at, None);
     }
 
     /// A parked event's retry reads the signer's records again, even inside
@@ -1055,5 +1154,200 @@ mod tests {
             Some("origin-server")
         );
         assert_eq!(peer_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // ── the dates a copied key is filed with ─────────────────────
+
+    const DAY: i64 = 24 * 60 * 60;
+
+    /// A key server answering every request with `key` and the extra `fields`.
+    async fn dated_key_server(key: [u8; 32], fields: serde_json::Value) -> String {
+        use base64::Engine;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/api/v1/signing-keys/{did}/{kid}",
+            axum::routing::get(move || {
+                let mut body = serde_json::json!({
+                    "public_key": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key),
+                    "algorithm": "ed25519",
+                });
+                for (name, value) in fields.as_object().unwrap() {
+                    body[name] = value.clone();
+                }
+                async move { axum::Json(body) }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// The row a peer copy of a fresh key is filed with, from a key server
+    /// that sends `fields`.
+    async fn peer_copy(fields: serde_json::Value) -> crate::db::SigningKeyRow {
+        let did = format!("did:plc:dated{}", rand::random::<u32>());
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let base = dated_key_server(*key.verifying_key().as_bytes(), fields).await;
+        let state = state_with(&base, stub_pds_resolver(&did, vec![]).await);
+        fetch_on_miss(
+            &state,
+            PEER,
+            &did,
+            &freeq_sdk::sigtag::sign_canonical("{}", &key),
+        );
+        assert!(wait_for_key(&state, &did, &kid).await.is_some());
+        state
+            .with_db(|db| db.get_signing_key_row(&did, &kid))
+            .flatten()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_peer_copy_keeps_the_dates_its_origin_sent() {
+        let row = peer_copy(serde_json::json!({
+            "registered_at": 1_700_000_000,
+            "expires_at": 1_800_000_000,
+        }))
+        .await;
+        assert_eq!(row.registered_at, 1_700_000_000);
+        assert_eq!(row.expires_at, Some(1_800_000_000));
+    }
+
+    #[tokio::test]
+    async fn a_peer_copy_the_origin_never_expires_is_filed_without_an_expiry() {
+        let row = peer_copy(serde_json::json!({
+            "registered_at": 1_700_000_000,
+            "expires_at": null,
+        }))
+        .await;
+        assert_eq!(row.registered_at, 1_700_000_000);
+        assert_eq!(row.expires_at, None);
+    }
+
+    #[tokio::test]
+    async fn a_peer_expiry_that_is_not_a_date_or_null_counts_as_none_sent() {
+        for sent in [serde_json::json!("soon"), serde_json::json!(1.8e9)] {
+            let row = peer_copy(serde_json::json!({
+                "registered_at": 1_700_000_000,
+                "expires_at": sent,
+            }))
+            .await;
+            assert_eq!(
+                row.expires_at,
+                Some(1_700_000_000 + 90 * DAY),
+                "expires_at {sent} is not a never-expires null"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_copy_with_only_a_registration_date_expires_a_lifetime_after_it() {
+        let row = peer_copy(serde_json::json!({ "registered_at": 1_700_000_000 })).await;
+        assert_eq!(row.registered_at, 1_700_000_000);
+        assert_eq!(row.expires_at, Some(1_700_000_000 + 90 * DAY));
+    }
+
+    #[tokio::test]
+    async fn a_copy_from_a_peer_that_sends_no_dates_counts_from_when_it_was_copied() {
+        let before = chrono::Utc::now().timestamp();
+        let row = peer_copy(serde_json::json!({})).await;
+        let after = chrono::Utc::now().timestamp();
+        assert!((before..=after).contains(&row.registered_at), "{row:?}");
+        assert_eq!(row.expires_at, Some(row.registered_at + 90 * DAY));
+    }
+
+    /// A key record of `did` made at `created_at` and expiring at `expires_at`.
+    fn dated_record(
+        did: &str,
+        key: &ed25519_dalek::SigningKey,
+        created_at: &str,
+        expires_at: &str,
+    ) -> serde_json::Value {
+        let key = freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&key.to_bytes()).unwrap();
+        serde_json::to_value(
+            freeq_sdk::identity_records::build_device_record_with_expiry(
+                &key, did, created_at, expires_at, None,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// The row a key found in `did`'s records is filed with.
+    async fn record_copy(
+        did: &str,
+        key: &ed25519_dalek::SigningKey,
+        records: Vec<serde_json::Value>,
+    ) -> crate::db::SigningKeyRow {
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let (base, _) = counting_key_server(None).await;
+        let state = state_with(&base, stub_pds_resolver(did, records).await);
+        fetch_on_miss(
+            &state,
+            PEER,
+            did,
+            &freeq_sdk::sigtag::sign_canonical("{}", key),
+        );
+        assert!(wait_for_key(&state, did, &kid).await.is_some());
+        // The retirement stamp, if any, lands just after the row.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        state
+            .with_db(|db| db.get_signing_key_row(did, &kid))
+            .flatten()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_key_found_in_the_records_is_filed_with_its_records_dates() {
+        let did = "did:plc:recorddates";
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let made = chrono::Utc::now() - chrono::TimeDelta::days(2);
+        let created_at = made.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        // A later expiry than the default: the record's date is kept, uncapped.
+        let row = record_copy(
+            did,
+            &key,
+            vec![dated_record(did, &key, &created_at, "2099-01-01T00:00:00Z")],
+        )
+        .await;
+        assert_eq!(row.registered_at, made.timestamp());
+        assert_eq!(
+            row.expires_at,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+        assert_eq!(row.removed_at, None);
+    }
+
+    #[tokio::test]
+    async fn a_key_its_records_let_expire_is_filed_expired_not_retired() {
+        let did = "did:plc:recordexpired";
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let row = record_copy(
+            did,
+            &key,
+            vec![dated_record(
+                did,
+                &key,
+                "2026-01-01T00:00:00Z",
+                "2026-02-01T00:00:00Z",
+            )],
+        )
+        .await;
+        assert_eq!(
+            row.expires_at,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-02-01T00:00:00Z")
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+        assert_eq!(row.removed_at, None, "only a retirement stamps removed_at");
     }
 }

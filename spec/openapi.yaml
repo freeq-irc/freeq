@@ -847,6 +847,13 @@ paths:
       tags: [identity]
       operationId: getDidSigningKeys
       summary: Registered client session signing keys for a DID.
+      description: |
+        The DID's unexpired keys, newest registration first: a key past its
+        `expires_at` is left out; a retired key stays, with its `removed_at`.
+        `public_key` is the most recently used key that is neither retired
+        nor expired, or null. A DID with no keys is a 200 with a null
+        `public_key` and an empty `keys`. An expired key is still answered
+        by `/api/v1/signing-keys/{did}/{kid}`.
       parameters:
         - $ref: "#/components/parameters/Did"
       security: [{}]
@@ -856,8 +863,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-        "404": { $ref: "#/components/responses/NotFound" }
+                $ref: "#/components/schemas/SigningKeySet"
   /api/v1/signing-keys/{did}/{kid}:
     get:
       tags: [identity]
@@ -2329,13 +2335,61 @@ components:
               items: { type: string }
     SigningKey:
       type: object
+      description: |
+        One signing key. `/api/v1/signing-keys/{did}/{kid}` answers every
+        field but the server-key ones; `/api/v1/signing-key` (this server's
+        own key) answers `algorithm`, `public_key`, `kid`, `registered_at`,
+        `expires_at`, `did`, `encoding` and the server-key fields. Times are
+        seconds since the epoch.
       properties:
         did: { type: string }
         kid: { type: string }
-        alg: { type: string, examples: [ed25519] }
+        algorithm: { type: string, examples: [ed25519] }
         public_key:
           type: string
           description: base64url (unpadded) raw public key bytes.
+        encoding: { type: string, examples: [base64url] }
+        source: { type: string, examples: [key-store] }
+        registered_at:
+          type: [integer, "null"]
+          description: |
+            When this server first saw the key; for a key copied from the
+            signer's records, the record's `createdAt`; for a key copied from
+            a peer server, the peer's date, or the copy time when the peer
+            sent none. Null only for this server's key without a database.
+        last_seen_at: { type: integer }
+        removed_at:
+          type: [integer, "null"]
+          description: When the key's owner retired it; null while it is not retired.
+        expires_at:
+          type: [integer, "null"]
+          description: |
+            When the key stops counting; null for a key that never expires
+            (a server's own key, a bot's did:key).
+        usage: { type: string }
+        canonical_form: { type: string }
+        spec: { type: string }
+        sig_tag_format: { type: string }
+        tag: { type: string }
+    SigningKeySet:
+      type: object
+      properties:
+        did: { type: string }
+        algorithm: { type: string }
+        public_key: { type: [string, "null"] }
+        encoding: { type: string }
+        source: { type: string }
+        keys:
+          type: array
+          items:
+            type: object
+            properties:
+              kid: { type: string }
+              public_key: { type: string }
+              registered_at: { type: integer }
+              last_seen_at: { type: integer }
+              removed_at: { type: [integer, "null"] }
+              expires_at: { type: [integer, "null"] }
     VerifyResult:
       type: object
       properties:

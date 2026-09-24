@@ -584,7 +584,15 @@ mod tests {
 
     /// DID has a signing key on file, so it has appeared here.
     fn appear(state: &SharedState) {
-        state.with_db(|db| db.save_signing_key_from(DID, &[7u8; 32], "local-session"));
+        state.with_db(|db| {
+            db.save_signing_key_from(
+                DID,
+                &[7u8; 32],
+                "local-session",
+                chrono::Utc::now().timestamp(),
+                None,
+            )
+        });
     }
 
     /// A state on an in-memory database where DID has appeared.

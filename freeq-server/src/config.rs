@@ -124,6 +124,14 @@ pub struct ServerConfig {
     #[arg(long, env = "RECORD_CACHE_SECS", default_value = "3600")]
     pub record_cache_secs: u64,
 
+    /// How long a signing key this server files lasts before it expires, in
+    /// days, counted from when it was first seen (or the date a peer sent).
+    /// A key published in the account's records follows its record instead.
+    /// This server's own keys, other servers' own keys and a bot's did:key
+    /// never expire.
+    #[arg(long, env = "SIGNING_KEY_LIFETIME_DAYS", default_value = "90")]
+    pub signing_key_lifetime_days: u64,
+
     /// How long a signer's cached records and proofs are kept once nobody
     /// has asked about them, in days.
     #[arg(long, env = "RECORD_CACHE_PRUNE_DAYS", default_value = "30")]
@@ -403,6 +411,7 @@ impl Default for ServerConfig {
             s2s_peer_api: vec![],
             peer_key_retry_secs: 60,
             record_cache_secs: 3600,
+            signing_key_lifetime_days: 90,
             record_cache_prune_days: 30,
             s2s_peer_trust: vec![],
             server_did: None,
@@ -551,6 +560,7 @@ struct FileConfig {
     s2s_peer_api: Option<MapOrPairs>,
     peer_key_retry_secs: Option<u64>,
     record_cache_secs: Option<u64>,
+    signing_key_lifetime_days: Option<u64>,
     record_cache_prune_days: Option<u64>,
     s2s_peer_trust: Option<MapOrPairs>,
     server_did: Option<String>,
@@ -687,6 +697,7 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
         max_messages_per_channel,
         peer_key_retry_secs,
         record_cache_secs,
+        signing_key_lifetime_days,
         record_cache_prune_days,
         act_expiry_secs,
         act_review_secs,
@@ -759,6 +770,7 @@ mod tests {
                 act_orphan_secs = 5
                 peer_key_retry_secs = 3
                 record_cache_secs = 600
+                signing_key_lifetime_days = 1
                 record_cache_prune_days = 7
                 s2s_peer_api = ["abcd=https://irc.example.com"]
                 "#,
@@ -776,6 +788,7 @@ mod tests {
         assert_eq!(c.act_orphan_secs, 5);
         assert_eq!(c.peer_key_retry_secs, 3);
         assert_eq!(c.record_cache_secs, 600);
+        assert_eq!(c.signing_key_lifetime_days, 1);
         assert_eq!(c.record_cache_prune_days, 7);
         assert_eq!(c.s2s_peer_api, vec!["abcd=https://irc.example.com"]);
     }
@@ -800,6 +813,7 @@ mod tests {
         assert_eq!(c.act_defer_max_total, 4096);
         assert_eq!(c.peer_key_retry_secs, 60);
         assert_eq!(c.record_cache_secs, 3600);
+        assert_eq!(c.signing_key_lifetime_days, 90);
         assert_eq!(c.record_cache_prune_days, 30);
     }
 

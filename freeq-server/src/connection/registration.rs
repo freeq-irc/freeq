@@ -586,6 +586,9 @@ pub(super) fn try_complete_registration(
         ) {
             let reply = Message::from_server(server_name, "FAIL", vec!["MSGSIG", code, detail]);
             send(state, session_id, format!("{reply}\r\n"));
+            if code == "KEY_EXPIRED" {
+                super::close_for_expired_key(state, session_id, conn.broker_token.as_deref());
+            }
         } else {
             let reply = Message::from_server(server_name, "MSGSIG", vec!["OK"]);
             send(state, session_id, format!("{reply}\r\n"));

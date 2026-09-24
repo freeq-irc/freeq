@@ -64,6 +64,11 @@
 ## How long a signer's identity-record listing is served from this server's
 ## cache before the signer's PDS is listed again (seconds):
 # record_cache_secs = 3600
+## How long a signing key this server files lasts before it expires (days),
+## counted from when it was first seen. A key published in the account's
+## records follows its record; this server's own keys, other servers' own keys
+## and a bot's did:key never expire:
+# signing_key_lifetime_days = 90
 ## How long a signer's cached records and proofs are kept once nobody has
 ## asked about them (days):
 # record_cache_prune_days = 30

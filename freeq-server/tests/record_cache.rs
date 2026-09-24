@@ -341,7 +341,15 @@ async fn a_restarted_server_serves_what_it_kept() {
     let served = stub_repo(&[device_record(1), device_record(2)]);
     {
         let (_http, state) = start(config.clone(), served.resolver.clone()).await;
-        state.with_db(|db| db.save_signing_key_from(DID, &[7u8; 32], "local-session"));
+        state.with_db(|db| {
+            db.save_signing_key_from(
+                DID,
+                &[7u8; 32],
+                "local-session",
+                chrono::Utc::now().timestamp(),
+                None,
+            )
+        });
         fill(&state, &served);
     }
 
