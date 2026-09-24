@@ -285,6 +285,54 @@ describe('publishing the device key through the broker', () => {
     expect(refresh, 'the account it published to').toHaveBeenCalledWith(DID);
   });
 
+  /** A key lookup on a store holding, for DID and `stored`'s kid, an answer
+   *  from the origin server when `vouched`. */
+  async function lookupHolding(stored: StoredDeviceKey, vouched: boolean) {
+    const { KeyLookup, MemoryKeyLookupStore } = await import('./key-lookup.js');
+    const raw = new Uint8Array(await crypto.subtle.exportKey('raw', stored.keyPair.publicKey));
+    const slot = JSON.stringify([DID, await deriveKid(raw)]);
+    const cache = new MemoryKeyLookupStore();
+    await cache.save({
+      keys: vouched
+        ? [[slot, { records: [], other: { publicKey: raw, source: 'OriginServer', retiredAt: null, expiresAt: null }, at: Date.now() }]]
+        : [],
+      records: [],
+      proven: [],
+    });
+    const lookup = new KeyLookup(
+      { fetch: globalThis.fetch as never, resolveDid: async () => ({ id: DID }) as never },
+      null,
+      3_600_000,
+      undefined,
+      cache,
+    );
+    return { lookup, refresh: vi.spyOn(lookup, 'refreshAccount') };
+  }
+
+  it('re-lists its own account on connect when its published key reads as vouched', async () => {
+    const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+    const { lookup, refresh } = await lookupHolding(stored, true);
+    const { client } = await makeClient(new MemoryDeviceKeyStore(stored), true, lookup);
+    await login(client);
+    await until(() => refresh.mock.calls.length > 0);
+    await pause();
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(refresh).toHaveBeenCalledWith(DID);
+  });
+
+  it('does not re-list when its published key reads as published, or its key is not published', async () => {
+    enrollAnswer = { status: 403, body: { error: 'insufficient_scope' } };
+    const published = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+    const first = await lookupHolding(published, false);
+    await login((await makeClient(new MemoryDeviceKeyStore(published), true, first.lookup)).client);
+    const unpublished = await storedKey();
+    const second = await lookupHolding(unpublished, true);
+    await login((await makeClient(new MemoryDeviceKeyStore(unpublished), true, second.lookup)).client);
+    await pause();
+    expect(first.refresh).not.toHaveBeenCalled();
+    expect(second.refresh).not.toHaveBeenCalled();
+  });
+
   it('reports a session that cannot publish once per connection, and tries again next connect', async () => {
     enrollAnswer = { status: 403, body: { error: 'insufficient_scope' } };
     const store = new MemoryDeviceKeyStore(await storedKey());

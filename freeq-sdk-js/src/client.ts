@@ -1774,10 +1774,32 @@ export class FreeqClient extends EventEmitter {
       }
       const pubkey = await this.signing.useKeyPair(stored.keyPair);
       if (!stored.recordUri) this.pendingEnrollment = stored;
+      else void this.relistIfVouched(stored);
       return pubkey;
     } catch (e) {
       log.warn('[freeq-sdk] device key unavailable, signing with a session key:', e);
       return this.signing.generateSigningKey();
+    }
+  }
+
+  /**
+   * A published key whose held answer is the origin server's was looked up
+   * before its record was listed (a lookup made before it was published, or
+   * one whose listing predates it). List the account once, so this client's
+   * own lines read as published rather than vouched. Off the connect path;
+   * never fails.
+   */
+  private async relistIfVouched(stored: StoredDeviceKey): Promise<void> {
+    const lookup = this.opts.keyLookup;
+    const did = this.sasl?.did;
+    if (!lookup || !did) return;
+    try {
+      const raw = new Uint8Array(await crypto.subtle.exportKey('raw', stored.keyPair.publicKey));
+      if (await lookup.holdsOriginAnswer(did, await signing.deriveKid(raw))) {
+        await lookup.refreshAccount(did);
+      }
+    } catch {
+      // The next connect checks again.
     }
   }
 

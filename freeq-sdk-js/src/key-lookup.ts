@@ -696,6 +696,16 @@ export class KeyLookup {
   }
 
   /**
+   * Whether the answer held for `(did, kid)` came from the origin server: a
+   * key the server vouched for, which a listing of the account's records
+   * could turn into a published one. Reads the stored snapshot first.
+   */
+  async holdsOriginAnswer(did: string, kid: string): Promise<boolean> {
+    await this.load();
+    return this.cache.get(JSON.stringify([did, kid]))?.other?.source === 'OriginServer';
+  }
+
+  /**
    * List `did`'s account at the PDS now, however recently it was listed:
    * this client has just published a device key record of its own, and the
    * home server's copy may predate it. Then drops the cached answers a new
