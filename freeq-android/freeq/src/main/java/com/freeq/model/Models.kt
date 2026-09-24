@@ -427,6 +427,21 @@ class AppState(application: Application) : AndroidViewModel(application) {
         // brokerToken alone is enough — broker /session call returns the real
         // handle, so we don't need a saved nick to attempt reconnect.
         get() = brokerToken != null
+
+    /** Whether the last session was a guest's; null when never written (an
+     *  install that predates it). Kept in the plain prefs, which survive the
+     *  encrypted prefs being rebuilt, so an account whose token is lost is
+     *  not mistaken for a guest. See [ReconnectDecision]. */
+    var lastSessionWasGuest: Boolean?
+        get() = if (prefs.contains("lastSessionWasGuest")) prefs.getBoolean("lastSessionWasGuest", false) else null
+        set(value) {
+            if (value == null) prefs.edit().remove("lastSessionWasGuest").apply()
+            else prefs.edit().putBoolean("lastSessionWasGuest", value).apply()
+        }
+
+    /** What to do to get back online after finding the connection down. */
+    internal val reconnectAction: ReconnectDecision.Action
+        get() = ReconnectDecision.decide(hasSavedSession, lastSessionWasGuest, nick.value)
     val lastReadMessageIds = mutableStateMapOf<String, String>()
     val lastReadTimestamps = mutableStateMapOf<String, Long>()
     var isDarkTheme = mutableStateOf(true)
@@ -606,6 +621,9 @@ class AppState(application: Application) : AndroidViewModel(application) {
     /** [freshSignIn]: this connect follows this app's own OAuth sign-in
      *  completing. Never true for a restored session or a reconnect. */
     fun connect(nickName: String, freshSignIn: Boolean = false) {
+        // Every account path sets pendingWebToken before calling this; a
+        // connect without one is a guest's.
+        if (pendingWebToken == null) lastSessionWasGuest = true
         // Fresh user-initiated connect — start by preferring WebSocket again.
         transportFallbackUsed = false
         connect(nickName, useWebSocket = true, freshSignIn = freshSignIn)
@@ -819,6 +837,7 @@ class AppState(application: Application) : AndroidViewModel(application) {
                 val session = withContext(Dispatchers.IO) { fetchBrokerSession(token) }
                 brokerRetryCount = 0
                 pendingWebToken = session.token
+                lastSessionWasGuest = false
                 cacheWebToken(session.token)
                 authenticatedDID.value = session.did
                 securePrefs.edit().putString("did", session.did).apply()
@@ -1495,6 +1514,7 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
             }
 
             is FreeqEvent.Authenticated -> {
+                state.lastSessionWasGuest = false
                 state.authenticatedDID.value = event.did
                 state.securePrefs.edit().putString("did", event.did).apply()
                 // Refresh login timestamp on every successful auth so
@@ -1851,10 +1871,10 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                         kotlinx.coroutines.delay(delay * 1000)
                         if (state.connectionState.value == ConnectionState.Disconnected
                             && state.nick.value.isNotEmpty()) {
-                            if (state.hasSavedSession) {
-                                state.reconnectSavedSession()
-                            } else {
-                                state.connect(state.nick.value)
+                            when (state.reconnectAction) {
+                                ReconnectDecision.Action.ReconnectSavedSession -> state.reconnectSavedSession()
+                                ReconnectDecision.Action.ConnectAsGuest -> state.connect(state.nick.value)
+                                ReconnectDecision.Action.None -> {}
                             }
                         }
                     }

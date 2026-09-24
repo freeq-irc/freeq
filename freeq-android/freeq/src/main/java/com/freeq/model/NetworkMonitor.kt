@@ -59,13 +59,13 @@ class NetworkMonitor(context: Context) {
         scope.launch {
             delay(1000)
             if (state.connectionState.value != ConnectionState.Disconnected) return@launch
-            if (state.hasSavedSession) {
+            when (state.reconnectAction) {
                 // Authenticated path — a plain connect() here would come
                 // back as a guest. Fresh call resets the broker retry
                 // budget the failed wake-up episode exhausted.
-                state.reconnectSavedSession()
-            } else if (state.nick.value.isNotEmpty()) {
-                state.connect(state.nick.value)
+                ReconnectDecision.Action.ReconnectSavedSession -> state.reconnectSavedSession()
+                ReconnectDecision.Action.ConnectAsGuest -> state.connect(state.nick.value)
+                ReconnectDecision.Action.None -> {}
             }
         }
     }

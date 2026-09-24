@@ -13,6 +13,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.freeq.model.AppState
+import com.freeq.model.ReconnectDecision
 import com.freeq.model.ServerConfig
 import com.freeq.ui.FreeqApp
 
@@ -45,8 +46,11 @@ class MainActivity : ComponentActivity() {
             if (state.connectionState.value == com.freeq.model.ConnectionState.Disconnected &&
                 !state.intentionalDisconnect
             ) {
-                if (state.hasSavedSession) state.reconnectSavedSession()
-                else if (state.nick.value.isNotEmpty()) state.connect(state.nick.value)
+                when (state.reconnectAction) {
+                    ReconnectDecision.Action.ReconnectSavedSession -> state.reconnectSavedSession()
+                    ReconnectDecision.Action.ConnectAsGuest -> state.connect(state.nick.value)
+                    ReconnectDecision.Action.None -> {}
+                }
             }
         }
     }
@@ -94,6 +98,7 @@ class MainActivity : ComponentActivity() {
                 val handle = uri.getQueryParameter("handle")
 
                 state.pendingWebToken = token
+                state.lastSessionWasGuest = false
                 brokerTok?.let { state.brokerToken = it }
                 did?.let { state.authenticatedDID.value = it }
                 // Persist secrets for session restore
