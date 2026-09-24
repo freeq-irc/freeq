@@ -953,6 +953,23 @@ describe('KeyLookup through the home server', () => {
     expect(hits.origin).toBe(0);
   });
 
+  it("answers a line during its account's prefetch from that prefetch, with no second request", async () => {
+    const { home, pds, fetch, resolveDid } = await homeNetwork();
+    // The batch answer takes a while, so the line arrives while it is out.
+    const slow = async (url: string): Promise<Response> => {
+      if (new URL(url).pathname === '/api/v1/records') await new Promise((r) => setTimeout(r, 50));
+      return fetch(url);
+    };
+    const lookup = new KeyLookup({ fetch: slow, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    const prefetching = lookup.prefetch([ALICE, BOB]);
+    // A live line from Alice while the prefetch is on the wire.
+    const found = await lookup.keyFor(ALICE, await kidOf(1));
+    await prefetching;
+    expect(found?.source).toBe('IdentityRecord');
+    expect(home.hits).toEqual({ ...noHome, batch: 1 });
+    expect(pds).toEqual({ listings: 0, proofs: 0 });
+  });
+
   it("remembers no key miss for an account whose records the prefetch did not bring", async () => {
     const { home, fetch, resolveDid } = await homeNetwork();
     // The home server has not seen Alice: her records are not prefetched,

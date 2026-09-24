@@ -613,12 +613,25 @@ export class KeyLookup {
    * record's proof. Whatever it does not serve is read from the PDS. A
    * listing that fails is not kept.
    *
+   * A prefetch in flight for the account is waited for first, and its
+   * listing used when it brought one.
+   *
    * `direct` lists at the PDS, the home server skipped, and always starts a
    * new listing, which lookups starting meanwhile join. Either way a listing
    * is kept only if none newer is held (`keepListing`), and is dated from
    * before its request.
    */
   private listDeviceRecords(did: string, direct = false): Promise<unknown[]> {
+    // A prefetch in flight for the account brings its listing: wait for it,
+    // and use that listing rather than asking again.
+    const prefetching = direct ? undefined : this.prefetching.get(did);
+    if (prefetching !== undefined) {
+      return prefetching.then(() => {
+        const held = this.records.get(did);
+        if (held !== undefined && Date.now() - held.at < this.ttlMs) return held.records;
+        return this.listDeviceRecords(did);
+      });
+    }
     let pending = direct ? undefined : this.listing.get(did);
     if (pending === undefined) {
       const started: Promise<unknown[]> = (async () => {
