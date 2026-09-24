@@ -760,7 +760,10 @@ impl Db {
                 // message under — when they emit.
                 //
                 // Superseded revisions are excluded, matching the
-                // decrypt-and-scan path below. An edit made since the upgrade
+                // decrypt-and-scan path below. "Newer" is the order
+                // `current_revision` reads: time, then an edit over its root,
+                // then msgid, then row id — not the row id alone, which made
+                // an edit filed late but written earlier the current text. An edit made since the upgrade
                 // leaves the index on its own, but rows indexed before it are
                 // still there, and returning them alongside the current one
                 // yields two hits for one logical message.
@@ -776,7 +779,10 @@ impl Db {
                        SELECT 1 FROM messages newer
                        WHERE newer.channel = m.channel
                          AND newer.root_msgid = m.root_msgid
-                         AND newer.id > m.id
+                         AND (newer.timestamp, newer.replaces_msgid IS NOT NULL,
+                              COALESCE(newer.msgid, ''), newer.id)
+                           > (m.timestamp, m.replaces_msgid IS NOT NULL,
+                              COALESCE(m.msgid, ''), m.id)
                    )
                  ORDER BY m.timestamp DESC, m.id DESC
                  LIMIT ?4",
@@ -804,7 +810,10 @@ impl Db {
                    SELECT 1 FROM messages newer
                    WHERE newer.channel = m.channel
                      AND newer.root_msgid = m.root_msgid
-                     AND newer.id > m.id
+                     AND (newer.timestamp, newer.replaces_msgid IS NOT NULL,
+                          COALESCE(newer.msgid, ''), newer.id)
+                       > (m.timestamp, m.replaces_msgid IS NOT NULL,
+                          COALESCE(m.msgid, ''), m.id)
                )
              ORDER BY timestamp DESC, id DESC
              LIMIT ?3",
@@ -1690,13 +1699,18 @@ impl Db {
     ///
     /// Displays that quote a message (pins, most visibly) need the version the
     /// author last wrote, not the one whose id happens to be on file.
+    ///
+    /// Within one second an edit outranks the message it revises, and a later
+    /// edit (by msgid, a ULID) outranks an earlier one: a relayed edit that
+    /// waited for its key is written after a later one, and the order it was
+    /// written in must not make it current.
     pub fn current_revision(&self, msgid: &str) -> SqlResult<Option<MessageRow>> {
         let root = self.root_of(msgid);
         let mut stmt = self.conn.prepare(
             "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did, root_msgid
              FROM messages
              WHERE root_msgid = ?1 AND deleted_at IS NULL
-             ORDER BY timestamp DESC, id DESC
+             ORDER BY timestamp DESC, replaces_msgid IS NOT NULL DESC, COALESCE(msgid, '') DESC, id DESC
              LIMIT 1",
         )?;
         let mut rows = stmt.query_map(params![root], map_message_row)?;
@@ -1710,6 +1724,21 @@ impl Db {
             }
             None => Ok(None),
         }
+    }
+
+    /// Whether a revision of `root` minted after `msgid` is on file. Msgids
+    /// are ULIDs, so their order is the order they were written in.
+    pub fn later_revision_on_file(&self, root: &str, msgid: &str) -> SqlResult<bool> {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM messages
+                 WHERE root_msgid = ?1 AND replaces_msgid IS NOT NULL AND msgid > ?2
+                 LIMIT 1",
+                params![root, msgid],
+                |_| Ok(true),
+            )
+            .optional()
+            .map(|found| found.unwrap_or(false))
     }
 
     /// Soft-delete a message *and every revision of it*.
@@ -1953,6 +1982,63 @@ impl Db {
         sender_did: Option<&str>,
         ctx: &crate::events::EventContext,
     ) -> SqlResult<bool> {
+        self.file_edit(
+            channel,
+            sender,
+            text,
+            timestamp,
+            tags,
+            msgid,
+            replaces_msgid,
+            sender_did,
+            ctx,
+            true,
+        )
+    }
+
+    /// [`Db::insert_edit_with`] for an edit a later revision has already
+    /// overtaken: filed, but the search index is left on the later text.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_overtaken_edit_with(
+        &self,
+        channel: &str,
+        sender: &str,
+        text: &str,
+        timestamp: u64,
+        tags: &HashMap<String, String>,
+        msgid: &str,
+        replaces_msgid: &str,
+        sender_did: Option<&str>,
+        ctx: &crate::events::EventContext,
+    ) -> SqlResult<bool> {
+        self.file_edit(
+            channel,
+            sender,
+            text,
+            timestamp,
+            tags,
+            msgid,
+            replaces_msgid,
+            sender_did,
+            ctx,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn file_edit(
+        &self,
+        channel: &str,
+        sender: &str,
+        text: &str,
+        timestamp: u64,
+        tags: &HashMap<String, String>,
+        msgid: &str,
+        replaces_msgid: &str,
+        sender_did: Option<&str>,
+        ctx: &crate::events::EventContext,
+        reindex: bool,
+    ) -> SqlResult<bool> {
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "{}".to_string());
         let stored_text = if let Some(ref key) = self.encryption_key {
             encrypt_at_rest(key, text)
@@ -2010,15 +2096,17 @@ impl Db {
             ctx,
         )?;
         let rowid = self.conn.last_insert_rowid();
-        if self.fts_enabled() {
-            self.conn.execute(
-                "DELETE FROM messages_fts WHERE rowid IN (
-                     SELECT id FROM messages WHERE channel = ?1 AND root_msgid = ?2 AND id <> ?3
-                 )",
-                params![channel, root, rowid],
-            )?;
+        if reindex {
+            if self.fts_enabled() {
+                self.conn.execute(
+                    "DELETE FROM messages_fts WHERE rowid IN (
+                         SELECT id FROM messages WHERE channel = ?1 AND root_msgid = ?2 AND id <> ?3
+                     )",
+                    params![channel, root, rowid],
+                )?;
+            }
+            self.fts_index(rowid, text)?;
         }
-        self.fts_index(rowid, text)?;
         tx.commit()?;
         Ok(true)
     }

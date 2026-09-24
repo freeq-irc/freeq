@@ -15,6 +15,7 @@ pub mod connection;
 pub mod crdt;
 pub mod db;
 pub mod events;
+pub mod held_relay;
 pub mod irc;
 pub mod iroh;
 pub mod key_expiry;

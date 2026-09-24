@@ -870,6 +870,10 @@ pub struct SharedState {
     /// Bounded and in memory only — a restart drops what is parked, which is
     /// the same thing an eviction drops: events nobody was shown.
     pub(crate) act_deferred: Mutex<crate::act_relay::DeferQueue>,
+    /// Relayed edits and mutations waiting for the key that would check them,
+    /// for a minute at most. Beside the task-event queue, not inside it, so
+    /// neither can push the other's items out.
+    pub(crate) held_relays: Mutex<crate::held_relay::HeldQueue>,
     /// Transitions waiting to reach the server that owns their task. Bounded
     /// and in memory only, beside the defer queue and for the same reason:
     /// what is held here is already filed, so a restart costs a prompt ruling
@@ -2061,6 +2065,10 @@ impl Server {
                 self.config.act_defer_max_per_origin,
                 self.config.act_defer_max_total,
             )),
+            held_relays: Mutex::new(crate::held_relay::HeldQueue::new(
+                self.config.act_defer_max_per_origin,
+                self.config.act_defer_max_total,
+            )),
             act_routes: Mutex::new(crate::act_relay::RouteQueue::new(MAX_PENDING_ROUTES)),
             s2s_manager: Mutex::new(None),
             cluster_doc: crate::crdt::ClusterDoc::new(&self.config.server_name),
@@ -2564,6 +2572,7 @@ impl Server {
 
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
         spawn_act_defer_retry_sweep(Arc::clone(&state));
+        spawn_held_relay_sweep(Arc::clone(&state));
         crate::broker_signout::spawn(Arc::clone(&state));
         crate::key_expiry::spawn(Arc::clone(&state));
         crate::record_cache::spawn(Arc::clone(&state));
@@ -2908,6 +2917,7 @@ impl Server {
         spawn_phantom_sweeper(Arc::clone(&state));
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
         spawn_act_defer_retry_sweep(Arc::clone(&state));
+        spawn_held_relay_sweep(Arc::clone(&state));
         crate::broker_signout::spawn(Arc::clone(&state));
         crate::key_expiry::spawn(Arc::clone(&state));
         crate::record_cache::spawn(Arc::clone(&state));
@@ -2960,6 +2970,7 @@ impl Server {
         spawn_phantom_sweeper(Arc::clone(&state));
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
         spawn_act_defer_retry_sweep(Arc::clone(&state));
+        spawn_held_relay_sweep(Arc::clone(&state));
         crate::broker_signout::spawn(Arc::clone(&state));
         crate::key_expiry::spawn(Arc::clone(&state));
         crate::record_cache::spawn(Arc::clone(&state));
@@ -4786,6 +4797,9 @@ fn dropped_task_id(tags: &HashMap<String, String>, event_id: &str) -> Option<Str
 /// completion is applied before it — and one that still cannot be judged goes
 /// back to waiting.
 pub(crate) fn retry_deferred_task_events(state: &Arc<SharedState>, did: &str, kid: &str) {
+    // Relayed edits and mutations wait on keys too, in a queue of their own;
+    // every arrival of a key comes through here, so this is their release too.
+    release_held_relays(state, did, kid);
     let waiting = state.act_deferred.lock().take_for_signer(did, kid);
     if waiting.is_empty() {
         return;
@@ -4924,6 +4938,153 @@ fn spawn_act_defer_retry_sweep(state: Arc<SharedState>) {
     });
 }
 
+/// Whether a relayed message is one that may wait for its signer's key: an
+/// edit, or a mutation that names the message it acts on.
+fn may_be_held(msg: &crate::s2s::S2sMessage) -> bool {
+    use crate::s2s::S2sMessage;
+    match msg {
+        S2sMessage::Privmsg { replaces_msgid, .. } => {
+            replaces_msgid.as_deref().is_some_and(|r| !r.is_empty())
+        }
+        S2sMessage::Tagmsg { tags, .. } => {
+            relayed_mutation_in(tags).is_some_and(|(.., subject, _)| subject.is_some())
+        }
+        _ => false,
+    }
+}
+
+/// Hold a relayed edit or mutation until its signer's key arrives.
+///
+/// The lookup for that key started on the same miss, off this path, and can
+/// finish before the item is held — in which case its release has already run
+/// and found nothing. So the store is asked once more after holding, and a key
+/// already there releases the item at once rather than after a minute.
+pub(crate) fn hold_relay(state: &Arc<SharedState>, item: crate::held_relay::HeldRelay) {
+    let (did, kid) = (item.signer.clone(), item.kid.clone());
+    {
+        let (kind, target, subject) = item.describe();
+        tracing::info!(
+            kind, target = %target, subject = ?subject, account = %did, kid = %kid,
+            origin = %item.origin,
+            "Holding a relayed edit or mutation until its signer's key arrives"
+        );
+    }
+    // Anything evicted to make room is logged by the queue.
+    let _evicted = state.held_relays.lock().hold(item);
+    if state
+        .with_db(|db| db.get_signing_key_by_kid(&did, &kid))
+        .flatten()
+        .is_some()
+    {
+        release_held_relays(state, &did, &kid);
+    }
+}
+
+/// A signing key is on file: send what was held for it back through the relay
+/// path, in the order it arrived.
+///
+/// On a task of its own, because the relay path is async and this is reached
+/// from places that are not (a key filed by `MSGSIG`, a lookup completing).
+/// One task per release keeps one key's items in arrival order.
+pub(crate) fn release_held_relays(state: &Arc<SharedState>, did: &str, kid: &str) {
+    let held = state.held_relays.lock().take_for_signer(did, kid);
+    if held.is_empty() {
+        return;
+    }
+    tracing::info!(
+        did = %did, kid = %kid, count = held.len(),
+        "A signing key arrived; re-checking the relayed edits and mutations that were waiting for it"
+    );
+    let manager = state.s2s_manager.lock().clone();
+    let (Some(manager), Ok(runtime)) = (manager, tokio::runtime::Handle::try_current()) else {
+        tracing::warn!(
+            did = %did, kid = %kid, count = held.len(),
+            "No federation link to release held edits and mutations through — dropping them"
+        );
+        return;
+    };
+    let state = Arc::clone(state);
+    runtime.spawn(async move {
+        for item in held {
+            process_s2s_event(
+                &state,
+                &manager,
+                &item.peer,
+                item.message,
+                Some(item.arrival),
+            )
+            .await;
+        }
+    });
+}
+
+/// Drop every held edit or mutation that has waited its minute by `now`, with
+/// the warning an uncheckable one got before there was a queue.
+pub(crate) fn expire_held_relays(state: &Arc<SharedState>, now: std::time::Instant) {
+    let expired = state.held_relays.lock().expire(now);
+    for item in expired {
+        let (kind, target, subject) = item.describe();
+        let key_source = crate::peer_keys::has_key_source(state, &item.origin);
+        let waited_secs = now.saturating_duration_since(item.held_at).as_secs();
+        if kind == "edit" {
+            tracing::warn!(
+                peer = %item.peer, origin = %item.origin, target = %target,
+                account = %item.signer, kid = %item.kid, subject = ?subject,
+                waited_secs, key_source,
+                "Relayed edit carries no signature this server can check — dropping it \
+                 after waiting for its key"
+            );
+        } else {
+            tracing::warn!(
+                kind, peer = %item.peer, origin = %item.origin, target = %target,
+                account = %item.signer, kid = %item.kid, subject = ?subject,
+                waited_secs, key_source,
+                "Relayed mutation carries no signature this server can check — dropping it \
+                 after waiting for its key"
+            );
+        }
+    }
+}
+
+/// Whether a later revision of the message a released edit revises is already
+/// on file. Msgids are ULIDs, so later means written later: an edit that
+/// waited for its key while a newer one (signed by a key already here) went
+/// through is filed — it happened — but must not become the current text or
+/// be shown as news.
+fn edit_overtaken(state: &Arc<SharedState>, root: Option<&str>, msgid: &str) -> bool {
+    let Some(root) = root else {
+        return false;
+    };
+    let overtaken = state
+        .with_db(|db| db.later_revision_on_file(root, msgid))
+        .unwrap_or(false);
+    if overtaken {
+        tracing::info!(
+            root = %root, msgid = %msgid,
+            "A released edit was overtaken by a later one while it waited — filed, not applied"
+        );
+    }
+    overtaken
+}
+
+/// Ask again for the keys held edits and mutations wait on, and drop what has
+/// waited its minute. The task-event sweep's twin, on the same tick.
+fn spawn_held_relay_sweep(state: Arc<SharedState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(DEFER_RETRY_TICK);
+        interval.tick().await; // skip first tick
+        loop {
+            interval.tick().await;
+            let now = std::time::Instant::now();
+            let due = state.held_relays.lock().retries_due(now);
+            for (origin, signer, kid) in due {
+                crate::peer_keys::fetch_again(&state, &origin, &signer, &kid);
+            }
+            expire_held_relays(&state, now);
+        }
+    });
+}
+
 /// Check a replayed event's signature against the bytes it travelled with.
 fn replayed_signature_verdict(
     state: &Arc<SharedState>,
@@ -4951,11 +5112,31 @@ pub(crate) async fn process_s2s_message(
     authenticated_peer_id: &str,
     msg: crate::s2s::S2sMessage,
 ) {
+    process_s2s_event(state, manager, authenticated_peer_id, msg, None).await;
+}
+
+/// [`process_s2s_message`], or — with `released` — a relayed edit or mutation
+/// coming back out of the held queue now that its key is on file.
+///
+/// A release runs the same path from the top, against the message exactly as
+/// it arrived, so it is judged, filed and delivered the way it would have been
+/// had the key been here then. It skips only the gates it already passed on
+/// arrival: the link's authentication (the link may be gone by now), the
+/// peer's rate limit (it was counted once), the dedup (its id is on file from
+/// the first pass, so a second check would refuse it) and the trust level.
+async fn process_s2s_event(
+    state: &Arc<SharedState>,
+    manager: &Arc<crate::s2s::S2sManager>,
+    authenticated_peer_id: &str,
+    msg: crate::s2s::S2sMessage,
+    released: Option<crate::held_relay::Arrival>,
+) {
     use crate::s2s::S2sMessage;
 
     // ── C-1 fix: Reject messages from unauthenticated peers ──
     // Hello and HelloAck are the handshake itself, so they must pass through.
-    if !matches!(&msg, S2sMessage::Hello { .. } | S2sMessage::HelloAck { .. })
+    if released.is_none()
+        && !matches!(&msg, S2sMessage::Hello { .. } | S2sMessage::HelloAck { .. })
         && !manager
             .authenticated_peers
             .lock()
@@ -4970,7 +5151,7 @@ pub(crate) async fn process_s2s_message(
     }
 
     // ── S2S rate limiting ──
-    {
+    if released.is_none() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -5178,13 +5359,20 @@ pub(crate) async fn process_s2s_message(
     }
 
     // Dedup: reject duplicate event_ids
-    if !event_id.is_empty() && !manager.dedup.check_and_insert(&origin, &event_id).await {
+    if released.is_none()
+        && !event_id.is_empty()
+        && !manager.dedup.check_and_insert(&origin, &event_id).await
+    {
         tracing::debug!(event_id = %event_id, "S2S event deduplicated (already seen)");
         return;
     }
 
     // Phase 3: Trust-level enforcement
-    let peer_trust = manager.get_trust(authenticated_peer_id).await;
+    let peer_trust = match released {
+        // Enforced when it arrived.
+        Some(_) => crate::s2s::TrustLevel::Full,
+        None => manager.get_trust(authenticated_peer_id).await,
+    };
     match (&msg, peer_trust) {
         // Readonly peers cannot originate any events
         (
@@ -5264,6 +5452,21 @@ pub(crate) async fn process_s2s_message(
         );
         authenticated_peer_id.to_string()
     };
+
+    // A relayed edit or mutation may have to wait for its signer's key, and
+    // what waits is the message as it arrived: everything below tidies it.
+    let mut as_arrived = (released.is_none() && may_be_held(&msg)).then(|| msg.clone());
+    // The time a relayed edit or mutation is filed under: when it arrived,
+    // which for a released one is up to a minute before now.
+    let arrived_at = released.as_ref().map_or_else(
+        || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        },
+        |a| a.at,
+    );
 
     match msg {
         S2sMessage::Hello {
@@ -5571,6 +5774,40 @@ pub(crate) async fn process_s2s_message(
                 && crate::connection::messaging::signing_venue(state, actor, &target).is_some()
                 && sig_verdict != Some(crate::connection::messaging::ClientSigVerdict::Valid)
             {
+                // Only for want of a key, which is on its way: the lookup
+                // started above. It waits for it rather than being lost.
+                if sig_verdict
+                    == Some(
+                        crate::connection::messaging::ClientSigVerdict::Unverifiable(
+                            crate::connection::messaging::NO_KEY_ON_FILE,
+                        ),
+                    )
+                    && let Some(kid) = sig
+                        .as_deref()
+                        .and_then(|s| freeq_sdk::sigtag::parse(s).ok())
+                        .map(|(kid, _)| kid.to_string())
+                    && let Some(message) = as_arrived.take()
+                {
+                    let origin_name =
+                        sanitize_s2s_str(&manager.peer_display_name(&origin).await, 64);
+                    hold_relay(
+                        state,
+                        crate::held_relay::HeldRelay {
+                            message,
+                            peer: authenticated_peer_id.to_string(),
+                            origin: origin.clone(),
+                            arrival: crate::held_relay::Arrival {
+                                origin_name,
+                                at: arrived_at,
+                            },
+                            signer: actor.to_string(),
+                            kid,
+                            held_at: std::time::Instant::now(),
+                            seq: 0,
+                        },
+                    );
+                    return;
+                }
                 tracing::warn!(
                     peer = %authenticated_peer_id, origin = %origin, target = %target,
                     account = %actor, verdict = ?sig_verdict,
@@ -5625,7 +5862,11 @@ pub(crate) async fn process_s2s_message(
             // server's name. Lets clients distinguish a peer-vouched federated
             // message from a locally-verified one, rather than rendering the
             // (only peer-trusted) `account` as if this server had verified it.
-            let origin_name = sanitize_s2s_str(&manager.peer_display_name(&origin).await, 64);
+            let origin_name = match &released {
+                // Captured when it was held: the release cannot wait on a lock.
+                Some(arrival) => arrival.origin_name.clone(),
+                None => sanitize_s2s_str(&manager.peer_display_name(&origin).await, 64),
+            };
             // What the log records about this relay: the verdict this server
             // actually reached, and the peer it came through. A signature we
             // stripped leaves nothing to have concluded, and a peer's word is
@@ -5711,10 +5952,7 @@ pub(crate) async fn process_s2s_message(
 
                 // Store in history + DB
                 {
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                    let timestamp = arrived_at;
                     let mut tags = HashMap::new();
                     tags.extend(relay_tags.iter().map(|(k, v)| (k.clone(), v.clone())));
                     tags.insert("msgid".to_string(), msgid.clone());
@@ -5729,6 +5967,11 @@ pub(crate) async fn process_s2s_message(
                     // resolving one against our own records answered "who is
                     // this" with the name of whoever holds that nick here.
                     let s2s_sender_did = account.clone();
+                    // A released edit a later revision overtook while it
+                    // waited is filed without taking the search index off the
+                    // later text, and goes no further.
+                    let overtaken =
+                        released.is_some() && edit_overtaken(state, edit_of.as_deref(), &msgid);
                     // File it before showing it. Persists the coordination
                     // tags (incl. +freeq.at/origin) so CHATHISTORY replay
                     // carries them, like the DM persist path — and if the
@@ -5745,6 +5988,17 @@ pub(crate) async fn process_s2s_message(
                             // reading history later — CHATHISTORY, the verify
                             // endpoint — can check the message at all. The DM
                             // path below has always filed the full set.
+                            Some(ref root) if overtaken => db.insert_overtaken_edit_with(
+                                &target,
+                                &from,
+                                &stored_body,
+                                timestamp,
+                                &tags,
+                                &msgid,
+                                root,
+                                s2s_sender_did.as_deref(),
+                                &event_ctx,
+                            ),
                             Some(ref root) => db.insert_edit_with(
                                 &target,
                                 &from,
@@ -5768,7 +6022,7 @@ pub(crate) async fn process_s2s_message(
                             ),
                         })
                         .unwrap_or(true);
-                    if !stored {
+                    if !stored || overtaken {
                         return;
                     }
                     let mut channels = state.channels.lock();
@@ -5928,14 +6182,15 @@ pub(crate) async fn process_s2s_message(
                     local_recipient.as_deref(),
                 );
                 let mut stored = true;
+                // As on the channel path: an overtaken released edit is filed
+                // without moving the search index, and goes no further.
+                let overtaken =
+                    released.is_some() && edit_overtaken(state, edit_of.as_deref(), &msgid);
                 if let (Some(s_did), Some(r_did)) =
                     (sender_did.as_deref(), recipient_did.as_deref())
                 {
                     let dm_key = crate::db::canonical_dm_key(s_did, r_did);
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                    let timestamp = arrived_at;
                     let mut tags = HashMap::new();
                     tags.extend(relay_tags.iter().map(|(k, v)| (k.clone(), v.clone())));
                     tags.insert("msgid".to_string(), msgid.clone());
@@ -5950,6 +6205,17 @@ pub(crate) async fn process_s2s_message(
                     // new message would leave the thread showing both versions.
                     stored = state
                         .with_db(|db| match edit_of {
+                            Some(ref root) if overtaken => db.insert_overtaken_edit_with(
+                                &dm_key,
+                                &from,
+                                &stored_body,
+                                timestamp,
+                                &tags,
+                                &msgid,
+                                root,
+                                sender_did.as_deref(),
+                                &event_ctx,
+                            ),
                             Some(ref root) => db.insert_edit_with(
                                 &dm_key,
                                 &from,
@@ -5974,7 +6240,7 @@ pub(crate) async fn process_s2s_message(
                         })
                         .unwrap_or(true);
                 }
-                if !stored {
+                if !stored || overtaken {
                     return;
                 }
                 // DM target: a nick or a `did:`. Resolve to every local session
@@ -6240,6 +6506,43 @@ pub(crate) async fn process_s2s_message(
                 && crate::connection::messaging::signing_venue(state, actor, &target).is_some()
                 && sig_verdict != Some(crate::connection::messaging::ClientSigVerdict::Valid)
             {
+                // Only for want of a key, which is on its way: the lookup
+                // started above. It waits for it rather than being lost. A
+                // task event never reaches here uncheckable — it parks in its
+                // own queue above.
+                if !is_task_event
+                    && sig_verdict
+                        == Some(
+                            crate::connection::messaging::ClientSigVerdict::Unverifiable(
+                                crate::connection::messaging::NO_KEY_ON_FILE,
+                            ),
+                        )
+                    && let Some(kid) = tags
+                        .get("+freeq.at/sig")
+                        .and_then(|s| freeq_sdk::sigtag::parse(s).ok())
+                        .map(|(kid, _)| kid.to_string())
+                    && let Some(message) = as_arrived.take()
+                {
+                    let origin_name =
+                        sanitize_s2s_str(&manager.peer_display_name(&origin).await, 64);
+                    hold_relay(
+                        state,
+                        crate::held_relay::HeldRelay {
+                            message,
+                            peer: authenticated_peer_id.to_string(),
+                            origin: origin.clone(),
+                            arrival: crate::held_relay::Arrival {
+                                origin_name,
+                                at: arrived_at,
+                            },
+                            signer: actor.to_string(),
+                            kid,
+                            held_at: std::time::Instant::now(),
+                            seq: 0,
+                        },
+                    );
+                    return;
+                }
                 tracing::warn!(
                     peer = %authenticated_peer_id, origin = %origin, target = %target,
                     account = %actor, verdict = ?sig_verdict,
@@ -6336,20 +6639,14 @@ pub(crate) async fn process_s2s_message(
                     origin: Some(sanitize_s2s_str(&origin, 64)),
                     ..Default::default()
                 },
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
+                timestamp: arrived_at,
             };
 
             // Persist reactions
             if let (Some(emoji), Some(target_msgid)) = (tags.get("+react"), tags.get("+reply")) {
                 let nick = actor_nick.clone();
                 let did = actor_did.clone();
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let ts = arrived_at;
                 let emoji = emoji.clone();
                 let target_msgid = target_msgid.clone();
                 let channel = target.clone();
@@ -8300,6 +8597,10 @@ mod s2s_adversarial_tests {
             #[cfg(feature = "av-native")]
             av_bridges: Mutex::new(std::collections::HashMap::new()),
             act_deferred: Mutex::new(crate::act_relay::DeferQueue::new(
+                config.act_defer_max_per_origin,
+                config.act_defer_max_total,
+            )),
+            held_relays: Mutex::new(crate::held_relay::HeldQueue::new(
                 config.act_defer_max_per_origin,
                 config.act_defer_max_total,
             )),
@@ -17512,6 +17813,81 @@ mod relayed_task_verdict_tests {
         );
     }
 
+    /// Guard: the task-event queue is untouched by the queue that now holds
+    /// relayed edits. A task event and an edit waiting on one key each wait in
+    /// their own queue, and the one landing releases both — the task event
+    /// exactly as before.
+    #[tokio::test]
+    async fn a_task_event_and_an_edit_waiting_on_one_key_each_keep_their_own_queue() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let mut member = capable_member(&state, "#guard");
+
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let event_id = "01GUARDOFFER00000000000000";
+        relay(
+            &state,
+            &mgr,
+            "#guard",
+            event_id,
+            signed_offer_tags("#guard", event_id, &key),
+        )
+        .await;
+        // An edit of a message the peer relayed, signed with the same key.
+        let root = crate::msgid::generate();
+        let edit = crate::msgid::generate();
+        let venue = freeq_sdk::chatsig::channel_venue("#guard");
+        let sig = freeq_sdk::chatsig::ChatDoc::message(SIGNER, &edit, &venue, "edited")
+            .with_edit(&root)
+            .sign(&key);
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Privmsg {
+                event_id: format!("{PEER}:{edit}"),
+                from: "tasker!t@remote".to_string(),
+                target: "#guard".to_string(),
+                text: "edited".to_string(),
+                origin: PEER.to_string(),
+                msgid: Some(edit.clone()),
+                sig: Some(sig),
+                account: Some(SIGNER.to_string()),
+                recipient_did: None,
+                replaces_msgid: Some(root),
+                tags: HashMap::new(),
+                multiline_lines: None,
+            },
+        )
+        .await;
+        assert_eq!(state.act_deferred.lock().len(), 1, "the task event waits");
+        assert_eq!(
+            state.held_relays.lock().len(),
+            1,
+            "the edit waits beside it"
+        );
+
+        state
+            .with_db(|db| db.save_signing_key(SIGNER, key.verifying_key().as_bytes()))
+            .expect("db present");
+        retry_deferred_task_events(
+            &state,
+            SIGNER,
+            &freeq_sdk::sigtag::derive_kid(&key.verifying_key()),
+        );
+        assert_eq!(state.act_deferred.lock().len(), 0);
+        assert!(
+            state.with_db(|db| db.is_act_event(event_id)).unwrap(),
+            "the task event is filed as before"
+        );
+        let first = received(&mut member).await;
+        assert!(first.contains(event_id), "and delivered as before: {first}");
+        let second = received(&mut member).await;
+        assert!(second.contains("edited"), "the edit follows: {second}");
+        assert_eq!(state.held_relays.lock().len(), 0);
+    }
+
     /// The visible trace of a drop: a waiting event thrown out of a full queue
     /// leaves a count on the task it belonged to, where that task is on file —
     /// and only there. One whose task was never stored leaves nothing but the
@@ -17989,5 +18365,855 @@ mod signing_key_rotation_tests {
         let rotated = start(dir.path(), true);
         let store = rotated.media_store.as_ref().expect("media store");
         assert_eq!(store.get("abcdefgh").unwrap(), b"kept across rotation");
+    }
+}
+
+#[cfg(test)]
+mod held_relay_tests {
+    //! A relayed edit, delete, reaction or unreaction whose signer's key this
+    //! server has not fetched yet waits for that key — up to a minute — and
+    //! goes through the relay path when it lands, instead of being dropped on
+    //! the first miss.
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
+
+    use super::s2s_adversarial_tests::{
+        PEER, setup_authenticated_peer, test_manager, test_state_with_db,
+    };
+    use super::{SharedState, process_s2s_message};
+    use crate::s2s::{S2sManager, S2sMessage};
+
+    const CH: &str = "#held";
+    const ALICE: &str = "did:plc:heldalice";
+    const FROM: &str = "alice!a@remote";
+
+    struct Rig {
+        state: Arc<SharedState>,
+        mgr: Arc<S2sManager>,
+        rx: mpsc::Receiver<String>,
+    }
+
+    /// A server linked to `PEER`, with one local member of `CH` that takes
+    /// message tags and account tags.
+    async fn rig() -> Rig {
+        rig_on(test_state_with_db()).await
+    }
+
+    async fn rig_on(state: Arc<SharedState>) -> Rig {
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let (tx, rx) = mpsc::channel(256);
+        state.connections.lock().insert("held-recv".to_string(), tx);
+        state
+            .cap_message_tags
+            .lock()
+            .insert("held-recv".to_string());
+        state.cap_account_tag.lock().insert("held-recv".to_string());
+        state
+            .channels
+            .lock()
+            .entry(CH.to_string())
+            .or_default()
+            .members
+            .insert("held-recv".to_string());
+        Rig { state, mgr, rx }
+    }
+
+    fn fresh_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
+    }
+
+    fn kid_of(key: &ed25519_dalek::SigningKey) -> String {
+        freeq_sdk::sigtag::derive_kid(&key.verifying_key())
+    }
+
+    /// The key arrives the way a peer fetch delivers it.
+    fn land(state: &Arc<SharedState>, did: &str, key: &ed25519_dalek::SigningKey) {
+        crate::peer_keys::key_landed(
+            state,
+            did,
+            &kid_of(key),
+            key.verifying_key().as_bytes(),
+            "origin-server",
+            crate::peer_keys::KeyDates {
+                registered_at: chrono::Utc::now().timestamp(),
+                expires_at: None,
+            },
+            None,
+        );
+    }
+
+    /// A ULID later than every one minted before it.
+    async fn next_id() -> String {
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        crate::msgid::generate()
+    }
+
+    fn privmsg(
+        target: &str,
+        msgid: &str,
+        text: &str,
+        replaces: Option<&str>,
+        sig: Option<String>,
+    ) -> S2sMessage {
+        S2sMessage::Privmsg {
+            event_id: format!("{PEER}:{msgid}"),
+            from: FROM.to_string(),
+            target: target.to_string(),
+            text: text.to_string(),
+            origin: PEER.to_string(),
+            msgid: Some(msgid.to_string()),
+            sig,
+            account: Some(ALICE.to_string()),
+            recipient_did: None,
+            replaces_msgid: replaces.map(str::to_string),
+            tags: HashMap::new(),
+            multiline_lines: None,
+        }
+    }
+
+    fn signed_edit(
+        key: &ed25519_dalek::SigningKey,
+        venue: &str,
+        msgid: &str,
+        text: &str,
+        root: &str,
+    ) -> String {
+        freeq_sdk::chatsig::ChatDoc::message(ALICE, msgid, venue, text)
+            .with_edit(root)
+            .sign(key)
+    }
+
+    fn channel_venue() -> String {
+        freeq_sdk::chatsig::channel_venue(CH)
+    }
+
+    /// A relayed channel edit of `root`, signed with `key`.
+    fn edit_msg(
+        key: &ed25519_dalek::SigningKey,
+        msgid: &str,
+        text: &str,
+        root: &str,
+    ) -> S2sMessage {
+        let sig = signed_edit(key, &channel_venue(), msgid, text, root);
+        privmsg(CH, msgid, text, Some(root), Some(sig))
+    }
+
+    /// A relayed mutation TAGMSG, signed the way a peer's client signs one.
+    fn mutation_msg(
+        key: &ed25519_dalek::SigningKey,
+        kind: freeq_sdk::chatsig::Mutation,
+        subject: &str,
+        emoji: Option<&str>,
+    ) -> S2sMessage {
+        use freeq_sdk::chatsig::Mutation;
+        let mut tags = HashMap::new();
+        match kind {
+            Mutation::Delete => {
+                tags.insert("+draft/delete".to_string(), subject.to_string());
+            }
+            Mutation::React => {
+                tags.insert("+draft/react".to_string(), emoji.unwrap().to_string());
+                tags.insert("+draft/reply".to_string(), subject.to_string());
+            }
+            Mutation::Unreact => {
+                tags.insert("+freeq.at/unreact".to_string(), emoji.unwrap().to_string());
+                tags.insert("+reply".to_string(), subject.to_string());
+            }
+        }
+        let event_id = crate::msgid::generate();
+        let venue = channel_venue();
+        let mut doc =
+            freeq_sdk::chatsig::ChatDoc::mutation(kind, ALICE, &event_id, &venue, subject);
+        if let Some(emoji) = emoji {
+            doc = doc.with_emoji(emoji);
+        }
+        tags.insert("+freeq.at/sig".to_string(), doc.sign(key));
+        tags.insert(
+            freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
+            event_id.clone(),
+        );
+        S2sMessage::Tagmsg {
+            event_id: format!("{PEER}:{event_id}"),
+            from: FROM.to_string(),
+            target: CH.to_string(),
+            tags,
+            origin: PEER.to_string(),
+            account: Some(ALICE.to_string()),
+        }
+    }
+
+    async fn relay(rig: &Rig, msg: S2sMessage) {
+        process_s2s_message(&rig.state, &rig.mgr, PEER, msg).await;
+    }
+
+    /// Relay a plain original (no signature needed) and drain its delivery.
+    async fn relay_original(rig: &mut Rig) -> String {
+        let root = crate::msgid::generate();
+        relay(rig, privmsg(CH, &root, "first words", None, None)).await;
+        let _ = drain(&mut rig.rx).await;
+        root
+    }
+
+    /// Wait for the release, which runs on a task of its own.
+    async fn settle(cond: impl Fn() -> bool) -> bool {
+        for _ in 0..200 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        cond()
+    }
+
+    async fn drain(rx: &mut mpsc::Receiver<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(Some(line)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await
+        {
+            out.push(line);
+        }
+        out
+    }
+
+    fn text_of(state: &Arc<SharedState>, root: &str) -> Option<String> {
+        state.channels.lock().get(CH).and_then(|ch| {
+            ch.history
+                .iter()
+                .find(|h| h.msgid.as_deref() == Some(root))
+                .map(|h| h.text.clone())
+        })
+    }
+
+    fn row_filed(state: &Arc<SharedState>, msgid: &str) -> bool {
+        state
+            .with_db(|db| db.find_message_by_msgid(msgid))
+            .flatten()
+            .is_some()
+    }
+
+    fn reactions_on(state: &Arc<SharedState>, root: &str) -> Vec<String> {
+        state
+            .with_db(|db| db.get_reactions_for_messages(&[root]))
+            .unwrap_or_default()
+            .remove(root)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.emoji)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_channel_edit_waits_for_its_key_and_is_applied_when_it_lands() {
+        let mut rig = rig().await;
+        let root = relay_original(&mut rig).await;
+        let key = fresh_key();
+        let edit_id = next_id().await;
+        relay(&rig, edit_msg(&key, &edit_id, "second words", &root)).await;
+
+        assert_eq!(rig.state.held_relays.lock().len(), 1, "held, not dropped");
+        assert_eq!(text_of(&rig.state, &root).as_deref(), Some("first words"));
+        assert!(
+            drain(&mut rig.rx).await.is_empty(),
+            "nothing shown while it waits"
+        );
+
+        land(&rig.state, ALICE, &key);
+        let state = rig.state.clone();
+        let r = root.clone();
+        assert!(
+            settle(move || text_of(&state, &r).as_deref() == Some("second words")).await,
+            "applied once the key is on file"
+        );
+        assert!(row_filed(&rig.state, &edit_id), "and filed");
+        let lines = drain(&mut rig.rx).await;
+        assert_eq!(lines.len(), 1, "delivered once: {lines:?}");
+        assert!(
+            lines[0].contains(&format!("+draft/edit={root}")),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("+freeq.at/sig="),
+            "with its signature: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("second words"));
+        assert_eq!(rig.state.held_relays.lock().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_released_edit_is_not_refused_by_the_dedup_it_already_passed() {
+        let mut rig = rig().await;
+        let root = relay_original(&mut rig).await;
+        let key = fresh_key();
+        let edit_id = next_id().await;
+        relay(&rig, edit_msg(&key, &edit_id, "second words", &root)).await;
+        // The dedup already holds this event's id: it was seen on arrival.
+        assert!(
+            !rig.mgr
+                .dedup
+                .check_and_insert(PEER, &format!("{PEER}:{edit_id}"))
+                .await,
+            "the arrival was recorded"
+        );
+        land(&rig.state, ALICE, &key);
+        let state = rig.state.clone();
+        assert!(settle(move || row_filed(&state, &edit_id)).await);
+    }
+
+    #[tokio::test]
+    async fn a_release_is_not_counted_against_the_peers_rate_limit() {
+        // A peer of its own, so the counter pinned here cannot touch another
+        // test's.
+        const RL_PEER: &str = "held-relay-rate-peer";
+        let mut rig = rig().await;
+        rig.mgr
+            .authenticated_peers
+            .lock()
+            .await
+            .insert(RL_PEER.to_string());
+        let root = crate::msgid::generate();
+        process_s2s_message(
+            &rig.state,
+            &rig.mgr,
+            RL_PEER,
+            privmsg(CH, &root, "first words", None, None),
+        )
+        .await;
+        let key = fresh_key();
+        let edit_id = next_id().await;
+        let mut msg = edit_msg(&key, &edit_id, "second words", &root);
+        if let S2sMessage::Privmsg { origin, .. } = &mut msg {
+            *origin = RL_PEER.to_string();
+        }
+        process_s2s_message(&rig.state, &rig.mgr, RL_PEER, msg).await;
+        let _ = drain(&mut rig.rx).await;
+        assert_eq!(rig.state.held_relays.lock().len(), 1);
+        // The peer is over its limit for every second the release could run in.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        super::S2S_RATE_LIMITS.lock().insert(
+            RL_PEER.to_string(),
+            (now, super::S2S_MAX_EVENTS_PER_SEC + 1),
+        );
+        land(&rig.state, ALICE, &key);
+        let state = rig.state.clone();
+        let r = root.clone();
+        assert!(
+            settle(move || text_of(&state, &r).as_deref() == Some("second words")).await,
+            "a release is not a new event from the peer"
+        );
+        super::S2S_RATE_LIMITS.lock().remove(RL_PEER);
+    }
+
+    #[tokio::test]
+    async fn a_delete_waits_for_its_key() {
+        let mut rig = rig().await;
+        let root = relay_original(&mut rig).await;
+        let key = fresh_key();
+        relay(
+            &rig,
+            mutation_msg(&key, freeq_sdk::chatsig::Mutation::Delete, &root, None),
+        )
+        .await;
+        assert_eq!(rig.state.held_relays.lock().len(), 1, "held, not dropped");
+        assert!(
+            text_of(&rig.state, &root).is_some(),
+            "still there while it waits"
+        );
+
+        land(&rig.state, ALICE, &key);
+        let state = rig.state.clone();
+        let r = root.clone();
+        assert!(
+            settle(move || text_of(&state, &r).is_none()).await,
+            "deleted once the key is on file"
+        );
+        assert!(!row_filed(&rig.state, &root), "and deleted in the store");
+        let lines = drain(&mut rig.rx).await;
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("TAGMSG") && l.contains(&format!("+draft/delete={root}"))),
+            "the delete is delivered: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reaction_and_its_unreaction_wait_for_their_key_and_apply_in_order() {
+        let mut rig = rig().await;
+        let root = relay_original(&mut rig).await;
+        let key = fresh_key();
+        use freeq_sdk::chatsig::Mutation;
+        relay(&rig, mutation_msg(&key, Mutation::React, &root, Some("👍"))).await;
+        assert_eq!(
+            rig.state.held_relays.lock().len(),
+            1,
+            "the reaction is held"
+        );
+        assert!(reactions_on(&rig.state, &root).is_empty());
+
+        land(&rig.state, ALICE, &key);
+        let state = rig.state.clone();
+        let r = root.clone();
+        assert!(
+            settle(move || reactions_on(&state, &r) == vec!["👍".to_string()]).await,
+            "the reaction is filed once the key is on file"
+        );
+        let lines = drain(&mut rig.rx).await;
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("TAGMSG") && l.contains("+react=👍")),
+            "and delivered: {lines:?}"
+        );
+
+        // An unreaction under a second key nothing holds yet.
+        let key2 = fresh_key();
+        relay(
+            &rig,
+            mutation_msg(&key2, Mutation::Unreact, &root, Some("👍")),
+        )
+        .await;
+        assert_eq!(
+            rig.state.held_relays.lock().len(),
+            1,
+            "the unreaction is held"
+        );
+        assert_eq!(reactions_on(&rig.state, &root), vec!["👍".to_string()]);
+        land(&rig.state, ALICE, &key2);
+        let state = rig.state.clone();
+        let r = root.clone();
+        assert!(
+            settle(move || reactions_on(&state, &r).is_empty()).await,
+            "removed once its key is on file"
+        );
+        let lines = drain(&mut rig.rx).await;
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("TAGMSG") && l.contains("+freeq.at/unreact=👍")),
+            "and delivered: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dm_edit_waits_for_its_key() {
+        const BOB: &str = "did:plc:heldbob";
+        let rig = rig().await;
+        let (tx, mut bob_rx) = mpsc::channel(64);
+        rig.state
+            .connections
+            .lock()
+            .insert("bob-sess".to_string(), tx);
+        rig.state
+            .cap_message_tags
+            .lock()
+            .insert("bob-sess".to_string());
+        rig.state
+            .did_sessions
+            .lock()
+            .entry(BOB.to_string())
+            .or_default()
+            .insert("bob-sess".to_string());
+
+        let root = crate::msgid::generate();
+        relay(&rig, privmsg(BOB, &root, "hi bob", None, None)).await;
+        let _ = drain(&mut bob_rx).await;
+
+        let key = fresh_key();
+        let edit_id = next_id().await;
+        let venue = freeq_sdk::chatsig::dm_venue(ALICE, BOB);
+        let sig = signed_edit(&key, &venue, &edit_id, "hello bob", &root);
+        relay(
+            &rig,
+            privmsg(BOB, &edit_id, "hello bob", Some(&root), Some(sig)),
+        )
+        .await;
+        assert_eq!(rig.state.held_relays.lock().len(), 1, "held, not dropped");
+        assert!(drain(&mut bob_rx).await.is_empty());
+
+        land(&rig.state, ALICE, &key);
+        let state = rig.state.clone();
+        let e = edit_id.clone();
+        assert!(settle(move || row_filed(&state, &e)).await, "filed");
+        let lines = drain(&mut bob_rx).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("hello bob") && lines[0].contains("+freeq.at/sig="));
+    }
+
+    #[tokio::test]
+    async fn a_held_multiline_edit_keeps_its_lines_and_verifies_on_release() {
+        let mut rig = rig().await;
+        let root = relay_original(&mut rig).await;
+        let key = fresh_key();
+        let edit_id = next_id().await;
+        let body = "line one\nline two";
+        let sig = signed_edit(&key, &channel_venue(), &edit_id, body, &root);
+        let mut msg = privmsg(CH, &edit_id, "line one\\nline two", Some(&root), Some(sig));
+        if let S2sMessage::Privmsg {
+            multiline_lines, ..
+        } = &mut msg
+        {
+            *multiline_lines = Some(
+                ["line one", "line two"]
+                    .iter()
+                    .map(|b| crate::s2s::MultilineLine {
+                        body: b.to_string(),
+                        concat: false,
+                    })
+                    .collect(),
+            );
+        }
+        relay(&rig, msg).await;
+        assert_eq!(rig.state.held_relays.lock().len(), 1, "held, not dropped");
+
+        land(&rig.state, ALICE, &key);
+        let state = rig.state.clone();
+        let r = root.clone();
+        assert!(
+            settle(move || text_of(&state, &r).as_deref() == Some(body)).await,
+            "the assembled body, which is what the signature covers"
+        );
+        let lines = drain(&mut rig.rx).await;
+        assert!(
+            lines.iter().any(|l| l.contains("line one"))
+                && lines.iter().any(|l| l.contains("line two")),
+            "both lines delivered: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_registered_here_by_msgsig_releases_what_waits_on_it() {
+        let mut rig = rig().await;
+        let root = relay_original(&mut rig).await;
+        let key = fresh_key();
+        let edit_id = next_id().await;
+        relay(&rig, edit_msg(&key, &edit_id, "second words", &root)).await;
+        assert_eq!(rig.state.held_relays.lock().len(), 1);
+
+        use base64::Engine;
+        let pubkey =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
+        crate::connection::file_session_signing_key(
+            &rig.state,
+            "alice-here",
+            Some(ALICE),
+            &pubkey,
+            None,
+        )
+        .expect("key filed");
+        let state = rig.state.clone();
+        let r = root.clone();
+        assert!(settle(move || text_of(&state, &r).as_deref() == Some("second words")).await);
+    }
+
+    #[tokio::test]
+    async fn two_held_edits_of_one_message_apply_in_arrival_order() {
+        let mut rig = rig().await;
+        let root = relay_original(&mut rig).await;
+        let key = fresh_key();
+        let e1 = next_id().await;
+        let e2 = next_id().await;
+        relay(&rig, edit_msg(&key, &e1, "second words", &root)).await;
+        relay(&rig, edit_msg(&key, &e2, "third words", &root)).await;
+        assert_eq!(rig.state.held_relays.lock().len(), 2);
+
+        land(&rig.state, ALICE, &key);
+        let state = rig.state.clone();
+        let e = e2.clone();
+        assert!(settle(move || row_filed(&state, &e)).await);
+        assert_eq!(text_of(&rig.state, &root).as_deref(), Some("third words"));
+        let lines = drain(&mut rig.rx).await;
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("second words") && lines[1].contains("third words"));
+    }
+
+    #[tokio::test]
+    async fn an_older_edit_released_late_never_replaces_newer_text() {
+        let mut rig = rig().await;
+        let root = relay_original(&mut rig).await;
+        // Two devices, two keys: the first not fetched yet, the second on file.
+        let key_a = fresh_key();
+        let key_b = fresh_key();
+        rig.state
+            .with_db(|db| db.save_signing_key(ALICE, key_b.verifying_key().as_bytes()))
+            .expect("db present");
+        let e1 = next_id().await;
+        let e2 = next_id().await;
+        relay(&rig, edit_msg(&key_a, &e1, "older words", &root)).await;
+        assert_eq!(rig.state.held_relays.lock().len(), 1, "the older one waits");
+        relay(&rig, edit_msg(&key_b, &e2, "newer words", &root)).await;
+        assert_eq!(text_of(&rig.state, &root).as_deref(), Some("newer words"));
+        let _ = drain(&mut rig.rx).await;
+
+        land(&rig.state, ALICE, &key_a);
+        let state = rig.state.clone();
+        let e = e1.clone();
+        assert!(
+            settle(move || row_filed(&state, &e)).await,
+            "the older edit is filed"
+        );
+        assert_eq!(
+            text_of(&rig.state, &root).as_deref(),
+            Some("newer words"),
+            "but the newer text stays current"
+        );
+        let current = rig
+            .state
+            .with_db(|db| db.current_revision(&root))
+            .flatten()
+            .expect("on file");
+        assert_eq!(current.text, "newer words", "in the store too");
+        assert!(
+            drain(&mut rig.rx).await.is_empty(),
+            "and nobody is shown the older text as if it were new"
+        );
+    }
+
+    /// The overtaken case, read through search: the newer text stays the one
+    /// search finds, and the older text filed late is not found.
+    #[tokio::test]
+    async fn an_overtaken_edit_filed_late_leaves_search_on_the_newer_text() {
+        let mut rig = rig().await;
+        let root = relay_original(&mut rig).await;
+        let key_a = fresh_key();
+        let key_b = fresh_key();
+        rig.state
+            .with_db(|db| db.save_signing_key(ALICE, key_b.verifying_key().as_bytes()))
+            .expect("db present");
+        let e1 = next_id().await;
+        let e2 = next_id().await;
+        relay(&rig, edit_msg(&key_a, &e1, "olderword", &root)).await;
+        relay(&rig, edit_msg(&key_b, &e2, "newerword", &root)).await;
+        land(&rig.state, ALICE, &key_a);
+        let state = rig.state.clone();
+        let e = e1.clone();
+        assert!(
+            settle(move || row_filed(&state, &e)).await,
+            "the older edit is filed"
+        );
+
+        let hits = |q: &str| {
+            rig.state
+                .with_db(|db| db.search_messages(CH, q, 10, None))
+                .expect("db present")
+                .len()
+        };
+        assert_eq!(hits("newerword"), 1, "search finds the current text");
+        assert_eq!(hits("olderword"), 0, "and not the text it overtook");
+    }
+
+    #[tokio::test]
+    async fn a_held_edit_whose_signature_is_wrong_is_dropped_when_its_key_lands() {
+        let mut rig = rig().await;
+        let root = relay_original(&mut rig).await;
+        let key = fresh_key();
+        let edit_id = next_id().await;
+        // Signed over other words than the ones that travelled.
+        let sig = signed_edit(&key, &channel_venue(), &edit_id, "what was signed", &root);
+        relay(
+            &rig,
+            privmsg(CH, &edit_id, "what was sent", Some(&root), Some(sig)),
+        )
+        .await;
+        assert_eq!(rig.state.held_relays.lock().len(), 1);
+
+        land(&rig.state, ALICE, &key);
+        let state = rig.state.clone();
+        assert!(settle(move || state.held_relays.lock().len() == 0).await);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(text_of(&rig.state, &root).as_deref(), Some("first words"));
+        assert!(!row_filed(&rig.state, &edit_id), "never filed");
+        assert!(drain(&mut rig.rx).await.is_empty(), "never shown");
+    }
+
+    #[tokio::test]
+    async fn held_past_the_minute_it_is_dropped_and_nothing_is_delivered() {
+        let mut rig = rig().await;
+        let root = relay_original(&mut rig).await;
+        let key = fresh_key();
+        let edit_id = next_id().await;
+        relay(&rig, edit_msg(&key, &edit_id, "second words", &root)).await;
+        assert_eq!(rig.state.held_relays.lock().len(), 1);
+
+        let then = std::time::Instant::now() + crate::held_relay::HOLD_LIMIT;
+        super::expire_held_relays(&rig.state, then);
+        assert_eq!(
+            rig.state.held_relays.lock().len(),
+            0,
+            "dropped at the limit"
+        );
+
+        // A key arriving afterwards finds nothing to release.
+        land(&rig.state, ALICE, &key);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(text_of(&rig.state, &root).as_deref(), Some("first words"));
+        assert!(!row_filed(&rig.state, &edit_id));
+        assert!(drain(&mut rig.rx).await.is_empty());
+    }
+
+    /// A peer with no key server configured, and a signer whose records say
+    /// nothing: nothing will ever answer, and the item ages out at the minute
+    /// rather than waiting on.
+    #[tokio::test]
+    async fn with_no_key_server_and_no_records_the_item_ages_out_at_the_minute() {
+        let mut rig = rig().await;
+        assert!(!crate::peer_keys::has_key_source(&rig.state, PEER));
+        let root = relay_original(&mut rig).await;
+        let key = fresh_key();
+        let edit_id = next_id().await;
+        let held_at = std::time::Instant::now();
+        relay(&rig, edit_msg(&key, &edit_id, "second words", &root)).await;
+
+        super::expire_held_relays(&rig.state, held_at + Duration::from_secs(55));
+        assert_eq!(
+            rig.state.held_relays.lock().len(),
+            1,
+            "still waiting at 55 s"
+        );
+        super::expire_held_relays(
+            &rig.state,
+            held_at + crate::held_relay::HOLD_LIMIT + Duration::from_secs(1),
+        );
+        assert_eq!(
+            rig.state.held_relays.lock().len(),
+            0,
+            "gone after the minute"
+        );
+        assert_eq!(text_of(&rig.state, &root).as_deref(), Some("first words"));
+    }
+
+    /// The lookup starts on the same miss that holds the item, and can finish
+    /// first. The item must not then wait out the minute for a key that is
+    /// already here.
+    #[tokio::test]
+    async fn a_key_that_landed_before_the_item_was_held_releases_it_at_once() {
+        let mut rig = rig().await;
+        let root = relay_original(&mut rig).await;
+        let key = fresh_key();
+        let edit_id = next_id().await;
+        let message = edit_msg(&key, &edit_id, "second words", &root);
+        // The key lands in the gap between the check and the hold.
+        rig.state
+            .with_db(|db| db.save_signing_key(ALICE, key.verifying_key().as_bytes()))
+            .expect("db present");
+        super::hold_relay(
+            &rig.state,
+            crate::held_relay::HeldRelay {
+                message,
+                peer: PEER.to_string(),
+                origin: PEER.to_string(),
+                arrival: crate::held_relay::Arrival {
+                    origin_name: PEER.to_string(),
+                    at: 0,
+                },
+                signer: ALICE.to_string(),
+                kid: kid_of(&key),
+                held_at: std::time::Instant::now(),
+                seq: 0,
+            },
+        );
+        let state = rig.state.clone();
+        let r = root.clone();
+        assert!(
+            settle(move || text_of(&state, &r).as_deref() == Some("second words")).await,
+            "released at once"
+        );
+        assert_eq!(rig.state.held_relays.lock().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_ceiling_evicts_the_oldest_held_item_and_the_two_queues_stay_apart() {
+        let state = super::test_state_with_config(crate::config::ServerConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            server_name: "test-s2s".to_string(),
+            challenge_timeout_secs: 60,
+            act_defer_max_per_origin: 2,
+            act_defer_max_total: 2,
+            ..Default::default()
+        });
+        let mut rig = rig_on(state).await;
+        // A full task-event queue…
+        for _ in 0..2 {
+            let dropped = rig
+                .state
+                .act_deferred
+                .lock()
+                .park(crate::act_relay::ParkedEvent {
+                    origin: PEER.to_string(),
+                    ..Default::default()
+                });
+            assert!(dropped.is_empty());
+        }
+        let root = relay_original(&mut rig).await;
+        let key = fresh_key();
+        let ids = [next_id().await, next_id().await, next_id().await];
+        // …does not stop an edit being held.
+        relay(&rig, edit_msg(&key, &ids[0], "one", &root)).await;
+        assert_eq!(rig.state.held_relays.lock().len(), 1);
+        relay(&rig, edit_msg(&key, &ids[1], "two", &root)).await;
+        // A full edit queue evicts its own oldest…
+        relay(&rig, edit_msg(&key, &ids[2], "three", &root)).await;
+        assert_eq!(rig.state.held_relays.lock().len(), 2);
+        // …and leaves the task events where they were.
+        assert_eq!(rig.state.act_deferred.lock().len(), 2);
+
+        land(&rig.state, ALICE, &key);
+        let state = rig.state.clone();
+        let r = root.clone();
+        assert!(settle(move || text_of(&state, &r).as_deref() == Some("three")).await);
+        assert!(
+            !row_filed(&rig.state, &ids[0]),
+            "the evicted edit never lands"
+        );
+        assert!(row_filed(&rig.state, &ids[1]));
+    }
+
+    /// The answer to the brief's `+n` question, pinned: membership is checked
+    /// when the edit is released, so an edit whose sender left a `+n` channel
+    /// while it waited is dropped, as a live one from a non-member is.
+    #[tokio::test]
+    async fn a_held_edit_released_after_its_sender_left_a_plus_n_channel_is_dropped() {
+        let mut rig = rig().await;
+        {
+            let mut channels = rig.state.channels.lock();
+            let ch = channels.get_mut(CH).unwrap();
+            ch.no_ext_msg = true;
+            ch.remote_members.insert(
+                "alice".to_string(),
+                super::RemoteMember {
+                    origin: PEER.to_string(),
+                    did: Some(ALICE.to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        let root = relay_original(&mut rig).await;
+        assert_eq!(text_of(&rig.state, &root).as_deref(), Some("first words"));
+        let key = fresh_key();
+        let edit_id = next_id().await;
+        relay(&rig, edit_msg(&key, &edit_id, "second words", &root)).await;
+        assert_eq!(rig.state.held_relays.lock().len(), 1);
+
+        rig.state
+            .channels
+            .lock()
+            .get_mut(CH)
+            .unwrap()
+            .remote_members
+            .remove("alice");
+        land(&rig.state, ALICE, &key);
+        let state = rig.state.clone();
+        assert!(settle(move || state.held_relays.lock().len() == 0).await);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(text_of(&rig.state, &root).as_deref(), Some("first words"));
+        assert!(drain(&mut rig.rx).await.is_empty());
     }
 }
