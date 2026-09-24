@@ -22,7 +22,16 @@ function openSnapshots(): Promise<IDBPDatabase> {
 }
 
 export class IndexedDbKeyLookupStore implements KeyLookupStore {
+  /** Settles before the first read: the previous lookup's flush, so its
+   *  last write lands before this one reads the shared snapshot. */
+  private readonly after: Promise<unknown>;
+
+  constructor(after: Promise<unknown> = Promise.resolve()) {
+    this.after = after;
+  }
+
   async load(): Promise<KeyLookupSnapshot | null> {
+    await this.after.catch(() => undefined);
     const db = await openSnapshots();
     try {
       return ((await db.get(STORE, KEY)) as KeyLookupSnapshot | undefined) ?? null;

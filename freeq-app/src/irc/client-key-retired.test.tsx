@@ -44,7 +44,7 @@ class MockFreeqClient {
 vi.mock('@freeq/sdk', () => ({
   FreeqClient: MockFreeqClient,
   IndexedDbDeviceKeyStore: class {},
-  KeyLookup: class { originBase() { return null; } },
+  KeyLookup: class { originBase() { return null; } async flush() {} },
   makeDidResolver: () => async () => ({ id: 'did:plc:x' }),
   recordKeyOf: async () => ({ publicKeyMultibase: 'z', signer: async () => '' }),
   decodeMultibaseEd25519: () => new Uint8Array(32),

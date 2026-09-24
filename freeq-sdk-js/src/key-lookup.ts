@@ -63,19 +63,28 @@ export interface Cached {
 }
 
 /**
- * What a lookup keeps between page loads: each (DID, kid) answer, a key found
- * or a miss with the time it was settled (a miss answers for the ttl), each
- * DID's proven device records with their listing time, when each DID was last
- * listed for a key lookup, and the CIDs of records whose proof checked.
- * Failures and lookups in flight are not kept.
+ * What a lookup keeps between page loads: each account's proven device
+ * records once (`accounts`); each (DID, kid) answer, a key found or a miss
+ * with the time it was settled (a miss answers for the ttl), reading its
+ * DID's records from `accounts`; when each DID's held listing was taken and
+ * when it was last listed for a key lookup; and the CIDs of records whose
+ * proof checked. Failures and lookups in flight are not kept. A snapshot of
+ * another `version` is not read.
  */
 export interface KeyLookupSnapshot {
-  keys: [string, Cached][];
-  records: [string, { records: unknown[]; at: number }][];
-  /** Absent from a snapshot saved before it was kept. */
-  refreshed?: [string, number][];
+  version: typeof SNAPSHOT_VERSION;
+  accounts: [string, unknown[]][];
+  keys: [string, { other: FoundKey | null | undefined; at: number }][];
+  records: [string, number][];
+  refreshed: [string, number][];
   proven: string[];
 }
+
+/** The snapshot shape this code reads and writes. */
+export const SNAPSHOT_VERSION = 2;
+
+/** The least time between two writes of a lookup's snapshot. */
+export const SAVE_EVERY_MS = 2_000;
 
 /** Where a key lookup keeps its snapshot. */
 export interface KeyLookupStore {
@@ -158,6 +167,12 @@ export class KeyLookup {
   private loaded: Promise<void> | null = null;
   /** Writes to the store, one after another. */
   private saving: Promise<void> = Promise.resolve();
+  /** When the store was last written, and the write held back until two
+   *  seconds after it. */
+  private lastWrite = -Infinity;
+  private heldWrite: ReturnType<typeof setTimeout> | null = null;
+  /** Set by `flush`: nothing is written after it. */
+  private flushed = false;
   /** The origin answered its batch key route with a 404: a server from
    *  before it, asked key by key for the rest of this lookup's life. */
   private batchRouteMissing = false;
@@ -171,19 +186,23 @@ export class KeyLookup {
     private readonly store: KeyLookupStore = new MemoryKeyLookupStore(),
   ) {}
 
-  /** Take in what the store holds, once; a store that cannot be read leaves the cache as it is. */
+  /** Take in what the store holds, once; a store that cannot be read, or a
+   *  snapshot of another shape, leaves the cache as it is. */
   private load(): Promise<void> {
     if (this.loaded === null) {
       this.loaded = this.store.load().then(
         (snapshot) => {
-          if (snapshot === null) return;
-          for (const [slot, cached] of snapshot.keys) {
-            if (!this.cache.has(slot)) this.cache.set(slot, cached);
+          if (snapshot === null || snapshot.version !== SNAPSHOT_VERSION) return;
+          const accounts = new Map(snapshot.accounts);
+          const recordsOf = (did: string) => accounts.get(did) ?? [];
+          for (const [slot, answer] of snapshot.keys) {
+            const did = (JSON.parse(slot) as [string, string])[0];
+            if (!this.cache.has(slot)) this.cache.set(slot, { ...answer, records: recordsOf(did) });
           }
-          for (const [did, listed] of snapshot.records) {
-            if (!this.records.has(did)) this.records.set(did, listed);
+          for (const [did, at] of snapshot.records) {
+            if (!this.records.has(did)) this.records.set(did, { records: recordsOf(did), at });
           }
-          for (const [did, at] of snapshot.refreshed ?? []) {
+          for (const [did, at] of snapshot.refreshed) {
             if (!this.refreshed.has(did)) this.refreshed.set(did, at);
           }
           for (const cid of snapshot.proven) this.proven.add(cid);
@@ -194,16 +213,66 @@ export class KeyLookup {
     return this.loaded;
   }
 
-  /** Write the found keys, proven records and proven CIDs to the store; a write that fails is dropped. */
-  private save(): Promise<void> {
-    const snapshot: KeyLookupSnapshot = {
-      keys: [...this.cache],
-      records: [...this.records],
+  /** What the store is given: each account's records once, the DID's held
+   *  listing where there is one, else the records its first answer holds. */
+  private snapshot(): KeyLookupSnapshot {
+    const accounts = new Map<string, unknown[]>();
+    for (const [did, listed] of this.records) accounts.set(did, listed.records);
+    const keys: KeyLookupSnapshot['keys'] = [];
+    for (const [slot, cached] of this.cache) {
+      const did = (JSON.parse(slot) as [string, string])[0];
+      if (!accounts.has(did)) accounts.set(did, cached.records);
+      keys.push([slot, { other: cached.other, at: cached.at }]);
+    }
+    return {
+      version: SNAPSHOT_VERSION,
+      accounts: [...accounts],
+      keys,
+      records: [...this.records].map(([did, listed]) => [did, listed.at]),
       refreshed: [...this.refreshed],
       proven: [...this.proven],
     };
+  }
+
+  /**
+   * Write the snapshot to the store, at most once every `SAVE_EVERY_MS`: a
+   * save inside that time is held and written when it ends, with whatever is
+   * held then. Nothing is written after `flush`. A write that fails is dropped.
+   */
+  private save(): Promise<void> {
+    if (this.flushed || this.heldWrite !== null) return Promise.resolve();
+    const wait = this.lastWrite + SAVE_EVERY_MS - Date.now();
+    if (wait <= 0) return this.write();
+    this.heldWrite = setTimeout(() => {
+      this.heldWrite = null;
+      if (!this.flushed) void this.write();
+    }, wait);
+    return Promise.resolve();
+  }
+
+  private write(): Promise<void> {
+    this.lastWrite = Date.now();
+    const snapshot = this.snapshot();
     this.saving = this.saving.then(() => this.store.save(snapshot)).catch(() => undefined);
     return this.saving;
+  }
+
+  /**
+   * Write a held save now, wait for every write to land, and write nothing
+   * after. Called before another lookup on the same store loads it, so that
+   * load sees this lookup's last answers and no later write of this one
+   * replaces what the other writes.
+   */
+  async flush(): Promise<void> {
+    if (!this.flushed) {
+      this.flushed = true;
+      if (this.heldWrite !== null) {
+        clearTimeout(this.heldWrite);
+        this.heldWrite = null;
+        void this.write();
+      }
+    }
+    await this.saving;
   }
 
   /** The origin to ask when none was given at construction. Set once; a

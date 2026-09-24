@@ -288,15 +288,18 @@ describe('publishing the device key through the broker', () => {
   /** A key lookup on a store holding, for DID and `stored`'s kid, an answer
    *  from the origin server when `vouched`. */
   async function lookupHolding(stored: StoredDeviceKey, vouched: boolean) {
-    const { KeyLookup, MemoryKeyLookupStore } = await import('./key-lookup.js');
+    const { KeyLookup, MemoryKeyLookupStore, SNAPSHOT_VERSION } = await import('./key-lookup.js');
     const raw = new Uint8Array(await crypto.subtle.exportKey('raw', stored.keyPair.publicKey));
     const slot = JSON.stringify([DID, await deriveKid(raw)]);
     const cache = new MemoryKeyLookupStore();
     await cache.save({
+      version: SNAPSHOT_VERSION,
+      accounts: [],
       keys: vouched
-        ? [[slot, { records: [], other: { publicKey: raw, source: 'OriginServer', retiredAt: null, expiresAt: null }, at: Date.now() }]]
+        ? [[slot, { other: { publicKey: raw, source: 'OriginServer', retiredAt: null, expiresAt: null }, at: Date.now() }]]
         : [],
       records: [],
+      refreshed: [],
       proven: [],
     });
     const lookup = new KeyLookup(

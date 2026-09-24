@@ -663,11 +663,13 @@ describe('KeyLookup against the batch key route', () => {
     expect(routes.asked).toHaveLength(1);
 
     vi.setSystemTime(clock(59));
+    await first.flush();
     const second = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
     expect(await second.keyForAt(ALICE, 'gone', at)).toBeNull();
     expect(routes.asked, 'the saved miss answers').toHaveLength(1);
 
     vi.setSystemTime(clock(61));
+    await second.flush();
     const third = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
     expect(await third.keyForAt(ALICE, 'gone', at)).toBeNull();
     expect(routes.asked, 'past the ttl, asked once').toHaveLength(2);
@@ -687,6 +689,7 @@ describe('KeyLookup with a store', () => {
     expect([inRecords?.source, atOrigin?.source]).toEqual(['IdentityRecord', 'OriginServer']);
     const requests = fetch.mock.calls.length;
 
+    await first.flush();
     const second = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
     expect(await second.keyFor(ALICE, await kidOf(1))).toEqual(inRecords);
     expect(await second.keyFor(ALICE, await kidOf(2))).toEqual(atOrigin);
@@ -743,6 +746,7 @@ describe('KeyLookup with a store', () => {
       'at.freeq.deviceKey',
       await buildDeviceRetirement(await key(1), ALICE, kid, clock(30).toISOString()),
     );
+    await first.flush();
     const second = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR, NO_RETRIES, store);
     vi.setSystemTime(clock(59));
     expect((await second.keyFor(ALICE, kid))?.retiredAt, 'inside the ttl the stored listing stands').toBeNull();
@@ -757,6 +761,84 @@ describe('KeyLookup with a store', () => {
     expect(hits.pds).toBe(2);
   });
 
+  /** A store that counts its writes and keeps the last one. */
+  function countingStore() {
+    const store = new MemoryKeyLookupStore();
+    const writes: unknown[] = [];
+    const save = store.save.bind(store);
+    store.save = async (snapshot) => {
+      writes.push(snapshot);
+      await save(snapshot);
+    };
+    return { store, writes };
+  }
+
+  it("keeps an account's records once, however many of its keys are held", async () => {
+    const records = [
+      await buildDeviceRecord(await key(1), ALICE, T0),
+      await buildDeviceRecord(await key(2), ALICE, T0),
+      await buildDeviceRecord(await key(3), ALICE, T0),
+    ];
+    const { fetch } = await network(records);
+    const { store, writes } = countingStore();
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
+    for (const seed of [1, 2, 3]) expect((await lookup.keyFor(ALICE, await kidOf(seed)))?.source).toBe('IdentityRecord');
+    await lookup.flush();
+    const saved = JSON.stringify(writes[writes.length - 1]);
+    const signature = (records[0] as { bindingSig: string }).bindingSig;
+    expect(saved.split(signature).length - 1, 'the first record, once').toBe(1);
+  });
+
+  it('writes the store at most once every two seconds', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    vi.setSystemTime(clock(0));
+    const { fetch } = await network([]);
+    const { store, writes } = countingStore();
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
+    for (let i = 0; i < 10; i++) await lookup.keyForAt(ALICE, `gone${i}`, new Date(NOW - HOUR));
+    expect(writes, 'ten settles, one write').toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(writes, 'and one more once two seconds have passed').toHaveLength(2);
+    const last = writes[1] as { keys: unknown[] };
+    expect(last.keys, 'holding all ten').toHaveLength(10);
+  });
+
+  it('starts empty from a snapshot of the old shape', async () => {
+    const k2 = await kidOf(2);
+    const { fetch, hits } = await network([], { [`${ALICE} ${k2}`]: await raw(2) });
+    const store = new MemoryKeyLookupStore();
+    // Records copied into every key's slot, and no version.
+    await store.save({
+      keys: [[JSON.stringify([ALICE, k2]), { records: [], other: { publicKey: await raw(2), source: 'OriginServer', retiredAt: null, expiresAt: null }, at: Date.now() }]],
+      records: [],
+      proven: [],
+    } as never);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
+    expect((await lookup.keyFor(ALICE, k2))?.source).toBe('OriginServer');
+    expect(hits.origin, 'asked, not read from the old snapshot').toBe(1);
+  });
+
+  it("lands an old lookup's held write before a new lookup's load once flushed, and writes nothing after", async () => {
+    const k2 = await kidOf(2);
+    const { fetch, routes } = await network([]);
+    const { store, writes } = countingStore();
+    const old = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
+    await old.keyForAt(ALICE, 'first', new Date(NOW - HOUR));
+    await old.keyForAt(ALICE, k2, new Date(NOW - HOUR));
+    expect(writes, 'the second write is held').toHaveLength(1);
+    await old.flush();
+    expect(writes).toHaveLength(2);
+
+    const next = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
+    const asked = routes.asked.length;
+    expect(await next.keyForAt(ALICE, k2, new Date(NOW - HOUR))).toBeNull();
+    expect(routes.asked, "the held miss came through").toHaveLength(asked);
+
+    await old.keyForAt(ALICE, 'late', new Date(NOW - HOUR));
+    await new Promise((r) => setTimeout(r, 2_100));
+    expect(writes, 'nothing from the old lookup after its flush').toHaveLength(2);
+  }, 10_000);
+
   it('keeps a miss in the store, so a later lookup does not ask for it inside the ttl', async () => {
     const originKeys: Record<string, Uint8Array> = {};
     const { fetch, hits } = await network([], originKeys);
@@ -765,6 +847,7 @@ describe('KeyLookup with a store', () => {
     expect(await first.keyFor(ALICE, await kidOf(2))).toBeNull();
 
     originKeys[`${ALICE} ${await kidOf(2)}`] = await raw(2);
+    await first.flush();
     const second = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
     expect(await second.keyFor(ALICE, await kidOf(2))).toBeNull();
     expect(hits.origin).toBe(1);
@@ -1144,6 +1227,7 @@ describe('KeyLookup through the home server', () => {
     await lookup.refreshAccount(ALICE);
     expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
 
+    await lookup.flush();
     const second = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES, store);
     expect((await second.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
     expect(hits.origin).toBe(1);

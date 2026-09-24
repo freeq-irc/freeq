@@ -97,8 +97,11 @@ describe('the Devices rows', () => {
     const record = await buildDeviceRecord(await recordKeyOf(pair), DID, createdAt, 'Work laptop');
     // What an earlier page load's lookup kept for this account, a minute ago.
     await new IndexedDbKeyLookupStore().save({
+      version: 2,
+      accounts: [[DID, [record]]],
       keys: [],
-      records: [[DID, { records: [record], at: Date.now() - 60_000 }]],
+      records: [[DID, Date.now() - 60_000]],
+      refreshed: [],
       proven: [],
     });
     bridge.connect('wss://test/irc', 'me', []);
