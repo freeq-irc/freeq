@@ -2023,6 +2023,71 @@ export class FreeqClient extends EventEmitter {
    * concat rules: a chunk with `draft/multiline-concat` is joined to
    * the predecessor with no separator; otherwise joined with `\n`.
    */
+  /**
+   * Fold a replayed edit into its original inside a history batch, so
+   * `historyBatch` hands the app a final transcript. The same for a
+   * single-line edit and for a multi-line one whose nested batch closes
+   * inside the history batch.
+   */
+  private foldReplayedEdit(
+    batch: Batch,
+    editOf: string,
+    text: string,
+    from: string,
+    tags: Record<string, string>,
+    isSelf: boolean,
+  ): void {
+    // Reactions attach to the msgid the user reacted to — usually
+    // the latest edit id — so replay delivers them ON the edit row.
+    // The collapse must carry them, or reactions on edited messages
+    // vanish every reload.
+    let editReactions: Map<string, Set<string>> | undefined;
+    const reactionsTag = tags['+freeq.at/reactions'];
+    if (reactionsTag) {
+      editReactions = new Map();
+      for (const part of reactionsTag.split(';')) {
+        const [emoji, nicks] = part.split(':');
+        if (emoji && nicks) {
+          const set = editReactions.get(emoji) ?? new Set<string>();
+          for (const n of nicks.split(',')) if (n) set.add(n);
+          editReactions.set(emoji, set);
+        }
+      }
+    }
+    const idx = batch.messages.findIndex(
+      (m) => m.id === editOf || m.editOf === editOf,
+    );
+    if (idx >= 0) {
+      const prev = batch.messages[idx];
+      const mergedReactions = editReactions
+        ? new Map([...(prev.reactions ?? new Map()), ...editReactions])
+        : prev.reactions;
+      batch.messages[idx] = {
+        ...prev,
+        text,
+        // The id does NOT move to the edit's. A message keeps the id
+        // it was born with, so anything holding a reference to it —
+        // a reaction, a pending delete, a reply — still resolves.
+        editOf: prev.editOf ?? editOf,
+        ...(mergedReactions ? { reactions: mergedReactions } : {}),
+      };
+      return;
+    }
+    // Original row absent from this batch window — deliver the
+    // edit as its own row rather than losing the content, keyed by
+    // the message's identity rather than this revision's wire id.
+    batch.messages.push({
+      id: editOf,
+      from,
+      text,
+      timestamp: tags['time'] ? new Date(tags['time']) : new Date(),
+      tags,
+      isSelf,
+      editOf,
+      ...(editReactions ? { reactions: editReactions } : {}),
+    });
+  }
+
   private assembleMultiline(lines: Array<{ body: string; concat: boolean }>): string {
     let result = '';
     for (let i = 0; i < lines.length; i++) {
@@ -2151,8 +2216,15 @@ export class FreeqClient extends EventEmitter {
       }
     }
 
-    // Edits ride through `messageEdited` regardless of how they arrived
+    // Edits ride through `messageEdited` regardless of how they arrived —
+    // except a replayed one, nested in a history batch, which folds into its
+    // original there exactly as a single-line replayed edit does.
     if (openerTags['+draft/edit']) {
+      const parent = batch.parentBatchId ? this.batches.get(batch.parentBatchId) : undefined;
+      if (parent) {
+        this.foldReplayedEdit(parent, openerTags['+draft/edit'], displayText, from, openerTags, isSelf);
+        return;
+      }
       const isStreaming = openerTags['+freeq.at/streaming'] === '1';
       this.emit(
         'messageEdited',
@@ -2688,55 +2760,7 @@ export class FreeqClient extends EventEmitter {
           const editBatchId = msg.tags['batch'];
           const editBatch = editBatchId ? this.batches.get(editBatchId) : undefined;
           if (editBatch && editBatch.type !== 'draft/multiline') {
-            // Reactions attach to the msgid the user reacted to — usually
-            // the latest edit id — so replay delivers them ON the edit row.
-            // The collapse must carry them, or reactions on edited messages
-            // vanish every reload.
-            let editReactions: Map<string, Set<string>> | undefined;
-            const reactionsTag = msg.tags['+freeq.at/reactions'];
-            if (reactionsTag) {
-              editReactions = new Map();
-              for (const part of reactionsTag.split(';')) {
-                const [emoji, nicks] = part.split(':');
-                if (emoji && nicks) {
-                  const set = editReactions.get(emoji) ?? new Set<string>();
-                  for (const n of nicks.split(',')) if (n) set.add(n);
-                  editReactions.set(emoji, set);
-                }
-              }
-            }
-            const idx = editBatch.messages.findIndex(
-              (m) => m.id === editOf || m.editOf === editOf,
-            );
-            if (idx >= 0) {
-              const prev = editBatch.messages[idx];
-              const mergedReactions = editReactions
-                ? new Map([...(prev.reactions ?? new Map()), ...editReactions])
-                : prev.reactions;
-              editBatch.messages[idx] = {
-                ...prev,
-                text: displayText,
-                // The id does NOT move to the edit's. A message keeps the id
-                // it was born with, so anything holding a reference to it —
-                // a reaction, a pending delete, a reply — still resolves.
-                editOf: prev.editOf ?? editOf,
-                ...(mergedReactions ? { reactions: mergedReactions } : {}),
-              };
-              break;
-            }
-            // Original row absent from this batch window — deliver the
-            // edit as its own row rather than losing the content, keyed by
-            // the message's identity rather than this revision's wire id.
-            editBatch.messages.push({
-              id: editOf,
-              from,
-              text: displayText,
-              timestamp: msg.tags['time'] ? new Date(msg.tags['time']) : new Date(),
-              tags: msg.tags,
-              isSelf,
-              editOf,
-              ...(editReactions ? { reactions: editReactions } : {}),
-            });
+            this.foldReplayedEdit(editBatch, editOf, displayText, from, msg.tags, isSelf);
             break;
           }
           const isStreaming = msg.tags['+freeq.at/streaming'] === '1';

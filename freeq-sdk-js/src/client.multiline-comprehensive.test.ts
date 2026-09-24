@@ -474,6 +474,107 @@ describe('comprehensive: nested multiline inside CHATHISTORY', () => {
   });
 });
 
+describe('comprehensive: a replayed multi-line edit folds into its original', () => {
+  // A join replay sends an edited message as its original line and then its
+  // edit line. When the edit is a multi-line batch nested in the history
+  // batch, it has to fold into its original there, as a single-line edit
+  // does — emitted mid-batch as `messageEdited`, a fresh session has nothing
+  // to apply it to and shows the original text.
+
+  it('multi-line original + multi-line edit: one row, edited text, reactions from both', async () => {
+    const { client, ws } = await makeMultilineClient('alice');
+    const edits: unknown[] = [];
+    const history: Message[][] = [];
+    client.on('messageEdited', (...args) => edits.push(args));
+    client.on('historyBatch', (_t, messages) => history.push(messages));
+    ws.recv(':srv BATCH +h1 chathistory #room');
+    ws.recv(
+      '@batch=h1;msgid=01ORIG;+freeq.at/reactions=👍:carol ' +
+        ':bob!u@h BATCH +o1 draft/multiline #room',
+    );
+    ws.recv('@batch=o1 :bob!u@h PRIVMSG #room :first 1');
+    ws.recv('@batch=o1 :bob!u@h PRIVMSG #room :first 2');
+    ws.recv(':srv BATCH -o1');
+    ws.recv(
+      '@batch=h1;msgid=02EDIT;+draft/edit=01ORIG;+freeq.at/reactions=🎉:dave ' +
+        ':bob!u@h BATCH +e1 draft/multiline #room',
+    );
+    ws.recv('@batch=e1 :bob!u@h PRIVMSG #room :second 1');
+    ws.recv('@batch=e1 :bob!u@h PRIVMSG #room :second 2');
+    ws.recv(':srv BATCH -e1');
+    ws.recv(':srv BATCH -h1');
+    await flushAsync();
+    expect(edits).toHaveLength(0);
+    expect(history).toHaveLength(1);
+    expect(history[0]).toHaveLength(1);
+    const row = history[0][0];
+    expect(row.id).toBe('01ORIG');
+    expect(row.text).toBe('second 1\nsecond 2');
+    expect(row.editOf).toBe('01ORIG');
+    expect([...(row.reactions?.get('👍') ?? [])]).toEqual(['carol']);
+    expect([...(row.reactions?.get('🎉') ?? [])]).toEqual(['dave']);
+  });
+
+  it('single-line original + multi-line edit: one row with the edited text', async () => {
+    const { client, ws } = await makeMultilineClient('alice');
+    const edits: unknown[] = [];
+    const history: Message[][] = [];
+    client.on('messageEdited', (...args) => edits.push(args));
+    client.on('historyBatch', (_t, messages) => history.push(messages));
+    ws.recv(':srv BATCH +h2 chathistory #room');
+    ws.recv('@batch=h2;msgid=01ONE :bob!u@h PRIVMSG #room :just one line');
+    ws.recv(
+      '@batch=h2;msgid=02TWO;+draft/edit=01ONE :bob!u@h BATCH +e2 draft/multiline #room',
+    );
+    ws.recv('@batch=e2 :bob!u@h PRIVMSG #room :now two');
+    ws.recv('@batch=e2 :bob!u@h PRIVMSG #room :lines');
+    ws.recv(':srv BATCH -e2');
+    ws.recv(':srv BATCH -h2');
+    await flushAsync();
+    expect(edits).toHaveLength(0);
+    expect(history[0]).toHaveLength(1);
+    expect(history[0][0].id).toBe('01ONE');
+    expect(history[0][0].text).toBe('now two\nlines');
+    expect(history[0][0].editOf).toBe('01ONE');
+  });
+
+  it('a multi-line edit whose original is not in the batch lands as its own row', async () => {
+    const { client, ws } = await makeMultilineClient('alice');
+    const history: Message[][] = [];
+    client.on('historyBatch', (_t, messages) => history.push(messages));
+    ws.recv(':srv BATCH +h3 chathistory #room');
+    ws.recv(
+      '@batch=h3;msgid=02LONE;+draft/edit=01GONE :bob!u@h BATCH +e3 draft/multiline #room',
+    );
+    ws.recv('@batch=e3 :bob!u@h PRIVMSG #room :orphan 1');
+    ws.recv('@batch=e3 :bob!u@h PRIVMSG #room :orphan 2');
+    ws.recv(':srv BATCH -e3');
+    ws.recv(':srv BATCH -h3');
+    await flushAsync();
+    expect(history[0]).toHaveLength(1);
+    expect(history[0][0].id).toBe('01GONE');
+    expect(history[0][0].text).toBe('orphan 1\norphan 2');
+    expect(history[0][0].editOf).toBe('01GONE');
+  });
+
+  it('guard: a live multi-line edit still arrives as messageEdited', async () => {
+    const { client, ws } = await makeMultilineClient('alice');
+    const edits: unknown[] = [];
+    const history: Message[][] = [];
+    client.on('messageEdited', (...args) => edits.push(args));
+    client.on('historyBatch', (_t, messages) => history.push(messages));
+    ws.recv('@msgid=02LIVE;+draft/edit=01ORIG :bob!u@h BATCH +e4 draft/multiline #room');
+    ws.recv('@batch=e4 :bob!u@h PRIVMSG #room :live 1');
+    ws.recv('@batch=e4 :bob!u@h PRIVMSG #room :live 2');
+    ws.recv(':srv BATCH -e4');
+    await flushAsync();
+    expect(history).toHaveLength(0);
+    expect(edits).toHaveLength(1);
+    expect((edits[0] as unknown[])[1]).toBe('01ORIG');
+    expect((edits[0] as unknown[])[2]).toBe('live 1\nlive 2');
+  });
+});
+
 // ────────────────────────────────────────────────────────────────────
 // 5. Edge cases
 // ────────────────────────────────────────────────────────────────────
