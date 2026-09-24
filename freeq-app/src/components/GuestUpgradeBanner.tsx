@@ -1,7 +1,7 @@
 import { useStore } from '../store';
 import { disconnect } from '../irc/client';
 import { useState } from 'react';
-import { TOP_BAR, TOP_BAR_ACCENT, TOP_BAR_CLOSE, TOP_BAR_INLINE_BUTTON, TOP_BAR_TEXT } from './topBar';
+import { TOP_BAR, TOP_BAR_ACCENT, TOP_BAR_CLOSE, TOP_BAR_INLINE_BUTTON, TOP_BAR_TEXT } from './TopBar';
 
 export function GuestUpgradeBanner() {
   const authDid = useStore((s) => s.authDid);
