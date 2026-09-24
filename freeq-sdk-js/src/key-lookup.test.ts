@@ -88,12 +88,61 @@ beforeAll(async () => {
  * `originKeys` by `${did} ${kid}`. Counts listings and origin requests per
  * host, and proof requests on their own.
  */
-async function network(records: unknown[], originKeys: Record<string, Uint8Array> = {}) {
+/** A key an origin holds: its bytes, and the dates it answers with. */
+type OriginKey = Uint8Array | { key: Uint8Array; removed_at?: number | null; expires_at?: number | null };
+
+/** How the stub origin answers its batch key route. */
+interface OriginRoutes {
+  /** A status the batch route answers with instead of keys (404: a server without it). */
+  batchStatus?: number;
+  /** Every key-route request, `batch` or `kid`, in order. */
+  asked: ('batch' | 'kid')[];
+}
+
+/**
+ * The origin key store's answer to `url` from `originKeys` by `${did} ${kid}`,
+ * on the per-kid route and the batch route; undefined for any other path.
+ */
+function originKeyAnswer(
+  url: URL,
+  originKeys: Record<string, OriginKey>,
+  routes: OriginRoutes,
+): Response | undefined {
+  const entry = (did: string, kid: string) => {
+    const held = originKeys[`${did} ${kid}`];
+    if (held === undefined) return undefined;
+    const { key, ...dates } = held instanceof Uint8Array ? { key: held } : held;
+    return { did, kid, algorithm: 'ed25519', public_key: b64url(key), ...dates };
+  };
+  if (url.pathname === '/api/v1/signing-keys') {
+    routes.asked.push('batch');
+    if (routes.batchStatus !== undefined) {
+      return Response.json({ error: 'status' }, { status: routes.batchStatus });
+    }
+    const keys = (url.searchParams.get('keys') ?? '')
+      .split(',')
+      .map((item) => {
+        const at = item.indexOf('/');
+        return entry(item.slice(0, at), item.slice(at + 1));
+      })
+      .filter((k) => k !== undefined);
+    return Response.json({ keys });
+  }
+  const prefix = '/api/v1/signing-keys/';
+  if (!url.pathname.startsWith(prefix)) return undefined;
+  routes.asked.push('kid');
+  const [did, kid] = url.pathname.slice(prefix.length).split('/').map(decodeURIComponent);
+  const found = entry(did!, kid!);
+  return found === undefined ? new Response('not found', { status: 404 }) : Response.json(found);
+}
+
+async function network(records: unknown[], originKeys: Record<string, OriginKey> = {}) {
   const { stubRepo } = await import('../test/repo-proofs.js');
   const repo = await stubRepo(ALICE, repoKey);
   const entries = [];
   for (const record of records) entries.push(await repo.add('at.freeq.deviceKey', record));
   const hits = { pds: 0, origin: 0, proofs: 0 };
+  const routes: OriginRoutes = { asked: [] };
   const fetch = vi.fn(async (input: string): Promise<Response> => {
     const url = new URL(input);
     if (url.origin === PDS) {
@@ -101,17 +150,16 @@ async function network(records: unknown[], originKeys: Record<string, Uint8Array
       else if (url.pathname === '/xrpc/com.atproto.repo.listRecords') hits.pds++;
       return (await repo.respond(url)) ?? new Response('unexpected', { status: 500 });
     }
-    const prefix = '/api/v1/signing-keys/';
-    if (url.origin === ORIGIN && url.pathname.startsWith(prefix)) {
-      hits.origin++;
-      const [did, kid] = url.pathname.slice(prefix.length).split('/').map(decodeURIComponent);
-      const found = originKeys[`${did} ${kid}`];
-      if (found === undefined) return new Response('not found', { status: 404 });
-      return Response.json({ did, kid, algorithm: 'ed25519', public_key: b64url(found) });
+    if (url.origin === ORIGIN) {
+      const answer = originKeyAnswer(url, originKeys, routes);
+      if (answer !== undefined) {
+        hits.origin++;
+        return answer;
+      }
     }
     return new Response('unexpected', { status: 500 });
   });
-  return { fetch, hits, repo };
+  return { fetch, hits, repo, routes };
 }
 
 function resolver(docs: DidDocument[]) {
@@ -491,10 +539,8 @@ describe('KeyLookup', () => {
 
   it('carries the date the origin removed a key', async () => {
     const key2 = await raw(2);
-    const fetch = vi.fn(async (input: string): Promise<Response> => {
-      const url = new URL(input);
-      if (url.origin === PDS) return Response.json({ records: [] });
-      return Response.json({ public_key: b64url(key2), removed_at: 1_780_000_000 });
+    const { fetch } = await network([], {
+      [`${ALICE} ${await kidOf(2)}`]: { key: key2, removed_at: 1_780_000_000 },
     });
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
     expect(await lookup.keyFor(ALICE, await kidOf(2))).toEqual({
@@ -516,6 +562,115 @@ describe('KeyLookup', () => {
     const given = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
     given.setDefaultOriginBase('https://elsewhere.example');
     expect(given.originBase()).toBe(ORIGIN);
+  });
+});
+
+describe('KeyLookup against the batch key route', () => {
+  const kids = async (...seeds: number[]) => Promise.all(seeds.map(kidOf));
+
+  it("takes a key's retirement from the earlier of its removal and its expiry", async () => {
+    const [k2, k3, k4] = await kids(2, 3, 4);
+    const { fetch } = await network([], {
+      [`${ALICE} ${k2}`]: { key: await raw(2), removed_at: 2_000, expires_at: 1_000 },
+      [`${ALICE} ${k3}`]: { key: await raw(3), removed_at: 2_000 },
+      [`${ALICE} ${k4}`]: { key: await raw(4), removed_at: null, expires_at: null },
+    });
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
+    expect((await lookup.keyFor(ALICE, k2!))?.retiredAt).toBe(1_000);
+    expect((await lookup.keyFor(ALICE, k3!))?.retiredAt, 'an old server sends no expiry').toBe(2_000);
+    expect((await lookup.keyFor(ALICE, k4!))?.retiredAt).toBeNull();
+  });
+
+  it('prefetches keys in one request per 50, and answers them and their misses without asking again', async () => {
+    const [k2, k3] = await kids(2, 3);
+    const { fetch, routes, hits } = await network([], {
+      [`${ALICE} ${k2}`]: await raw(2),
+      [`${WEB_SIGNER} ${k3}`]: await raw(3),
+    });
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
+    const pairs: [string, string][] = [
+      [ALICE, k2!],
+      [WEB_SIGNER, k3!],
+      ...Array.from({ length: 58 }, (_, i): [string, string] => [ALICE, `absent${i}`]),
+    ];
+    // Alice's records are held, so a key of hers the origin leaves out is a miss.
+    await lookup.provenDeviceRecords(ALICE);
+    const listed = hits.pds;
+    await lookup.prefetchKeys(pairs);
+    expect(routes.asked).toEqual(['batch', 'batch']);
+
+    expect(await lookup.keyForAt(ALICE, k2!, new Date(NOW - HOUR))).toEqual({
+      publicKey: await raw(2),
+      source: 'OriginServer',
+      retiredAt: null,
+      expiresAt: null,
+    });
+    expect((await lookup.keyForAt(WEB_SIGNER, k3!, new Date(NOW - HOUR)))?.source).toBe('OriginServer');
+    expect(await lookup.keyForAt(ALICE, 'absent7', new Date(NOW - HOUR))).toBeNull();
+    expect(routes.asked, 'nothing asked again').toEqual(['batch', 'batch']);
+    expect(hits.pds, 'nor listed again').toBe(listed);
+
+    await lookup.prefetchKeys(pairs);
+    expect(routes.asked, 'a second prefetch asks nothing').toEqual(['batch', 'batch']);
+  });
+
+  it('asks the per-kid route after a 404 from the batch route, and the batch route no more', async () => {
+    const [k2, k3] = await kids(2, 3);
+    const { fetch, routes } = await network([], {
+      [`${ALICE} ${k2}`]: await raw(2),
+      [`${ALICE} ${k3}`]: await raw(3),
+    });
+    routes.batchStatus = 404;
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
+    expect((await lookup.keyFor(ALICE, k2!))?.source).toBe('OriginServer');
+    expect((await lookup.keyFor(ALICE, k3!))?.source).toBe('OriginServer');
+    expect(routes.asked).toEqual(['batch', 'kid', 'kid']);
+  });
+
+  it('counts a 429 or a 5xx from the batch route as a failure, not a miss', async () => {
+    const [k2] = await kids(2);
+    const { fetch, routes } = await network([], { [`${ALICE} ${k2}`]: await raw(2) });
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
+    for (const status of [429, 503]) {
+      routes.batchStatus = status;
+      await lookup.prefetchKeys([[ALICE, k2!]]);
+    }
+    routes.batchStatus = undefined;
+    expect((await lookup.keyFor(ALICE, k2!))?.source).toBe('OriginServer');
+    expect(routes.asked).toEqual(['batch', 'batch', 'batch']);
+  });
+
+  it("asks a replayed line's missing key once, and a fresh line's again at each retry", async () => {
+    const replayed = await network([]);
+    const late = new KeyLookup({ fetch: replayed.fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, [1, 2, 3]);
+    expect(await late.keyForAt(ALICE, 'gone', new Date(Date.now() - HOUR))).toBeNull();
+    expect(replayed.routes.asked).toHaveLength(1);
+
+    const fresh = await network([]);
+    const live = new KeyLookup({ fetch: fresh.fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, [1, 2, 3]);
+    expect(await live.keyForAt(ALICE, 'gone', new Date(Date.now() - 1_000))).toBeNull();
+    expect(fresh.routes.asked).toHaveLength(4);
+  });
+
+  it('keeps a miss in the store for the ttl, across a new lookup, then asks once more', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(clock(0));
+    const { fetch, routes } = await network([]);
+    const store = new MemoryKeyLookupStore();
+    const at = new Date(NOW - 10 * HOUR);
+    const first = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
+    expect(await first.keyForAt(ALICE, 'gone', at)).toBeNull();
+    expect(routes.asked).toHaveLength(1);
+
+    vi.setSystemTime(clock(59));
+    const second = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
+    expect(await second.keyForAt(ALICE, 'gone', at)).toBeNull();
+    expect(routes.asked, 'the saved miss answers').toHaveLength(1);
+
+    vi.setSystemTime(clock(61));
+    const third = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
+    expect(await third.keyForAt(ALICE, 'gone', at)).toBeNull();
+    expect(routes.asked, 'past the ttl, asked once').toHaveLength(2);
   });
 });
 
@@ -602,7 +757,7 @@ describe('KeyLookup with a store', () => {
     expect(hits.pds).toBe(2);
   });
 
-  it('keeps no miss in the store', async () => {
+  it('keeps a miss in the store, so a later lookup does not ask for it inside the ttl', async () => {
     const originKeys: Record<string, Uint8Array> = {};
     const { fetch, hits } = await network([], originKeys);
     const store = new MemoryKeyLookupStore();
@@ -611,8 +766,8 @@ describe('KeyLookup with a store', () => {
 
     originKeys[`${ALICE} ${await kidOf(2)}`] = await raw(2);
     const second = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
-    expect((await second.keyFor(ALICE, await kidOf(2)))?.source).toBe('OriginServer');
-    expect(hits.origin).toBe(2);
+    expect(await second.keyFor(ALICE, await kidOf(2))).toBeNull();
+    expect(hits.origin).toBe(1);
   });
 });
 
@@ -773,16 +928,8 @@ async function homeNetwork(originKeys: Record<string, Uint8Array> = {}) {
       const answer = await home.respond(url);
       if (answer !== undefined) return answer;
       hits.origin++;
-      // The origin's key route: one server answers both in production.
-      const prefix = '/api/v1/signing-keys/';
-      if (url.pathname.startsWith(prefix)) {
-        const [did, kid] = url.pathname.slice(prefix.length).split('/').map(decodeURIComponent);
-        const found = originKeys[`${did} ${kid}`];
-        if (found !== undefined) {
-          return Response.json({ did, kid, algorithm: 'ed25519', public_key: b64url(found) });
-        }
-      }
-      return new Response('not found', { status: 404 });
+      // The origin's key routes: one server answers both in production.
+      return originKeyAnswer(url, originKeys, { asked: [] }) ?? new Response('not found', { status: 404 });
     }
     return new Response('unexpected', { status: 500 });
   });
@@ -804,6 +951,18 @@ describe('KeyLookup through the home server', () => {
     expect(home.batches).toEqual([[ALICE, BOB, CAROL]]);
     expect(pds).toEqual({ listings: 0, proofs: 0 });
     expect(hits.origin).toBe(0);
+  });
+
+  it("remembers no key miss for an account whose records the prefetch did not bring", async () => {
+    const { home, fetch, resolveDid } = await homeNetwork();
+    // The home server has not seen Alice: her records are not prefetched,
+    // and it holds no key for her either.
+    home.left.add(ALICE);
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    await lookup.prefetch([ALICE]);
+    await lookup.prefetchKeys([[ALICE, await kidOf(1)]]);
+    // Her line lists her records itself, and finds the key published there.
+    expect((await lookup.keyForAt(ALICE, await kidOf(1), new Date(NOW - HOUR)))?.source).toBe('IdentityRecord');
   });
 
   it('shares one batch request between two prefetches for the same signers', async () => {

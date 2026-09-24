@@ -35,9 +35,10 @@ export type KeySource = 'IdentityRecord' | 'DidDocument' | 'OriginServer';
 export interface FoundKey {
   publicKey: Uint8Array;
   source: KeySource;
-  /** When the key was retired, unix seconds: by a retirement or the expiry
-   *  in the signer's records, or the date the origin server says it was
-   *  removed. Only a date at or before the instant asked about. */
+  /** When the key stopped counting, unix seconds. From the signer's records:
+   *  its retirement or expiry, only when at or before the instant asked
+   *  about. From the origin server: the earlier of its removal and its
+   *  expiry, which may be later than that instant. */
   retiredAt: number | null;
   /** When the key stops counting, unix seconds: its record's expiry, told
    *  whether or not it has passed. Only the records give one. */
@@ -62,10 +63,11 @@ export interface Cached {
 }
 
 /**
- * What a lookup keeps between page loads: each (DID, kid) answer that found a
- * key, each DID's proven device records with their listing time, when each
- * DID was last listed for a key lookup, and the CIDs of records whose proof
- * checked. Misses, failures and lookups in flight are not kept.
+ * What a lookup keeps between page loads: each (DID, kid) answer, a key found
+ * or a miss with the time it was settled (a miss answers for the ttl), each
+ * DID's proven device records with their listing time, when each DID was last
+ * listed for a key lookup, and the CIDs of records whose proof checked.
+ * Failures and lookups in flight are not kept.
  */
 export interface KeyLookupSnapshot {
   keys: [string, Cached][];
@@ -111,6 +113,16 @@ interface Settled {
 export const MISS_RETRY_AFTER_MS: readonly number[] = [2_000, 6_000, 15_000];
 
 /**
+ * How recently a line must have been signed for its missing key to be asked
+ * again at the retry delays: a line that just arrived may name a key its
+ * server is still fetching; a replayed one settles on its first miss.
+ */
+export const FRESH_LINE_MS = 120_000;
+
+/** Most keys one request to the origin's batch key route names. */
+export const MAX_KEYS_PER_REQUEST = 50;
+
+/**
  * Looks keys up by (DID, kid). A miss, when every source answered without the
  * key, is cached for `ttlMs`; a key found is cached without expiry, and one
  * found in the records takes the DID's listing again once that is older than
@@ -146,6 +158,9 @@ export class KeyLookup {
   private loaded: Promise<void> | null = null;
   /** Writes to the store, one after another. */
   private saving: Promise<void> = Promise.resolve();
+  /** The origin answered its batch key route with a 404: a server from
+   *  before it, asked key by key for the rest of this lookup's life. */
+  private batchRouteMissing = false;
 
   /** `originBase` is the origin server's base URL; the reader's `fetch` serves its requests. */
   constructor(
@@ -182,7 +197,7 @@ export class KeyLookup {
   /** Write the found keys, proven records and proven CIDs to the store; a write that fails is dropped. */
   private save(): Promise<void> {
     const snapshot: KeyLookupSnapshot = {
-      keys: [...this.cache].filter(([, cached]) => cached.other !== null),
+      keys: [...this.cache],
       records: [...this.records],
       refreshed: [...this.refreshed],
       proven: [...this.proven],
@@ -269,7 +284,9 @@ export class KeyLookup {
     const refreshes = this.refreshes.get(did);
     const listed = cached === undefined;
     let settled = await this.ask(did, kid, at, cached?.records);
-    for (const after of this.retryAfterMs) {
+    // Only a line signed just now is asked about again.
+    const retries = Date.now() - at.getTime() <= FRESH_LINE_MS ? this.retryAfterMs : [];
+    for (const after of retries) {
       const missed = settled.other === null && !settled.failed && this.originBase() !== null;
       if (!missed) break;
       await new Promise((resolve) => setTimeout(resolve, Math.max(0, started + after - performance.now())));
@@ -356,6 +373,92 @@ export class KeyLookup {
       };
     }
     return { records, other: null, failed, failure };
+  }
+
+  /**
+   * Ask the origin's batch key route for the keys of `pairs` ([DID, kid]), in
+   * one request per 50, for the pairs no answer is held for: not a key found,
+   * not a miss inside the ttl, not a key the DID's held records name. A key
+   * the origin answers is kept as its answer; a pair it leaves out is kept as
+   * a miss only when the DID's records are held (or it is a did:key, which
+   * has none). A request that fails, or is answered 429 or 5xx, keeps nothing,
+   * since it said nothing about the keys. Against a server without the route
+   * (a 404) nothing is asked. Never fails.
+   */
+  async prefetchKeys(pairs: [string, string][]): Promise<void> {
+    await this.load();
+    const base = this.originBase();
+    if (base === null || this.batchRouteMissing) return;
+    const now = Date.now();
+    const asked: [string, string][] = [];
+    const seen = new Set<string>();
+    for (const [did, kid] of pairs) {
+      const slot = JSON.stringify([did, kid]);
+      if (seen.has(slot) || this.inFlight.has(slot)) continue;
+      seen.add(slot);
+      const hit = this.cache.get(slot);
+      if (hit !== undefined && hit.other !== undefined && (hit.other !== null || now - hit.at < this.ttlMs)) {
+        continue;
+      }
+      const held = this.records.get(did)?.records ?? hit?.records;
+      if (held !== undefined && (await fromRecords(did, kid, held, new Date(now))) !== null) continue;
+      asked.push([did, kid]);
+    }
+    let kept = false;
+    for (let i = 0; i < asked.length; i += MAX_KEYS_PER_REQUEST) {
+      const chunk = asked.slice(i, i + MAX_KEYS_PER_REQUEST);
+      let answered: Map<string, OriginAnswer>;
+      try {
+        const found = await this.fromBatchRoute(base, chunk);
+        if (found === null) return;
+        answered = found;
+      } catch {
+        continue;
+      }
+      for (const [did, kid] of chunk) {
+        const slot = JSON.stringify([did, kid]);
+        const answer = answered.get(slot);
+        const records = this.records.get(did)?.records ?? [];
+        let other: FoundKey | null = null;
+        if (answer?.key && answer.key.length === 32 && (await deriveKid(answer.key)) === kid) {
+          other = { publicKey: answer.key, source: 'OriginServer', retiredAt: answer.retiredAt, expiresAt: null };
+        }
+        // A miss counts only when the account's records were read: without
+        // them, the line's own lookup lists the account.
+        if (other === null && !this.records.has(did) && !did.startsWith('did:key:')) continue;
+        this.remember(slot, records, other);
+        kept = true;
+      }
+    }
+    if (kept) await this.save();
+  }
+
+  /**
+   * The origin's batch key route's answer for `pairs`, by slot; null when the
+   * origin has no such route (a 404), which it remembers. Throws on anything
+   * else that is not a 200.
+   */
+  private async fromBatchRoute(
+    base: string,
+    pairs: [string, string][],
+  ): Promise<Map<string, OriginAnswer> | null> {
+    const keys = pairs.map(([did, kid]) => `${encodeURIComponent(did)}/${encodeURIComponent(kid)}`).join(',');
+    const res = await this.reader.fetch(`${base.replace(/\/+$/, '')}/api/v1/signing-keys?keys=${keys}`);
+    if (res.status === 404) {
+      this.batchRouteMissing = true;
+      return null;
+    }
+    if (!res.ok) throw new Error(`the origin key store answered ${res.status}`);
+    const body = (await res.json()) as { keys?: unknown };
+    if (!Array.isArray(body.keys)) throw new Error('the origin answer is not a key list');
+    const out = new Map<string, OriginAnswer>();
+    for (const entry of body.keys as Record<string, unknown>[]) {
+      if (typeof entry !== 'object' || entry === null) continue;
+      if (typeof entry.did !== 'string' || typeof entry.kid !== 'string') continue;
+      const answer = originAnswer(entry);
+      if (answer !== null) out.set(JSON.stringify([entry.did, entry.kid]), answer);
+    }
+    return out;
   }
 
   /**
@@ -626,22 +729,53 @@ export class KeyLookup {
     return null;
   }
 
-  /** The key the origin holds for `(did, kid)`, and when it was removed. */
+  /**
+   * The key the origin holds for `(did, kid)`, and when it stopped counting:
+   * through the batch key route, or the per-kid route on a server without it.
+   */
   private async fromOrigin(
     base: string,
     did: string,
     kid: string,
   ): Promise<[Uint8Array | null, number | null]> {
+    if (!this.batchRouteMissing) {
+      const answered = await this.fromBatchRoute(base, [[did, kid]]);
+      if (answered !== null) {
+        const answer = answered.get(JSON.stringify([did, kid]));
+        return answer === undefined ? [null, null] : [answer.key, answer.retiredAt];
+      }
+    }
     const path = `/api/v1/signing-keys/${encodeURIComponent(did)}/${encodeURIComponent(kid)}`;
     const res = await this.reader.fetch(`${base.replace(/\/+$/, '')}${path}`);
     if (res.status === 404) return [null, null];
     if (!res.ok) throw new Error(`the origin key store answered ${res.status}`);
-    const answer = (await res.json()) as { public_key?: unknown; removed_at?: unknown };
-    if (typeof answer.public_key !== 'string') throw new Error('the origin answer is not a key');
-    const removedAt = typeof answer.removed_at === 'number' ? answer.removed_at : null;
-    // A key that does not decode is refused like a wrong one.
-    return [base64UrlDecode(answer.public_key), removedAt];
+    const answer = originAnswer((await res.json()) as Record<string, unknown>);
+    if (answer === null) throw new Error('the origin answer is not a key');
+    return [answer.key, answer.retiredAt];
   }
+}
+
+/** A key the origin answered, and when it stopped counting (unix seconds). */
+interface OriginAnswer {
+  /** Null when it does not decode: refused like a wrong key. */
+  key: Uint8Array | null;
+  retiredAt: number | null;
+}
+
+/**
+ * One key of an origin's answer: its bytes, and the earlier of its
+ * `removed_at` and `expires_at`. A server from before expiries sends no
+ * `expires_at`, and its keys are taken as not expiring. Null when the answer
+ * carries no key.
+ */
+function originAnswer(entry: Record<string, unknown>): OriginAnswer | null {
+  if (typeof entry.public_key !== 'string') return null;
+  const dates = [entry.removed_at, entry.expires_at].filter((d): d is number => typeof d === 'number');
+  // A key that does not decode is refused like a wrong one.
+  return {
+    key: base64UrlDecode(entry.public_key),
+    retiredAt: dates.length === 0 ? null : Math.min(...dates),
+  };
 }
 
 /**

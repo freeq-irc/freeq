@@ -1683,8 +1683,10 @@ export class FreeqClient extends EventEmitter {
         targetDid: this.didForNick(line.target),
         checker,
       };
+      const sigTag = line.tags[signing.SIG_TAG] ?? line.tags['freeq.at/sig'];
       (batch.deferredChecks ??= []).push({
         did: line.tags['account'],
+        kid: (sigTag && sigTagKid(sigTag)) || undefined,
         start: () => this.checkLater(delivered, line, onSettled, '', at),
       });
       return;
@@ -1729,15 +1731,21 @@ export class FreeqClient extends EventEmitter {
 
   /**
    * Start the checks held on a closed batch, once its signers' records are
-   * prefetched in one request (see `KeyLookup.prefetch`). Off the receive path.
+   * prefetched in one request (see `KeyLookup.prefetch`), then the keys the
+   * records did not answer in one more (`KeyLookup.prefetchKeys`). Off the
+   * receive path.
    */
   private startDeferredChecks(batch: Batch): void {
     const held = batch.deferredChecks;
     if (!held?.length) return;
     const dids = [...new Set(held.map((h) => h.did).filter((d): d is string => !!d && isDid(d)))];
+    const pairs = held
+      .filter((h) => !!h.did && isDid(h.did) && !!h.kid)
+      .map((h): [string, string] => [h.did!, h.kid!]);
     const lookup = this.opts.keyLookup;
     void (async () => {
       if (lookup && dids.length > 0) await lookup.prefetch(dids).catch(() => undefined);
+      if (lookup && pairs.length > 0) await lookup.prefetchKeys(pairs).catch(() => undefined);
       for (const h of held) h.start();
     })();
   }

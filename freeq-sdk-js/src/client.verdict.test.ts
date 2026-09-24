@@ -67,6 +67,13 @@ interface Origin {
   records: unknown[];
   delayMs: number;
   setReads: number;
+  /** Serve `/api/v1/records?dids=`, each account with no device records;
+   *  off, the server has no record routes. */
+  recordRoutes: boolean;
+  /** Requests to `/api/v1/records?dids=`, to the batch key route, and to the per-kid route. */
+  recordsReads: number;
+  batchReads: number;
+  kidReads: number;
 }
 
 let origin: Origin;
@@ -92,8 +99,31 @@ const stubFetch = async (input: string): Promise<Response> => {
     });
   }
   if (url.origin !== ORIGIN) return new Response('unexpected', { status: 500 });
+  if (url.pathname === '/api/v1/records' && origin.recordRoutes) {
+    origin.recordsReads++;
+    const dids = (url.searchParams.get('dids') ?? '').split(',');
+    return Response.json({
+      accounts: dids.map((did) => ({
+        did,
+        collections: {
+          'at.freeq.deviceKey': { records: [], proofs: [], fetched_at: Math.floor(Date.now() / 1000) },
+        },
+      })),
+    });
+  }
   // A server without the record routes.
   if (url.pathname.startsWith('/api/v1/records')) return new Response('not found', { status: 404 });
+  if (url.pathname === '/api/v1/signing-keys') {
+    origin.batchReads++;
+    if (origin.delayMs > 0) await new Promise((r) => setTimeout(r, origin.delayMs));
+    const keys = (url.searchParams.get('keys') ?? '').split(',').flatMap((item) => {
+      const at = item.indexOf('/');
+      const [did, kid] = [item.slice(0, at), item.slice(at + 1)];
+      const held = origin.keys.get(`${did} ${kid}`);
+      return held ? [{ did, kid, public_key: b64url(held.key), removed_at: held.removedAt ?? null }] : [];
+    });
+    return Response.json({ keys });
+  }
   if (url.pathname === '/api/v1/signing-key') {
     return Response.json({ did: SERVER_DID, public_key: origin.serverKeys[0] && b64url(origin.serverKeys[0]) });
   }
@@ -106,6 +136,7 @@ const stubFetch = async (input: string): Promise<Response> => {
       : [];
     return Response.json({ did, keys });
   }
+  origin.kidReads++;
   if (origin.delayMs > 0) await new Promise((r) => setTimeout(r, origin.delayMs));
   const held = origin.keys.get(`${did} ${kid}`);
   if (!held) return new Response('not found', { status: 404 });
@@ -125,7 +156,17 @@ beforeEach(() => {
   MockWebSocket.instances = [];
   // @ts-expect-error mock global
   globalThis.WebSocket = MockWebSocket;
-  origin = { keys: new Map(), serverKeys: [], records: [], delayMs: 0, setReads: 0 };
+  origin = {
+    keys: new Map(),
+    serverKeys: [],
+    records: [],
+    delayMs: 0,
+    setReads: 0,
+    recordRoutes: false,
+    recordsReads: 0,
+    batchReads: 0,
+    kidReads: 0,
+  };
   vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 404 })));
 });
 
@@ -623,6 +664,33 @@ describe('a replayed history batch', () => {
     release();
     await settle(s, [first.msgid, multi.msgid]);
     expect(s.seen.get(multi.msgid)?.settled?.state).toBe('device');
+  });
+
+  it('asks for its signers in one records request and their keys in one key request', async () => {
+    origin.recordRoutes = true;
+    const s = await session(OWN_DID, lookup());
+    const lines = [
+      await signed(A, 41, 'first', { batch: 'h' }),
+      await signed(B, 42, 'second', { batch: 'h' }),
+      await signed(A, 44, 'from another device', { batch: 'h' }),
+      await signed(C, 43, 'fourth', { batch: 'h' }),
+      await signed(A, 41, 'fifth', { batch: 'h' }),
+    ];
+    s.ws.recv(':srv BATCH +h chathistory #room');
+    for (const l of lines) s.ws.recv(l.wire);
+    s.ws.recv(':srv BATCH -h');
+    await settle(s, lines.map((l) => l.msgid));
+
+    expect(lines.map((l) => s.seen.get(l.msgid)?.settled?.state)).toEqual([
+      'device',
+      'device',
+      'device',
+      'device',
+      'device',
+    ]);
+    expect(origin.recordsReads, 'records').toBe(1);
+    expect(origin.batchReads, 'keys').toBe(1);
+    expect(origin.kidReads, 'no key asked on its own').toBe(0);
   });
 
   it('prefetches nothing for a batch with no signed line', async () => {
