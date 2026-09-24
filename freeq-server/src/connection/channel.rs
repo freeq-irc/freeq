@@ -529,228 +529,7 @@ pub(super) fn handle_join(
     }
 
     // Replay recent message history with server-time + batch when supported
-    {
-        let has_tags_cap = state.cap_message_tags.lock().contains(session_id);
-        let has_time_cap = state.cap_server_time.lock().contains(session_id);
-        let has_batch_cap = state.cap_batch.lock().contains(session_id);
-        let has_multiline_cap = state.cap_draft_multiline.lock().contains(session_id);
-
-        // Clone the history out so the DB call (reactions lookup) can
-        // happen without holding the channels lock — and so the per-row
-        // emit loop below isn't holding the lock either.
-        let history: Vec<crate::server::HistoryMessage> = {
-            let channels = state.channels.lock();
-            channels
-                .get(channel)
-                .map(|ch| ch.history.iter().cloned().collect())
-                .unwrap_or_default()
-        };
-
-        // The channel's task events, for a joiner that asked for them: the
-        // newest MAX_HISTORY, the same cap the messages get. Fetched on their
-        // own terms, not within the span of the message buffer — a task
-        // posted after the last chat line, or into a room nobody has chatted
-        // in, replays too.
-        let batch_id = format!("hist{}", crate::msgid::generate());
-        let mut act_lines = super::act::replay_lines(
-            state,
-            session_id,
-            &crate::events::venue_of(channel),
-            channel,
-            0,
-            i64::MAX,
-            crate::server::MAX_HISTORY,
-            has_time_cap,
-            has_batch_cap.then_some(batch_id.as_str()),
-        );
-        act_lines.reverse();
-
-        if !history.is_empty() || !act_lines.is_empty() {
-            // Fetch persisted reactions for this batch so they ride on
-            // the replayed messages — mirrors the explicit CHATHISTORY
-            // emission path (messaging.rs). Without this, joiners see
-            // history with no reaction chips until a live TAGMSG
-            // arrives.
-            let msgids: Vec<&str> = history.iter().filter_map(|h| h.msgid.as_deref()).collect();
-            let reactions: std::collections::HashMap<String, Vec<crate::db::ReactionRow>> =
-                if has_tags_cap && !msgids.is_empty() {
-                    state
-                        .with_db(|db| db.get_reactions_for_messages(&msgids))
-                        .unwrap_or_default()
-                } else {
-                    std::collections::HashMap::new()
-                };
-
-            // Start batch if client supports it
-            if has_batch_cap {
-                let batch_start =
-                    format!(":{server_name} BATCH +{batch_id} chathistory {channel}\r\n");
-                send(state, session_id, batch_start);
-            }
-
-            // Messages and task events interleave in time order: each task
-            // event goes out before the first message that landed after it.
-
-            for hist in &history {
-                while act_lines
-                    .last()
-                    .is_some_and(|(ts, _)| *ts <= hist.timestamp as i64)
-                {
-                    let (_, line) = act_lines.pop().expect("just checked");
-                    send(state, session_id, line);
-                }
-                let mut msg_tags = if has_tags_cap {
-                    hist.tags.clone()
-                } else {
-                    std::collections::HashMap::new()
-                };
-
-                // Replay carries one entry per logical message, so an edited
-                // message arrives as its current text with no `+draft/edit` to
-                // hint at the revision — this is what lets a late joiner render
-                // "(edited)".
-                if has_tags_cap && hist.edited {
-                    msg_tags.insert("+freeq.at/edited".to_string(), "1".to_string());
-                }
-
-                // Add msgid tag if available
-                if has_tags_cap && let Some(ref mid) = hist.msgid {
-                    msg_tags.insert("msgid".to_string(), mid.clone());
-                    // Include persisted reactions as `+freeq.at/reactions`
-                    // (format: `emoji1:nick1,nick2;emoji2:nick3`).
-                    if let Some(reaction_rows) = reactions.get(mid) {
-                        let mut by_emoji: std::collections::HashMap<&str, Vec<&str>> =
-                            std::collections::HashMap::new();
-                        for r in reaction_rows {
-                            by_emoji.entry(&r.emoji).or_default().push(&r.reactor_nick);
-                        }
-                        if !by_emoji.is_empty() {
-                            let encoded: Vec<String> = by_emoji
-                                .iter()
-                                .map(|(emoji, nicks)| format!("{}:{}", emoji, nicks.join(",")))
-                                .collect();
-                            msg_tags.insert("+freeq.at/reactions".to_string(), encoded.join(";"));
-                        }
-                    }
-                }
-
-                // Add server-time tag
-                if has_time_cap {
-                    let ts = chrono::DateTime::from_timestamp(hist.timestamp as i64, 0)
-                        .unwrap_or_default()
-                        .format("%Y-%m-%dT%H:%M:%S.000Z")
-                        .to_string();
-                    msg_tags.insert("time".to_string(), ts);
-                }
-
-                // Add batch tag
-                if has_batch_cap {
-                    msg_tags.insert("batch".to_string(), batch_id.clone());
-                }
-
-                // Multi-line stored bodies: emitting `\n` raw in a
-                // PRIVMSG terminates the IRC line mid-text. Mirror the
-                // explicit CHATHISTORY emission path — nested
-                // `draft/multiline` BATCH for capable receivers, split
-                // PRIVMSGs otherwise.
-                let bodies: Vec<&str> = hist.text.split('\n').collect();
-                let is_multiline = bodies.len() > 1;
-                if is_multiline && has_multiline_cap && has_batch_cap {
-                    let ml_id = format!("ml{}", crate::msgid::generate());
-                    let opener = irc::Message {
-                        tags: msg_tags.clone(),
-                        prefix: Some(hist.from.clone()),
-                        command: "BATCH".to_string(),
-                        params: vec![
-                            format!("+{ml_id}"),
-                            "draft/multiline".to_string(),
-                            channel.to_string(),
-                        ],
-                    };
-                    send(state, session_id, format!("{opener}\r\n"));
-                    for body in &bodies {
-                        let mut chunk_tags = std::collections::HashMap::new();
-                        chunk_tags.insert("batch".to_string(), ml_id.clone());
-                        let chunk = irc::Message {
-                            tags: chunk_tags,
-                            prefix: Some(hist.from.clone()),
-                            command: "PRIVMSG".to_string(),
-                            params: vec![channel.to_string(), body.to_string()],
-                        };
-                        send(state, session_id, format!("{chunk}\r\n"));
-                    }
-                    let mut closer_tags = std::collections::HashMap::new();
-                    if let Some(b) = msg_tags.get("batch") {
-                        closer_tags.insert("batch".to_string(), b.clone());
-                    }
-                    let closer = irc::Message {
-                        tags: closer_tags,
-                        prefix: None,
-                        command: "BATCH".to_string(),
-                        params: vec![format!("-{ml_id}")],
-                    };
-                    send(state, session_id, format!("{closer}\r\n"));
-                    continue;
-                }
-                if is_multiline {
-                    // Fallback: split at \n into N PRIVMSGs. msgid +
-                    // client tags ride on the first chunk; later chunks
-                    // carry only the chathistory batch tag so they stay
-                    // grouped under the same replay unit.
-                    for (i, body) in bodies.iter().enumerate() {
-                        let chunk_tags = if i == 0 {
-                            msg_tags.clone()
-                        } else {
-                            let mut t = std::collections::HashMap::new();
-                            if has_batch_cap {
-                                t.insert("batch".to_string(), batch_id.clone());
-                            }
-                            t
-                        };
-                        if !chunk_tags.is_empty() && has_tags_cap {
-                            let chunk = irc::Message {
-                                tags: chunk_tags,
-                                prefix: Some(hist.from.clone()),
-                                command: "PRIVMSG".to_string(),
-                                params: vec![channel.to_string(), body.to_string()],
-                            };
-                            send(state, session_id, format!("{chunk}\r\n"));
-                        } else {
-                            let line = format!(":{} PRIVMSG {} :{}\r\n", hist.from, channel, body);
-                            send(state, session_id, line);
-                        }
-                    }
-                    continue;
-                }
-
-                if !msg_tags.is_empty() && has_tags_cap {
-                    let tag_msg = irc::Message {
-                        tags: msg_tags,
-                        prefix: Some(hist.from.clone()),
-                        command: "PRIVMSG".to_string(),
-                        params: vec![channel.to_string(), hist.text.clone()],
-                    };
-                    send(state, session_id, format!("{tag_msg}\r\n"));
-                } else {
-                    let line = format!(":{} PRIVMSG {} :{}\r\n", hist.from, channel, hist.text);
-                    send(state, session_id, line);
-                }
-            }
-
-            // Whatever happened after the last message — sent whether or not
-            // this client batches, since the events are the point and the
-            // batch is only how they are framed.
-            while let Some((_, line)) = act_lines.pop() {
-                send(state, session_id, line);
-            }
-
-            // End batch
-            if has_batch_cap {
-                let batch_end = format!(":{server_name} BATCH -{batch_id}\r\n");
-                send(state, session_id, batch_end);
-            }
-        }
-    }
+    replay_history(state, session_id, server_name, channel, send);
 
     let nick_list: Vec<String> = {
         let channels = state.channels.lock();
@@ -2329,6 +2108,308 @@ pub(super) fn auto_modes_for(is_op: bool, is_halfop: bool, is_voiced: bool) -> V
         modes.push("v");
     }
     modes
+}
+
+/// Replay a channel's recent history to one session that just joined it, with
+/// server-time and a `chathistory` batch when the session supports them.
+pub(crate) fn replay_history(
+    state: &Arc<SharedState>,
+    session_id: &str,
+    server_name: &str,
+    channel: &str,
+    send: &impl Fn(&Arc<SharedState>, &str, String),
+) {
+    let has_tags_cap = state.cap_message_tags.lock().contains(session_id);
+    let has_time_cap = state.cap_server_time.lock().contains(session_id);
+    let has_batch_cap = state.cap_batch.lock().contains(session_id);
+    let has_multiline_cap = state.cap_draft_multiline.lock().contains(session_id);
+
+    // Clone the history out so the DB call (reactions lookup) can
+    // happen without holding the channels lock — and so the per-row
+    // emit loop below isn't holding the lock either.
+    let history: Vec<crate::server::HistoryMessage> = {
+        let channels = state.channels.lock();
+        channels
+            .get(channel)
+            .map(|ch| ch.history.iter().cloned().collect())
+            .unwrap_or_default()
+    };
+
+    // The channel's task events, for a joiner that asked for them: the
+    // newest MAX_HISTORY, the same cap the messages get. Fetched on their
+    // own terms, not within the span of the message buffer — a task
+    // posted after the last chat line, or into a room nobody has chatted
+    // in, replays too.
+    let batch_id = format!("hist{}", crate::msgid::generate());
+    let mut act_lines = super::act::replay_lines(
+        state,
+        session_id,
+        &crate::events::venue_of(channel),
+        channel,
+        0,
+        i64::MAX,
+        crate::server::MAX_HISTORY,
+        has_time_cap,
+        has_batch_cap.then_some(batch_id.as_str()),
+    );
+    act_lines.reverse();
+
+    if !history.is_empty() || !act_lines.is_empty() {
+        // Fetch persisted reactions for this batch so they ride on
+        // the replayed messages — mirrors the explicit CHATHISTORY
+        // emission path (messaging.rs). Without this, joiners see
+        // history with no reaction chips until a live TAGMSG
+        // arrives.
+        let msgids: Vec<&str> = history.iter().filter_map(|h| h.msgid.as_deref()).collect();
+        let reactions: std::collections::HashMap<String, Vec<crate::db::ReactionRow>> =
+            if has_tags_cap && !msgids.is_empty() {
+                state
+                    .with_db(|db| db.get_reactions_for_messages(&msgids))
+                    .unwrap_or_default()
+            } else {
+                std::collections::HashMap::new()
+            };
+
+        // Start batch if client supports it
+        if has_batch_cap {
+            let batch_start = format!(":{server_name} BATCH +{batch_id} chathistory {channel}\r\n");
+            send(state, session_id, batch_start);
+        }
+
+        // Messages and task events interleave in time order: each task
+        // event goes out before the first message that landed after it.
+
+        for hist in &history {
+            while act_lines
+                .last()
+                .is_some_and(|(ts, _)| *ts <= hist.timestamp as i64)
+            {
+                let (_, line) = act_lines.pop().expect("just checked");
+                send(state, session_id, line);
+            }
+
+            // Persisted reactions as `+freeq.at/reactions` (format:
+            // `emoji1:nick1,nick2;emoji2:nick3`), filed under the root.
+            let reactions_tag = hist
+                .msgid
+                .as_ref()
+                .and_then(|mid| reactions.get(mid))
+                .map(|rows| {
+                    let mut by_emoji: std::collections::HashMap<&str, Vec<&str>> =
+                        std::collections::HashMap::new();
+                    for r in rows {
+                        by_emoji.entry(&r.emoji).or_default().push(&r.reactor_nick);
+                    }
+                    by_emoji
+                        .iter()
+                        .map(|(emoji, nicks)| format!("{}:{}", emoji, nicks.join(",")))
+                        .collect::<Vec<_>>()
+                        .join(";")
+                })
+                .filter(|encoded| !encoded.is_empty());
+
+            // The lines this message replays as: its text, its tags, its time.
+            //
+            // An edited message goes out as CHATHISTORY sends it — the original
+            // line, then the newest edit line, each with its own id, text and
+            // signature — so each checks out against its own words. A joiner
+            // without message-tags cannot tell an edit from a new message, so
+            // it gets one line with the newest text, as before.
+            let mut lines: Vec<(&str, std::collections::HashMap<String, String>, u64)> = Vec::new();
+            if !has_tags_cap {
+                lines.push((&hist.text, std::collections::HashMap::new(), hist.timestamp));
+            } else {
+                let mut original_tags = hist.tags.clone();
+                if let Some(ref mid) = hist.msgid {
+                    original_tags.insert("msgid".to_string(), mid.clone());
+                }
+                match &hist.edit {
+                    None => {
+                        if let Some(ref r) = reactions_tag {
+                            original_tags.insert("+freeq.at/reactions".to_string(), r.clone());
+                        }
+                        lines.push((&hist.text, original_tags, hist.timestamp));
+                    }
+                    Some(edit) => {
+                        let mut edit_tags = edit.tags.clone();
+                        edit_tags.insert("msgid".to_string(), edit.msgid.clone());
+                        if let Some(ref root) = hist.msgid {
+                            edit_tags.insert("+draft/edit".to_string(), root.clone());
+                        }
+                        match edit.original_text {
+                            // Reactions ride on the original line only: they
+                            // are filed under the message, which is the
+                            // original's id.
+                            Some(ref original_text) => {
+                                if let Some(ref r) = reactions_tag {
+                                    original_tags
+                                        .insert("+freeq.at/reactions".to_string(), r.clone());
+                                }
+                                lines.push((original_text, original_tags, hist.timestamp));
+                            }
+                            // No original held: the edit line alone, carrying
+                            // the reactions, since there is no other line.
+                            None => {
+                                if let Some(ref r) = reactions_tag {
+                                    edit_tags.insert("+freeq.at/reactions".to_string(), r.clone());
+                                }
+                            }
+                        }
+                        lines.push((&hist.text, edit_tags, edit.timestamp));
+                    }
+                }
+            }
+
+            for (text, mut msg_tags, timestamp) in lines {
+                if has_time_cap {
+                    let ts = chrono::DateTime::from_timestamp(timestamp as i64, 0)
+                        .unwrap_or_default()
+                        .format("%Y-%m-%dT%H:%M:%S.000Z")
+                        .to_string();
+                    msg_tags.insert("time".to_string(), ts);
+                }
+                if has_batch_cap {
+                    msg_tags.insert("batch".to_string(), batch_id.clone());
+                }
+                replay_line(
+                    state,
+                    session_id,
+                    send,
+                    &hist.from,
+                    channel,
+                    text,
+                    msg_tags,
+                    ReplayCaps {
+                        tags: has_tags_cap,
+                        batch: has_batch_cap,
+                        multiline: has_multiline_cap,
+                    },
+                    &batch_id,
+                );
+            }
+        }
+
+        // Whatever happened after the last message — sent whether or not
+        // this client batches, since the events are the point and the
+        // batch is only how they are framed.
+        while let Some((_, line)) = act_lines.pop() {
+            send(state, session_id, line);
+        }
+
+        // End batch
+        if has_batch_cap {
+            let batch_end = format!(":{server_name} BATCH -{batch_id}\r\n");
+            send(state, session_id, batch_end);
+        }
+    }
+}
+
+/// What a joining session negotiated that decides how a replayed line is
+/// framed.
+#[derive(Clone, Copy)]
+struct ReplayCaps {
+    tags: bool,
+    batch: bool,
+    multiline: bool,
+}
+
+/// Send one replayed line, framed for the session.
+///
+/// Multi-line stored bodies: emitting `\n` raw in a PRIVMSG terminates the IRC
+/// line mid-text. Mirror the explicit CHATHISTORY emission path — nested
+/// `draft/multiline` BATCH for capable receivers, split PRIVMSGs otherwise.
+fn replay_line(
+    state: &Arc<SharedState>,
+    session_id: &str,
+    send: &impl Fn(&Arc<SharedState>, &str, String),
+    from: &str,
+    channel: &str,
+    text: &str,
+    msg_tags: std::collections::HashMap<String, String>,
+    caps: ReplayCaps,
+    batch_id: &str,
+) {
+    let bodies: Vec<&str> = text.split('\n').collect();
+    let is_multiline = bodies.len() > 1;
+    if is_multiline && caps.multiline && caps.batch {
+        let ml_id = format!("ml{}", crate::msgid::generate());
+        let opener = irc::Message {
+            tags: msg_tags.clone(),
+            prefix: Some(from.to_string()),
+            command: "BATCH".to_string(),
+            params: vec![
+                format!("+{ml_id}"),
+                "draft/multiline".to_string(),
+                channel.to_string(),
+            ],
+        };
+        send(state, session_id, format!("{opener}\r\n"));
+        for body in &bodies {
+            let mut chunk_tags = std::collections::HashMap::new();
+            chunk_tags.insert("batch".to_string(), ml_id.clone());
+            let chunk = irc::Message {
+                tags: chunk_tags,
+                prefix: Some(from.to_string()),
+                command: "PRIVMSG".to_string(),
+                params: vec![channel.to_string(), body.to_string()],
+            };
+            send(state, session_id, format!("{chunk}\r\n"));
+        }
+        let mut closer_tags = std::collections::HashMap::new();
+        if let Some(b) = msg_tags.get("batch") {
+            closer_tags.insert("batch".to_string(), b.clone());
+        }
+        let closer = irc::Message {
+            tags: closer_tags,
+            prefix: None,
+            command: "BATCH".to_string(),
+            params: vec![format!("-{ml_id}")],
+        };
+        send(state, session_id, format!("{closer}\r\n"));
+        return;
+    }
+    if is_multiline {
+        // Fallback: split at \n into N PRIVMSGs. msgid + client tags ride on
+        // the first chunk; later chunks carry only the chathistory batch tag
+        // so they stay grouped under the same replay unit.
+        for (i, body) in bodies.iter().enumerate() {
+            let chunk_tags = if i == 0 {
+                msg_tags.clone()
+            } else {
+                let mut t = std::collections::HashMap::new();
+                if caps.batch {
+                    t.insert("batch".to_string(), batch_id.to_string());
+                }
+                t
+            };
+            if !chunk_tags.is_empty() && caps.tags {
+                let chunk = irc::Message {
+                    tags: chunk_tags,
+                    prefix: Some(from.to_string()),
+                    command: "PRIVMSG".to_string(),
+                    params: vec![channel.to_string(), body.to_string()],
+                };
+                send(state, session_id, format!("{chunk}\r\n"));
+            } else {
+                let line = format!(":{from} PRIVMSG {channel} :{body}\r\n");
+                send(state, session_id, line);
+            }
+        }
+        return;
+    }
+
+    if !msg_tags.is_empty() && caps.tags {
+        let tag_msg = irc::Message {
+            tags: msg_tags,
+            prefix: Some(from.to_string()),
+            command: "PRIVMSG".to_string(),
+            params: vec![channel.to_string(), text.to_string()],
+        };
+        send(state, session_id, format!("{tag_msg}\r\n"));
+    } else {
+        let line = format!(":{from} PRIVMSG {channel} :{text}\r\n");
+        send(state, session_id, line);
+    }
 }
 
 #[cfg(test)]

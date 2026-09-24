@@ -19,6 +19,9 @@
 pub(crate) mod act;
 mod cap;
 mod channel;
+// Join replay, reached directly by the server's tests.
+#[cfg(test)]
+pub(crate) use channel::replay_history;
 pub(crate) mod draft_multiline;
 pub mod helpers;
 pub(crate) mod login;

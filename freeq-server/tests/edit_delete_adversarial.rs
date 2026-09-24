@@ -1268,8 +1268,10 @@ async fn unreacting_by_the_original_clears_a_reaction_made_on_the_edit() {
 
         bob.send_react("#rid1", &edit_id, "🔥");
         std::thread::sleep(Duration::from_millis(300));
+        // Reactions ride the replayed original line, which carries the id
+        // they are filed under.
         let with_reaction =
-            replayed_line(addr, "rid_c", "#rid1", "v2").expect("joiner replays the edited message");
+            replayed_line(addr, "rid_c", "#rid1", "v1").expect("joiner replays the original line");
         assert!(
             with_reaction.contains("+freeq.at/reactions=🔥:rid_b"),
             "a reaction filed against the edit id must ride the replayed \
@@ -1278,7 +1280,7 @@ async fn unreacting_by_the_original_clears_a_reaction_made_on_the_edit() {
 
         bob.send_unreact("#rid1", &original, "🔥");
         std::thread::sleep(Duration::from_millis(300));
-        let after = replayed_line(addr, "rid_d", "#rid1", "v2").expect("still replayed");
+        let after = replayed_line(addr, "rid_d", "#rid1", "v1").expect("still replayed");
         assert!(
             !after.contains("+freeq.at/reactions"),
             "un-reacting by the original id left the reaction behind: {after}"
@@ -1321,7 +1323,8 @@ async fn unreacting_by_the_edit_id_clears_a_reaction_made_on_the_original() {
         bob.send_unreact("#rid2", &edit_id, "🔥");
         std::thread::sleep(Duration::from_millis(300));
 
-        let after = replayed_line(addr, "rid2_c", "#rid2", "v2").expect("still replayed");
+        // The original line is the one that carries reactions.
+        let after = replayed_line(addr, "rid2_c", "#rid2", "v1").expect("still replayed");
         assert!(
             !after.contains("+freeq.at/reactions"),
             "un-reacting by the edit id left the reaction behind: {after}"
@@ -1355,7 +1358,8 @@ async fn two_ids_never_split_a_reaction_tally() {
         bob.send_react("#tally", &edit_id, "🔥");
         std::thread::sleep(Duration::from_millis(300));
 
-        let line = replayed_line(addr, "tal_c", "#tally", "v2").expect("replayed");
+        // The original line is the one that carries reactions.
+        let line = replayed_line(addr, "tal_c", "#tally", "v1").expect("replayed");
         // Tag order is not stable, so the tally may be the first tag and carry
         // the leading `@`.
         let tally = line
@@ -1413,8 +1417,9 @@ async fn deleting_by_the_edit_id_does_not_resurrect_for_a_joiner() {
     .await;
 }
 
-/// Join replay collapses revisions into one message, so nothing in the wire
-/// form says it was ever edited — hence the marker.
+/// Join replay sends an edited message as its original line and then its edit
+/// line; the edit line's `+draft/edit` is what says it was edited, so the old
+/// merged line's `+freeq.at/edited` marker is gone.
 #[tokio::test]
 async fn join_replay_marks_an_edited_message() {
     let resolver = resolver_with(vec![]);
@@ -1435,17 +1440,18 @@ async fn join_replay_marks_an_edited_message() {
 
         alice.tx("PRIVMSG #marked :untouched");
         bob.rx(|l| l.contains("untouched"), "plain message");
-        alice.say_then_edit(&mut bob, "#marked", "v1", "v2");
+        let (original, _) = alice.say_then_edit(&mut bob, "#marked", "v1", "v2");
         std::thread::sleep(Duration::from_millis(200));
 
         let edited = replayed_line(addr, "mrk_c", "#marked", "v2").expect("replayed");
         assert!(
-            edited.contains("+freeq.at/edited=1"),
+            edited.contains(&format!("+draft/edit={original}")),
             "a late joiner can't tell this text isn't what was sent: {edited}"
         );
+        assert!(!edited.contains("+freeq.at/edited"), "{edited}");
         let plain = replayed_line(addr, "mrk_d", "#marked", "untouched").expect("replayed");
         assert!(
-            !plain.contains("+freeq.at/edited"),
+            !plain.contains("+freeq.at/edited") && !plain.contains("+draft/edit"),
             "an unedited message must not be marked: {plain}"
         );
     })
@@ -1598,9 +1604,10 @@ async fn unpersisted_guest_dm_ids_pass_through_unchanged() {
 }
 
 /// After a restart, in-memory history is rebuilt from the DB — where an edit is
-/// a separate row. The rebuild has to collapse the revisions the way the live
-/// edit path does, or the next joiner is replayed the same message twice: once
-/// as sent, once as revised.
+/// a separate row. The rebuild has to pair the revisions the way the live edit
+/// path does: the next joiner is replayed the original line once and the edit
+/// line once, the edit naming the original, never the original twice or the
+/// edit as a message of its own.
 #[tokio::test]
 async fn an_edited_message_replays_once_after_a_restart() {
     use freeq_server::db::Db;
@@ -1652,22 +1659,506 @@ async fn an_edited_message_replays_once_after_a_restart() {
         c.drain();
         c.tx("JOIN #restart");
 
+        let original = c
+            .maybe(|l| l.contains("PRIVMSG") && l.contains("before"), 2000)
+            .expect("the original line is replayed");
+        assert!(
+            original.contains("msgid=rst-1") && !original.contains("+draft/edit"),
+            "the original line keys on the identity clients hold: {original}"
+        );
         let replayed = c
             .maybe(|l| l.contains("PRIVMSG") && l.contains("after"), 2000)
             .expect("the current text is replayed");
         assert!(
-            replayed.contains("msgid=rst-1"),
-            "replay must key on the identity clients hold: {replayed}"
+            replayed.contains("msgid=rst-2") && replayed.contains("+draft/edit=rst-1"),
+            "a message revised before the restart replays its edit as an edit of it: {replayed}"
         );
         assert!(
-            replayed.contains("+freeq.at/edited=1"),
-            "a message revised before the restart is still an edited message: {replayed}"
+            c.maybe(
+                |l| l.contains("PRIVMSG") && (l.contains("before") || l.contains("after")),
+                800
+            )
+            .is_none(),
+            "a revision was replayed twice"
         );
+    })
+    .await;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// JOIN REPLAY OF AN EDITED MESSAGE
+// ═══════════════════════════════════════════════════════════════
+//
+// An edited message replays as its original line and then its newest edit
+// line, each with its own text, id and signature — as CHATHISTORY sends them —
+// rather than one merged line carrying the original's signature over the
+// newest text, which every checker reads as invalid.
+
+impl C {
+    fn with_cap_list(addr: SocketAddr, nick: &str, caps: &str) -> Self {
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let w = s.try_clone().unwrap();
+        let mut c = Self {
+            reader: BufReader::new(s),
+            writer: w,
+        };
+        c.tx("CAP LS 302");
+        c.tx(&format!("NICK {nick}"));
+        c.tx(&format!("USER {nick} 0 * :test"));
+        c.tx(&format!("CAP REQ :{caps}"));
+        c.rx(|l| l.contains("ACK"), "CAP ACK");
+        c.tx("CAP END");
+        c
+    }
+    /// A message signed by its author, under the id the author minted.
+    fn send_signed_message(
+        &mut self,
+        target: &str,
+        venue: &str,
+        did: &str,
+        text: &str,
+        extra_tags: &str,
+        key: &SigningKey,
+    ) -> String {
+        let msgid = freeq_server::msgid::generate();
+        let sig = ChatDoc::message(did, &msgid, venue, text).sign(key);
+        self.tx(&format!(
+            "@{extra_tags}{EVENT_ID_TAG}={msgid};+freeq.at/sig={sig} PRIVMSG {target} :{text}"
+        ));
+        msgid
+    }
+}
+
+/// Every PRIVMSG a fresh joiner is replayed on joining `channel`.
+fn replayed_privmsgs(addr: SocketAddr, nick: &str, channel: &str, caps: &str) -> Vec<String> {
+    let mut joiner = C::with_cap_list(addr, nick, caps);
+    joiner.reg();
+    joiner.drain();
+    joiner.tx(&format!("JOIN {channel}"));
+    let mut out = Vec::new();
+    loop {
+        let line = joiner.rx(|_| true, "replay");
+        if line.split_whitespace().nth(1) == Some("366") {
+            break;
+        }
+        if line.contains(" PRIVMSG ") {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// A line's tags and its trailing text.
+fn tags_and_body(line: &str) -> (HashMap<String, String>, String) {
+    let mut tags = HashMap::new();
+    let rest = match line.strip_prefix('@').and_then(|s| s.split_once(' ')) {
+        Some((raw, rest)) => {
+            for tag in raw.split(';') {
+                let (k, v) = tag.split_once('=').unwrap_or((tag, ""));
+                tags.insert(k.to_string(), v.to_string());
+            }
+            rest
+        }
+        None => line,
+    };
+    // `:prefix PRIVMSG target :text` — the text's colon is optional when it
+    // holds no space.
+    let body = rest
+        .split_once(" PRIVMSG ")
+        .and_then(|(_, r)| r.split_once(' '))
+        .map(|(_, b)| b.strip_prefix(':').unwrap_or(b))
+        .unwrap_or("");
+    (tags, body.to_string())
+}
+
+/// Check a replayed line's signature against its own text, rebuilding the
+/// document the way a receiving client does.
+fn verifies(line: &str, venue: &str, key: &SigningKey) -> bool {
+    let (tags, body) = tags_and_body(line);
+    let (Some(did), Some(msgid), Some(sig)) = (
+        tags.get("account"),
+        tags.get("msgid"),
+        tags.get("+freeq.at/sig"),
+    ) else {
+        return false;
+    };
+    let mut doc = ChatDoc::message(did, msgid, venue, &body);
+    if let Some(edit) = tags.get("+draft/edit") {
+        doc = doc.with_edit(edit);
+    }
+    doc.with_coord(tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .verify(sig, &key.verifying_key())
+        .is_ok()
+}
+
+async fn signed_edit_replay(extra_tags: &'static str, v1: &'static str, v2: &'static str) {
+    let key_a = PrivateKey::generate_ed25519();
+    let resolver = resolver_with(vec![(DID_ALICE, &key_a)]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, move |addr| {
+        let mut alice = C::with_sasl(addr, "rpl_a", DID_ALICE, key_a);
+        alice.reg();
+        let signing = SigningKey::from_bytes(&[11u8; 32]);
+        alice.msgsig(&signing);
+        alice.drain();
+        alice.tx("JOIN #rpl");
+        alice.num("366");
+        alice.drain();
+        let venue = freeq_sdk::chatsig::channel_venue("#rpl");
+
+        let original =
+            alice.send_signed_message("#rpl", &venue, DID_ALICE, v1, extra_tags, &signing);
+        alice.rx(|l| l.contains("PRIVMSG") && l.contains(v1), "echo v1");
+        alice.send_signed_edit_tagged(
+            "#rpl", &venue, DID_ALICE, &original, v2, extra_tags, &signing,
+        );
+        alice.rx(|l| l.contains("PRIVMSG") && l.contains(v2), "echo v2");
+
+        let lines = replayed_privmsgs(addr, "rpl_j", "#rpl", "message-tags server-time batch");
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        let (t0, b0) = tags_and_body(&lines[0]);
+        let (t1, b1) = tags_and_body(&lines[1]);
+        assert_eq!(b0, v1, "the original line carries the original text");
+        assert_eq!(t0.get("msgid"), Some(&original));
+        assert!(!t0.contains_key("+freeq.at/edited") && !t0.contains_key("+draft/edit"));
         assert!(
-            c.maybe(|l| l.contains("PRIVMSG") && l.contains("before"), 800)
-                .is_none(),
-            "the pre-edit text was replayed as a second message"
+            verifies(&lines[0], &venue, &signing),
+            "original: {}",
+            lines[0]
         );
+        assert_eq!(b1, v2, "the edit line carries the edit's text");
+        assert_ne!(t1.get("msgid"), Some(&original), "under its own id");
+        assert_eq!(t1.get("+draft/edit"), Some(&original));
+        assert_eq!(t1.get("account").map(String::as_str), Some(DID_ALICE));
+        assert!(verifies(&lines[1], &venue, &signing), "edit: {}", lines[1]);
+        assert!(t0.contains_key("batch") && t0.get("batch") == t1.get("batch"));
+        if !extra_tags.is_empty() {
+            assert!(t0.contains_key("+encrypted") && t1.contains_key("+encrypted"));
+        }
+    })
+    .await;
+}
+
+impl C {
+    #[allow(clippy::too_many_arguments)]
+    fn send_signed_edit_tagged(
+        &mut self,
+        target: &str,
+        venue: &str,
+        did: &str,
+        original_msgid: &str,
+        new_text: &str,
+        extra_tags: &str,
+        key: &SigningKey,
+    ) {
+        let edit_id = freeq_server::msgid::generate();
+        let sig = ChatDoc::message(did, &edit_id, venue, new_text)
+            .with_edit(original_msgid)
+            .sign(key);
+        self.tx(&format!(
+            "@{extra_tags}{EVENT_ID_TAG}={edit_id};+draft/edit={original_msgid};+freeq.at/sig={sig} \
+             PRIVMSG {target} :{new_text}"
+        ));
+    }
+}
+
+#[tokio::test]
+async fn join_replay_sends_the_original_and_its_edit_each_with_its_own_signature() {
+    signed_edit_replay("", "what was said", "what was meant").await;
+}
+
+/// An E2EE edit: the lines carry the ciphertext each signature covers.
+#[tokio::test]
+async fn join_replay_of_an_encrypted_edit_carries_the_ciphertext_its_signature_covers() {
+    signed_edit_replay(
+        "+encrypted=;",
+        "ENC1:bm9uY2Ux:Y2lwaGVyMQ",
+        "ENC1:bm9uY2Uy:Y2lwaGVyMg",
+    )
+    .await;
+}
+
+/// A guest's edit is unsigned; it replays in the same two-line shape.
+#[tokio::test]
+async fn join_replay_of_a_guests_edit_sends_the_original_and_the_edit() {
+    let resolver = resolver_with(vec![]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, |addr| {
+        let mut alice = C::with_caps(addr, "grp_a");
+        alice.reg();
+        alice.drain();
+        let mut bob = C::with_caps(addr, "grp_b");
+        bob.reg();
+        bob.drain();
+        alice.tx("JOIN #grp");
+        alice.num("366");
+        alice.drain();
+        bob.tx("JOIN #grp");
+        bob.num("366");
+        bob.drain();
+        let (original, edit_id) = alice.say_then_edit(&mut bob, "#grp", "guest v1", "guest v2");
+        std::thread::sleep(Duration::from_millis(200));
+
+        let lines = replayed_privmsgs(addr, "grp_j", "#grp", "message-tags server-time batch");
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        let (t0, b0) = tags_and_body(&lines[0]);
+        let (t1, b1) = tags_and_body(&lines[1]);
+        assert_eq!(
+            (b0.as_str(), t0.get("msgid")),
+            ("guest v1", Some(&original))
+        );
+        assert_eq!((b1.as_str(), t1.get("msgid")), ("guest v2", Some(&edit_id)));
+        assert_eq!(t1.get("+draft/edit"), Some(&original));
+        assert!(!lines.iter().any(|l| l.contains("+freeq.at/edited")));
+    })
+    .await;
+}
+
+/// The lines a joiner is replayed for one message, with the batch id (fresh
+/// on every join) taken out so two replays compare.
+fn lines_for(lines: &[String], root: &str) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|l| {
+            l.contains(&format!("msgid={root}")) || l.contains(&format!("+draft/edit={root}"))
+        })
+        .map(|l| {
+            let (mut tags, body) = tags_and_body(l);
+            tags.remove("batch");
+            let mut tags: Vec<_> = tags.into_iter().collect();
+            tags.sort();
+            format!("{tags:?} {body}")
+        })
+        .collect()
+}
+
+/// An edit of a message whose original row has left the newest `MAX_HISTORY`
+/// rows: the rebuild loads the original by id, so the replay after a restart
+/// is the replay before it.
+#[tokio::test]
+async fn an_edit_of_a_message_outside_the_history_window_replays_the_same_after_a_restart() {
+    use freeq_server::db::Db;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("window.db");
+    {
+        let db = Db::open(&path).unwrap();
+        db.save_channel("#window", &freeq_server::server::ChannelState::default())
+            .unwrap();
+        db.insert_message(
+            "#window",
+            "win_a!~u@host",
+            "the old words",
+            100,
+            &HashMap::new(),
+            Some("win-root"),
+            None,
+        )
+        .unwrap();
+        for i in 0..freeq_server::server::MAX_HISTORY {
+            db.insert_message(
+                "#window",
+                "filler!~u@host",
+                &format!("filler {i}"),
+                200 + i as u64,
+                &HashMap::new(),
+                Some(&format!("win-fill-{i:03}")),
+                None,
+            )
+            .unwrap();
+        }
+    }
+    let config = |path: &std::path::Path| freeq_server::config::ServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        server_name: "test-edit".to_string(),
+        challenge_timeout_secs: 60,
+        db_path: Some(path.to_str().unwrap().to_string()),
+        ..Default::default()
+    };
+    let caps = "message-tags server-time batch";
+
+    let (addr, handle) =
+        freeq_server::server::Server::with_resolver(config(&path), resolver_with(vec![]))
+            .start()
+            .await
+            .unwrap();
+    let before = tokio::task::spawn_blocking(move || {
+        let mut alice = C::with_caps(addr, "win_a");
+        alice.reg();
+        alice.drain();
+        alice.tx("JOIN #window");
+        alice.num("366");
+        alice.drain();
+        alice.send_edit("#window", "win-root", "the new words");
+        alice.rx(
+            |l| l.contains("PRIVMSG") && l.contains("the new words"),
+            "echo",
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        replayed_privmsgs(addr, "win_j", "#window", caps)
+    })
+    .await
+    .unwrap();
+    handle.abort();
+    let before = lines_for(&before, "win-root");
+    assert_eq!(
+        before.len(),
+        2,
+        "original and edit before the restart: {before:#?}"
+    );
+
+    let (addr, _h) =
+        freeq_server::server::Server::with_resolver(config(&path), resolver_with(vec![]))
+            .start()
+            .await
+            .unwrap();
+    let after =
+        tokio::task::spawn_blocking(move || replayed_privmsgs(addr, "win_k", "#window", caps))
+            .await
+            .unwrap();
+    assert_eq!(
+        lines_for(&after, "win-root"),
+        before,
+        "the same replay after the restart"
+    );
+}
+
+/// A peer's edit is filed with the root in its `replaces_msgid` column and no
+/// `+draft/edit` tag. Replayed after a restart, the edit line names that root,
+/// and its signature verifies with it.
+#[tokio::test]
+async fn a_peer_edit_filed_before_a_restart_replays_verifying_with_the_root() {
+    use freeq_server::db::Db;
+
+    let signing = SigningKey::from_bytes(&[12u8; 32]);
+    let venue = freeq_sdk::chatsig::channel_venue("#peerrpl");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("peer.db");
+    {
+        let db = Db::open(&path).unwrap();
+        db.save_channel("#peerrpl", &freeq_server::server::ChannelState::default())
+            .unwrap();
+        let root = freeq_server::msgid::generate();
+        let edit = freeq_server::msgid::generate();
+        let filed = |msgid: &str, sig: String| {
+            HashMap::from([
+                ("msgid".to_string(), msgid.to_string()),
+                ("+freeq.at/sig".to_string(), sig),
+                ("account".to_string(), DID_ALICE.to_string()),
+                ("+freeq.at/origin".to_string(), "peer".to_string()),
+            ])
+        };
+        let root_sig = ChatDoc::message(DID_ALICE, &root, &venue, "peer v1").sign(&signing);
+        db.insert_message(
+            "#peerrpl",
+            "alice!a@remote",
+            "peer v1",
+            100,
+            &filed(&root, root_sig),
+            Some(&root),
+            Some(DID_ALICE),
+        )
+        .unwrap();
+        let edit_sig = ChatDoc::message(DID_ALICE, &edit, &venue, "peer v2")
+            .with_edit(&root)
+            .sign(&signing);
+        db.insert_edit(
+            "#peerrpl",
+            "alice!a@remote",
+            "peer v2",
+            110,
+            &filed(&edit, edit_sig),
+            &edit,
+            &root,
+            Some(DID_ALICE),
+        )
+        .unwrap();
+    }
+    let config = freeq_server::config::ServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        server_name: "test-edit".to_string(),
+        challenge_timeout_secs: 60,
+        db_path: Some(path.to_str().unwrap().to_string()),
+        ..Default::default()
+    };
+    let (addr, _h) = freeq_server::server::Server::with_resolver(config, resolver_with(vec![]))
+        .start()
+        .await
+        .unwrap();
+    run(addr, move |addr| {
+        let lines = replayed_privmsgs(addr, "prp_j", "#peerrpl", "message-tags server-time batch");
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(
+            verifies(&lines[0], &venue, &signing),
+            "original: {}",
+            lines[0]
+        );
+        assert!(lines[1].contains("+draft/edit="), "{}", lines[1]);
+        assert!(verifies(&lines[1], &venue, &signing), "edit: {}", lines[1]);
+    })
+    .await;
+}
+
+/// An edit filed in one channel that names a message filed in another (a +i
+/// one): after a restart the rebuild must not load that message's text into
+/// this channel's replay.
+#[tokio::test]
+async fn after_a_restart_an_edit_never_replays_another_channels_original() {
+    use freeq_server::db::Db;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("xchan.db");
+    {
+        let db = Db::open(&path).unwrap();
+        let secret = freeq_server::server::ChannelState {
+            invite_only: true,
+            ..Default::default()
+        };
+        db.save_channel("#xsecret", &secret).unwrap();
+        db.save_channel("#xpublic", &freeq_server::server::ChannelState::default())
+            .unwrap();
+        db.insert_message(
+            "#xsecret",
+            "guest!g@host",
+            "secret words",
+            100,
+            &HashMap::new(),
+            Some("x-secret"),
+            None,
+        )
+        .unwrap();
+        db.insert_edit(
+            "#xpublic",
+            "guest!x@remote",
+            "public words",
+            110,
+            &HashMap::new(),
+            "x-edit",
+            "x-secret",
+            None,
+        )
+        .unwrap();
+    }
+    let config = freeq_server::config::ServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        server_name: "test-edit".to_string(),
+        challenge_timeout_secs: 60,
+        db_path: Some(path.to_str().unwrap().to_string()),
+        ..Default::default()
+    };
+    let (addr, _h) = freeq_server::server::Server::with_resolver(config, resolver_with(vec![]))
+        .start()
+        .await
+        .unwrap();
+    run(addr, |addr| {
+        let lines = replayed_privmsgs(addr, "xch_j", "#xpublic", "message-tags server-time batch");
+        assert!(
+            !lines.iter().any(|l| l.contains("secret words")),
+            "another channel's text reached this channel's replay: {lines:#?}"
+        );
+        assert_eq!(lines.len(), 1, "the edit alone: {lines:#?}");
+        assert!(lines[0].ends_with("public words"), "{}", lines[0]);
     })
     .await;
 }

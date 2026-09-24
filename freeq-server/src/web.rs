@@ -2468,18 +2468,48 @@ pub(crate) async fn api_verify_message(
             tags: row.tags,
             msgid: row.msgid,
             edited: row.replaces_msgid.is_some(),
+            edit: None,
         });
     }
     if found.is_none() {
+        // An entry holds the original under the root id and the newest edit
+        // under its own; each is checked against its own text and tags. An
+        // entry whose original never reached this server holds no original to
+        // check.
         let channels = state.channels.lock();
         for (ch_name, ch) in channels.iter() {
-            if let Some(msg) = ch
-                .history
-                .iter()
-                .find(|m| m.msgid.as_deref() == Some(msgid.as_str()))
-            {
+            for m in &ch.history {
+                let as_original = m.msgid.as_deref() == Some(msgid.as_str())
+                    && m.edit.as_ref().is_none_or(|e| e.original_text.is_some());
+                let as_edit = m.edit.as_ref().filter(|e| e.msgid == msgid);
+                let msg = if let Some(edit) = as_edit {
+                    revises = m.msgid.clone();
+                    crate::server::HistoryMessage {
+                        text: m.text.clone(),
+                        timestamp: edit.timestamp,
+                        tags: edit.tags.clone(),
+                        msgid: Some(edit.msgid.clone()),
+                        edit: None,
+                        ..m.clone()
+                    }
+                } else if as_original {
+                    crate::server::HistoryMessage {
+                        text: m
+                            .edit
+                            .as_ref()
+                            .and_then(|e| e.original_text.clone())
+                            .unwrap_or_else(|| m.text.clone()),
+                        edit: None,
+                        ..m.clone()
+                    }
+                } else {
+                    continue;
+                };
                 venue = ch_name.clone();
-                found = Some(msg.clone());
+                found = Some(msg);
+                break;
+            }
+            if found.is_some() {
                 break;
             }
         }

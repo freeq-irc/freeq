@@ -2015,6 +2015,7 @@ pub(super) fn handle_privmsg_with_multiline(
                     tags: history_tags,
                     msgid: Some(msgid.clone()),
                     edited: false,
+                    edit: None,
                 });
                 while ch.history.len() > MAX_HISTORY {
                     ch.history.pop_front();
@@ -3773,18 +3774,51 @@ fn handle_edit(
 
     // Update in-memory history (channels only)
     // Note: we keep the original msgid stable so that subsequent edits
-    // (e.g., streaming) can still find the message by original_msgid.
+    // (e.g., streaming) can still find the message by original_msgid. The
+    // entry keeps the original's text and tags beside the newest edit's, so
+    // join replay sends each line with its own signature.
     if is_channel {
+        let edit_tags = crate::server::edit_line_tags(
+            store_tags.clone(),
+            &edit_msgid,
+            editor_did,
+            original_msgid,
+        );
+        let in_memory = state.channels.lock().get(target).is_some_and(|ch| {
+            ch.history
+                .iter()
+                .any(|h| h.msgid.as_deref() == Some(original_msgid))
+        });
+        // An edit of a message no longer in memory starts its entry from the
+        // original on file, as the startup rebuild does.
+        let original_row = match (in_memory, &original) {
+            (false, Some(Some(row))) => Some(row.clone()),
+            _ => None,
+        };
         let mut channels = state.channels.lock();
         if let Some(ch) = channels.get_mut(target) {
-            for hist in ch.history.iter_mut() {
-                if hist.msgid.as_deref() == Some(original_msgid) {
-                    hist.text = new_text.to_string();
-                    // Don't change hist.msgid — keep original stable for chained edits
-                    // Join replay collapses revisions into this one entry, so
-                    // without the flag a late joiner can't tell it was edited.
-                    hist.edited = true;
-                    break;
+            if let Some(hist) = ch
+                .history
+                .iter_mut()
+                .find(|h| h.msgid.as_deref() == Some(original_msgid))
+            {
+                hist.apply_edit(
+                    new_text.to_string(),
+                    edit_msgid.clone(),
+                    timestamp,
+                    edit_tags,
+                );
+            } else if let Some(row) = original_row {
+                let mut entry = crate::server::HistoryMessage::from_row(row);
+                entry.apply_edit(
+                    new_text.to_string(),
+                    edit_msgid.clone(),
+                    timestamp,
+                    edit_tags,
+                );
+                ch.history.push_back(entry);
+                while ch.history.len() > crate::server::MAX_HISTORY {
+                    ch.history.pop_front();
                 }
             }
         }

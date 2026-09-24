@@ -1719,16 +1719,32 @@ async fn replayed_texts(
     nick: &str,
     channel: &str,
 ) -> Vec<String> {
+    replayed_messages(server, id, nick, channel)
+        .await
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
+}
+
+/// As [`replayed_texts`], with each message's tags.
+async fn replayed_messages(
+    server: &TestServer,
+    id: &TestId,
+    nick: &str,
+    channel: &str,
+) -> Vec<(String, std::collections::HashMap<String, String>)> {
     let (h, mut rx) = connect(server, id, nick);
     wait_auth_and_register(&mut rx).await;
     h.join(channel).await.unwrap();
     let mut seen = Vec::new();
     // Replay arrives before the NAMES reply; collect until it goes quiet.
     while let Ok(Some(e)) = timeout(Duration::from_secs(2), rx.recv()).await {
-        if let Event::Message { text, target, .. } = e
+        if let Event::Message {
+            text, target, tags, ..
+        } = e
             && target.eq_ignore_ascii_case(channel)
         {
-            seen.push(text);
+            seen.push((text, tags));
         }
     }
     h.quit(None).await.ok();
@@ -1775,17 +1791,19 @@ async fn channel_edit_crosses_without_duplicating() {
         "the edit never crossed the hop"
     );
 
-    // The peer holds ONE message, carrying the newest text.
-    let replayed = replayed_texts(&srv_b, &carol, "carol", "#fedit").await;
-    let versions: Vec<&String> = replayed
+    // The peer holds ONE message: a joiner is replayed its original line and
+    // its edit line, the edit naming the original — never two messages.
+    let replayed = replayed_messages(&srv_b, &carol, "carol", "#fedit").await;
+    let versions: Vec<(&str, Option<&str>)> = replayed
         .iter()
-        .filter(|t| *t == "before" || *t == "after")
+        .filter(|(t, _)| t == "before" || t == "after")
+        .map(|(t, tags)| (t.as_str(), tags.get("+draft/edit").map(String::as_str)))
         .collect();
     assert_eq!(
         versions,
-        vec![&"after".to_string()],
-        "a joiner on the peer must see the edited message once, not both \
-         revisions: {replayed:?}"
+        vec![("before", None), ("after", Some(msgid.as_str()))],
+        "a joiner on the peer must see the original once and the edit as an \
+         edit of it: {replayed:?}"
     );
 
     ha.quit(None).await.ok();

@@ -455,10 +455,114 @@ pub struct HistoryMessage {
     /// ULID message ID (IRCv3 `msgid` tag). Stays the *original* id across
     /// edits — a message's identity for life.
     pub msgid: Option<String>,
-    /// The text has been edited since it was sent. Join replay carries one
-    /// entry per logical message, so this is the only thing that tells a late
-    /// joiner the version they're reading isn't the original.
+    /// The text has been edited since it was sent.
     pub edited: bool,
+    /// The newest edit, when there is one. `text` is then the edit's text, and
+    /// `tags` and `timestamp` stay the original's, so join replay can send the
+    /// original line and the edit line each with its own signature.
+    pub edit: Option<HistoryEdit>,
+}
+
+/// The newest edit of a message in in-memory history.
+#[derive(Debug, Clone)]
+pub struct HistoryEdit {
+    /// The edit's own msgid.
+    pub msgid: String,
+    pub timestamp: u64,
+    /// The edit's own tags: its signature and `account`, and `+draft/edit`
+    /// naming the root.
+    pub tags: HashMap<String, String>,
+    /// The original's own text. `None` when this server never held the
+    /// original: the entry's `tags` and `timestamp` are then the first edit's,
+    /// and replay sends the edit line alone.
+    pub original_text: Option<String>,
+}
+
+impl HistoryMessage {
+    /// An entry for the original message a stored row holds.
+    pub(crate) fn from_row(row: crate::db::MessageRow) -> Self {
+        let mut tags = row.tags;
+        if let Some(ref did) = row.sender_did {
+            tags.insert("account".to_string(), did.clone());
+        }
+        tags.remove("+draft/edit");
+        HistoryMessage {
+            from: row.sender,
+            text: row.text,
+            timestamp: row.timestamp,
+            tags,
+            // Identity is the root; a revision row's own id is audit trail,
+            // never the key clients hold.
+            msgid: row.root_msgid.or(row.msgid),
+            edited: false,
+            edit: None,
+        }
+    }
+
+    /// An entry for an edit of a message this server does not hold.
+    pub(crate) fn from_orphan_edit(
+        from: String,
+        root: String,
+        text: String,
+        edit_msgid: String,
+        timestamp: u64,
+        tags: HashMap<String, String>,
+    ) -> Self {
+        HistoryMessage {
+            from,
+            text,
+            timestamp,
+            tags: tags.clone(),
+            msgid: Some(root),
+            edited: true,
+            edit: Some(HistoryEdit {
+                msgid: edit_msgid,
+                timestamp,
+                tags,
+                original_text: None,
+            }),
+        }
+    }
+
+    /// Take a newer edit: its text becomes current, the original's is kept.
+    pub(crate) fn apply_edit(
+        &mut self,
+        text: String,
+        edit_msgid: String,
+        timestamp: u64,
+        tags: HashMap<String, String>,
+    ) {
+        let original_text = match self.edit.take() {
+            Some(previous) => previous.original_text,
+            None => Some(std::mem::take(&mut self.text)),
+        };
+        self.text = text;
+        self.edited = true;
+        self.edit = Some(HistoryEdit {
+            msgid: edit_msgid,
+            timestamp,
+            tags,
+            original_text,
+        });
+    }
+}
+
+/// The tags an edit row's line is replayed with: as filed, plus its own msgid,
+/// the sender's DID as `account`, and `+draft/edit` naming the root — the value
+/// this server checked the signature with, whether the edit was made here or
+/// relayed (a peer's edit files the root only in its `replaces_msgid` column).
+pub(crate) fn edit_line_tags(
+    mut tags: HashMap<String, String>,
+    msgid: &str,
+    sender_did: Option<&str>,
+    root: &str,
+) -> HashMap<String, String> {
+    tags.insert("msgid".to_string(), msgid.to_string());
+    if let Some(did) = sender_did {
+        tags.insert("account".to_string(), did.to_string());
+    }
+    tags.insert("+draft/edit".to_string(), root.to_string());
+    tags
 }
 
 /// Maximum number of history messages to keep per channel.
@@ -1872,43 +1976,62 @@ impl Server {
                     .map_err(|e| anyhow::anyhow!("Failed to load messages for {name}: {e}"))?;
                 // An edit is a separate row, so a revised message comes back as
                 // several rows. In-memory history holds one entry per logical
-                // message, keyed by its root id and carrying the newest text —
-                // otherwise every restart turns an edited message into two
-                // entries in the next joiner's replay.
+                // message, keyed by its root id: the original's text and tags,
+                // and the newest edit beside them — the same shape the live
+                // paths leave, so a restart reproduces the replay it left.
                 let mut by_root: HashMap<String, usize> = HashMap::new();
                 for msg in messages {
-                    let mut tags = msg.tags;
-                    if let Some(ref did) = msg.sender_did {
-                        tags.insert("account".to_string(), did.clone());
-                    }
-                    // Replay presents the collapsed entry as the message
-                    // itself, not as an edit of something the joiner never saw.
-                    tags.remove("+draft/edit");
                     let root = msg.root_msgid.clone().or_else(|| msg.msgid.clone());
-                    // Newest text under the entry the message already has —
-                    // the same in-place swap the live edit path makes, so a
-                    // restart reproduces the state it left.
-                    if let Some(ref root) = root
-                        && let Some(&idx) = by_root.get(root)
-                        && let Some(existing) = ch.history.get_mut(idx)
+                    let Some(edit_of) = msg.replaces_msgid.clone().filter(|_| root.is_some())
+                    else {
+                        if let Some(ref root) = root {
+                            // Already loaded by id for an edit filed ahead of it.
+                            if by_root.contains_key(root) {
+                                continue;
+                            }
+                            by_root.insert(root.clone(), ch.history.len());
+                        }
+                        ch.history.push_back(HistoryMessage::from_row(msg));
+                        continue;
+                    };
+                    let root = root.unwrap_or(edit_of);
+                    let edit_msgid = msg.msgid.clone().unwrap_or_default();
+                    let tags =
+                        edit_line_tags(msg.tags, &edit_msgid, msg.sender_did.as_deref(), &root);
+                    if let Some(existing) = by_root.get(&root).and_then(|&i| ch.history.get_mut(i))
                     {
-                        existing.text = msg.text;
-                        existing.edited = true;
+                        existing.apply_edit(msg.text, edit_msgid, msg.timestamp, tags);
                         continue;
                     }
-                    if let Some(ref root) = root {
-                        by_root.insert(root.clone(), ch.history.len());
+                    // The first row of this message in the window is an edit:
+                    // its original is older than the rows loaded. Load it by
+                    // id, so the replay still starts from it — only from this
+                    // channel: an id names a message wherever it was filed,
+                    // and another channel's text never belongs in this replay.
+                    let original = db
+                        .find_message_by_msgid(&root)
+                        .ok()
+                        .flatten()
+                        .filter(|row| row.channel.eq_ignore_ascii_case(name));
+                    let mut entry = match original {
+                        Some(original) => HistoryMessage::from_row(original),
+                        None => HistoryMessage::from_orphan_edit(
+                            msg.sender.clone(),
+                            root.clone(),
+                            msg.text.clone(),
+                            edit_msgid.clone(),
+                            msg.timestamp,
+                            tags.clone(),
+                        ),
+                    };
+                    if entry.edit.is_none() {
+                        entry.apply_edit(msg.text, edit_msgid, msg.timestamp, tags);
                     }
-                    ch.history.push_back(HistoryMessage {
-                        from: msg.sender,
-                        text: msg.text,
-                        timestamp: msg.timestamp,
-                        tags,
-                        // Identity is the root; a revision row's own id is
-                        // audit trail, never the key clients hold.
-                        msgid: root,
-                        edited: msg.replaces_msgid.is_some(),
-                    });
+                    by_root.insert(root, ch.history.len());
+                    ch.history.push_back(entry);
+                }
+                while ch.history.len() > crate::server::MAX_HISTORY {
+                    ch.history.pop_front();
                 }
             }
 
@@ -6025,6 +6148,20 @@ async fn process_s2s_event(
                     if !stored || overtaken {
                         return;
                     }
+                    // An edit of a message no longer in memory starts its
+                    // entry from the original on file. Read before the lock.
+                    let mut original_row = edit_of
+                        .as_deref()
+                        .filter(|root| {
+                            !state.channels.lock().get(&channel_key).is_some_and(|ch| {
+                                ch.history.iter().any(|h| h.msgid.as_deref() == Some(*root))
+                            })
+                        })
+                        .and_then(|root| state.with_db(|db| db.find_message_by_msgid(root)))
+                        .flatten()
+                        // Only this channel's: an edit naming a message filed
+                        // elsewhere has no original here.
+                        .filter(|row| row.channel.eq_ignore_ascii_case(&target));
                     let mut channels = state.channels.lock();
                     if let Some(ch) = channels.get_mut(&channel_key) {
                         // An edit revises the entry we already hold; only a
@@ -6045,26 +6182,65 @@ async fn process_s2s_event(
                         let author_matches = revised.is_some_and(|i| {
                             ch.history[i].from.split('!').next() == from.split('!').next()
                         });
-                        if let (Some(i), true) = (revised, author_matches) {
-                            ch.history[i].text = stored_body.clone();
-                            ch.history[i].edited = true;
+                        // The edit line replays with the root as its
+                        // `+draft/edit`: the value the check above ran with.
+                        let edit_tags = edit_of.as_deref().map(|root| {
+                            edit_line_tags(tags.clone(), &msgid, account.as_deref(), root)
+                        });
+                        if let (Some(i), true, Some(edit_tags)) =
+                            (revised, author_matches, edit_tags.clone())
+                        {
+                            ch.history[i].apply_edit(
+                                stored_body.clone(),
+                                msgid.clone(),
+                                timestamp,
+                                edit_tags,
+                            );
                         } else if revised.is_some() {
                             tracing::warn!(
                                 channel = %target, from = %from,
                                 "S2S edit dropped: would rewrite another user's history entry"
                             );
                         } else {
-                            ch.history.push_back(HistoryMessage {
-                                from: from.clone(),
-                                text: stored_body.clone(),
-                                timestamp,
-                                tags: tags.clone(),
-                                // An edit of a message we never saw still keys
-                                // on the root — the identity everyone else
-                                // holds it under.
-                                msgid: Some(edit_of.clone().unwrap_or_else(|| msgid.clone())),
-                                edited: edit_of.is_some(),
-                            });
+                            let entry = match (edit_of.clone(), edit_tags) {
+                                (Some(root), Some(edit_tags)) => {
+                                    // Held on file but no longer in memory: start
+                                    // from the original, as the startup rebuild
+                                    // does. An edit of a message we never saw
+                                    // still keys on the root — the identity
+                                    // everyone else holds it under.
+                                    let mut entry = match original_row.take() {
+                                        Some(row) => HistoryMessage::from_row(row),
+                                        None => HistoryMessage::from_orphan_edit(
+                                            from.clone(),
+                                            root,
+                                            stored_body.clone(),
+                                            msgid.clone(),
+                                            timestamp,
+                                            edit_tags.clone(),
+                                        ),
+                                    };
+                                    if entry.edit.is_none() {
+                                        entry.apply_edit(
+                                            stored_body.clone(),
+                                            msgid.clone(),
+                                            timestamp,
+                                            edit_tags,
+                                        );
+                                    }
+                                    entry
+                                }
+                                _ => HistoryMessage {
+                                    from: from.clone(),
+                                    text: stored_body.clone(),
+                                    timestamp,
+                                    tags: tags.clone(),
+                                    msgid: Some(msgid.clone()),
+                                    edited: false,
+                                    edit: None,
+                                },
+                            };
+                            ch.history.push_back(entry);
                             while ch.history.len() > MAX_HISTORY {
                                 ch.history.pop_front();
                             }
@@ -19215,5 +19391,468 @@ mod held_relay_tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(text_of(&rig.state, &root).as_deref(), Some("first words"));
         assert!(drain(&mut rig.rx).await.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod join_replay_tests {
+    //! Join replay sends an edited message as its original line and then its
+    //! newest edit line, each with its own signature — not one merged line
+    //! that carries the original's signature over the newest text.
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use tokio::sync::mpsc;
+
+    use super::s2s_adversarial_tests::{
+        PEER, setup_authenticated_peer, test_manager, test_state_with_db,
+    };
+    use super::{SharedState, process_s2s_message};
+    use crate::s2s::{S2sManager, S2sMessage};
+
+    const CH: &str = "#replay";
+    const ALICE: &str = "did:plc:replayalice";
+    const FROM: &str = "alice!a@remote";
+
+    struct Rig {
+        state: Arc<SharedState>,
+        mgr: Arc<S2sManager>,
+        key: ed25519_dalek::SigningKey,
+    }
+
+    async fn rig() -> Rig {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        state.channels.lock().entry(CH.to_string()).or_default();
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        state
+            .with_db(|db| db.save_signing_key(ALICE, key.verifying_key().as_bytes()))
+            .expect("db present");
+        Rig { state, mgr, key }
+    }
+
+    async fn next_id() -> String {
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        crate::msgid::generate()
+    }
+
+    fn venue() -> String {
+        freeq_sdk::chatsig::channel_venue(CH)
+    }
+
+    /// Relay a signed message from the peer; `root` makes it an edit.
+    async fn relay(rig: &Rig, msgid: &str, text: &str, root: Option<&str>) {
+        let body = text.replace("\\n", "\n");
+        let venue = venue();
+        let mut doc = freeq_sdk::chatsig::ChatDoc::message(ALICE, msgid, &venue, &body);
+        if let Some(root) = root {
+            doc = doc.with_edit(root);
+        }
+        let sig = doc.sign(&rig.key);
+        let lines = text.contains("\\n").then(|| {
+            body.split('\n')
+                .map(|b| crate::s2s::MultilineLine {
+                    body: b.to_string(),
+                    concat: false,
+                })
+                .collect()
+        });
+        process_s2s_message(
+            &rig.state,
+            &rig.mgr,
+            PEER,
+            S2sMessage::Privmsg {
+                event_id: format!("{PEER}:{msgid}"),
+                from: FROM.to_string(),
+                target: CH.to_string(),
+                text: text.to_string(),
+                origin: PEER.to_string(),
+                msgid: Some(msgid.to_string()),
+                sig: Some(sig),
+                account: Some(ALICE.to_string()),
+                recipient_did: None,
+                replaces_msgid: root.map(str::to_string),
+                tags: HashMap::new(),
+                multiline_lines: lines,
+            },
+        )
+        .await;
+    }
+
+    #[derive(Clone, Copy)]
+    struct Caps {
+        tags: bool,
+        batch: bool,
+        multiline: bool,
+    }
+    const FULL: Caps = Caps {
+        tags: true,
+        batch: true,
+        multiline: false,
+    };
+
+    /// Join replay as a session with `caps` receives it, one parsed line each.
+    fn replay(state: &Arc<SharedState>, caps: Caps) -> Vec<crate::irc::Message> {
+        let sid = format!("joiner-{}", crate::msgid::generate());
+        let (tx, mut rx) = mpsc::channel(512);
+        state.connections.lock().insert(sid.clone(), tx);
+        if caps.tags {
+            state.cap_message_tags.lock().insert(sid.clone());
+        }
+        if caps.batch {
+            state.cap_batch.lock().insert(sid.clone());
+        }
+        if caps.multiline {
+            state.cap_draft_multiline.lock().insert(sid.clone());
+        }
+        state.cap_server_time.lock().insert(sid.clone());
+        crate::connection::replay_history(
+            state,
+            &sid,
+            "test-s2s",
+            CH,
+            &|st: &Arc<SharedState>, to: &str, line: String| {
+                if let Some(tx) = st.connections.lock().get(to) {
+                    let _ = tx.try_send(line);
+                }
+            },
+        );
+        let mut out = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            out.push(crate::irc::Message::parse(&line).expect("a line"));
+        }
+        out
+    }
+
+    fn privmsgs(lines: &[crate::irc::Message]) -> Vec<&crate::irc::Message> {
+        lines.iter().filter(|m| m.command == "PRIVMSG").collect()
+    }
+
+    /// Check a replayed line's signature against its own text, the way a
+    /// receiving client rebuilds the document.
+    fn verifies(line: &crate::irc::Message, key: &ed25519_dalek::SigningKey) -> bool {
+        let tag = |k: &str| line.tags.get(k).map(String::as_str);
+        let (Some(did), Some(msgid), Some(sig)) =
+            (tag("account"), tag("msgid"), tag("+freeq.at/sig"))
+        else {
+            return false;
+        };
+        let venue = venue();
+        let body = line.params.last().map(String::as_str).unwrap_or("");
+        let mut doc = freeq_sdk::chatsig::ChatDoc::message(did, msgid, &venue, body);
+        if let Some(edit) = tag("+draft/edit") {
+            doc = doc.with_edit(edit);
+        }
+        doc.with_coord(line.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .verify(sig, &key.verifying_key())
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_peer_edit_replays_as_its_original_then_its_edit_each_verifying() {
+        let rig = rig().await;
+        let root = crate::msgid::generate();
+        relay(&rig, &root, "first words", None).await;
+        let edit = next_id().await;
+        relay(&rig, &edit, "second words", Some(&root)).await;
+
+        let lines = replay(&rig.state, FULL);
+        let msgs = privmsgs(&lines);
+        assert_eq!(msgs.len(), 2, "{lines:?}");
+        assert_eq!(msgs[0].params[1], "first words");
+        assert_eq!(msgs[0].tags.get("msgid"), Some(&root));
+        assert!(!msgs[0].tags.contains_key("+draft/edit"));
+        assert!(!msgs[0].tags.contains_key("+freeq.at/edited"));
+        assert!(
+            verifies(msgs[0], &rig.key),
+            "the original verifies: {:?}",
+            msgs[0]
+        );
+        assert_eq!(msgs[1].params[1], "second words");
+        assert_eq!(msgs[1].tags.get("msgid"), Some(&edit));
+        assert_eq!(
+            msgs[1].tags.get("+draft/edit"),
+            Some(&root),
+            "this server's root"
+        );
+        assert_eq!(msgs[1].tags.get("account").map(String::as_str), Some(ALICE));
+        assert!(
+            verifies(msgs[1], &rig.key),
+            "the edit verifies: {:?}",
+            msgs[1]
+        );
+        // Both inside the chathistory batch.
+        let batch = msgs[0].tags.get("batch").expect("batched");
+        assert_eq!(msgs[1].tags.get("batch"), Some(batch));
+    }
+
+    #[tokio::test]
+    async fn a_message_edited_three_times_replays_its_original_and_third_edit_only() {
+        let rig = rig().await;
+        let root = crate::msgid::generate();
+        relay(&rig, &root, "v0", None).await;
+        let mut last = String::new();
+        for text in ["v1", "v2", "v3"] {
+            last = next_id().await;
+            relay(&rig, &last, text, Some(&root)).await;
+        }
+        let lines = replay(&rig.state, FULL);
+        let msgs = privmsgs(&lines);
+        let texts: Vec<&str> = msgs.iter().map(|m| m.params[1].as_str()).collect();
+        assert_eq!(texts, vec!["v0", "v3"]);
+        assert_eq!(msgs[1].tags.get("msgid"), Some(&last));
+        assert!(verifies(msgs[0], &rig.key) && verifies(msgs[1], &rig.key));
+    }
+
+    #[tokio::test]
+    async fn an_edit_whose_original_never_arrived_replays_alone_and_verifies() {
+        let rig = rig().await;
+        let root = crate::msgid::generate();
+        let edit = next_id().await;
+        relay(&rig, &edit, "only the edit", Some(&root)).await;
+        let lines = replay(&rig.state, FULL);
+        let msgs = privmsgs(&lines);
+        assert_eq!(msgs.len(), 1, "{lines:?}");
+        assert_eq!(msgs[0].params[1], "only the edit");
+        assert_eq!(msgs[0].tags.get("msgid"), Some(&edit));
+        assert_eq!(msgs[0].tags.get("+draft/edit"), Some(&root));
+        assert!(verifies(msgs[0], &rig.key));
+    }
+
+    /// Original missed, edit 1 arrives, edit 2 arrives: one edit line, with
+    /// edit 2's text and signature.
+    #[tokio::test]
+    async fn with_the_original_missed_two_edits_replay_as_the_second_alone() {
+        let rig = rig().await;
+        let root = crate::msgid::generate();
+        let e1 = next_id().await;
+        relay(&rig, &e1, "edit one", Some(&root)).await;
+        let e2 = next_id().await;
+        relay(&rig, &e2, "edit two", Some(&root)).await;
+        let lines = replay(&rig.state, FULL);
+        let msgs = privmsgs(&lines);
+        assert_eq!(msgs.len(), 1, "{lines:?}");
+        assert_eq!(msgs[0].params[1], "edit two");
+        assert_eq!(msgs[0].tags.get("msgid"), Some(&e2));
+        assert!(verifies(msgs[0], &rig.key));
+    }
+
+    #[tokio::test]
+    async fn a_joiner_without_message_tags_gets_one_line_with_the_newest_text() {
+        let rig = rig().await;
+        let root = crate::msgid::generate();
+        relay(&rig, &root, "first words", None).await;
+        let edit = next_id().await;
+        relay(&rig, &edit, "second words", Some(&root)).await;
+        let lines = replay(
+            &rig.state,
+            Caps {
+                tags: false,
+                batch: false,
+                multiline: false,
+            },
+        );
+        let msgs = privmsgs(&lines);
+        assert_eq!(msgs.len(), 1, "{lines:?}");
+        assert_eq!(msgs[0].params[1], "second words");
+        assert!(msgs[0].tags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_joiner_with_message_tags_but_no_batch_gets_the_two_lines() {
+        let rig = rig().await;
+        let root = crate::msgid::generate();
+        relay(&rig, &root, "first words", None).await;
+        let edit = next_id().await;
+        relay(&rig, &edit, "second words", Some(&root)).await;
+        let lines = replay(
+            &rig.state,
+            Caps {
+                tags: true,
+                batch: false,
+                multiline: false,
+            },
+        );
+        let msgs = privmsgs(&lines);
+        assert_eq!(msgs.len(), 2, "{lines:?}");
+        assert!(msgs.iter().all(|m| !m.tags.contains_key("batch")));
+        assert_eq!(msgs[1].tags.get("+draft/edit"), Some(&root));
+        assert!(verifies(msgs[0], &rig.key) && verifies(msgs[1], &rig.key));
+    }
+
+    #[tokio::test]
+    async fn reactions_ride_on_the_original_line_only() {
+        let rig = rig().await;
+        let root = crate::msgid::generate();
+        relay(&rig, &root, "first words", None).await;
+        let edit = next_id().await;
+        relay(&rig, &edit, "second words", Some(&root)).await;
+        rig.state
+            .with_db(|db| db.store_reaction_by(&root, CH, "carol", None, "👍", 1, None))
+            .expect("db present");
+        let lines = replay(&rig.state, FULL);
+        let msgs = privmsgs(&lines);
+        assert_eq!(msgs.len(), 2, "{lines:?}");
+        assert_eq!(
+            msgs[0].tags.get("+freeq.at/reactions").map(String::as_str),
+            Some("👍:carol")
+        );
+        assert!(!msgs[1].tags.contains_key("+freeq.at/reactions"));
+    }
+
+    /// A peer edit that names a message filed in another channel — here a +i
+    /// one — must not bring that message's text into this channel's replay.
+    /// The edit is treated as having no original here.
+    #[tokio::test]
+    async fn a_peer_edit_naming_a_message_in_another_channel_never_replays_its_text() {
+        let rig = rig().await;
+        let secret = crate::msgid::generate();
+        {
+            let mut channels = rig.state.channels.lock();
+            channels
+                .entry("#secret".to_string())
+                .or_default()
+                .invite_only = true;
+        }
+        rig.state
+            .with_db(|db| {
+                db.insert_message(
+                    "#secret",
+                    "guest!g@host",
+                    "secret words",
+                    100,
+                    &HashMap::new(),
+                    Some(&secret),
+                    None,
+                )
+            })
+            .expect("db present");
+        // An unsigned edit (no account) under the guest's nick, into CH.
+        let edit = next_id().await;
+        process_s2s_message(
+            &rig.state,
+            &rig.mgr,
+            PEER,
+            S2sMessage::Privmsg {
+                event_id: format!("{PEER}:{edit}"),
+                from: "guest!x@remote".to_string(),
+                target: CH.to_string(),
+                text: "public words".to_string(),
+                origin: PEER.to_string(),
+                msgid: Some(edit.clone()),
+                sig: None,
+                account: None,
+                recipient_did: None,
+                replaces_msgid: Some(secret.clone()),
+                tags: HashMap::new(),
+                multiline_lines: None,
+            },
+        )
+        .await;
+        let lines = replay(&rig.state, FULL);
+        assert!(
+            !lines
+                .iter()
+                .any(|m| m.params.iter().any(|p| p.contains("secret words"))),
+            "another channel's text reached this channel's replay: {lines:?}"
+        );
+        let msgs = privmsgs(&lines);
+        assert_eq!(msgs.len(), 1, "the edit alone: {lines:?}");
+        assert_eq!(msgs[0].params[1], "public words");
+    }
+
+    /// Without a database, the verify endpoint reads in-memory history: the
+    /// root id answers with the original's own text (what its signature
+    /// covers), the edit's id with the edit's.
+    #[tokio::test]
+    async fn the_verify_fallback_reads_the_original_text_for_the_root_and_the_edit_for_its_id() {
+        let state =
+            super::s2s_adversarial_tests::test_state_without_db(crate::config::ServerConfig {
+                listen_addr: "127.0.0.1:0".to_string(),
+                server_name: "test-s2s".to_string(),
+                challenge_timeout_secs: 60,
+                ..Default::default()
+            });
+        let mut entry = super::HistoryMessage {
+            from: FROM.to_string(),
+            text: "first words".to_string(),
+            timestamp: 100,
+            tags: HashMap::from([("account".to_string(), ALICE.to_string())]),
+            msgid: Some("vf-root".to_string()),
+            edited: false,
+            edit: None,
+        };
+        entry.apply_edit(
+            "second words".to_string(),
+            "vf-edit".to_string(),
+            110,
+            super::edit_line_tags(HashMap::new(), "vf-edit", Some(ALICE), "vf-root"),
+        );
+        state
+            .channels
+            .lock()
+            .entry(CH.to_string())
+            .or_default()
+            .history
+            .push_back(entry);
+        let read = |id: &str| {
+            let state = state.clone();
+            let id = id.to_string();
+            async move {
+                crate::web::api_verify_message(axum::extract::State(state), axum::extract::Path(id))
+                    .await
+                    .expect("found")
+                    .0
+            }
+        };
+        assert_eq!(read("vf-root").await["text"], "first words");
+        assert_eq!(read("vf-edit").await["text"], "second words");
+    }
+
+    #[tokio::test]
+    async fn a_multiline_edited_message_replays_both_for_multiline_and_fallback_joiners() {
+        let rig = rig().await;
+        let root = crate::msgid::generate();
+        relay(&rig, &root, "one\\ntwo", None).await;
+        let edit = next_id().await;
+        relay(&rig, &edit, "three\\nfour", Some(&root)).await;
+
+        // With draft/multiline: two nested batches, the original's then the edit's.
+        let lines = replay(
+            &rig.state,
+            Caps {
+                tags: true,
+                batch: true,
+                multiline: true,
+            },
+        );
+        let openers: Vec<&crate::irc::Message> = lines
+            .iter()
+            .filter(|m| {
+                m.command == "BATCH"
+                    && m.params.get(1).map(String::as_str) == Some("draft/multiline")
+            })
+            .collect();
+        assert_eq!(openers.len(), 2, "{lines:?}");
+        assert_eq!(openers[0].tags.get("msgid"), Some(&root));
+        assert!(!openers[0].tags.contains_key("+draft/edit"));
+        assert_eq!(openers[1].tags.get("msgid"), Some(&edit));
+        assert_eq!(openers[1].tags.get("+draft/edit"), Some(&root));
+        let bodies: Vec<&str> = privmsgs(&lines)
+            .iter()
+            .map(|m| m.params[1].as_str())
+            .collect();
+        assert_eq!(bodies, vec!["one", "two", "three", "four"]);
+
+        // Without it: each line split into PRIVMSGs, the tags on each first chunk.
+        let lines = replay(&rig.state, FULL);
+        let msgs = privmsgs(&lines);
+        let bodies: Vec<&str> = msgs.iter().map(|m| m.params[1].as_str()).collect();
+        assert_eq!(bodies, vec!["one", "two", "three", "four"], "{lines:?}");
+        assert_eq!(msgs[0].tags.get("msgid"), Some(&root));
+        assert_eq!(msgs[2].tags.get("msgid"), Some(&edit));
+        assert_eq!(msgs[2].tags.get("+draft/edit"), Some(&root));
     }
 }
