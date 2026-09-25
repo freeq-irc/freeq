@@ -1750,6 +1750,26 @@ pub(super) fn handle_kick(
         ChannelTarget::Local {
             session_id: target_session,
         } => {
+            let victim_did = state.session_dids.lock().get(&target_session).cloned();
+            let (is_room, room_founder) = state
+                .channels
+                .lock()
+                .get(channel)
+                .map(|ch| (ch.room, ch.founder_did.clone()))
+                .unwrap_or((false, None));
+            // A room's founder is never kicked: a founder bypasses bans, so
+            // the ban a room kick carries would not hold, and a room with
+            // no founder has nobody left who can rotate its key.
+            if is_room && victim_did.is_some() && victim_did == room_founder {
+                let reply = Message::from_server(
+                    server_name,
+                    irc::ERR_CHANOPRIVSNEEDED,
+                    vec![nick, channel, "Cannot kick the room founder"],
+                );
+                send(state, session_id, format!("{reply}\r\n"));
+                return;
+            }
+
             // Broadcast KICK, then remove from channel
             let hostmask = conn.hostmask();
             let kick_msg = format!(":{hostmask} KICK {channel} {target_nick} :{reason}\r\n");
@@ -1771,17 +1791,21 @@ pub(super) fn handle_kick(
             // silently puts them right back in the channel they were
             // kicked from. Skip the clear if another session for that DID
             // is still a member (multi-device: only this device was kicked).
-            let victim_did = state.session_dids.lock().get(&target_session).cloned();
             if let Some(did) = victim_did {
-                // In a room, a kick is a roster removal: the DID may not
-                // walk back in on the strength of having been a member.
-                // (A still-valid invite would readmit them — that is what
-                // the REST "remove member" call, which also bans, is for.)
-                let is_room = state.channels.lock().get(channel).is_some_and(|c| c.room);
+                // In a room, a kick is a removal: off the roster, so the
+                // DID may not walk back in on the strength of having been
+                // a member, and banned, so a still-valid invite does not
+                // readmit it either. The same as the REST "remove member"
+                // call; the kicker's client is expected to rotate the epoch.
                 if is_room {
                     let (d, c) = (did.clone(), channel.to_string());
                     state
                         .with_db(move |db| db.remove_room_member(&c, &d, crate::rooms::now_secs()));
+                    let set_by = conn
+                        .authenticated_did
+                        .clone()
+                        .unwrap_or_else(|| nick.to_string());
+                    crate::rooms::ban_did(state, channel, &did, &set_by);
                 }
                 let other_session_still_member = {
                     let did_sessions = state.did_sessions.lock();
@@ -3082,8 +3106,100 @@ mod room_admission_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(!is_member(&state, GUEST_DID), "kicked means off the roster");
-        // Without a token they cannot come back on the strength of membership.
-        assert!(v.join(ROOM, None).await.contains(" 473 "));
+        // They cannot come back on the strength of membership. The ban a
+        // room kick carries is checked first, so the refusal is 474; with
+        // the ban lifted (MODE -b) the bare roster check would say 473.
+        assert!(v.join(ROOM, None).await.contains(" 474 "));
+    }
+
+    /// A kick in a room is a removal, not a time-out: the DID is banned as
+    /// well as unrostered, so the invite everyone else still holds no
+    /// longer admits it. Same outcome as `DELETE /rooms/{ch}/members/{did}`.
+    #[tokio::test]
+    async fn a_kick_in_a_room_bans_the_did_so_a_valid_token_no_longer_admits() {
+        let state = crate::server::test_state_with_db();
+        room_fixture(&state, far_future(), None);
+        let mut f = Client::signed_in(&state, "founder", FOUNDER).await;
+        f.join(ROOM, None).await;
+        let mut v = Client::signed_in(&state, "victim", GUEST_DID).await;
+        assert!(v.join(ROOM, Some(TOKEN)).await.contains(" JOIN "));
+
+        f.tx(&format!("KICK {ROOM} victim :bye")).await;
+        v.rx(|l| l.contains(" KICK ")).await.expect("the KICK");
+        // The founder, still inside, sees the ban announced after the KICK.
+        let mode = f
+            .rx(|l| l.split_whitespace().nth(1) == Some("MODE") && l.contains(" +b "))
+            .await
+            .expect("MODE +b");
+        assert!(
+            mode.ends_with(&format!("MODE {ROOM} +b {GUEST_DID}")),
+            "{mode}"
+        );
+        let ch = state.channels.lock().get(ROOM).cloned().unwrap();
+        assert!(
+            ch.bans
+                .iter()
+                .any(|b| b.mask == GUEST_DID && b.set_by == FOUNDER),
+            "banned by DID, attributed to the kicker: {:?}",
+            ch.bans
+        );
+        let persisted = state.with_db(|db| db.load_channels()).unwrap();
+        assert!(
+            persisted[ROOM].bans.iter().any(|b| b.mask == GUEST_DID),
+            "the ban survives a restart"
+        );
+        assert!(!is_member(&state, GUEST_DID), "and off the roster");
+
+        // The invite is untouched (unlimited, unexpired) and admits nobody
+        // who was kicked.
+        assert!(v.join(ROOM, Some(TOKEN)).await.contains(" 474 "));
+        assert!(!is_member(&state, GUEST_DID));
+    }
+
+    /// The founder bypasses bans, so a kick could not hold; and a room
+    /// with no founder has nobody left who can rotate its key.
+    #[tokio::test]
+    async fn the_room_founder_cannot_be_kicked() {
+        let state = crate::server::test_state_with_db();
+        room_fixture(&state, far_future(), None);
+        let mut f = Client::signed_in(&state, "founder", FOUNDER).await;
+        f.join(ROOM, None).await;
+        let mut m = Client::signed_in(&state, "member", GUEST_DID).await;
+        assert!(m.join(ROOM, Some(TOKEN)).await.contains(" JOIN "));
+        // Op the member, so the refusal is about the founder, not about
+        // privilege.
+        let member_sid = state
+            .nick_to_session
+            .lock()
+            .get_session("member")
+            .map(str::to_string)
+            .expect("member's session");
+        state
+            .channels
+            .lock()
+            .get_mut(ROOM)
+            .unwrap()
+            .ops
+            .insert(member_sid.clone());
+
+        m.tx(&format!("KICK {ROOM} founder :coup")).await;
+        let reply = m
+            .rx(|l| l.split_whitespace().nth(1) == Some("482"))
+            .await
+            .expect("482");
+        assert!(
+            reply.ends_with(&format!("482 member {ROOM} :Cannot kick the room founder")),
+            "{reply}"
+        );
+        let ch = state.channels.lock().get(ROOM).cloned().unwrap();
+        assert_eq!(ch.members.len(), 2, "the founder is still inside");
+        assert!(ch.bans.is_empty(), "and not banned");
+        assert!(
+            state
+                .with_db(|db| db.is_room_member(ROOM, FOUNDER))
+                .unwrap(),
+            "and still on the roster"
+        );
     }
 
     #[tokio::test]

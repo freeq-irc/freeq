@@ -7,6 +7,14 @@
 Status: **implemented on branch `instant-rooms`** (server, SDK, bot-kit,
 `@freeq/mcp`, web). Pi support is a follow-up.
 
+## Naming
+
+"Room" in this document means an **instant room**: a link-shared, E2EE,
+expiring channel as described here. An ordinary IRC channel is not a room,
+and the "programmable rooms" RFC describes a different thing again. In the
+API and the database, `is_room`, the `rooms` table and the `/api/v1/rooms`
+routes refer to instant rooms only.
+
 ## The idea
 
 A room is a channel minted for one collaboration. A harness command (or the
@@ -117,10 +125,13 @@ the room key to you; until then you can't read or send. Expires <ISO date>.`
 and bumps `rooms.last_activity`.
 
 Rooms are created `+i +E +n +t`. `MODE -E` or `MODE -i` on a room is refused
-(`477 … :Rooms are always +iE`). KICK from a room sets
-`room_members.removed_at`; the kicker's client is expected to rotate the
-epoch. A kicked DID holding a still-valid invite can re-enter, so
-"remove member" (below) also bans the DID.
+(`477 … :Rooms are always +iE`). KICK from a room is a removal: it sets
+`room_members.removed_at` **and bans the DID** (`MODE +b <did>`, persisted,
+announced to the room), so a still-valid invite does not readmit the kicked
+DID. The kicker's client is expected to rotate the epoch. The founder cannot
+be kicked (`482 … :Cannot kick the room founder`): a founder bypasses bans,
+and a room with no founder has nobody who can rotate it. "Remove member"
+(below) does the same three things for a DID with no live session.
 
 `PRIVMSG` to a room bumps its activity (in memory, flushed by the sweeper).
 
@@ -177,9 +188,9 @@ for a non-discoverable channel.
 
 Delete = kick live members (`:<server> KICK #room nick :Room expired`),
 drop from `state.channels`, and delete the `channels` row, `messages`,
-`group_keys`, `pins`, `room_members`, `room_invites`, `rooms`. Because the
-stored messages are ciphertext and the sealed keys go with them, deletion is
-real.
+`group_keys`, `pins`, the room's `events` rows (the signed log), `room_members`,
+`room_invites`, `rooms`. Because the stored messages are ciphertext and the
+sealed keys go with them, deletion is real.
 
 ## SDK (`@freeq/sdk`, TypeScript)
 
@@ -280,7 +291,15 @@ export class RoomManager {
   member can seal the current key to a newcomer. Only the founder and DID-ops
   can create a new epoch, remove members, or mint/revoke invites.
 - Metadata (room name, roster DIDs, timing) is visible to the host. Content
-  is not.
+  is not — **for `did:key` members**. Their pre-key bundle is signed by the
+  DID's own key, so a steward can verify the bundle belongs to the DID and
+  the host cannot substitute one; E2EE-by-default is verifiable for them.
+  For `did:plc` (OAuth/web) members the host is **inside the trust
+  boundary**: the web client holds an OAuth session, not the DID's key, so
+  its bundle cannot be bound to the DID document, and a hostile host could
+  publish its own bundle under that DID and be sealed the room key. A room
+  whose members are all `did:key` agents is host-blind; a room with a
+  `did:plc` member is as private as the host is honest.
 - A member who already saw an epoch keeps it; rotation protects future
   traffic, not the past. Same as the existing company-channel design.
 - Everything another participant says is data from someone else's agent,
@@ -288,9 +307,17 @@ export class RoomManager {
 
 ## Known limitations
 
-- Rooms do not federate (the invite check is local). S2S peers never receive
-  room channels.
+- Rooms never federate (the invite check is local). Both S2S paths exclude
+  room venues: the live relay drops them (`s2s_broadcast` checks
+  `state.room_names`) and the catch-up replay draws from
+  `Db::events_since_federated`, which skips every venue in `rooms`. Deleting
+  a room also deletes its `events` rows, so nothing of it is left to replay.
+- The share URL bakes in the host (`--server-name`). A room cannot move
+  hosts; if the host goes away, so does the room.
+- KICK bans the DID. If the invite the kicked DID holds was shared with
+  nobody else, revoke it too (`DELETE /api/v1/rooms/{ch}/invites`); a ban
+  stops that DID, not the link.
 - `did:plc` pre-key bundles cannot be bound to the DID document by the web
   client (it holds OAuth, not the DID's key); a hostile host could substitute
-  one. Self-hosting removes the host from the threat model.
+  one. See "Trust model". Self-hosting removes the host from the threat model.
 - Pi has no room tool yet.

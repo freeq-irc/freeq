@@ -2846,6 +2846,22 @@ async fn api_put_group_keys(
                 skipped.push(serde_json::json!({ "did": member_did, "reason": "not a member" }));
                 continue;
             }
+            // A seal that exists belongs to whoever made it. An ordinary
+            // member may seal to a newcomer and re-seal to themselves, but
+            // not write over another member's key: in a flat-trust room
+            // that would let any one member hand a peer a blob that opens
+            // to nothing, or to a key of the writer's choosing. A steward
+            // may, because that is how a bad seal gets repaired.
+            if is_room
+                && !is_authority
+                && *member_did != caller
+                && state
+                    .with_db(|db| db.group_key_exists(&channel, member_did, epoch))
+                    .unwrap_or(false)
+            {
+                skipped.push(serde_json::json!({ "did": member_did, "reason": "already sealed" }));
+                continue;
+            }
             let (ch, md, sw) = (channel.clone(), member_did.clone(), sealed_wire.to_string());
             state.with_db(|db| db.save_group_key(&ch, &md, epoch, &sw));
             stored += 1;
@@ -3305,9 +3321,12 @@ async fn api_room_keep(
 /// ban it, and kick any live session it has. Founder or DID-op. The
 /// caller then rotates the epoch; the server cannot, it holds no key.
 ///
-/// The ban is what makes this different from a KICK: a kicked DID with a
-/// still-valid invite could walk back in, and revoking every invite to
-/// stop one person would punish everyone else holding the link.
+/// The same three steps a KICK in a room performs (`handle_kick`), for a
+/// DID that need not have a live session: a roster entry with nobody
+/// connected can only be removed here. The ban (`crate::rooms::ban_did`)
+/// is what makes either stick — a removed DID with a still-valid invite
+/// could walk back in, and revoking every invite to stop one person would
+/// punish everyone else holding the link.
 async fn api_room_remove_member(
     Path((name, did)): Path<(String, String)>,
     State(state): State<Arc<SharedState>>,
@@ -3339,37 +3358,7 @@ async fn api_room_remove_member(
     let now = crate::rooms::now_secs();
     let (c, d) = (channel.clone(), did.clone());
     state.with_db(move |db| db.remove_room_member(&c, &d, now));
-
-    // Ban by DID, in memory and on disk, announced to the room so every
-    // client's ban list agrees with the server's.
-    let ban = crate::server::BanEntry::new(did.clone(), caller.clone());
-    let newly_banned = {
-        let mut channels = state.channels.lock();
-        match channels.get_mut(&channel) {
-            Some(ch) if !ch.bans.iter().any(|b| b.mask == did) => {
-                ch.bans.push(ban.clone());
-                true
-            }
-            _ => false,
-        }
-    };
-    if newly_banned {
-        let (c, b) = (channel.clone(), ban);
-        state.with_db(move |db| db.add_ban(&c, &b));
-        let line = format!(":{} MODE {channel} +b {did}\r\n", state.config.server_name);
-        let members: Vec<String> = state
-            .channels
-            .lock()
-            .get(&channel)
-            .map(|ch| ch.members.iter().cloned().collect())
-            .unwrap_or_default();
-        let conns = state.connections.lock();
-        for sid in members {
-            if let Some(tx) = conns.get(&sid) {
-                let _ = tx.try_send(line.clone());
-            }
-        }
-    }
+    crate::rooms::ban_did(&state, &channel, &did, &caller);
     crate::rooms::kick_did(&state, &channel, &did, "Removed from room");
     tracing::info!(channel = %channel, removed = %did, by = %caller, "room member removed");
     (StatusCode::OK, Json(serde_json::json!({ "removed": did })))
@@ -9284,6 +9273,105 @@ mod room_rest_tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// In a room any member may seal the current epoch to a newcomer, but a
+    /// seal that already exists belongs to whoever made it: an ordinary
+    /// member cannot write over another member's key. A steward can (that
+    /// is how a bad seal is repaired), and anyone can replace their own.
+    #[tokio::test]
+    async fn a_members_seal_is_not_overwritten_by_another_ordinary_member() {
+        const NEWCOMER: &str = "did:key:zNewcomer";
+        let state = crate::server::test_state_with_db();
+        let hf = session(&state, "s-f", FOUNDER);
+        let (_, created) = create(&state, &hf, "").await;
+        let channel = created["channel"].as_str().unwrap().to_string();
+        let now = crate::rooms::now_secs();
+        state
+            .with_db(|db| {
+                db.upsert_room_member(&channel, MEMBER, now)?;
+                db.upsert_room_member(&channel, NEWCOMER, now)
+            })
+            .unwrap();
+        let hm = session(&state, "s-m", MEMBER);
+        let hn = session(&state, "s-n", NEWCOMER);
+        let put = |h: axum::http::HeaderMap, body: serde_json::Value| {
+            api_put_group_keys(
+                Path(channel.clone()),
+                State(state.clone()),
+                h,
+                axum::Json(body),
+            )
+        };
+        let sealed_for = |did: &str| -> Option<String> {
+            state
+                .with_db(|db| db.get_group_keys_for_member(&channel, did))
+                .unwrap()
+                .into_iter()
+                .find(|(epoch, _)| *epoch == 1)
+                .map(|(_, wire)| wire)
+        };
+
+        // The founder opens epoch 1, sealed to themselves and to MEMBER.
+        let (status, Json(v)) = put(
+            hf.clone(),
+            serde_json::json!({"epoch": 1, "keys": {FOUNDER: "EGK1:f", MEMBER: "EGK1:m-by-founder"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["stored"], 2);
+
+        // A first seal by an ordinary member still stores: MEMBER seals to
+        // NEWCOMER, who has none yet.
+        let (status, Json(v)) = put(
+            hm.clone(),
+            serde_json::json!({"epoch": 1, "keys": {NEWCOMER: "EGK1:n-by-member"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(
+            (v["stored"].as_u64(), v["skipped"].as_array().map(Vec::len)),
+            (Some(1), Some(0))
+        );
+        assert_eq!(sealed_for(NEWCOMER).as_deref(), Some("EGK1:n-by-member"));
+
+        // An ordinary member cannot write over another member's seal.
+        let (status, Json(v)) = put(
+            hn.clone(),
+            serde_json::json!({"epoch": 1, "keys": {MEMBER: "EGK1:forged"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["stored"], 0);
+        assert_eq!(
+            v["skipped"],
+            serde_json::json!([{"did": MEMBER, "reason": "already sealed"}])
+        );
+        assert_eq!(
+            sealed_for(MEMBER).as_deref(),
+            Some("EGK1:m-by-founder"),
+            "the row is unchanged"
+        );
+
+        // A member may replace their own.
+        let (status, Json(v)) = put(
+            hn.clone(),
+            serde_json::json!({"epoch": 1, "keys": {NEWCOMER: "EGK1:n-own"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["stored"], 1);
+        assert_eq!(sealed_for(NEWCOMER).as_deref(), Some("EGK1:n-own"));
+
+        // The founder may repair anyone's.
+        let (status, Json(v)) = put(
+            hf,
+            serde_json::json!({"epoch": 1, "keys": {MEMBER: "EGK1:m-repaired"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["stored"], 1);
+        assert_eq!(sealed_for(MEMBER).as_deref(), Some("EGK1:m-repaired"));
     }
 
     #[tokio::test]

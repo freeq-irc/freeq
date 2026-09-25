@@ -6824,8 +6824,11 @@ pub(crate) async fn process_s2s_message(
             } else {
                 limit.min(MAX_REPLAY)
             };
+            // Rooms are the one venue the live path never relays
+            // (`s2s_broadcast` drops `state.room_names`), so the replay
+            // draws from the federated view of the log, not the whole log.
             let rows = state
-                .with_db(|db| db.events_since(since_ts, limit + 1))
+                .with_db(|db| db.events_since_federated(since_ts, limit + 1))
                 .unwrap_or_default();
             let more = rows.len() > limit;
             let events: Vec<crate::s2s::ReplayedEvent> = rows
@@ -15031,14 +15034,18 @@ mod catchup_tests {
                 .unwrap();
         }
 
-        let all = state.with_db(|db| db.events_since(0, 10)).unwrap();
+        let all = state
+            .with_db(|db| db.events_since_federated(0, 10))
+            .unwrap();
         assert_eq!(all.len(), 3);
         assert!(
             all.windows(2).all(|w| w[0].timestamp <= w[1].timestamp),
             "oldest first, so a replay applies them in the order they happened"
         );
 
-        let recent = state.with_db(|db| db.events_since(250, 10)).unwrap();
+        let recent = state
+            .with_db(|db| db.events_since_federated(250, 10))
+            .unwrap();
         assert_eq!(recent.len(), 1, "the window is respected");
         assert_eq!(recent[0].event_id, "01WINDOW00000000000000003");
     }

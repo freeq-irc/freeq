@@ -2741,6 +2741,21 @@ impl Db {
         Ok(())
     }
 
+    /// Whether a sealed key is already filed for `member_did` at `epoch`.
+    /// `api_put_group_keys` asks this before letting an ordinary room member
+    /// write: a seal that exists belongs to whoever made it, and only a
+    /// steward or the member it is addressed to may replace it.
+    pub fn group_key_exists(&self, channel: &str, member_did: &str, epoch: i64) -> SqlResult<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM group_keys
+                WHERE channel = ?1 AND member_did = ?2 AND epoch = ?3
+             )",
+            params![channel.to_lowercase(), member_did, epoch],
+            |row| row.get::<_, bool>(0),
+        )
+    }
+
     /// Fetch all sealed group keys for one member of a channel, newest epoch
     /// first. Returns `(epoch, sealed_wire)` pairs.
     pub fn get_group_keys_for_member(
@@ -11848,7 +11863,8 @@ fn pin_event_id(channel: &str, msgid: &str, at: u64, pinning: bool) -> String {
 
 impl Db {
     /// Events accepted at or after `since_ts`, oldest first — the whole log,
-    /// for local readers and tests.
+    /// for local readers and tests. Never the answer to a peer: that is
+    /// `events_since_federated`.
     pub fn events_since(&self, since_ts: u64, limit: usize) -> SqlResult<Vec<StoredEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT event_id, canonical, signature, sig_state, kind, venue,
@@ -11860,6 +11876,40 @@ impl Db {
         let rows = stmt.query_map(params![since_ts as i64, limit as i64], map_stored_event)?;
         rows.collect()
     }
+
+    /// The slice of the log a peer may be handed in a catch-up: everything
+    /// `events_since` returns except events in an instant room. Rooms never
+    /// federate — the live relay drops them (`s2s_broadcast`), so a replay
+    /// must too, or a peer that was away would receive what one that stayed
+    /// never did. A room's venue is its lowercased channel name, which is
+    /// the `rooms` primary key, so the exclusion is a subquery on that table.
+    pub fn events_since_federated(
+        &self,
+        since_ts: u64,
+        limit: usize,
+    ) -> SqlResult<Vec<StoredEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, canonical, signature, sig_state, kind, venue,
+                    actor_did, subject, body_hash, emoji, origin, conflict, timestamp
+             FROM events
+             WHERE timestamp >= ?1
+               AND venue NOT IN (SELECT channel FROM rooms)
+             ORDER BY timestamp ASC, event_id ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![since_ts as i64, limit as i64], map_stored_event)?;
+        rows.collect()
+    }
+
+    /// Drop every event filed under `venue`. Part of deleting a room: the
+    /// log row carries the ciphertext's hash and signature, and a deleted
+    /// room leaves nothing behind that says it existed.
+    pub fn delete_events_for_venue(&self, venue: &str) -> SqlResult<usize> {
+        self.conn.execute(
+            "DELETE FROM events WHERE venue = ?1",
+            params![freeq_sdk::chatsig::channel_venue(venue)],
+        )
+    }
 }
 
 #[cfg(test)]
@@ -11870,8 +11920,11 @@ mod replay_window_tests {
     /// included. Live relay is peer-blind broadcast to allowlisted peers, so
     /// withholding a DM from a replay would protect nothing — the peer already
     /// got it as it happened — while denying its own users the messages they
-    /// missed. Scope is one rule for both paths; see
-    /// `docs/FEDERATION-TOPOLOGY.md`.
+    /// missed. Scope is one rule for both paths, and that rule has exactly
+    /// one carve-out: instant rooms, which the live relay never sends
+    /// (`s2s_broadcast` drops them) and the replay must not send either
+    /// (`a_replay_window_excludes_room_venues`). See
+    /// `docs/FEDERATION-TOPOLOGY.md` and `docs/INSTANT-ROOMS.md`.
     #[test]
     fn a_replay_window_includes_a_direct_message() {
         let db = Db::open_memory().unwrap();
@@ -11896,11 +11949,66 @@ mod replay_window_tests {
         )
         .unwrap();
 
-        let window = db.events_since(0, 10).unwrap();
+        let window = db.events_since_federated(0, 10).unwrap();
         assert_eq!(window.len(), 2, "the window is the window");
         assert!(
             window.iter().any(|e| e.venue.starts_with("dm:")),
             "including the direct message, which the peer receives live anyway"
+        );
+    }
+
+    /// A room never federates: the live relay drops it, and a replay must
+    /// not hand a peer what the live path withheld. The exclusion keys on
+    /// the `rooms` table, which is exactly the set of venues the live path
+    /// refuses (`state.room_names` is loaded from it).
+    #[test]
+    fn a_replay_window_excludes_room_venues() {
+        let db = Db::open_memory().unwrap();
+        db.create_room("#r-quiet-copper-fox", "did:key:zF", 1, 1_000_000)
+            .unwrap();
+        db.insert_message(
+            "#public",
+            "a!u@h",
+            "in the open",
+            10,
+            &HashMap::new(),
+            Some("M1"),
+            Some("did:plc:a"),
+        )
+        .unwrap();
+        // Filed with the channel's own casing: the venue is folded on the
+        // way in, so it matches the lowercased `rooms.channel` key.
+        db.insert_message(
+            "#R-Quiet-Copper-Fox",
+            "f!u@h",
+            "EG1:1:ciphertext",
+            20,
+            &HashMap::new(),
+            Some("M2"),
+            Some("did:key:zF"),
+        )
+        .unwrap();
+
+        let federated = db.events_since_federated(0, 10).unwrap();
+        assert_eq!(
+            federated
+                .iter()
+                .map(|e| e.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["M1"],
+            "only the public event crosses"
+        );
+        let local = db.events_since(0, 10).unwrap();
+        assert_eq!(local.len(), 2, "the local log still holds both");
+        assert_eq!(
+            db.delete_events_for_venue("#r-quiet-copper-fox").unwrap(),
+            1,
+            "deleting a room's venue removes exactly its rows"
+        );
+        assert_eq!(db.events_since(0, 10).unwrap().len(), 1);
+        assert!(
+            db.get_event("M1").unwrap().is_some(),
+            "another venue's event is untouched"
         );
     }
 }
@@ -12088,12 +12196,14 @@ mod room_db_tests {
         .unwrap();
         db.store_pin(CH, "01MSG", "f", 1000).unwrap();
         db.add_user_channel(F, CH).unwrap();
+        assert!(db.get_event("01MSG").unwrap().is_some(), "logged");
 
         db.delete_channel(CH).unwrap();
         db.prune_messages(CH, 0).unwrap();
         db.delete_group_keys(CH).unwrap();
         db.delete_pins(CH).unwrap();
         db.delete_user_channel_rows(CH).unwrap();
+        db.delete_events_for_venue(CH).unwrap();
         db.delete_room(CH).unwrap();
 
         assert!(!db.channel_row_exists(CH).unwrap());
@@ -12104,5 +12214,22 @@ mod room_db_tests {
         assert!(db.get_messages(CH, 10, None).unwrap().is_empty());
         assert!(db.get_pins(CH).unwrap().is_empty());
         assert!(db.get_user_channels(F).unwrap().is_empty());
+        assert!(db.get_event("01MSG").unwrap().is_none(), "unlogged");
+    }
+
+    /// `group_key_exists` is the question `api_put_group_keys` asks before
+    /// letting an ordinary member write over someone else's seal.
+    #[test]
+    fn a_sealed_key_is_visible_per_member_and_epoch() {
+        let db = Db::open_memory().unwrap();
+        assert!(!db.group_key_exists(CH, F, 1).unwrap());
+        db.save_group_key(CH, F, 1, "EGK1:a").unwrap();
+        assert!(db.group_key_exists(CH, F, 1).unwrap());
+        assert!(
+            db.group_key_exists("#R-AMBER-FOX-LAKE", F, 1).unwrap(),
+            "channel keys are folded"
+        );
+        assert!(!db.group_key_exists(CH, F, 2).unwrap(), "other epoch");
+        assert!(!db.group_key_exists(CH, M, 1).unwrap(), "other member");
     }
 }
