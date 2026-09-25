@@ -159,7 +159,13 @@ class ChannelState(val name: String) {
     }
 
     fun appendIfNew(msg: ChatMessage) {
-        if (messageIds.contains(msg.id)) return
+        if (messageIds.contains(msg.id)) {
+            // Already held (e.g. the cache copy loaded first). A CHATHISTORY
+            // replay may still carry the server's reactions the held copy
+            // lacks: fold them in, as iOS and macOS do.
+            foldReplayedReactions(msg)
+            return
+        }
         messageIds.add(msg.id)
         if (messages.isNotEmpty() && msg.timestamp < messages.last().timestamp) {
             val idx = messages.indexOfFirst { it.timestamp > msg.timestamp }
@@ -253,6 +259,21 @@ class ChannelState(val name: String) {
     fun hasReaction(msgId: String, emoji: String, from: String): Boolean {
         val idx = findMessage(msgId) ?: return false
         return messages[idx].reactions[emoji]?.contains(from) == true
+    }
+
+    /** Take a replayed copy's reactions onto the held row: each emoji the
+     *  copy carries with anyone on it replaces the held one. New collections,
+     *  so the list sees a changed row. */
+    private fun foldReplayedReactions(replayed: ChatMessage) {
+        if (replayed.reactions.values.all { it.isEmpty() }) return
+        val idx = findMessage(replayed.id) ?: return
+        val held = messages[idx]
+        val folded = mutableMapOf<String, MutableSet<String>>()
+        for ((emoji, nicks) in held.reactions) folded[emoji] = nicks.toMutableSet()
+        for ((emoji, nicks) in replayed.reactions) {
+            if (nicks.isNotEmpty()) folded[emoji] = nicks.toMutableSet()
+        }
+        messages[idx] = held.copy(reactions = folded)
     }
 
     private fun mutateReactions(

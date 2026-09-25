@@ -257,6 +257,32 @@ class ChannelStateTest {
         assertEquals(setOf("bob"), ch.messages[0].reactions["\uD83D\uDC4D"])
     }
 
+    @Test fun a_held_row_takes_the_reactions_a_replayed_copy_carries() {
+        // The phone holds the row from its cache; the history replay carries
+        // the server's reactions for it.
+        val ch = ChannelState("#test")
+        ch.appendIfNew(msg(id = "a"))
+        ch.addReaction("a", "\uD83D\uDC4D", "alice")
+        val replayed = msg(id = "a").copy(
+            reactions = mutableMapOf(
+                "\uD83D\uDC4D" to mutableSetOf("alice", "bob"),
+                "\uD83C\uDF89" to mutableSetOf("carol"),
+            ),
+        )
+        ch.appendIfNew(replayed)
+        assertEquals(1, ch.messages.size)
+        assertEquals(setOf("alice", "bob"), ch.messages[0].reactions["\uD83D\uDC4D"])
+        assertEquals(setOf("carol"), ch.messages[0].reactions["\uD83C\uDF89"])
+    }
+
+    @Test fun a_replayed_copy_with_no_reactions_leaves_the_held_ones() {
+        val ch = ChannelState("#test")
+        ch.appendIfNew(msg(id = "a"))
+        ch.addReaction("a", "\uD83D\uDC4D", "alice")
+        ch.appendIfNew(msg(id = "a"))
+        assertEquals(setOf("alice"), ch.messages[0].reactions["\uD83D\uDC4D"])
+    }
+
     @Test fun removeReaction_for_someone_who_never_reacted_is_a_noop() {
         val ch = ChannelState("#test")
         ch.appendIfNew(msg(id = "a"))
