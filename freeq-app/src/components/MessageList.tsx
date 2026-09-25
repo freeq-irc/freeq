@@ -877,6 +877,14 @@ function SystemMessageImpl({ msg }: { msg: Message }) {
   );
 }
 
+/** Whether a row shows "(edited)" — a header row and a follow-on line alike.
+ *  `editOf` covers an edit seen live; the tag covers one replayed on join,
+ *  where the server collapses the revisions into a single row and nothing
+ *  else in the wire form says it was ever edited. */
+function showsEdited(msg: Message): boolean {
+  return (!!msg.editOf || msg.tags['+freeq.at/edited'] === '1') && !msg.isStreaming;
+}
+
 interface MessageProps {
   msg: Message;
   channel: string;
@@ -963,12 +971,7 @@ function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
           )}
           <span className="text-xs text-fg-dim whitespace-nowrap cursor-default" title={msg.timestamp.toLocaleString([], { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })}>{formatTime(msg.timestamp)}</span>
           {msg.isStreaming && <span className="text-xs text-blue-400 animate-pulse">streaming…</span>}
-          {/* `editOf` covers an edit seen live; the tag covers one replayed on
-              join, where the server collapses the revisions into a single row
-              and nothing else in the wire form says it was ever edited. */}
-          {(msg.editOf || msg.tags['+freeq.at/edited'] === '1') && !msg.isStreaming && (
-            <span className="text-xs text-fg-dim">(edited)</span>
-          )}
+          {showsEdited(msg) && <span className="text-xs text-fg-dim">(edited)</span>}
           {msg.encrypted && <EncryptedBadge />}
         </div>
         <MessageContent msg={msg} channel={channel} onNickClick={onNickClick} />
@@ -1071,6 +1074,7 @@ function GroupedMessageImpl({ msg, channel, onNickClick }: MessageProps) {
 
       <div className="min-w-0 flex-1">
         <MessageContent msg={msg} channel={channel} onNickClick={onNickClick} />
+        {showsEdited(msg) && <span className="text-xs text-fg-dim">(edited)</span>}
         <Reactions msg={msg} channel={channel} />
       </div>
 
