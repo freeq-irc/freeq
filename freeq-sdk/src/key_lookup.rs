@@ -1226,25 +1226,7 @@ impl<P: ClientProvider> KeyLookup<P> {
             return;
         }
         for flight in &flights {
-            // Whichever caller reaches the cell first makes the request; the
-            // rest await it. A request that served nothing sets the cell too,
-            // so nothing is left in flight for the next prefetch to await.
-            flight
-                .cell
-                .get_or_init(|| async {
-                    let accounts = self
-                        .reader
-                        .fetch_accounts(home, &flight.asked, DEVICE_KEY_TYPE)
-                        .await;
-                    let served = !accounts.is_empty();
-                    for (did, account) in accounts {
-                        self.proven_from_home(&did, &account).await;
-                    }
-                    if served {
-                        self.save().await;
-                    }
-                })
-                .await;
+            self.settle_prefetch(home, flight).await;
         }
         let mut prefetching = self.prefetching.lock();
         for flight in &flights {
@@ -1254,6 +1236,29 @@ impl<P: ClientProvider> KeyLookup<P> {
                 }
             }
         }
+    }
+
+    /// Run `flight`'s request, or await it when another caller runs it:
+    /// whichever reaches the cell first makes the request. A request that
+    /// served nothing sets the cell too, so nothing is left in flight for the
+    /// next prefetch to await.
+    async fn settle_prefetch(&self, home: &str, flight: &Prefetch) {
+        flight
+            .cell
+            .get_or_init(|| async {
+                let accounts = self
+                    .reader
+                    .fetch_accounts(home, &flight.asked, DEVICE_KEY_TYPE)
+                    .await;
+                let served = !accounts.is_empty();
+                for (did, account) in accounts {
+                    self.proven_from_home(&did, &account).await;
+                }
+                if served {
+                    self.save().await;
+                }
+            })
+            .await;
     }
 
     /// Prove one account the home server served, and keep it as that DID's
@@ -1375,11 +1380,30 @@ impl<P: ClientProvider> KeyLookup<P> {
     /// `did`'s proven device records from the listing in flight, else a new
     /// one. A listing that fails is not kept.
     ///
+    /// A prefetch in flight for the account is waited for first, and its
+    /// listing used when it brought one inside the ttl.
+    ///
     /// `direct` lists at the PDS, the home server skipped, and always starts
     /// a new listing, which lookups starting meanwhile join. Either way a
     /// listing is kept only if none newer is held (`keep_listing`), and is
     /// dated from before its request.
     async fn list_device_records(&self, did: &str, direct: bool) -> Result<Vec<serde_json::Value>> {
+        let prefetching = self.prefetching.lock().get(did).cloned();
+        if !direct
+            && let Some(flight) = prefetching
+            && let Some(home) = self.origin_base()
+        {
+            self.settle_prefetch(home, &flight).await;
+            let held = self
+                .records
+                .lock()
+                .get(did)
+                .filter(|(_, at)| self.inside_ttl(*at))
+                .map(|(records, _)| records.clone());
+            if let Some(records) = held {
+                return Ok(records);
+            }
+        }
         let cell = if direct {
             let cell = Listing::default();
             self.listing.lock().insert(did.to_string(), cell.clone());
@@ -3704,6 +3728,27 @@ mod tests {
         assert_eq!(found.map(|f| f.source), Some(KeySource::OriginServer));
         assert_eq!(home_server.counts(), (0, 0, 0), "no records asked for");
         assert!(home_server.batches.lock().is_empty());
+        assert_eq!(pds.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn answers_a_line_during_its_accounts_prefetch_from_that_prefetch_with_no_second_request()
+    {
+        let (home_server, pds, _repos, docs) = three_signers().await;
+        // The batch answer takes a while, so the line arrives while it is out.
+        home_server.batch_delay_ms.store(200, Ordering::SeqCst);
+        let keys = lookup_at_home(docs, &home_server);
+        let signers = [ALICE.to_string(), BOB.to_string()];
+        let (_, found) = tokio::join!(keys.prefetch(&signers), async {
+            // A live line from Alice while the prefetch is on the wire.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            keys.key_for(ALICE, &kid_of(1)).await
+        });
+        assert_eq!(
+            found.unwrap().map(|f| f.source),
+            Some(KeySource::IdentityRecord)
+        );
+        assert_eq!(home_server.counts(), (1, 0, 0), "one batch request");
         assert_eq!(pds.hits(), 0);
     }
 
