@@ -94,6 +94,9 @@ pub struct KeyLookup<P: ClientProvider> {
     #[cfg(test)]
     before_remember: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     retry_after: Vec<Duration>,
+    /// The origin answered its batch key route with a 404: a server from
+    /// before it, asked key by key for the rest of this lookup's life.
+    batch_route_missing: std::sync::atomic::AtomicBool,
     /// Where the cache is kept between launches, and whether it has been
     /// taken in yet. The snapshot is read once, before the first lookup,
     /// once `after` (another lookup's flush) has settled.
@@ -219,6 +222,31 @@ pub const MISS_RETRY_AFTER: [Duration; 3] = [
     Duration::from_secs(6),
     Duration::from_secs(15),
 ];
+
+/// How recently a line must have been signed for its missing key to be asked
+/// again at the retry delays: a line that just arrived may name a key its
+/// server is still fetching; a replayed one settles on its first miss.
+pub const FRESH_LINE: Duration = Duration::from_secs(120);
+
+/// Most keys one request to the origin's batch key route names.
+pub const MAX_KEYS_PER_REQUEST: usize = 50;
+
+/// How a key is asked for; see [`KeyLookup::key_for_at_with`].
+#[derive(Debug, Clone, Copy)]
+pub struct KeyAsk {
+    /// Ask a fresh line's miss again at the retry delays.
+    pub retry: bool,
+}
+
+impl Default for KeyAsk {
+    fn default() -> Self {
+        Self { retry: true }
+    }
+}
+
+/// A key the origin answered: its bytes, `None` when they do not decode, and
+/// when it stopped counting.
+type OriginAnswer = (Option<[u8; 32]>, Option<i64>);
 
 /// One (DID, kid)'s cached answer: the signer's device records as listed,
 /// folded again at whatever time is asked, and what the other sources said,
@@ -461,6 +489,7 @@ impl<P: ClientProvider> KeyLookup<P> {
             #[cfg(test)]
             before_remember: Mutex::new(None),
             retry_after: MISS_RETRY_AFTER.to_vec(),
+            batch_route_missing: Default::default(),
             writer: Writer::new(Arc::new(MemoryKeyLookupStore::default())),
             loaded: tokio::sync::OnceCell::new(),
             after: Mutex::new(None),
@@ -678,6 +707,19 @@ impl<P: ClientProvider> KeyLookup<P> {
         kid: &str,
         at: DateTime<Utc>,
     ) -> Result<Option<FoundKey>> {
+        self.key_for_at_with(did, kid, at, KeyAsk::default()).await
+    }
+
+    /// [`Self::key_for_at`], asked as `ask` says: `retry: false` settles a
+    /// fresh line's miss without the retry delays. A line signed more than
+    /// [`FRESH_LINE`] before now is never asked about again.
+    pub async fn key_for_at_with(
+        &self,
+        did: &str,
+        kid: &str,
+        at: DateTime<Utc>,
+        ask: KeyAsk,
+    ) -> Result<Option<FoundKey>> {
         self.load().await;
         let slot = (did.to_string(), kid.to_string());
         loop {
@@ -711,7 +753,7 @@ impl<P: ClientProvider> KeyLookup<P> {
                 .or_default()
                 .clone();
             let settled = cell
-                .get_or_init(|| self.settle(&slot, did, kid, at, cached))
+                .get_or_init(|| self.settle(&slot, did, kid, at, cached, ask))
                 .await
                 .clone();
             {
@@ -745,6 +787,7 @@ impl<P: ClientProvider> KeyLookup<P> {
         kid: &str,
         at: DateTime<Utc>,
         cached: Option<Cached>,
+        ask: KeyAsk,
     ) -> Settled {
         let started = tokio::time::Instant::now();
         let refreshes = self.refresh_count(did);
@@ -752,7 +795,16 @@ impl<P: ClientProvider> KeyLookup<P> {
         let mut settled = self
             .ask(did, kid, at, cached.map(|c| c.records), false)
             .await;
-        for after in &self.retry_after {
+        // Only a line signed just now is asked about again.
+        let fresh = (Utc::now() - at)
+            .to_std()
+            .map_or(true, |since| since <= FRESH_LINE);
+        let retries: &[Duration] = if ask.retry && fresh {
+            &self.retry_after
+        } else {
+            &[]
+        };
+        for after in retries {
             let missed = matches!(settled.other, Some(None))
                 && settled.failure.is_none()
                 && self.origin_base().is_some();
@@ -860,6 +912,160 @@ impl<P: ClientProvider> KeyLookup<P> {
     pub async fn proven_device_records(&self, did: &str) -> Result<Vec<serde_json::Value>> {
         self.load().await;
         self.list_device_records(did, false).await
+    }
+
+    /// Ask the origin's batch key route for the keys of `pairs`, in one
+    /// request per [`MAX_KEYS_PER_REQUEST`], for the pairs no answer is held
+    /// for: not a key found, not a miss inside the ttl, not a key the DID's
+    /// held records name, not a pair whose lookup is in flight. A key the
+    /// origin answers is kept as its answer; a pair it leaves out is kept as a
+    /// miss only when the DID's records are held (or it is a did:key, which
+    /// has none). A request that fails, or is answered 429 or 5xx, keeps
+    /// nothing, since it said nothing about the keys. Against a server without
+    /// the route (a 404) nothing is asked. Never fails.
+    pub async fn prefetch_keys(&self, pairs: &[(String, String)]) {
+        self.load().await;
+        let Some(base) = self.origin_base() else {
+            return;
+        };
+        if self
+            .batch_route_missing
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let now = Utc::now();
+        let mut asked: Vec<(String, String)> = Vec::new();
+        for (did, kid) in pairs {
+            let slot = (did.clone(), kid.clone());
+            if asked.contains(&slot) || self.in_flight.lock().contains_key(&slot) {
+                continue;
+            }
+            let hit = self.cache.lock().get(&slot).cloned();
+            if let Some(hit) = &hit {
+                let answered = match hit.other {
+                    Some(Some(_)) => true,
+                    Some(None) => self.inside_ttl(hit.at),
+                    None => false,
+                };
+                if answered {
+                    continue;
+                }
+            }
+            let held = self
+                .records
+                .lock()
+                .get(did)
+                .map(|(records, _)| records.clone())
+                .or(hit.map(|h| h.records));
+            if held.is_some_and(|records| in_records(did, kid, &records, now).is_some()) {
+                continue;
+            }
+            asked.push(slot);
+        }
+        let mut kept = false;
+        for chunk in asked.chunks(MAX_KEYS_PER_REQUEST) {
+            let answered = match self.ask_batch_route(base, chunk).await {
+                Ok(Some(answered)) => answered,
+                // The route is missing: nothing more is asked through it.
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::debug!(error = %e, "batch key request failed");
+                    continue;
+                }
+            };
+            for (did, kid) in chunk {
+                let slot = (did.clone(), kid.clone());
+                let found = answered.get(&slot).and_then(|(key, retired_at)| {
+                    key.filter(|key| derive_kid_bytes(key) == *kid)
+                        .map(|public_key| FoundKey {
+                            public_key,
+                            source: KeySource::OriginServer,
+                            retired_at: *retired_at,
+                            created_at: None,
+                            expires_at: None,
+                        })
+                });
+                let records = self
+                    .records
+                    .lock()
+                    .get(did)
+                    .map(|(records, _)| records.clone());
+                // A miss counts only when the account's records were read:
+                // without them, the line's own lookup lists the account.
+                if found.is_none() && records.is_none() && !did.starts_with("did:key:") {
+                    continue;
+                }
+                self.remember(slot, records.unwrap_or_default(), Some(found));
+                kept = true;
+            }
+        }
+        if kept {
+            self.save().await;
+        }
+    }
+
+    /// The origin's batch key route's answer for `pairs`, by (DID, kid);
+    /// `None` when the origin has no such route (a 404), which is remembered.
+    /// An error for anything else that is not a success.
+    async fn ask_batch_route(
+        &self,
+        base: &str,
+        pairs: &[(String, String)],
+    ) -> Result<Option<HashMap<(String, String), OriginAnswer>>> {
+        let mut url = url::Url::parse(base).context("invalid origin base URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("origin base URL cannot take a path"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "signing-keys"]);
+        let encode =
+            |part: &str| url::form_urlencoded::byte_serialize(part.as_bytes()).collect::<String>();
+        let keys: Vec<String> = pairs
+            .iter()
+            .map(|(did, kid)| format!("{}/{}", encode(did), encode(kid)))
+            .collect();
+        url.set_query(Some(&format!("keys={}", keys.join(","))));
+        let client = self.reader.clients.client_for(url.as_str()).await?;
+        let response = client
+            .get(url.clone())
+            .send()
+            .await
+            .context("request to the origin key store failed")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            self.batch_route_missing
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Ok(None);
+        }
+        #[derive(Deserialize)]
+        struct Answer {
+            keys: Vec<serde_json::Value>,
+        }
+        let answer: Answer = response
+            .error_for_status()
+            .context("the origin key store answered with an error")?
+            .json()
+            .await
+            .context("the origin answer is not a key list")?;
+        let mut out = HashMap::new();
+        for entry in answer.keys {
+            let (Some(did), Some(kid)) = (
+                entry
+                    .get("did")
+                    .and_then(|d| d.as_str())
+                    .map(str::to_string),
+                entry
+                    .get("kid")
+                    .and_then(|k| k.as_str())
+                    .map(str::to_string),
+            ) else {
+                continue;
+            };
+            let Ok(key) = serde_json::from_value::<OriginKey>(entry) else {
+                continue;
+            };
+            out.insert((did, kid), (decode_key(&key.public_key), key.retired_at()));
+        }
+        Ok(Some(out))
     }
 
     /// Take the device records of `dids` from the origin, the home server, in
@@ -1265,13 +1471,26 @@ impl<P: ClientProvider> KeyLookup<P> {
             .find(|key| derive_kid_bytes(key) == kid))
     }
 
-    /// The key the origin holds for `(did, kid)`, and when it stopped counting.
+    /// The key the origin holds for `(did, kid)`, and when it stopped
+    /// counting: through the batch key route, or the per-kid route on a
+    /// server without it.
     async fn at_origin(
         &self,
         base: &str,
         did: &str,
         kid: &str,
     ) -> Result<Option<([u8; 32], Option<i64>)>> {
+        if !self
+            .batch_route_missing
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let pair = [(did.to_string(), kid.to_string())];
+            if let Some(answered) = self.ask_batch_route(base, &pair).await? {
+                return Ok(answered
+                    .get(&pair[0])
+                    .and_then(|(key, retired_at)| key.map(|key| (key, *retired_at))));
+            }
+        }
         let mut url = url::Url::parse(base).context("invalid origin base URL")?;
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("origin base URL cannot take a path"))?
@@ -1292,13 +1511,17 @@ impl<P: ClientProvider> KeyLookup<P> {
             .json()
             .await
             .context("the origin key store answer is not a key")?;
-        // A key that does not decode to 32 bytes is refused like a wrong one.
-        Ok(URL_SAFE_NO_PAD
-            .decode(&answer.public_key)
-            .ok()
-            .and_then(|bytes| bytes.try_into().ok())
-            .map(|key| (key, answer.retired_at())))
+        Ok(decode_key(&answer.public_key).map(|key| (key, answer.retired_at())))
     }
+}
+
+/// The raw bytes of a base64url key the origin sent. A key that does not
+/// decode to 32 bytes is refused like a wrong one.
+fn decode_key(public_key: &str) -> Option<[u8; 32]> {
+    URL_SAFE_NO_PAD
+        .decode(public_key)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
 }
 
 /// The key `kid` names among `did`'s device records at `at`: live then, or
@@ -1769,6 +1992,34 @@ mod tests {
                                 }
                                 _ => StatusCode::NOT_FOUND.into_response(),
                             }
+                        }
+                    }
+                }),
+            )
+            // The origin's batch key route, from the same keys.
+            .route(
+                "/api/v1/signing-keys",
+                get({
+                    let keys = keys.clone();
+                    move |Query(q): Query<HashMap<String, String>>| {
+                        let held = keys.lock().clone();
+                        async move {
+                            let found: Vec<serde_json::Value> = q
+                                .get("keys")
+                                .map(|k| k.split(',').collect::<Vec<_>>())
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter_map(|pair| {
+                                    let (did, kid) = pair.split_once('/')?;
+                                    let key = held.get(&(did.to_string(), kid.to_string()))?;
+                                    Some(json!({
+                                        "did": did,
+                                        "kid": kid,
+                                        "public_key": URL_SAFE_NO_PAD.encode(key),
+                                    }))
+                                })
+                                .collect();
+                            axum::Json(json!({ "keys": found }))
                         }
                     }
                 }),
@@ -2599,9 +2850,19 @@ mod tests {
     struct KeyServer {
         base: String,
         keys: Arc<parking_lot::Mutex<HashMap<(String, String), serde_json::Value>>>,
+        /// Each request, `kid` or `batch`, in the order they arrived.
+        asked: Arc<parking_lot::Mutex<Vec<&'static str>>>,
+        /// The DID/kid pairs each batch request named.
+        batches: Arc<parking_lot::Mutex<Vec<Vec<String>>>>,
+        /// Set to answer the batch route with this status.
+        batch_status: Arc<parking_lot::Mutex<Option<u16>>>,
     }
 
     impl KeyServer {
+        fn asked(&self) -> Vec<&'static str> {
+            self.asked.lock().clone()
+        }
+
         fn hold(&self, did: &str, kid: String, entry: serde_json::Value) {
             self.keys.lock().insert((did.to_string(), kid), entry);
         }
@@ -2616,6 +2877,9 @@ mod tests {
         use axum::response::IntoResponse;
         let keys: Arc<parking_lot::Mutex<HashMap<(String, String), serde_json::Value>>> =
             Default::default();
+        let asked: Arc<parking_lot::Mutex<Vec<&'static str>>> = Default::default();
+        let batches: Arc<parking_lot::Mutex<Vec<Vec<String>>>> = Default::default();
+        let batch_status: Arc<parking_lot::Mutex<Option<u16>>> = Default::default();
         let answer = |keys: &HashMap<(String, String), serde_json::Value>, did: &str, kid: &str| {
             keys.get(&(did.to_string(), kid.to_string())).map(|entry| {
                 let mut entry = entry.clone();
@@ -2624,27 +2888,72 @@ mod tests {
                 entry
             })
         };
-        let router = axum::Router::new().route(
-            "/api/v1/signing-keys/{did}/{kid}",
-            get({
-                let keys = keys.clone();
-                move |Path((did, kid)): Path<(String, String)>| {
-                    let found = answer(&keys.lock(), &did, &kid);
-                    async move {
-                        match found {
-                            Some(entry) => axum::Json(entry).into_response(),
-                            None => StatusCode::NOT_FOUND.into_response(),
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/signing-keys/{did}/{kid}",
+                get({
+                    let (keys, asked) = (keys.clone(), asked.clone());
+                    move |Path((did, kid)): Path<(String, String)>| {
+                        asked.lock().push("kid");
+                        let found = answer(&keys.lock(), &did, &kid);
+                        async move {
+                            match found {
+                                Some(entry) => axum::Json(entry).into_response(),
+                                None => StatusCode::NOT_FOUND.into_response(),
+                            }
                         }
                     }
-                }
-            }),
-        );
+                }),
+            )
+            .route(
+                "/api/v1/signing-keys",
+                get({
+                    let (keys, asked, batches, status) = (
+                        keys.clone(),
+                        asked.clone(),
+                        batches.clone(),
+                        batch_status.clone(),
+                    );
+                    move |Query(q): Query<HashMap<String, String>>| {
+                        asked.lock().push("batch");
+                        let named: Vec<String> = q
+                            .get("keys")
+                            .map(|k| k.split(',').map(str::to_string).collect())
+                            .unwrap_or_default();
+                        batches.lock().push(named.clone());
+                        let status = *status.lock();
+                        let held = keys.lock().clone();
+                        async move {
+                            if let Some(status) = status {
+                                return StatusCode::from_u16(status).unwrap().into_response();
+                            }
+                            if named.is_empty() || named.len() > 50 {
+                                return StatusCode::BAD_REQUEST.into_response();
+                            }
+                            let found: Vec<serde_json::Value> = named
+                                .iter()
+                                .filter_map(|pair| {
+                                    let (did, kid) = pair.rsplit_once('/')?;
+                                    answer(&held, did, kid)
+                                })
+                                .collect();
+                            axum::Json(json!({ "keys": found })).into_response()
+                        }
+                    }
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
-        KeyServer { base, keys }
+        KeyServer {
+            base,
+            keys,
+            asked,
+            batches,
+            batch_status,
+        }
     }
 
     /// A lookup for ALICE whose origin is `server`.
@@ -2741,6 +3050,176 @@ mod tests {
             Some(Some(4_000)),
             "a fractional date, rounded down"
         );
+    }
+
+    #[tokio::test]
+    async fn prefetches_keys_in_one_request_per_50_and_answers_them_and_their_misses_without_asking_again()
+     {
+        let pds = pds(vec![]).await;
+        let server = key_server().await;
+        server.hold(ALICE, kid_of(2), key_entry(2));
+        server.hold(WEB_SIGNER, kid_of(3), key_entry(3));
+        let keys = lookup_at(&pds, &server);
+        let mut pairs = vec![
+            (ALICE.to_string(), kid_of(2)),
+            (WEB_SIGNER.to_string(), kid_of(3)),
+        ];
+        pairs.extend((0..58).map(|i| (ALICE.to_string(), format!("absent{i}"))));
+        // Alice's records are held, so a key of hers the origin leaves out is
+        // a miss.
+        keys.proven_device_records(ALICE).await.unwrap();
+        let listed = pds.hits();
+        keys.prefetch_keys(&pairs).await;
+        assert_eq!(server.asked(), vec!["batch", "batch"]);
+        let sizes: Vec<usize> = server.batches.lock().iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![50, 10]);
+
+        let then = Utc::now() - chrono::TimeDelta::hours(1);
+        assert_eq!(
+            keys.key_for_at(ALICE, &kid_of(2), then).await.unwrap(),
+            Some(FoundKey {
+                public_key: raw(2),
+                source: KeySource::OriginServer,
+                retired_at: None,
+                created_at: None,
+                expires_at: None,
+            })
+        );
+        assert_eq!(
+            keys.key_for_at(WEB_SIGNER, &kid_of(3), then)
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::OriginServer)
+        );
+        assert_eq!(keys.key_for_at(ALICE, "absent7", then).await.unwrap(), None);
+        assert_eq!(
+            server.asked(),
+            vec!["batch", "batch"],
+            "nothing asked again"
+        );
+        assert_eq!(pds.hits(), listed, "nor listed again");
+
+        keys.prefetch_keys(&pairs).await;
+        assert_eq!(
+            server.asked(),
+            vec!["batch", "batch"],
+            "a second prefetch asks nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetches_no_key_the_held_records_name() {
+        let pds = pds(vec![device_record(1)]).await;
+        let server = key_server().await;
+        let keys = lookup_at(&pds, &server);
+        keys.proven_device_records(ALICE).await.unwrap();
+        keys.prefetch_keys(&[(ALICE.to_string(), kid_of(1))]).await;
+        assert!(server.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn asks_the_per_kid_route_after_a_404_from_the_batch_route_and_the_batch_route_no_more() {
+        let pds = pds(vec![]).await;
+        let server = key_server().await;
+        server.hold(ALICE, kid_of(2), key_entry(2));
+        server.hold(ALICE, kid_of(3), key_entry(3));
+        *server.batch_status.lock() = Some(404);
+        let keys = lookup_at(&pds, &server);
+        for seed in [2, 3] {
+            assert_eq!(
+                keys.key_for(ALICE, &kid_of(seed))
+                    .await
+                    .unwrap()
+                    .map(|f| f.source),
+                Some(KeySource::OriginServer)
+            );
+        }
+        assert_eq!(server.asked(), vec!["batch", "kid", "kid"]);
+        keys.prefetch_keys(&[(ALICE.to_string(), kid_of(4))]).await;
+        assert_eq!(
+            server.asked(),
+            vec!["batch", "kid", "kid"],
+            "after a 404 the prefetch asks nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn counts_a_429_or_a_5xx_from_the_batch_route_as_a_failure_not_a_miss() {
+        let pds = pds(vec![]).await;
+        let server = key_server().await;
+        server.hold(ALICE, kid_of(2), key_entry(2));
+        let keys = lookup_at(&pds, &server);
+        keys.proven_device_records(ALICE).await.unwrap();
+        for status in [429, 503] {
+            *server.batch_status.lock() = Some(status);
+            keys.prefetch_keys(&[(ALICE.to_string(), kid_of(2))]).await;
+        }
+        *server.batch_status.lock() = None;
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(2))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::OriginServer)
+        );
+        assert_eq!(server.asked(), vec!["batch", "batch", "batch"]);
+    }
+
+    #[tokio::test]
+    async fn asks_a_replayed_lines_missing_key_once_and_a_fresh_lines_again_at_each_retry() {
+        let pds = pds(vec![]).await;
+        let delays = vec![
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            Duration::from_millis(3),
+        ];
+        let replayed = key_server().await;
+        let late = lookup_at(&pds, &replayed).with_retry_delays(delays.clone());
+        let hour_ago = Utc::now() - chrono::TimeDelta::hours(1);
+        assert_eq!(
+            late.key_for_at(ALICE, "gone", hour_ago).await.unwrap(),
+            None
+        );
+        assert_eq!(replayed.asked().len(), 1);
+
+        let fresh = key_server().await;
+        let live = lookup_at(&pds, &fresh).with_retry_delays(delays);
+        let just_now = Utc::now() - chrono::TimeDelta::seconds(1);
+        assert_eq!(
+            live.key_for_at(ALICE, "gone", just_now).await.unwrap(),
+            None
+        );
+        assert_eq!(fresh.asked().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn skips_the_retries_when_asked_to() {
+        let pds = pds(vec![]).await;
+        let server = key_server().await;
+        let keys = lookup_at(&pds, &server)
+            .with_retry_delays(vec![Duration::from_millis(1), Duration::from_millis(2)]);
+        let found = keys
+            .key_for_at_with(ALICE, "gone", Utc::now(), KeyAsk { retry: false })
+            .await
+            .unwrap();
+        assert_eq!(found, None);
+        assert_eq!(server.asked().len(), 1, "a fresh line, asked once");
+    }
+
+    #[tokio::test]
+    async fn keeps_a_miss_in_the_store_so_a_later_lookup_does_not_ask_for_it_inside_the_ttl() {
+        let pds = pds(vec![]).await;
+        let server = key_server().await;
+        let store = Arc::new(MemoryKeyLookupStore::default());
+        let first = lookup_at(&pds, &server).with_store(store.clone());
+        assert_eq!(first.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
+
+        server.hold(ALICE, kid_of(2), key_entry(2));
+        first.flush().await;
+        let second = lookup_at(&pds, &server).with_store(store);
+        assert_eq!(second.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
+        assert_eq!(server.asked().len(), 1);
     }
 
     #[tokio::test]
@@ -3035,6 +3514,26 @@ mod tests {
         assert_eq!(home_server.counts().1, listings + 1, "the per-DID route");
         assert_eq!(listed.len(), 2, "the PDS listing is kept");
         assert_eq!(source_of(&keys, 4).await, Some(KeySource::IdentityRecord));
+    }
+
+    #[tokio::test]
+    async fn remembers_no_key_miss_for_an_account_whose_records_the_prefetch_did_not_bring() {
+        let (home_server, _pds, _repos, docs) = three_signers().await;
+        // The home server has not seen Alice: her records are not prefetched,
+        // and it holds no key for her either.
+        home_server.unseen.lock().insert(ALICE.to_string());
+        let keys = lookup_at_home(docs, &home_server);
+        keys.prefetch(&[ALICE.to_string()]).await;
+        keys.prefetch_keys(&[(ALICE.to_string(), kid_of(1))]).await;
+        // Her line lists her records itself, and finds the key published there.
+        let hour_ago = Utc::now() - chrono::TimeDelta::hours(1);
+        assert_eq!(
+            keys.key_for_at(ALICE, &kid_of(1), hour_ago)
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::IdentityRecord)
+        );
     }
 
     #[tokio::test]

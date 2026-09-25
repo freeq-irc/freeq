@@ -2546,7 +2546,9 @@ fn check_now_or_hold(
 }
 
 /// Start the checks held on a closed batch, once its signers' records are
-/// prefetched in one request. Off the receive path.
+/// prefetched in one request (see `KeyLookup::prefetch`), then the keys the
+/// records did not answer in one more (`KeyLookup::prefetch_keys`). Off the
+/// receive path.
 fn start_deferred_checks(
     held: Vec<HeldCheck>,
     checker: Option<&Arc<SignatureChecker>>,
@@ -2562,12 +2564,22 @@ fn start_deferred_checks(
     let event_tx = event_tx.clone();
     tokio::spawn(async move {
         let mut dids: Vec<String> = Vec::new();
+        let mut pairs: Vec<(String, String)> = Vec::new();
         for check in &held {
-            if crate::address::is_did(&check.signed.did) && !dids.contains(&check.signed.did) {
-                dids.push(check.signed.did.clone());
+            let signed = &check.signed;
+            if !crate::address::is_did(&signed.did) {
+                continue;
+            }
+            if !dids.contains(&signed.did) {
+                dids.push(signed.did.clone());
+            }
+            let pair = (signed.did.clone(), signed.kid.clone());
+            if !pairs.contains(&pair) {
+                pairs.push(pair);
             }
         }
         checker.lookup.prefetch(&dids).await;
+        checker.lookup.prefetch_keys(&pairs).await;
         for check in held {
             spawn_verdict_check(
                 Some(&checker),
@@ -10842,5 +10854,134 @@ mod verdict_tests {
         // This stub serves no account, so each check then falls through on
         // its own, as it would without a home server. A server that serves
         // them answers all of it in the one request above.
+    }
+
+    /// A signed line by `did` under the kid of `seed`'s key.
+    fn signed_by(did: &str, seed: u8, msgid: &str) -> crate::verdict::Signed {
+        crate::verdict::Signed {
+            kid: crate::sigtag::derive_kid_bytes(&public(seed)),
+            ..signed_line(did, msgid)
+        }
+    }
+
+    /// Request counts for a home server serving records and keys.
+    #[derive(Default)]
+    struct KeyRoutes {
+        records: AtomicUsize,
+        batch: AtomicUsize,
+        kid: AtomicUsize,
+        /// The DID/kid pairs each batch key request named.
+        named: parking_lot::Mutex<Vec<Vec<String>>>,
+    }
+
+    /// A home server with no records for anyone, holding `keys` by
+    /// (DID, kid) on its batch and per-kid key routes.
+    async fn key_routes(keys: HashMap<(String, String), [u8; 32]>) -> (String, Arc<KeyRoutes>) {
+        let routes = Arc::new(KeyRoutes::default());
+        let keys = Arc::new(keys);
+        let (r1, r2, r3) = (routes.clone(), routes.clone(), routes.clone());
+        let (k2, k3) = (keys.clone(), keys);
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/records",
+                get(move || {
+                    r1.records.fetch_add(1, Ordering::SeqCst);
+                    async move { axum::Json(json!({ "accounts": [] })) }
+                }),
+            )
+            .route(
+                "/api/v1/signing-keys",
+                get(
+                    move |axum::extract::Query(q): axum::extract::Query<
+                        HashMap<String, String>,
+                    >| {
+                        r2.batch.fetch_add(1, Ordering::SeqCst);
+                        let pairs: Vec<String> = q
+                            .get("keys")
+                            .map(|k| k.split(',').map(str::to_string).collect())
+                            .unwrap_or_default();
+                        r2.named.lock().push(pairs.clone());
+                        let found: Vec<Value> = pairs
+                            .iter()
+                            .filter_map(|pair| {
+                                let (did, kid) = pair.split_once('/')?;
+                                let key = k2.get(&(did.to_string(), kid.to_string()))?;
+                                Some(json!({ "did": did, "kid": kid, "public_key": b64(key) }))
+                            })
+                            .collect();
+                        async move { axum::Json(json!({ "keys": found })) }
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/signing-keys/{did}/{kid}",
+                get(move |Path((did, kid)): Path<(String, String)>| {
+                    r3.kid.fetch_add(1, Ordering::SeqCst);
+                    let key = k3.get(&(did.clone(), kid.clone())).copied();
+                    async move {
+                        let key = key.ok_or(StatusCode::NOT_FOUND)?;
+                        Ok::<_, StatusCode>(axum::Json(
+                            json!({ "did": did, "kid": kid, "public_key": b64(&key) }),
+                        ))
+                    }
+                }),
+            );
+        (serve(router).await, routes)
+    }
+
+    /// Wait for `n` verdict events.
+    async fn verdicts(rx: &mut mpsc::Receiver<Event>, n: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut seen = 0;
+            while seen < n {
+                if let Some(Event::Verdict { .. }) = rx.recv().await {
+                    seen += 1;
+                }
+            }
+        })
+        .await
+        .expect("every held check settled");
+    }
+
+    #[tokio::test]
+    async fn a_closed_batch_asks_for_its_signers_in_one_records_request_and_their_keys_in_one_key_request()
+     {
+        const A: &str = "did:plc:alice";
+        const B: &str = "did:plc:bob";
+        const C: &str = "did:plc:carol";
+        let keys: HashMap<(String, String), [u8; 32]> = [(A, 41), (B, 42), (A, 44), (C, 43)]
+            .into_iter()
+            .map(|(did, seed)| {
+                (
+                    (
+                        did.to_string(),
+                        crate::sigtag::derive_kid_bytes(&public(seed)),
+                    ),
+                    public(seed),
+                )
+            })
+            .collect();
+        let (base, routes) = key_routes(keys).await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let checker = checker_for(Some(base));
+        let held: Vec<HeldCheck> = [(A, 41), (B, 42), (A, 44), (C, 43), (A, 41)]
+            .iter()
+            .enumerate()
+            .map(|(i, (did, seed))| HeldCheck {
+                signed: signed_by(did, *seed, &format!("m{i}")),
+                taught: None,
+            })
+            .collect();
+        start_deferred_checks(held, Some(&checker), &DidMaps::default(), &tx);
+        verdicts(&mut rx, 5).await;
+
+        assert_eq!(routes.records.load(Ordering::SeqCst), 1, "records");
+        assert_eq!(routes.batch.load(Ordering::SeqCst), 1, "keys");
+        assert_eq!(routes.named.lock()[0].len(), 4, "each key named once");
+        assert_eq!(
+            routes.kid.load(Ordering::SeqCst),
+            0,
+            "no key asked on its own"
+        );
     }
 }
