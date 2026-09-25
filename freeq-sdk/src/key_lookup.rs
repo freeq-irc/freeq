@@ -1504,6 +1504,25 @@ impl<P: ClientProvider> KeyLookup<P> {
         }
     }
 
+    /// Whether the answer held for `(did, kid)` came from the origin server:
+    /// a key the server vouched for, which a listing of the account's records
+    /// could turn into a published one. Reads the stored snapshot first.
+    pub async fn holds_origin_answer(&self, did: &str, kid: &str) -> bool {
+        self.load().await;
+        self.cache
+            .lock()
+            .get(&(did.to_string(), kid.to_string()))
+            .is_some_and(|c| {
+                matches!(
+                    c.other,
+                    Some(Some(FoundKey {
+                        source: KeySource::OriginServer,
+                        ..
+                    }))
+                )
+            })
+    }
+
     /// Whether a miss for `(did, kid)` is remembered inside the ttl. Reads
     /// the stored snapshot first.
     pub async fn holds_miss(&self, did: &str, kid: &str) -> bool {

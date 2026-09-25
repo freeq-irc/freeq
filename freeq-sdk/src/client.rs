@@ -2136,9 +2136,9 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
 }
 
 /// The key this connection signs with. With a store, the stored key, or a
-/// fresh one saved into it; the stored copy comes back too while it is not
-/// yet published. Without a store, or when the store fails, a fresh session
-/// key, as before stores existed.
+/// fresh one saved into it, and the stored copy with it. Without a store, or
+/// when the store fails, a fresh session key, as before stores existed, and
+/// no stored copy.
 fn session_signing_key(
     store: Option<&dyn crate::device_key::DeviceKeyStore>,
 ) -> (
@@ -2170,8 +2170,34 @@ fn session_signing_key(
         }
     };
     let key = ed25519_dalek::SigningKey::from_bytes(&stored.seed);
-    let unpublished = stored.record_uri.is_none().then_some(stored);
-    (key, unpublished)
+    (key, Some(stored))
+}
+
+/// A published key whose held answer is the origin server's was looked up
+/// before its record was listed (a lookup made before it was published, or
+/// one whose listing predates it). List the account once, so this client's
+/// own lines read as published rather than vouched. Off the connect path;
+/// never fails.
+fn spawn_relist_if_vouched(
+    lookup: Option<Arc<crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>>>,
+    stored: Option<&crate::device_key::StoredDeviceKey>,
+    did: &str,
+) {
+    let (Some(lookup), Some(stored)) = (lookup, stored) else {
+        return;
+    };
+    if stored.record_uri.is_none() {
+        return;
+    }
+    let kid = crate::sigtag::derive_kid(
+        &ed25519_dalek::SigningKey::from_bytes(&stored.seed).verifying_key(),
+    );
+    let did = did.to_string();
+    tokio::spawn(async move {
+        if lookup.holds_origin_answer(&did, &kid).await {
+            lookup.refresh_account(&did).await;
+        }
+    });
 }
 
 /// Right after a new sign-in, replace a stored key the account's records have
@@ -3005,11 +3031,17 @@ where
                                         );
                                     }
                                 }
-                                let (key, unpublished) =
+                                let (key, stored) =
                                     session_signing_key(config.device_key_store.as_deref());
                                 if config.enrollment.is_some() {
-                                    pending_enrollment = unpublished;
+                                    pending_enrollment =
+                                        stored.clone().filter(|s| s.record_uri.is_none());
                                 }
+                                spawn_relist_if_vouched(
+                                    config.key_lookup.clone(),
+                                    stored.as_ref(),
+                                    &did,
+                                );
                                 let pubkey_bytes = key.verifying_key().as_bytes().to_vec();
                                 use base64::Engine;
                                 let pubkey_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&pubkey_bytes);
@@ -9371,6 +9403,152 @@ mod device_key_tests {
             listings.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "the lookup lists nothing more"
+        );
+    }
+
+    /// A lookup store holding, for did:plc:tester and `seed`'s kid, the
+    /// origin server's answer.
+    fn vouched_for(seed: u8) -> Arc<crate::key_lookup::MemoryKeyLookupStore> {
+        use crate::key_lookup::{CachedKey, FoundKeySnapshot, KeyLookupSnapshot, KeyLookupStore};
+        let public = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key();
+        let snapshot = KeyLookupSnapshot {
+            version: crate::key_lookup::SNAPSHOT_VERSION,
+            keys: vec![(
+                (
+                    "did:plc:tester".to_string(),
+                    crate::sigtag::derive_kid(&public),
+                ),
+                CachedKey {
+                    other: Some(Some(FoundKeySnapshot {
+                        public_key: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .encode(public.as_bytes()),
+                        source: "OriginServer".to_string(),
+                        retired_at: None,
+                    })),
+                    at: chrono::Utc::now().timestamp_millis(),
+                },
+            )],
+            ..Default::default()
+        };
+        let store = Arc::new(crate::key_lookup::MemoryKeyLookupStore::default());
+        store
+            .save(&serde_json::to_string(&snapshot).unwrap())
+            .unwrap();
+        store
+    }
+
+    /// A lookup store holding did:plc:tester's records, naming `seed`'s key,
+    /// and that key's answer read from them: how the lookup holds a published
+    /// key (a records answer is folded from the account's records again).
+    fn published_for(seed: u8) -> Arc<crate::key_lookup::MemoryKeyLookupStore> {
+        use crate::key_lookup::{CachedKey, KeyLookupSnapshot, KeyLookupStore};
+        let key = crate::crypto::PrivateKey::ed25519_from_bytes(&[seed; 32]).unwrap();
+        let record = serde_json::to_value(
+            crate::identity_records::build_device_record(
+                &key,
+                "did:plc:tester",
+                &(chrono::Utc::now() - chrono::TimeDelta::days(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let kid = crate::sigtag::derive_kid(
+            &ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key(),
+        );
+        let now = chrono::Utc::now().timestamp_millis();
+        let snapshot = KeyLookupSnapshot {
+            version: crate::key_lookup::SNAPSHOT_VERSION,
+            accounts: vec![("did:plc:tester".to_string(), vec![record])],
+            keys: vec![(
+                ("did:plc:tester".to_string(), kid),
+                CachedKey {
+                    other: None,
+                    at: now,
+                },
+            )],
+            records: vec![("did:plc:tester".to_string(), now)],
+            refreshed: vec![("did:plc:tester".to_string(), now)],
+            proven: Vec::new(),
+        };
+        let store = Arc::new(crate::key_lookup::MemoryKeyLookupStore::default());
+        store
+            .save(&serde_json::to_string(&snapshot).unwrap())
+            .unwrap();
+        store
+    }
+
+    /// Wait up to a second for `count` to reach `at_least`.
+    async fn until_at_least(count: &std::sync::atomic::AtomicUsize, at_least: usize) {
+        for _ in 0..100 {
+            if count.load(std::sync::atomic::Ordering::SeqCst) >= at_least {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn re_lists_its_own_account_on_connect_when_its_published_key_reads_as_vouched() {
+        let (lookup, listings, _) = lookup_counting(repo_holding(&[])).await;
+        let lookup = Arc::new(lookup.with_store(vouched_for(5)));
+        let store = MemoryStore::holding(5, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
+        let config = ConnectConfig {
+            key_lookup: Some(lookup),
+            ..config_with(Some(store), None)
+        };
+        let _conn = connect_once(config).await;
+        until_at_least(&listings, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            listings.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "listed once"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_re_list_when_its_published_key_reads_as_published_or_its_key_is_not_published()
+     {
+        let (lookup, listings, _) = lookup_counting(repo_holding(&[])).await;
+        let published_lookup = Arc::new(lookup.with_store(published_for(5)));
+        let published = MemoryStore::holding(5, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
+        let config = ConnectConfig {
+            key_lookup: Some(published_lookup.clone()),
+            ..config_with(Some(published), None)
+        };
+        let _conn = connect_once(config).await;
+
+        let (lookup, unpublished_listings, _) = lookup_counting(repo_holding(&[])).await;
+        let unpublished = MemoryStore::holding(5, None);
+        let config = ConnectConfig {
+            key_lookup: Some(Arc::new(lookup.with_store(vouched_for(5)))),
+            ..config_with(Some(unpublished), None)
+        };
+        let _conn = connect_once(config).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(listings.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            unpublished_listings.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        // The published key's answer was held, from the records.
+        let kid = crate::sigtag::derive_kid(
+            &ed25519_dalek::SigningKey::from_bytes(&[5; 32]).verifying_key(),
+        );
+        assert_eq!(
+            published_lookup
+                .key_for("did:plc:tester", &kid)
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(crate::key_lookup::KeySource::IdentityRecord)
+        );
+        assert_eq!(
+            listings.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "answered from the held records"
         );
     }
 
