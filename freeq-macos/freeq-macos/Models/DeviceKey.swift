@@ -12,6 +12,7 @@ final class KeychainDeviceKeyStore: DeviceKeyStore {
     private static let seedKey = "deviceKeySeed"
     private static let createdAtKey = "deviceKeyCreatedAt"
     private static let recordUriKey = "deviceKeyRecordUri"
+    private static let refusedKey = "deviceKeyRefused"
     private static let log = Logger(subsystem: "at.freeq.macos", category: "devicekey")
 
     func load() throws -> StoredDeviceKey? {
@@ -27,7 +28,8 @@ final class KeychainDeviceKeyStore: DeviceKeyStore {
         return StoredDeviceKey(
             seed: seed,
             createdAt: createdAt,
-            recordUri: KeychainHelper.load(key: Self.recordUriKey)
+            recordUri: KeychainHelper.load(key: Self.recordUriKey),
+            refused: KeychainHelper.load(key: Self.refusedKey) != nil
         )
     }
 
@@ -38,6 +40,11 @@ final class KeychainDeviceKeyStore: DeviceKeyStore {
             _ = KeychainHelper.save(key: Self.recordUriKey, value: uri)
         } else {
             KeychainHelper.delete(key: Self.recordUriKey)
+        }
+        if key.refused {
+            _ = KeychainHelper.save(key: Self.refusedKey, value: "1")
+        } else {
+            KeychainHelper.delete(key: Self.refusedKey)
         }
     }
 

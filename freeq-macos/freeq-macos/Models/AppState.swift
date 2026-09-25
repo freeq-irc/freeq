@@ -2585,7 +2585,7 @@ extension AppState {
                 }
                 requestHistory(channel: channel)
                 return
-            case .keyRetired(let refusal):
+            case .keyRefused(let refusal):
                 signOutRefusedKey(refusal)
                 return
             case .apiBearer(let sessionId):
