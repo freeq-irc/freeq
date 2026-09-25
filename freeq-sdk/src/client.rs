@@ -2157,6 +2157,7 @@ fn session_signing_key(
                 seed: key.to_bytes(),
                 created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 record_uri: None,
+                refused: false,
             };
             if let Err(e) = store.save(&stored) {
                 tracing::warn!(error = %e, "device key not saved; signing with a session key");
@@ -2200,11 +2201,22 @@ fn spawn_relist_if_vouched(
     });
 }
 
-/// Right after a new sign-in, replace a stored key the account's records have
-/// retired with a new one, saved with no record URI so this connect publishes
-/// it. A saved login or a reconnect reads and changes nothing. Records count
-/// only once their repository proof checks, through `lookup`'s cache, and only
-/// the records that can retire the key are proven.
+/// Whether a key made at `created_at` (RFC 3339) is past its lifetime now. A
+/// date that does not parse counts as not past it.
+fn past_key_lifetime(created_at: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(created_at).is_ok_and(|made| {
+        made.with_timezone(&chrono::Utc) + crate::identity_records::KEY_LIFETIME
+            <= chrono::Utc::now()
+    })
+}
+
+/// Right after a new sign-in, replace a stored key with a new one, saved with
+/// no record URI so this connect publishes it, when the server refused it as
+/// expired, when it is past its lifetime by its own date, or when the
+/// account's records retired it or let it expire. A saved login or a
+/// reconnect reads and changes nothing. Records count only once their
+/// repository proof checks, through `lookup`'s cache, and only the records
+/// that can retire the key are proven.
 async fn replace_retired_device_key<P: freeq_oauth::ClientProvider>(
     fresh_sign_in: bool,
     store: Option<&dyn crate::device_key::DeviceKeyStore>,
@@ -2217,6 +2229,14 @@ async fn replace_retired_device_key<P: freeq_oauth::ClientProvider>(
     let Ok(Some(stored)) = store.load() else {
         return;
     };
+    // Refused by the server as expired, or past its lifetime by its own
+    // date: replaced without asking the account. The flag is what makes a
+    // server with a shorter lifetime, or a clock ahead of this one, still
+    // converge.
+    if stored.refused || past_key_lifetime(&stored.created_at) {
+        save_replacement(store);
+        return;
+    }
     let kid = crate::sigtag::derive_kid(
         &ed25519_dalek::SigningKey::from_bytes(&stored.seed).verifying_key(),
     );
@@ -2231,17 +2251,49 @@ async fn replace_retired_device_key<P: freeq_oauth::ClientProvider>(
     let retired = crate::identity_records::device_key_history(did, &records)
         .iter()
         .any(|k| k.kid == kid && k.retired_at.is_some_and(|r| r <= now));
-    if !retired {
-        return;
+    if retired {
+        save_replacement(store);
     }
+}
+
+/// Save a new key in place of the stored one, with no record URI, so this
+/// connect presents and publishes it. A store that fails keeps the old key.
+fn save_replacement(store: &dyn crate::device_key::DeviceKeyStore) {
     let key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
     let replacement = crate::device_key::StoredDeviceKey {
         seed: key.to_bytes(),
-        created_at: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         record_uri: None,
+        refused: false,
     };
     if let Err(e) = store.save(&replacement) {
-        tracing::warn!(error = %e, "replacement device key not saved; keeping the retired one");
+        tracing::warn!(error = %e, "replacement device key not saved; keeping the old one");
+    }
+}
+
+/// Save the stored device key marked refused, when it is the key this
+/// connection presented (`presented`, its seed); a session key the client
+/// fell back to leaves the store as it is. A store that fails leaves it as it
+/// was.
+fn mark_device_key_refused(
+    store: Option<&dyn crate::device_key::DeviceKeyStore>,
+    presented: Option<[u8; 32]>,
+) {
+    let (Some(store), Some(presented)) = (store, presented) else {
+        return;
+    };
+    match store.load() {
+        Ok(Some(stored)) if stored.seed == presented && !stored.refused => {
+            let refused = crate::device_key::StoredDeviceKey {
+                refused: true,
+                ..stored
+            };
+            if let Err(e) = store.save(&refused) {
+                tracing::warn!(error = %e, "the refused device key could not be marked");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "the refused device key could not be read"),
     }
 }
 
@@ -2737,6 +2789,11 @@ fn spawn_enrollment(
     key_lookup: Option<Arc<crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>>>,
 ) {
     use crate::device_key::EnrollOutcome;
+    // A key past its lifetime would be refused as soon as it is published.
+    if past_key_lifetime(&stored.created_at) {
+        tracing::warn!("device key past its lifetime; not published");
+        return;
+    }
     tokio::spawn(async move {
         let key = crate::crypto::PrivateKey::Ed25519(key);
         let record = match crate::identity_records::build_device_record(
@@ -2753,12 +2810,21 @@ fn spawn_enrollment(
         };
         match enrollment.publish(record, key.public_key_multibase()).await {
             EnrollOutcome::Published { uri } => {
-                let published = crate::device_key::StoredDeviceKey {
-                    record_uri: Some(uri),
-                    ..stored
-                };
-                if let Err(e) = store.save(&published) {
-                    tracing::warn!(error = %e, "published device key not saved");
+                // Read again: a refusal may have marked the key meanwhile,
+                // and a key replaced meanwhile must not take this key's URI,
+                // or it would read as published.
+                match store.load() {
+                    Ok(Some(current)) if current.seed == stored.seed => {
+                        let published = crate::device_key::StoredDeviceKey {
+                            record_uri: Some(uri),
+                            ..current
+                        };
+                        if let Err(e) = store.save(&published) {
+                            tracing::warn!(error = %e, "published device key not saved");
+                        }
+                    }
+                    Ok(_) => tracing::warn!("device key replaced while it was published"),
+                    Err(e) => tracing::warn!(error = %e, "published device key not read back"),
                 }
                 // The listing taken at connect predates this record, and so
                 // may the home server's copy. Our own lines are checked
@@ -2817,6 +2883,9 @@ where
     let mut seen_act_events: SeenActEvents = SeenActEvents::default();
     // Session message-signing keypair (generated after SASL success)
     let mut msg_signing_key: Option<ed25519_dalek::SigningKey> = None;
+    // The seed of the stored device key this connection presented; `None`
+    // when it signs with a session key.
+    let mut presented_seed: Option<[u8; 32]> = None;
     let mut msg_signing_did: Option<String> = None;
     // The session signing key's public half, waiting for registration to
     // finish so `MSGSIG` isn't sent into a connection that will discard it.
@@ -3033,6 +3102,7 @@ where
                                 }
                                 let (key, stored) =
                                     session_signing_key(config.device_key_store.as_deref());
+                                presented_seed = stored.as_ref().map(|s| s.seed);
                                 if config.enrollment.is_some() {
                                     pending_enrollment =
                                         stored.clone().filter(|s| s.record_uri.is_none());
@@ -3693,6 +3763,17 @@ where
                             }
                         }
                         "FAIL" => {
+                            // The server refused the presented device key as
+                            // expired: marked before the app hears of it, so
+                            // the next fresh sign-in replaces it.
+                            if msg.params.first().map(String::as_str) == Some("MSGSIG")
+                                && msg.params.get(1).map(String::as_str) == Some("KEY_EXPIRED")
+                            {
+                                mark_device_key_refused(
+                                    config.device_key_store.as_deref(),
+                                    presented_seed,
+                                );
+                            }
                             // IRCv3 FAIL command — emit as ServerNotice
                             let text = msg.params.join(" ");
                             let _ = event_tx.send(Event::ServerNotice { text }).await;
@@ -9164,7 +9245,13 @@ mod device_key_tests {
     use crate::identity_records::DeviceKeyRecord;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    const CREATED: &str = "2026-09-11T10:00:00.000Z";
+    /// A day before one instant fixed for the test run: a stored key made
+    /// then is inside its lifetime, and records built twice match.
+    fn created() -> String {
+        static NOW: std::sync::LazyLock<chrono::DateTime<chrono::Utc>> =
+            std::sync::LazyLock::new(chrono::Utc::now);
+        (*NOW - chrono::TimeDelta::days(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
 
     #[derive(Default)]
     struct MemoryStore {
@@ -9177,8 +9264,9 @@ mod device_key_tests {
             Arc::new(Self {
                 key: parking_lot::Mutex::new(Some(StoredDeviceKey {
                     seed: [seed; 32],
-                    created_at: CREATED.to_string(),
+                    created_at: created(),
                     record_uri: record_uri.map(str::to_string),
+                    refused: false,
                 })),
                 saves: Default::default(),
             })
@@ -9552,6 +9640,265 @@ mod device_key_tests {
         );
     }
 
+    const EXPIRED: &str = ":srv FAIL MSGSIG KEY_EXPIRED :This device's signing key has expired. Sign in again to continue.";
+
+    /// A registered connection kept open: the server's side of the socket,
+    /// the events, and the client's handle.
+    struct Live {
+        server: TcpStream,
+        events: mpsc::Receiver<Event>,
+        _handle: ClientHandle,
+    }
+
+    /// `connect_once`'s registration, left open for the test to go on.
+    async fn connect_live(config: ConnectConfig) -> Live {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_side = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let (handle, events) =
+            connect_with_stream(EstablishedConnection::Plain(client_side), config, None);
+        let caps = format!("sasl message-tags server-time {MSGSIG_CAP}");
+        for line in [
+            format!(":srv CAP * LS :{caps}"),
+            format!(":srv CAP * ACK :{caps}"),
+            ":srv 900 tester :You are now logged in as did:plc:tester".to_string(),
+            ":srv 903 tester :SASL authentication successful".to_string(),
+            ":srv 001 tester :Welcome".to_string(),
+        ] {
+            server
+                .write_all(format!("{line}\r\n").as_bytes())
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        Live {
+            server,
+            events,
+            _handle: handle,
+        }
+    }
+
+    impl Live {
+        async fn send(&mut self, line: &str) {
+            self.server
+                .write_all(format!("{line}\r\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        /// The next server notice, as the app would hear it.
+        async fn notice(&mut self) -> String {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Some(Event::ServerNotice { text }) = self.events.recv().await {
+                        return text;
+                    }
+                }
+            })
+            .await
+            .expect("a notice")
+        }
+    }
+
+    #[tokio::test]
+    async fn marks_its_stored_key_refused_on_key_expired_before_the_app_hears_of_it() {
+        let store = MemoryStore::holding(5, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
+        let mut live = connect_live(config_with(Some(store.clone()), None)).await;
+        live.send(EXPIRED).await;
+        let heard = live.notice().await;
+        assert!(heard.starts_with("MSGSIG KEY_EXPIRED"), "{heard}");
+        let kept = store.key.lock().clone().unwrap();
+        assert!(kept.refused, "marked before the notice went out");
+        assert_eq!(kept.seed, [5; 32], "the same key, marked");
+        assert_eq!(
+            kept.record_uri.as_deref(),
+            Some("at://did:plc:tester/at.freeq.deviceKey/3k")
+        );
+    }
+
+    /// A store whose first read fails, so the connect signs with a session key.
+    struct FailingFirstLoad {
+        inner: Arc<MemoryStore>,
+        loads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DeviceKeyStore for FailingFirstLoad {
+        fn load(&self) -> anyhow::Result<Option<StoredDeviceKey>> {
+            if self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                anyhow::bail!("store unavailable");
+            }
+            self.inner.load()
+        }
+        fn save(&self, key: &StoredDeviceKey) -> anyhow::Result<()> {
+            self.inner.save(key)
+        }
+    }
+
+    #[tokio::test]
+    async fn leaves_its_stored_key_unmarked_when_key_expired_refuses_a_session_key_it_fell_back_to()
+    {
+        let inner = MemoryStore::holding(5, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
+        let store = Arc::new(FailingFirstLoad {
+            inner: inner.clone(),
+            loads: Default::default(),
+        });
+        let config = ConnectConfig {
+            device_key_store: Some(store as Arc<dyn DeviceKeyStore>),
+            ..config_with(None, None)
+        };
+        let mut live = connect_live(config).await;
+        live.send(EXPIRED).await;
+        live.notice().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!inner.key.lock().clone().unwrap().refused);
+        assert!(inner.saves.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn presents_a_new_key_at_the_next_fresh_sign_in_after_key_expired_whatever_its_dates() {
+        let store = MemoryStore::holding(5, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
+        let mut live = connect_live(config_with(Some(store.clone()), None)).await;
+        live.send(EXPIRED).await;
+        live.notice().await;
+        drop(live);
+
+        let config = ConnectConfig {
+            fresh_sign_in: true,
+            ..config_with(Some(store.clone()), None)
+        };
+        let next = connect_once(config).await;
+        assert_ne!(next.msgsig(), public_b64(&[5; 32]));
+        let replaced = store.key.lock().clone().unwrap();
+        assert_ne!(replaced.seed, [5; 32]);
+        assert_eq!(next.msgsig(), public_b64(&replaced.seed));
+        assert!(!replaced.refused);
+        assert_eq!(replaced.record_uri, None);
+    }
+
+    #[tokio::test]
+    async fn keeps_a_refused_key_on_a_reconnect() {
+        let store = MemoryStore::holding(5, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
+        store.key.lock().as_mut().unwrap().refused = true;
+        let again = connect_once(config_with(Some(store.clone()), None)).await;
+        assert_eq!(
+            again.msgsig(),
+            public_b64(&[5; 32]),
+            "only a fresh sign-in replaces it"
+        );
+        assert!(store.saves.lock().is_empty());
+    }
+
+    /// `created()` moved back past the key lifetime.
+    fn past_its_lifetime() -> String {
+        (chrono::Utc::now() - chrono::TimeDelta::days(91))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    #[tokio::test]
+    async fn replaces_a_stored_key_past_its_lifetime_at_a_fresh_sign_in() {
+        // Made 91 days ago: past its lifetime by its own date, with nothing
+        // read from the account to say so.
+        let store = MemoryStore::holding(5, Some("at://did:plc:tester/at.freeq.deviceKey/3o"));
+        store.key.lock().as_mut().unwrap().created_at = past_its_lifetime();
+        let config = ConnectConfig {
+            fresh_sign_in: true,
+            ..config_with(Some(store.clone()), None)
+        };
+        let conn = connect_once(config).await;
+        assert_ne!(conn.msgsig(), public_b64(&[5; 32]));
+        assert_ne!(store.key.lock().clone().unwrap().seed, [5; 32]);
+    }
+
+    #[tokio::test]
+    async fn does_not_publish_a_key_past_its_lifetime() {
+        let store = MemoryStore::holding(6, None);
+        store.key.lock().as_mut().unwrap().created_at = past_its_lifetime();
+        let enrollment = StubEnrollment::answering(EnrollOutcome::Published {
+            uri: "at://did:plc:tester/at.freeq.deviceKey/3kdevice".to_string(),
+        });
+        let _conn = connect_once(config_with(Some(store.clone()), Some(enrollment.clone()))).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(enrollment.calls.lock().is_empty());
+        assert_eq!(store.key.lock().clone().unwrap().record_uri, None);
+    }
+
+    /// An enrollment that runs `meanwhile` while its write is out, then
+    /// answers published.
+    struct EnrollmentMeanwhile {
+        uri: String,
+        meanwhile: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Enrollment for EnrollmentMeanwhile {
+        fn publish(
+            &self,
+            _record: DeviceKeyRecord,
+            _signer_public_key: String,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = EnrollOutcome> + Send>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(meanwhile) = self.meanwhile.lock().take() {
+                meanwhile();
+            }
+            let uri = self.uri.clone();
+            Box::pin(async move { EnrollOutcome::Published { uri } })
+        }
+    }
+
+    async fn publish_while(store: Arc<MemoryStore>, meanwhile: impl FnOnce() + Send + 'static) {
+        let enrollment = Arc::new(EnrollmentMeanwhile {
+            uri: "at://did:plc:tester/at.freeq.deviceKey/3kdevice".to_string(),
+            meanwhile: parking_lot::Mutex::new(Some(Box::new(meanwhile))),
+            calls: Default::default(),
+        });
+        let config = ConnectConfig {
+            enrollment: Some(enrollment.clone() as Arc<dyn Enrollment>),
+            ..config_with(Some(store), None)
+        };
+        let _conn = connect_once(config).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            enrollment.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn the_enrollment_save_keeps_a_refused_mark_set_meanwhile() {
+        let store = MemoryStore::holding(6, None);
+        let marking = store.clone();
+        publish_while(store.clone(), move || {
+            marking.key.lock().as_mut().unwrap().refused = true;
+        })
+        .await;
+        let kept = store.key.lock().clone().unwrap();
+        assert!(kept.refused, "the mark stands");
+        assert_eq!(
+            kept.record_uri.as_deref(),
+            Some("at://did:plc:tester/at.freeq.deviceKey/3kdevice")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_enrollment_gives_no_uri_to_a_key_replaced_meanwhile() {
+        let store = MemoryStore::holding(6, None);
+        let replacing = store.clone();
+        publish_while(store.clone(), move || {
+            let mut held = replacing.key.lock();
+            let key = held.as_mut().unwrap();
+            key.seed = [9; 32];
+        })
+        .await;
+        let kept = store.key.lock().clone().unwrap();
+        assert_eq!(kept.seed, [9; 32]);
+        assert_eq!(
+            kept.record_uri, None,
+            "the new key does not read as published"
+        );
+    }
+
     #[tokio::test]
     async fn a_published_key_is_saved_with_its_uri() {
         let uri = "at://did:plc:tester/at.freeq.deviceKey/3kdevice";
@@ -9571,7 +9918,7 @@ mod device_key_tests {
             &crate::identity_records::build_device_record(
                 &key,
                 "did:plc:tester",
-                CREATED,
+                &created(),
                 Some("laptop")
             )
             .unwrap()
@@ -9580,8 +9927,9 @@ mod device_key_tests {
             store.saves.lock().clone(),
             vec![StoredDeviceKey {
                 seed: [6; 32],
-                created_at: CREATED.to_string(),
+                created_at: created(),
                 record_uri: Some(uri.to_string()),
+                refused: false,
             }]
         );
         assert_eq!(conn.unpublished_events(), 0);

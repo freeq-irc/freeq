@@ -89,11 +89,13 @@ dictionary SignatureVerdict {
     string sentence;
 };
 
-// This device's signing key, as the app's store keeps it.
+// This device's signing key, as the app's store keeps it. `refused`: the
+// server refused it as expired; the next fresh sign-in replaces it.
 dictionary StoredDeviceKey {
     bytes seed;
     string created_at;
     string? record_uri;
+    boolean refused = false;
 };
 
 // Where the app keeps this device's signing key between connects.

@@ -4444,7 +4444,8 @@ public object FfiConverterTypeSignatureVerdict: FfiConverterRustBuffer<Signature
 data class StoredDeviceKey (
     var `seed`: kotlin.ByteArray, 
     var `createdAt`: kotlin.String, 
-    var `recordUri`: kotlin.String?
+    var `recordUri`: kotlin.String?, 
+    var `refused`: kotlin.Boolean = false
 ) {
     
     companion object
@@ -4459,19 +4460,22 @@ public object FfiConverterTypeStoredDeviceKey: FfiConverterRustBuffer<StoredDevi
             FfiConverterByteArray.read(buf),
             FfiConverterString.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
     override fun allocationSize(value: StoredDeviceKey) = (
             FfiConverterByteArray.allocationSize(value.`seed`) +
             FfiConverterString.allocationSize(value.`createdAt`) +
-            FfiConverterOptionalString.allocationSize(value.`recordUri`)
+            FfiConverterOptionalString.allocationSize(value.`recordUri`) +
+            FfiConverterBoolean.allocationSize(value.`refused`)
     )
 
     override fun write(value: StoredDeviceKey, buf: ByteBuffer) {
             FfiConverterByteArray.write(value.`seed`, buf)
             FfiConverterString.write(value.`createdAt`, buf)
             FfiConverterOptionalString.write(value.`recordUri`, buf)
+            FfiConverterBoolean.write(value.`refused`, buf)
     }
 }
 

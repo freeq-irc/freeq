@@ -26,6 +26,9 @@ pub struct StoredDeviceKey {
     pub created_at: String,
     /// The `at://` URI of the record that publishes the key, once written.
     pub record_uri: Option<String>,
+    /// The server refused the key as expired (`FAIL MSGSIG KEY_EXPIRED`):
+    /// the next fresh sign-in replaces it without reading the account.
+    pub refused: bool,
 }
 
 /// Where a device keeps its signing key between connects.
@@ -65,6 +68,9 @@ struct KeyFile {
     created_at: String,
     #[serde(default)]
     record_uri: Option<String>,
+    /// Absent in a file from before the flag, which reads as not refused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    refused: bool,
 }
 
 /// A [`DeviceKeyStore`] in one JSON file, readable by its owner only.
@@ -95,6 +101,7 @@ impl DeviceKeyStore for FileDeviceKeyStore {
             seed,
             created_at: file.created_at,
             record_uri: file.record_uri,
+            refused: file.refused,
         }))
     }
 
@@ -103,6 +110,7 @@ impl DeviceKeyStore for FileDeviceKeyStore {
             seed: URL_SAFE_NO_PAD.encode(key.seed),
             created_at: key.created_at.clone(),
             record_uri: key.record_uri.clone(),
+            refused: key.refused,
         })?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -151,6 +159,7 @@ mod tests {
             seed: [7; 32],
             created_at: "2026-09-11T10:00:00.000Z".to_string(),
             record_uri: None,
+            refused: false,
         };
         store.save(&key).unwrap();
         assert_eq!(store.load().unwrap(), Some(key.clone()));
@@ -182,6 +191,7 @@ mod tests {
                 seed: [1; 32],
                 created_at: "2026-09-11T10:00:00.000Z".to_string(),
                 record_uri: None,
+                refused: false,
             })
             .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
@@ -193,6 +203,7 @@ mod tests {
                 seed: [2; 32],
                 created_at: "2026-09-11T10:00:00.000Z".to_string(),
                 record_uri: None,
+                refused: false,
             })
             .unwrap();
         let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
@@ -212,5 +223,36 @@ mod tests {
         .unwrap();
         assert!(FileDeviceKeyStore::new(&path).load().is_err());
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn keeps_a_refused_keys_flag_through_a_save_and_a_load() {
+        let path = temp_path("refused");
+        let store = FileDeviceKeyStore::new(&path);
+        let key = StoredDeviceKey {
+            seed: [3; 32],
+            created_at: "2026-09-11T10:00:00.000Z".to_string(),
+            record_uri: Some("at://did:plc:alice/at.freeq.deviceKey/3k".to_string()),
+            refused: true,
+        };
+        store.save(&key).unwrap();
+        assert_eq!(FileDeviceKeyStore::new(&path).load().unwrap(), Some(key));
+    }
+
+    #[test]
+    fn a_file_from_before_the_flag_reads_as_not_refused() {
+        let path = temp_path("before-refused");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"seed":"{}","created_at":"2026-09-11T10:00:00.000Z","record_uri":null}}"#,
+                URL_SAFE_NO_PAD.encode([4u8; 32])
+            ),
+        )
+        .unwrap();
+        let loaded = FileDeviceKeyStore::new(&path).load().unwrap().unwrap();
+        assert!(!loaded.refused);
+        assert_eq!(loaded.seed, [4; 32]);
     }
 }

@@ -264,6 +264,9 @@ pub struct StoredDeviceKey {
     pub seed: Vec<u8>,
     pub created_at: String,
     pub record_uri: Option<String>,
+    /// The server refused the key as expired; the next fresh sign-in
+    /// replaces it.
+    pub refused: bool,
 }
 
 /// What publishing a device key came to.
@@ -612,6 +615,7 @@ impl freeq_sdk::device_key::DeviceKeyStore for StoreAdapter {
             seed,
             created_at: stored.created_at,
             record_uri: stored.record_uri,
+            refused: stored.refused,
         }))
     }
 
@@ -621,6 +625,7 @@ impl freeq_sdk::device_key::DeviceKeyStore for StoreAdapter {
                 seed: key.seed.to_vec(),
                 created_at: key.created_at.clone(),
                 record_uri: key.record_uri.clone(),
+                refused: key.refused,
             })
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
@@ -3667,6 +3672,7 @@ mod tests {
                 seed: vec![7u8; 32],
                 created_at: "2026-09-11T10:00:00.000Z".to_string(),
                 record_uri: None,
+                refused: false,
             })),
             saves: Mutex::new(Vec::new()),
         });
@@ -3691,6 +3697,39 @@ mod tests {
         );
     }
 
+    /// The refused mark crosses both ways.
+    #[test]
+    fn the_store_adapter_carries_the_refused_mark_both_ways() {
+        use freeq_sdk::device_key::DeviceKeyStore as SdkStore;
+        let app = Arc::new(AppStore {
+            key: Mutex::new(Some(StoredDeviceKey {
+                seed: vec![7u8; 32],
+                created_at: "2026-09-11T10:00:00.000Z".to_string(),
+                record_uri: None,
+                refused: true,
+            })),
+            saves: Mutex::new(Vec::new()),
+        });
+        let adapter = StoreAdapter(app.clone());
+        let loaded = adapter.load().unwrap().expect("the app holds a key");
+        assert!(loaded.refused);
+        adapter
+            .save(&freeq_sdk::device_key::StoredDeviceKey {
+                refused: false,
+                ..loaded.clone()
+            })
+            .unwrap();
+        adapter.save(&loaded).unwrap();
+        let saves: Vec<bool> = app
+            .saves
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|k| k.refused)
+            .collect();
+        assert_eq!(saves, vec![false, true]);
+    }
+
     /// A seed that is not 32 bytes is an error, not a key.
     #[test]
     fn the_store_adapter_refuses_a_seed_of_the_wrong_length() {
@@ -3700,6 +3739,7 @@ mod tests {
                 seed: vec![1u8; 31],
                 created_at: "2026-09-11T10:00:00.000Z".to_string(),
                 record_uri: None,
+                refused: false,
             })),
             saves: Mutex::new(Vec::new()),
         });
