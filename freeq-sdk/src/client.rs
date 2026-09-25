@@ -2287,11 +2287,11 @@ impl SignatureChecker {
             .and_then(|ms| i64::try_from(ms).ok())
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
         let at = chrono::DateTime::from_timestamp_millis(at_ms).unwrap_or_else(chrono::Utc::now);
-        let lookup = |did: String, retry: bool| {
+        let lookup = |did: String, retry: bool, server: bool| {
             let lookup = self.lookup.clone();
             let kid = signed.kid.clone();
             async move {
-                let ask = crate::key_lookup::KeyAsk { retry };
+                let ask = crate::key_lookup::KeyAsk { retry, server };
                 lookup
                     .key_for_at_with(&did, &kid, at, ask)
                     .await
@@ -2300,14 +2300,14 @@ impl SignatureChecker {
             }
         };
         let found = match origin_server_did(signed.origin.as_deref()) {
-            None => lookup(signed.did.clone(), true).await,
+            None => lookup(signed.did.clone(), true, false).await,
             Some(server) => {
                 // Every relayed line carries its origin, whether the sender
                 // or the peer server signed it. The sender is asked first
                 // without the retry delays, so a line the server signed is
                 // not held up by them.
                 let missed_before = self.lookup.holds_miss(&signed.did, &signed.kid).await;
-                match lookup(signed.did.clone(), false).await {
+                match lookup(signed.did.clone(), false, false).await {
                     Some(found) => Some(found),
                     None => {
                         // The peer server's own key, which signs on a
@@ -2315,7 +2315,7 @@ impl SignatureChecker {
                         // neither a wrong key nor a forged tag can make a
                         // line verify here. No retries: the origin reads a
                         // server's document itself before it answers.
-                        if let Some(by_server) = lookup(server, false).await {
+                        if let Some(by_server) = lookup(server, false, true).await {
                             return server_verdict(signed, &by_server.public_key);
                         }
                         // Not the server's: the sender's key, which the
@@ -2327,7 +2327,7 @@ impl SignatureChecker {
                             None
                         } else {
                             self.lookup.forget_with(&signed.did, &signed.kid, false);
-                            lookup(signed.did.clone(), true).await
+                            lookup(signed.did.clone(), true, false).await
                         }
                     }
                 }
@@ -2605,8 +2605,9 @@ fn check_now_or_hold(
 
 /// Start the checks held on a closed batch, once its signers' records are
 /// prefetched in one request (see `KeyLookup::prefetch`), then the keys the
-/// records did not answer in one more (`KeyLookup::prefetch_keys`). Off the
-/// receive path.
+/// records did not answer in one more (`KeyLookup::prefetch_keys`). A
+/// relayed line's key is asked under its peer server too, where the line's
+/// check looks for it next. Off the receive path.
 fn start_deferred_checks(
     held: Vec<HeldCheck>,
     checker: Option<&Arc<SignatureChecker>>,
@@ -2622,7 +2623,7 @@ fn start_deferred_checks(
     let event_tx = event_tx.clone();
     tokio::spawn(async move {
         let mut dids: Vec<String> = Vec::new();
-        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut pairs: Vec<crate::key_lookup::KeyPair> = Vec::new();
         for check in &held {
             let signed = &check.signed;
             if !crate::address::is_did(&signed.did) {
@@ -2631,9 +2632,16 @@ fn start_deferred_checks(
             if !dids.contains(&signed.did) {
                 dids.push(signed.did.clone());
             }
-            let pair = (signed.did.clone(), signed.kid.clone());
-            if !pairs.contains(&pair) {
-                pairs.push(pair);
+            // A relayed line's key is asked under its peer server too,
+            // where the line's check looks for it next.
+            let server = origin_server_did(signed.origin.as_deref())
+                .map(|server| crate::key_lookup::KeyPair::server(server, &signed.kid));
+            for pair in std::iter::once(crate::key_lookup::KeyPair::new(&signed.did, &signed.kid))
+                .chain(server)
+            {
+                if !pairs.contains(&pair) {
+                    pairs.push(pair);
+                }
             }
         }
         checker.lookup.prefetch(&dids).await;
@@ -10954,21 +10962,64 @@ mod verdict_tests {
         kid: AtomicUsize,
         /// The DID/kid pairs each batch key request named.
         named: parking_lot::Mutex<Vec<Vec<String>>>,
+        /// Every DID whose records were asked for, on either records route.
+        records_of: parking_lot::Mutex<Vec<String>>,
     }
 
-    /// A home server with no records for anyone, holding `keys` by
-    /// (DID, kid) on its batch and per-kid key routes.
+    /// A home server holding no records for any account it is asked for,
+    /// and `keys` by (DID, kid) on its batch and per-kid key routes.
     async fn key_routes(keys: HashMap<(String, String), [u8; 32]>) -> (String, Arc<KeyRoutes>) {
         let routes = Arc::new(KeyRoutes::default());
         let keys = Arc::new(keys);
-        let (r1, r2, r3) = (routes.clone(), routes.clone(), routes.clone());
+        let (r1, r2, r3, r4) = (
+            routes.clone(),
+            routes.clone(),
+            routes.clone(),
+            routes.clone(),
+        );
         let (k2, k3) = (keys.clone(), keys);
+        let empty = |collection: &str| {
+            json!({ collection: {
+                "fetched_at": chrono::Utc::now().timestamp(),
+                "stale": false,
+                "records": [],
+                "proofs": [],
+            } })
+        };
         let router = axum::Router::new()
             .route(
                 "/api/v1/records",
-                get(move || {
-                    r1.records.fetch_add(1, Ordering::SeqCst);
-                    async move { axum::Json(json!({ "accounts": [] })) }
+                get(
+                    move |axum::extract::Query(q): axum::extract::Query<
+                        HashMap<String, String>,
+                    >| {
+                        r1.records.fetch_add(1, Ordering::SeqCst);
+                        let collection = q.get("collection").cloned().unwrap_or_default();
+                        let dids: Vec<String> = q
+                            .get("dids")
+                            .map(|d| d.split(',').map(str::to_string).collect())
+                            .unwrap_or_default();
+                        r1.records_of.lock().extend(dids.iter().cloned());
+                        let accounts: Vec<Value> = dids
+                            .iter()
+                            .map(|did| json!({ "did": did, "collections": empty(&collection) }))
+                            .collect();
+                        async move { axum::Json(json!({ "accounts": accounts })) }
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/records/{did}/{collection}",
+                get(move |Path((did, _)): Path<(String, String)>| {
+                    r4.records_of.lock().push(did.clone());
+                    async move {
+                        axum::Json(json!({
+                            "did": did,
+                            "fetched_at": chrono::Utc::now().timestamp(),
+                            "stale": false,
+                            "records": [],
+                        }))
+                    }
                 }),
             )
             .route(
@@ -11272,6 +11323,118 @@ mod verdict_tests {
                 .await
                 .map(|v| v.state),
             Some(VerdictState::Unverifiable)
+        );
+    }
+
+    /// A relayed line as the receive path rebuilds it: RELAYED_SENDER's,
+    /// signed with `seed`'s key, from `peer`.
+    fn relayed_signed(seed: u8, body: &str, peer: &str) -> crate::verdict::Signed {
+        let msgid = crate::chatsig::new_event_id();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let doc = crate::chatsig::ChatDoc::message(RELAYED_SENDER, &msgid, "#room", body);
+        let (sig_tag, canonical) = (doc.sign(&key), doc.canonical());
+        crate::verdict::Signed {
+            did: RELAYED_SENDER.to_string(),
+            kid: crate::sigtag::derive_kid_bytes(&public(seed)),
+            sig_tag,
+            msgid,
+            origin: Some(peer.to_string()),
+            doc: crate::verdict::SignedDoc::Chat(canonical),
+        }
+    }
+
+    /// The next verdict event.
+    async fn next_verdict(rx: &mut mpsc::Receiver<Event>) -> Verdict {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(Event::Verdict { verdict, .. }) = rx.recv().await {
+                    return verdict;
+                }
+            }
+        })
+        .await
+        .expect("a verdict")
+    }
+
+    #[tokio::test]
+    async fn sends_one_key_request_when_two_batches_naming_the_same_key_close_together() {
+        const A: &str = "did:plc:alice";
+        let kid = crate::sigtag::derive_kid_bytes(&public(41));
+        let (base, routes) =
+            key_routes(HashMap::from([((A.to_string(), kid.clone()), public(41))])).await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let checker = checker_for(Some(base));
+        for batch in ["h1", "h2"] {
+            let held = vec![HeldCheck {
+                signed: signed_by(A, 41, batch),
+                taught: None,
+            }];
+            start_deferred_checks(held, Some(&checker), &DidMaps::default(), &tx);
+        }
+        verdicts(&mut rx, 2).await;
+        assert_eq!(routes.batch.load(Ordering::SeqCst), 1, "keys");
+        assert_eq!(
+            routes.kid.load(Ordering::SeqCst),
+            0,
+            "no key asked on its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetches_a_relayed_line_in_a_history_batch_under_the_peer_server_too_in_one_request()
+    {
+        let signed = relayed_signed(51, "signed by the peer", PEER);
+        let kid = signed.kid.clone();
+        let (base, routes) = key_routes(HashMap::from([(
+            (PEER_DID.to_string(), kid.clone()),
+            public(51),
+        )]))
+        .await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let checker = checker_for(Some(base));
+        let held = vec![HeldCheck {
+            signed,
+            taught: None,
+        }];
+        start_deferred_checks(held, Some(&checker), &DidMaps::default(), &tx);
+        assert_eq!(
+            next_verdict(&mut rx).await,
+            plain_verdict(VerdictState::Server, Some(kid.clone()))
+        );
+        assert_eq!(
+            *routes.named.lock(),
+            vec![vec![
+                format!("{RELAYED_SENDER}/{kid}"),
+                format!("{PEER_DID}/{kid}")
+            ]]
+        );
+        assert_eq!(
+            routes.kid.load(Ordering::SeqCst),
+            0,
+            "no key asked on its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn asks_for_no_device_records_of_a_peer_server() {
+        let signed = relayed_signed(51, "signed by the peer", PEER);
+        let kid = signed.kid.clone();
+        let (base, routes) = key_routes(HashMap::from([(
+            (PEER_DID.to_string(), kid.clone()),
+            public(51),
+        )]))
+        .await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let checker = checker_for(Some(base));
+        spawn_verdict_check(Some(&checker), Some(signed), None, &DidMaps::default(), &tx);
+        assert_eq!(
+            next_verdict(&mut rx).await,
+            plain_verdict(VerdictState::Server, Some(kid))
+        );
+        assert!(
+            !routes.records_of.lock().iter().any(|did| did == PEER_DID),
+            "records asked for: {:?}",
+            routes.records_of.lock()
         );
     }
 }

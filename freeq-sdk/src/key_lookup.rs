@@ -81,6 +81,9 @@ pub struct KeyLookup<P: ClientProvider> {
     /// The prefetch in flight for each DID, so two batches closing together
     /// make one request. Several DIDs share one entry.
     prefetching: Mutex<HashMap<String, Arc<Prefetch>>>,
+    /// One batch key request in flight per (DID, kid), so prefetches racing
+    /// on a key share one request: held locked while the request runs.
+    prefetching_keys: Mutex<HashMap<(String, String), KeyPrefetch>>,
     /// CIDs of records whose repository proof has checked, so each is fetched
     /// once however often the records are listed.
     proven: Arc<Mutex<HashSet<crate::identity_records::Cid>>>,
@@ -236,11 +239,44 @@ pub const MAX_KEYS_PER_REQUEST: usize = 50;
 pub struct KeyAsk {
     /// Ask a fresh line's miss again at the retry delays.
     pub retry: bool,
+    /// The DID is a server's, which has no device records: none are listed.
+    pub server: bool,
 }
 
 impl Default for KeyAsk {
     fn default() -> Self {
-        Self { retry: true }
+        Self {
+            retry: true,
+            server: false,
+        }
+    }
+}
+
+/// A key to prefetch: its DID and kid, and whether the DID is a server's,
+/// which has no device records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyPair {
+    pub did: String,
+    pub kid: String,
+    pub server: bool,
+}
+
+impl KeyPair {
+    /// A signer's key.
+    pub fn new(did: impl Into<String>, kid: impl Into<String>) -> Self {
+        Self {
+            did: did.into(),
+            kid: kid.into(),
+            server: false,
+        }
+    }
+
+    /// A server's own key.
+    pub fn server(did: impl Into<String>, kid: impl Into<String>) -> Self {
+        Self {
+            server: true,
+            ..Self::new(did, kid)
+        }
     }
 }
 
@@ -267,6 +303,9 @@ struct Settled {
     other: Option<Option<FoundKey>>,
     failure: Option<Arc<anyhow::Error>>,
 }
+
+/// A batch key request in flight, locked until it settles.
+type KeyPrefetch = Arc<tokio::sync::Mutex<()>>;
 
 /// A lookup in flight, which every ask for its (DID, kid) awaits.
 type InFlight = Arc<tokio::sync::OnceCell<Settled>>;
@@ -483,6 +522,7 @@ impl<P: ClientProvider> KeyLookup<P> {
             refreshed: Default::default(),
             listing: Mutex::new(HashMap::new()),
             prefetching: Mutex::new(HashMap::new()),
+            prefetching_keys: Mutex::new(HashMap::new()),
             proven: Default::default(),
             proving: Default::default(),
             refreshes: Mutex::new(HashMap::new()),
@@ -711,8 +751,10 @@ impl<P: ClientProvider> KeyLookup<P> {
     }
 
     /// [`Self::key_for_at`], asked as `ask` says: `retry: false` settles a
-    /// fresh line's miss without the retry delays. A line signed more than
-    /// [`FRESH_LINE`] before now is never asked about again.
+    /// fresh line's miss without the retry delays; `server: true` names a
+    /// server's DID, which has no device records: none are listed. A line
+    /// signed more than [`FRESH_LINE`] before now is never asked about
+    /// again.
     pub async fn key_for_at_with(
         &self,
         did: &str,
@@ -792,9 +834,11 @@ impl<P: ClientProvider> KeyLookup<P> {
         let started = tokio::time::Instant::now();
         let refreshes = self.refresh_count(did);
         let listed = cached.is_none();
-        let mut settled = self
-            .ask(did, kid, at, cached.map(|c| c.records), false)
-            .await;
+        // A server's DID has no device records to list.
+        let held = cached
+            .map(|c| c.records)
+            .or_else(|| ask.server.then(Vec::new));
+        let mut settled = self.ask(did, kid, at, held, false).await;
         // Only a line signed just now is asked about again.
         let fresh = (Utc::now() - at)
             .to_std()
@@ -917,13 +961,15 @@ impl<P: ClientProvider> KeyLookup<P> {
     /// Ask the origin's batch key route for the keys of `pairs`, in one
     /// request per [`MAX_KEYS_PER_REQUEST`], for the pairs no answer is held
     /// for: not a key found, not a miss inside the ttl, not a key the DID's
-    /// held records name, not a pair whose lookup is in flight. A key the
-    /// origin answers is kept as its answer; a pair it leaves out is kept as a
-    /// miss only when the DID's records are held (or it is a did:key, which
-    /// has none). A request that fails, or is answered 429 or 5xx, keeps
-    /// nothing, since it said nothing about the keys. Against a server without
-    /// the route (a 404) nothing is asked. Never fails.
-    pub async fn prefetch_keys(&self, pairs: &[(String, String)]) {
+    /// held records name, not a pair whose lookup is in flight. A pair
+    /// another prefetch is asking for is not asked again; its answer is
+    /// waited for. A key the origin answers is kept as its answer; a pair it
+    /// leaves out is kept as a miss only when the DID's records are held (or
+    /// it is a did:key or a server's DID, which have none). A request that
+    /// fails, or is answered 429 or 5xx, keeps nothing, since it said nothing
+    /// about the keys. Against a server without the route (a 404) nothing is
+    /// asked. Never fails.
+    pub async fn prefetch_keys(&self, pairs: &[KeyPair]) {
         self.load().await;
         let Some(base) = self.origin_base() else {
             return;
@@ -935,10 +981,18 @@ impl<P: ClientProvider> KeyLookup<P> {
             return;
         }
         let now = Utc::now();
-        let mut asked: Vec<(String, String)> = Vec::new();
-        for (did, kid) in pairs {
+        let mut asked: Vec<KeyPair> = Vec::new();
+        let mut waits: Vec<KeyPrefetch> = Vec::new();
+        // Held while this call's request runs, so a prefetch naming one of
+        // its keys meanwhile waits for it instead of asking again.
+        let mine: KeyPrefetch = Arc::new(tokio::sync::Mutex::new(()));
+        let asking = mine.clone().try_lock_owned().expect("a new lock is free");
+        for pair in pairs {
+            let (did, kid) = (&pair.did, &pair.kid);
             let slot = (did.clone(), kid.clone());
-            if asked.contains(&slot) || self.in_flight.lock().contains_key(&slot) {
+            if asked.iter().any(|p| p.did == *did && p.kid == *kid)
+                || self.in_flight.lock().contains_key(&slot)
+            {
                 continue;
             }
             let hit = self.cache.lock().get(&slot).cloned();
@@ -952,20 +1006,62 @@ impl<P: ClientProvider> KeyLookup<P> {
                     continue;
                 }
             }
-            let held = self
-                .records
-                .lock()
-                .get(did)
-                .map(|(records, _)| records.clone())
-                .or(hit.map(|h| h.records));
+            let held = if pair.server {
+                None
+            } else {
+                self.records
+                    .lock()
+                    .get(did)
+                    .map(|(records, _)| records.clone())
+                    .or(hit.map(|h| h.records))
+            };
             if held.is_some_and(|records| in_records(did, kid, &records, now).is_some()) {
                 continue;
             }
-            asked.push(slot);
+            {
+                let mut prefetching = self.prefetching_keys.lock();
+                if let Some(other) = prefetching.get(&slot) {
+                    if !waits.iter().any(|w| Arc::ptr_eq(w, other)) {
+                        waits.push(other.clone());
+                    }
+                    continue;
+                }
+                prefetching.insert(slot, mine.clone());
+            }
+            asked.push(pair.clone());
         }
+        let kept = self.ask_batch_route_for(base, &asked).await;
+        {
+            let mut prefetching = self.prefetching_keys.lock();
+            for pair in &asked {
+                let slot = (pair.did.clone(), pair.kid.clone());
+                if prefetching
+                    .get(&slot)
+                    .is_some_and(|m| Arc::ptr_eq(m, &mine))
+                {
+                    prefetching.remove(&slot);
+                }
+            }
+        }
+        drop(asking);
+        if kept {
+            self.save().await;
+        }
+        for other in waits {
+            let _ = other.lock().await;
+        }
+    }
+
+    /// `prefetch_keys`' requests for the pairs it asks; whether any answer
+    /// was kept.
+    async fn ask_batch_route_for(&self, base: &str, asked: &[KeyPair]) -> bool {
         let mut kept = false;
         for chunk in asked.chunks(MAX_KEYS_PER_REQUEST) {
-            let answered = match self.ask_batch_route(base, chunk).await {
+            let slots: Vec<(String, String)> = chunk
+                .iter()
+                .map(|p| (p.did.clone(), p.kid.clone()))
+                .collect();
+            let answered = match self.ask_batch_route(base, &slots).await {
                 Ok(Some(answered)) => answered,
                 // The route is missing: nothing more is asked through it.
                 Ok(None) => break,
@@ -974,7 +1070,8 @@ impl<P: ClientProvider> KeyLookup<P> {
                     continue;
                 }
             };
-            for (did, kid) in chunk {
+            for pair in chunk {
+                let (did, kid) = (&pair.did, &pair.kid);
                 let slot = (did.clone(), kid.clone());
                 let found = answered.get(&slot).and_then(|(key, retired_at)| {
                     key.filter(|key| derive_kid_bytes(key) == *kid)
@@ -986,11 +1083,14 @@ impl<P: ClientProvider> KeyLookup<P> {
                             expires_at: None,
                         })
                 });
-                let records = self
-                    .records
-                    .lock()
-                    .get(did)
-                    .map(|(records, _)| records.clone());
+                let records = if pair.server {
+                    Some(Vec::new())
+                } else {
+                    self.records
+                        .lock()
+                        .get(did)
+                        .map(|(records, _)| records.clone())
+                };
                 // A miss counts only when the account's records were read:
                 // without them, the line's own lookup lists the account.
                 if found.is_none() && records.is_none() && !did.starts_with("did:key:") {
@@ -1000,9 +1100,7 @@ impl<P: ClientProvider> KeyLookup<P> {
                 kept = true;
             }
         }
-        if kept {
-            self.save().await;
-        }
+        kept
     }
 
     /// The origin's batch key route's answer for `pairs`, by (DID, kid);
@@ -3098,10 +3196,10 @@ mod tests {
         server.hold(WEB_SIGNER, kid_of(3), key_entry(3));
         let keys = lookup_at(&pds, &server);
         let mut pairs = vec![
-            (ALICE.to_string(), kid_of(2)),
-            (WEB_SIGNER.to_string(), kid_of(3)),
+            KeyPair::new(ALICE, kid_of(2)),
+            KeyPair::new(WEB_SIGNER, kid_of(3)),
         ];
-        pairs.extend((0..58).map(|i| (ALICE.to_string(), format!("absent{i}"))));
+        pairs.extend((0..58).map(|i| KeyPair::new(ALICE, format!("absent{i}"))));
         // Alice's records are held, so a key of hers the origin leaves out is
         // a miss.
         keys.proven_device_records(ALICE).await.unwrap();
@@ -3151,7 +3249,7 @@ mod tests {
         let server = key_server().await;
         let keys = lookup_at(&pds, &server);
         keys.proven_device_records(ALICE).await.unwrap();
-        keys.prefetch_keys(&[(ALICE.to_string(), kid_of(1))]).await;
+        keys.prefetch_keys(&[KeyPair::new(ALICE, kid_of(1))]).await;
         assert!(server.asked().is_empty());
     }
 
@@ -3173,7 +3271,7 @@ mod tests {
             );
         }
         assert_eq!(server.asked(), vec!["batch", "kid", "kid"]);
-        keys.prefetch_keys(&[(ALICE.to_string(), kid_of(4))]).await;
+        keys.prefetch_keys(&[KeyPair::new(ALICE, kid_of(4))]).await;
         assert_eq!(
             server.asked(),
             vec!["batch", "kid", "kid"],
@@ -3190,7 +3288,7 @@ mod tests {
         keys.proven_device_records(ALICE).await.unwrap();
         for status in [429, 503] {
             *server.batch_status.lock() = Some(status);
-            keys.prefetch_keys(&[(ALICE.to_string(), kid_of(2))]).await;
+            keys.prefetch_keys(&[KeyPair::new(ALICE, kid_of(2))]).await;
         }
         *server.batch_status.lock() = None;
         assert_eq!(
@@ -3237,7 +3335,15 @@ mod tests {
         let keys = lookup_at(&pds, &server)
             .with_retry_delays(vec![Duration::from_millis(1), Duration::from_millis(2)]);
         let found = keys
-            .key_for_at_with(ALICE, "gone", Utc::now(), KeyAsk { retry: false })
+            .key_for_at_with(
+                ALICE,
+                "gone",
+                Utc::now(),
+                KeyAsk {
+                    retry: false,
+                    ..KeyAsk::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(found, None);
@@ -3257,6 +3363,27 @@ mod tests {
         let second = lookup_at(&pds, &server).with_store(store);
         assert_eq!(second.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
         assert_eq!(server.asked().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_prefetches_racing_on_one_key_share_one_request() {
+        let pds = pds(vec![]).await;
+        let server = key_server().await;
+        server.hold(ALICE, kid_of(2), key_entry(2));
+        let keys = lookup_at(&pds, &server);
+        let pair = [KeyPair::new(ALICE, kid_of(2))];
+        tokio::join!(keys.prefetch_keys(&pair), keys.prefetch_keys(&pair));
+        assert_eq!(server.asked(), vec!["batch"]);
+    }
+
+    #[tokio::test]
+    async fn keeps_a_servers_missing_key_as_a_miss() {
+        let pds = pds(vec![]).await;
+        let server = key_server().await;
+        let keys = lookup_at(&pds, &server);
+        keys.prefetch_keys(&[KeyPair::server("did:web:peer.example", kid_of(2))])
+            .await;
+        assert!(keys.holds_miss("did:web:peer.example", &kid_of(2)).await);
     }
 
     #[tokio::test]
@@ -3554,6 +3681,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn asks_for_no_device_records_of_a_server() {
+        let (home_server, pds, _repos, docs) = three_signers().await;
+        const PEER: &str = "did:web:peer.example";
+        home_server
+            .keys
+            .lock()
+            .insert((PEER.to_string(), kid_of(7)), raw(7));
+        let keys = lookup_at_home(docs, &home_server);
+        let found = keys
+            .key_for_at_with(
+                PEER,
+                &kid_of(7),
+                Utc::now(),
+                KeyAsk {
+                    retry: false,
+                    server: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.map(|f| f.source), Some(KeySource::OriginServer));
+        assert_eq!(home_server.counts(), (0, 0, 0), "no records asked for");
+        assert!(home_server.batches.lock().is_empty());
+        assert_eq!(pds.hits(), 0);
+    }
+
+    #[tokio::test]
     async fn remembers_no_key_miss_for_an_account_whose_records_the_prefetch_did_not_bring() {
         let (home_server, _pds, _repos, docs) = three_signers().await;
         // The home server has not seen Alice: her records are not prefetched,
@@ -3561,7 +3715,7 @@ mod tests {
         home_server.unseen.lock().insert(ALICE.to_string());
         let keys = lookup_at_home(docs, &home_server);
         keys.prefetch(&[ALICE.to_string()]).await;
-        keys.prefetch_keys(&[(ALICE.to_string(), kid_of(1))]).await;
+        keys.prefetch_keys(&[KeyPair::new(ALICE, kid_of(1))]).await;
         // Her line lists her records itself, and finds the key published there.
         let hour_ago = Utc::now() - chrono::TimeDelta::hours(1);
         assert_eq!(
