@@ -2219,6 +2219,18 @@ async fn replace_retired_device_key<P: freeq_oauth::ClientProvider>(
     }
 }
 
+/// The did:web of the peer server a relayed line's `+freeq.at/origin`
+/// names, whose own key may have signed it; `None` without one, or for a
+/// value that is not a host name.
+fn origin_server_did(origin: Option<&str>) -> Option<String> {
+    let origin = origin?;
+    let host_name = !origin.is_empty()
+        && origin
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    host_name.then(|| format!("did:web:{origin}"))
+}
+
 /// Checks received signatures for one connection. Holds the connected
 /// server's own key set, so a signature the server made on a sender's behalf
 /// reads as the server's.
@@ -2275,7 +2287,53 @@ impl SignatureChecker {
             .and_then(|ms| i64::try_from(ms).ok())
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
         let at = chrono::DateTime::from_timestamp_millis(at_ms).unwrap_or_else(chrono::Utc::now);
-        if let Ok(Some(found)) = self.lookup.key_for_at(&signed.did, &signed.kid, at).await {
+        let lookup = |did: String, retry: bool| {
+            let lookup = self.lookup.clone();
+            let kid = signed.kid.clone();
+            async move {
+                let ask = crate::key_lookup::KeyAsk { retry };
+                lookup
+                    .key_for_at_with(&did, &kid, at, ask)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        };
+        let found = match origin_server_did(signed.origin.as_deref()) {
+            None => lookup(signed.did.clone(), true).await,
+            Some(server) => {
+                // Every relayed line carries its origin, whether the sender
+                // or the peer server signed it. The sender is asked first
+                // without the retry delays, so a line the server signed is
+                // not held up by them.
+                let missed_before = self.lookup.holds_miss(&signed.did, &signed.kid).await;
+                match lookup(signed.did.clone(), false).await {
+                    Some(found) => Some(found),
+                    None => {
+                        // The peer server's own key, which signs on a
+                        // sender's behalf. The kid is a hash of the key, so
+                        // neither a wrong key nor a forged tag can make a
+                        // line verify here. No retries: the origin reads a
+                        // server's document itself before it answers.
+                        if let Some(by_server) = lookup(server, false).await {
+                            return server_verdict(signed, &by_server.public_key);
+                        }
+                        // Not the server's: the sender's key, which the
+                        // origin may still be fetching from the peer. Its
+                        // miss from just now is dropped and it is asked again
+                        // with the retries a line that just arrived gets; a
+                        // miss remembered from an earlier line stands.
+                        if missed_before {
+                            None
+                        } else {
+                            self.lookup.forget_with(&signed.did, &signed.kid, false);
+                            lookup(signed.did.clone(), true).await
+                        }
+                    }
+                }
+            }
+        };
+        if let Some(found) = found {
             let state = match crate::verdict::check(signed, &found.public_key) {
                 Ok(false) => VerdictState::Invalid,
                 Err(()) => VerdictState::Unverifiable,
@@ -9906,7 +9964,11 @@ mod verdict_tests {
         }
 
         async fn wait(&mut self, want: impl Fn(&Event) -> bool) -> Event {
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            self.wait_within(5, want).await
+        }
+
+        async fn wait_within(&mut self, secs: u64, want: impl Fn(&Event) -> bool) -> Event {
+            tokio::time::timeout(std::time::Duration::from_secs(secs), async {
                 loop {
                     let event = self.events.recv().await.expect("the session ended");
                     if want(&event) {
@@ -9915,7 +9977,7 @@ mod verdict_tests {
                 }
             })
             .await
-            .expect("no such event in 5s")
+            .expect("no such event in time")
         }
 
         /// The next message or TAGMSG delivered, and the verdict it settles
@@ -9957,6 +10019,25 @@ mod verdict_tests {
                 settled,
                 act,
                 msgid,
+            }
+        }
+
+        /// The verdict the next message is delivered with.
+        async fn next_delivered(&mut self) -> Option<Verdict> {
+            match self.wait(|e| matches!(e, Event::Message { .. })).await {
+                Event::Message { verdict, .. } => verdict,
+                _ => unreachable!(),
+            }
+        }
+
+        /// The next `Event::Verdict`, waited for up to `secs`.
+        async fn next_verdict_within(&mut self, secs: u64) -> Verdict {
+            match self
+                .wait_within(secs, |e| matches!(e, Event::Verdict { .. }))
+                .await
+            {
+                Event::Verdict { verdict, .. } => verdict,
+                _ => unreachable!(),
             }
         }
     }
@@ -10667,6 +10748,7 @@ mod verdict_tests {
             kid: "kid".to_string(),
             sig_tag: "kid:sig".to_string(),
             msgid: msgid.to_string(),
+            origin: None,
             doc: crate::verdict::SignedDoc::Chat("{}".to_string()),
         }
     }
@@ -10982,6 +11064,214 @@ mod verdict_tests {
             routes.kid.load(Ordering::SeqCst),
             0,
             "no key asked on its own"
+        );
+    }
+
+    // ── a line a peer server signed ─────────────────────────────────────
+
+    const RELAYED_SENDER: &str = "did:plc:relayedsender";
+    const PEER: &str = "peer.example";
+    const PEER_DID: &str = "did:web:peer.example";
+
+    /// A line from RELAYED_SENDER signed with `seed`'s key, tagged with
+    /// `peer` as its origin when given. The wire, the msgid and the kid.
+    fn relayed(seed: u8, body: &str, peer: Option<&str>) -> (String, String, String) {
+        let msgid = crate::chatsig::new_event_id();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let sig =
+            crate::chatsig::ChatDoc::message(RELAYED_SENDER, &msgid, "#room", body).sign(&key);
+        let mut tags = HashMap::from([
+            ("account".to_string(), RELAYED_SENDER.to_string()),
+            ("msgid".to_string(), msgid.clone()),
+            (crate::sigtag::SIG_TAG.to_string(), sig),
+        ]);
+        if let Some(peer) = peer {
+            tags.insert("+freeq.at/origin".to_string(), peer.to_string());
+        }
+        let kid = crate::sigtag::derive_kid_bytes(&public(seed));
+        (line(tags, "PRIVMSG", "#room", Some(body)), msgid, kid)
+    }
+
+    fn multibase(seed: u8) -> String {
+        crate::crypto::PrivateKey::ed25519_from_bytes(&[seed; 32])
+            .unwrap()
+            .public_key_multibase()
+    }
+
+    /// A PDS holding no records for anyone.
+    async fn empty_pds() -> String {
+        serve(axum::Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(|| async { axum::Json(json!({ "records": [] })) }),
+        ))
+        .await
+    }
+
+    /// The peer server's did:web document, naming `seed`'s key; its records
+    /// are on `pds`, which holds none.
+    fn peer_document(seed: u8, pds: &str) -> crate::did::DidDocument {
+        crate::did::make_test_did_document_with_pds(PEER_DID, &multibase(seed), Some(pds))
+    }
+
+    /// The sender's document: a PDS holding no records, so a miss under the
+    /// sender is a miss, not a failure.
+    fn sender_document(pds: &str) -> crate::did::DidDocument {
+        crate::did::make_test_did_document_with_pds(RELAYED_SENDER, &multibase(99), Some(pds))
+    }
+
+    /// The verdict `wire` settles on, on a fresh session with `documents`
+    /// resolvable and an origin holding nothing.
+    async fn relayed_verdict(
+        wire: &str,
+        documents: Vec<crate::did::DidDocument>,
+    ) -> Option<Verdict> {
+        let base = serve_origin(Arc::new(Origin::default())).await;
+        let mut session = Session::open(Some(key_lookup(&base, documents)), OWN_DID).await;
+        session.send(wire).await;
+        session.next_line().await.settled
+    }
+
+    #[tokio::test]
+    async fn reads_as_the_servers_when_the_peer_servers_own_key_signed_it() {
+        let pds = empty_pds().await;
+        let (wire, _, kid) = relayed(51, "relayed", Some(PEER));
+        assert_eq!(
+            relayed_verdict(&wire, vec![peer_document(51, &pds)]).await,
+            Some(plain_verdict(VerdictState::Server, Some(kid)))
+        );
+    }
+
+    #[tokio::test]
+    async fn stays_unverifiable_when_the_peer_servers_key_is_not_the_one_that_signed() {
+        let pds = empty_pds().await;
+        let (wire, _, kid) = relayed(52, "relayed", Some(PEER));
+        assert_eq!(
+            relayed_verdict(&wire, vec![peer_document(51, &pds)]).await,
+            Some(plain_verdict(VerdictState::Unverifiable, Some(kid)))
+        );
+    }
+
+    #[tokio::test]
+    async fn stays_unverifiable_when_an_origin_tag_names_a_server_whose_key_did_not_sign_it() {
+        let pds = empty_pds().await;
+        // Signed by some key of the sender's own, tagged with a server it
+        // never passed through.
+        let (wire, _, _) = relayed(53, "not relayed at all", Some(PEER));
+        assert_eq!(
+            relayed_verdict(&wire, vec![peer_document(51, &pds)])
+                .await
+                .map(|v| v.state),
+            Some(VerdictState::Unverifiable)
+        );
+    }
+
+    #[tokio::test]
+    async fn remembers_a_missing_server_key_like_any_miss() {
+        let pds = empty_pds().await;
+        let origin = Arc::new(Origin::default());
+        let base = serve_origin(origin.clone()).await;
+        let resolver = crate::did::DidResolver::static_map(
+            [peer_document(51, &pds), sender_document(&pds)]
+                .into_iter()
+                .map(|d| (d.id.clone(), d))
+                .collect(),
+        );
+        let reader = crate::identity_records::RecordReader::new(
+            resolver,
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        );
+        // Short retries: the first line's sender miss is asked again, as any
+        // fresh line's is, before it is remembered.
+        let lookup = Arc::new(
+            crate::key_lookup::KeyLookup::new(
+                reader,
+                Some(base),
+                std::time::Duration::from_secs(3600),
+            )
+            .with_retry_delays(vec![
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(30),
+            ]),
+        );
+        let mut session = Session::open(Some(lookup), OWN_DID).await;
+        let (first, _, _) = relayed(52, "one", Some(PEER));
+        let (second, _, _) = relayed(52, "two", Some(PEER));
+        session.send(&first).await;
+        session.next_line().await;
+        let asked = origin.key_reads.load(Ordering::SeqCst);
+        session.send(&second).await;
+        assert_eq!(
+            session.next_line().await.settled.map(|v| v.state),
+            Some(VerdictState::Unverifiable)
+        );
+        assert_eq!(
+            origin.key_reads.load(Ordering::SeqCst),
+            asked,
+            "the second line asks nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn still_retries_a_federated_users_key_that_reaches_the_server_after_the_line() {
+        let pds = empty_pds().await;
+        let origin = Arc::new(Origin::default());
+        let base = serve_origin(origin.clone()).await;
+        let lookup = key_lookup(&base, vec![peer_document(51, &pds), sender_document(&pds)]);
+        let mut session = Session::open(Some(lookup), OWN_DID).await;
+        let (wire, _, kid) = relayed(54, "from a federated user", Some(PEER));
+        // The server copies the key from the peer 2.5 s after the line
+        // arrives.
+        let later = origin.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+            later.hold(RELAYED_SENDER, public(54), None);
+        });
+        session.send(&wire).await;
+        let delivered = session.next_delivered().await;
+        assert_eq!(delivered.map(|v| v.state), Some(VerdictState::Pending));
+        let settled = session.next_verdict_within(12).await;
+        assert_eq!(
+            settled,
+            Verdict {
+                state: VerdictState::Device,
+                layer: Some(KeyLayer::Vouched),
+                kid: Some(kid),
+                key_source: Some(crate::key_lookup::KeySource::OriginServer),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn gives_a_server_signed_relayed_line_the_server_verdict_without_waiting_out_the_retries()
+    {
+        let pds = empty_pds().await;
+        let base = serve_origin(Arc::new(Origin::default())).await;
+        // The default retries: 2, 6 and 15 seconds.
+        let lookup = key_lookup(&base, vec![peer_document(51, &pds), sender_document(&pds)]);
+        let mut session = Session::open(Some(lookup), OWN_DID).await;
+        let (wire, _, kid) = relayed(51, "signed by the peer", Some(PEER));
+        session.send(&wire).await;
+        session.next_delivered().await;
+        let started = std::time::Instant::now();
+        let settled = session.next_verdict_within(5).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_500),
+            "settled in {:?}",
+            started.elapsed()
+        );
+        assert_eq!(settled, plain_verdict(VerdictState::Server, Some(kid)));
+    }
+
+    #[tokio::test]
+    async fn is_not_looked_up_under_a_server_without_the_tag() {
+        let pds = empty_pds().await;
+        let (wire, _, _) = relayed(51, "no tag", None);
+        assert_eq!(
+            relayed_verdict(&wire, vec![peer_document(51, &pds)])
+                .await
+                .map(|v| v.state),
+            Some(VerdictState::Unverifiable)
         );
     }
 }

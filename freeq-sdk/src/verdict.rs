@@ -109,6 +109,9 @@ pub(crate) struct Signed {
     /// The line's id: what a late verdict is filed under, and whose ULID
     /// time dates the signature.
     pub msgid: String,
+    /// A chat line's `+freeq.at/origin`: the peer server it was relayed
+    /// from, whose own key may have signed it on the sender's behalf.
+    pub origin: Option<String>,
     pub doc: SignedDoc,
 }
 
@@ -178,6 +181,7 @@ pub(crate) fn first_look(line: &Line<'_>) -> FirstLook {
             kid,
             sig_tag: sig_tag.to_string(),
             msgid: act.event_id.clone(),
+            origin: None,
             doc: SignedDoc::Act {
                 tags: pairs()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -244,6 +248,7 @@ pub(crate) fn first_look(line: &Line<'_>) -> FirstLook {
         kid,
         sig_tag: sig_tag.to_string(),
         msgid: doc.0.to_string(),
+        origin: tag("+freeq.at/origin").map(str::to_string),
         doc: SignedDoc::Chat(doc.1),
     })
 }

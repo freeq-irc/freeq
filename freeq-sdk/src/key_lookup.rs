@@ -1362,6 +1362,12 @@ impl<P: ClientProvider> KeyLookup<P> {
     /// published since — which is the whole point of the caller's retry
     /// (`freeq-server/src/peer_keys.rs:184`).
     pub fn forget(&self, did: &str, kid: &str) {
+        self.forget_with(did, kid, true);
+    }
+
+    /// [`Self::forget`]; `relist: false` keeps the DID's refresh time, for a
+    /// caller whose miss was listed just now.
+    pub fn forget_with(&self, did: &str, kid: &str, relist: bool) {
         let slot = (did.to_string(), kid.to_string());
         let mut cache = self.cache.lock();
         let found = cache.get(&slot).is_some_and(|c| {
@@ -1370,8 +1376,20 @@ impl<P: ClientProvider> KeyLookup<P> {
         });
         if !found {
             cache.remove(&slot);
-            self.refreshed.lock().remove(did);
+            if relist {
+                self.refreshed.lock().remove(did);
+            }
         }
+    }
+
+    /// Whether a miss for `(did, kid)` is remembered inside the ttl. Reads
+    /// the stored snapshot first.
+    pub async fn holds_miss(&self, did: &str, kid: &str) -> bool {
+        self.load().await;
+        self.cache
+            .lock()
+            .get(&(did.to_string(), kid.to_string()))
+            .is_some_and(|c| c.other == Some(None) && self.inside_ttl(c.at))
     }
 
     /// List `did`'s account at the PDS now, however recently it was listed:
@@ -2671,6 +2689,25 @@ mod tests {
             Some(KeySource::IdentityRecord)
         );
         assert_eq!(pds.hits(), 2, "the forgotten miss listed the account again");
+    }
+
+    /// A caller whose miss was listed just now drops the miss but keeps the
+    /// listing: the next lookup answers from it rather than listing again.
+    #[tokio::test]
+    async fn forgetting_a_miss_while_keeping_the_listing_does_not_list_again() {
+        let pds = pds(vec![device_record(1)]).await;
+        let origin = origin(vec![]).await;
+        let keys = lookup(vec![alice_on(&pds)], Some(&origin), HOUR);
+        assert_eq!(keys.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
+        assert!(keys.holds_miss(ALICE, &kid_of(2)).await);
+        keys.forget_with(ALICE, &kid_of(2), false);
+        assert!(!keys.holds_miss(ALICE, &kid_of(2)).await);
+        assert_eq!(keys.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
+        assert_eq!(
+            (pds.hits(), origin.hits()),
+            (1, 2),
+            "the origin asked again, the account not listed again"
+        );
     }
 
     /// Only a miss is forgotten: a key found stays cached.
