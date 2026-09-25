@@ -540,6 +540,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         server.clone()
     };
 
+    // Sign with the key the did:key already is, so the bot keeps one key row.
+    let device_key_store =
+        freeq_sdk::device_key::DidKeyDeviceKeyStore::for_did_key(&did, &private_key);
     let conn_config = ConnectConfig {
         server_addr,
         nick: nick.clone(),
@@ -551,6 +554,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         tls_insecure: false,
         web_token: None,
         websocket_url,
+        device_key_store,
         ..Default::default()
     };
 

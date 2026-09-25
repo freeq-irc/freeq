@@ -191,6 +191,11 @@ impl Orchestrator {
         tracing::info!(backend = %stt.label(), "STT backend ready");
 
         let (websocket_url, server_addr) = derive_transport(&cfg.server)?;
+        // Sign with the key the did:key already is, so the bot keeps one key row.
+        let device_key_store = freeq_sdk::device_key::DidKeyDeviceKeyStore::for_did_key(
+            &ident.did,
+            &ident.private_key,
+        );
         let conn_config = ConnectConfig {
             server_addr,
             nick: cfg.nick.clone(),
@@ -202,6 +207,7 @@ impl Orchestrator {
             tls_insecure: false,
             web_token: None,
             websocket_url,
+            device_key_store,
             ..Default::default()
         };
         let signer = Arc::new(KeySigner::new(ident.did.clone(), ident.private_key));

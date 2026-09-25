@@ -9654,6 +9654,38 @@ mod device_key_tests {
     }
 
     #[tokio::test]
+    async fn presents_the_did_keys_own_public_key_on_every_connect() {
+        let key = crate::crypto::PrivateKey::ed25519_from_bytes(&[8; 32]).unwrap();
+        let did = format!("did:key:{}", key.public_key_multibase());
+        let store = crate::device_key::DidKeyDeviceKeyStore::for_did_key(&did, &key)
+            .expect("an ed25519 key's own did:key");
+        let config = || ConnectConfig {
+            device_key_store: Some(store.clone()),
+            ..config_with(None, None)
+        };
+        let first = connect_as(config(), &did).await;
+        let second = connect_as(config(), &did).await;
+        assert_eq!(first.msgsig(), public_b64(&[8; 32]));
+        assert_eq!(second.msgsig(), public_b64(&[8; 32]));
+    }
+
+    #[test]
+    fn a_did_key_store_is_only_for_the_keys_own_did_key() {
+        let key = crate::crypto::PrivateKey::ed25519_from_bytes(&[8; 32]).unwrap();
+        let other = crate::crypto::PrivateKey::ed25519_from_bytes(&[9; 32]).unwrap();
+        let secp = crate::crypto::PrivateKey::generate_secp256k1();
+        let own = format!("did:key:{}", key.public_key_multibase());
+        use crate::device_key::DidKeyDeviceKeyStore;
+        assert!(DidKeyDeviceKeyStore::for_did_key(&own, &key).is_some());
+        assert!(DidKeyDeviceKeyStore::for_did_key("did:web:bot.example.com", &key).is_none());
+        assert!(DidKeyDeviceKeyStore::for_did_key("did:plc:avharness0", &key).is_none());
+        let others = format!("did:key:{}", other.public_key_multibase());
+        assert!(DidKeyDeviceKeyStore::for_did_key(&others, &key).is_none());
+        let secps = format!("did:key:{}", secp.public_key_multibase());
+        assert!(DidKeyDeviceKeyStore::for_did_key(&secps, &secp).is_none());
+    }
+
+    #[tokio::test]
     async fn load_and_save_get_the_signed_in_did() {
         let store = Arc::new(MemoryStore::default());
         let _conn = connect_once(config_with(Some(store.clone()), None)).await;

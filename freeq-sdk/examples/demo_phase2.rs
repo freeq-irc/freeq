@@ -150,6 +150,9 @@ async fn main() -> Result<()> {
     };
     let did = format!("did:key:{}", private_key.public_key_multibase());
     println!("DID: {did}");
+    // Sign with the key the did:key already is, so the bot keeps one key row.
+    let device_key_store =
+        freeq_sdk::device_key::DidKeyDeviceKeyStore::for_did_key(&did, &private_key);
     let signer = KeySigner::new(did.clone(), private_key);
 
     // Connect
@@ -163,6 +166,7 @@ async fn main() -> Result<()> {
         tls_insecure: false,
         web_token: None,
         websocket_url: None,
+        device_key_store,
         ..Default::default()
     };
     let conn = client::establish_connection(&config).await?;

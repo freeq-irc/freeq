@@ -37,6 +37,9 @@ async fn main() -> anyhow::Result<()> {
 
     let server = std::env::var("IRC_SERVER").unwrap_or_else(|_| "irc.freeq.at:6697".to_string());
 
+    // A did:key bot signs with the key its DID already is, so it keeps one
+    // key row; a did:web identity gets no store and a key per session.
+    let device_key_store = freeq_sdk::device_key::DidKeyDeviceKeyStore::for_did_key(&did, &private_key);
     let config = ConnectConfig {
         server_addr: server,
         nick: "demo-bot".to_string(),
@@ -45,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         tls: true,
         tls_insecure: false,
         web_token: None,
+        device_key_store,
         ..Default::default()
     };
 

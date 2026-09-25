@@ -41,6 +41,60 @@ pub trait DeviceKeyStore: Send + Sync {
     fn save(&self, did: &str, key: &StoredDeviceKey) -> Result<()>;
 }
 
+/// A bot's store: the ed25519 key its did:key names, handed back for every
+/// sign-in, so the bot signs with the one key its DID already is and keeps
+/// one key row on each server. A save is kept in memory for the process's
+/// life. Without an [`Enrollment`] nothing is published.
+///
+/// Twin of bot-kit's `MemoryDeviceKeyStore` over `importDidKeyPair(seed)`.
+pub struct DidKeyDeviceKeyStore {
+    key: std::sync::Mutex<StoredDeviceKey>,
+}
+
+impl DidKeyDeviceKeyStore {
+    /// The store for `key` when `did` is that ed25519 key's own did:key;
+    /// `None` for any other DID or a secp256k1 key.
+    pub fn for_did_key(
+        did: &str,
+        key: &crate::crypto::PrivateKey,
+    ) -> Option<std::sync::Arc<dyn DeviceKeyStore>> {
+        let crate::crypto::PrivateKey::Ed25519(signing) = key else {
+            return None;
+        };
+        if did != format!("did:key:{}", key.public_key_multibase()) {
+            return None;
+        }
+        let stored = StoredDeviceKey {
+            seed: signing.to_bytes(),
+            created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            record_uri: None,
+            refused: false,
+        };
+        Some(std::sync::Arc::new(Self {
+            key: std::sync::Mutex::new(stored),
+        }))
+    }
+}
+
+impl DeviceKeyStore for DidKeyDeviceKeyStore {
+    fn load(&self, _did: &str) -> Result<Option<StoredDeviceKey>> {
+        Ok(Some(
+            self.key
+                .lock()
+                .map_err(|_| anyhow::anyhow!("did:key store poisoned"))?
+                .clone(),
+        ))
+    }
+
+    fn save(&self, _did: &str, key: &StoredDeviceKey) -> Result<()> {
+        *self
+            .key
+            .lock()
+            .map_err(|_| anyhow::anyhow!("did:key store poisoned"))? = key.clone();
+        Ok(())
+    }
+}
+
 /// What publishing a device key came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnrollOutcome {

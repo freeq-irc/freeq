@@ -40,6 +40,9 @@ async fn main() -> Result<()> {
     let key_path = key_dir.join("key.ed25519");
     let private_key = PrivateKey::ed25519_from_bytes(&std::fs::read(&key_path)?)?;
     let did = format!("did:key:{}", private_key.public_key_multibase());
+    // Sign with the key the did:key already is, so the bot keeps one key row.
+    let device_key_store =
+        freeq_sdk::device_key::DidKeyDeviceKeyStore::for_did_key(&did, &private_key);
     let signer = KeySigner::new(did.clone(), private_key);
 
     // Connect
@@ -49,6 +52,7 @@ async fn main() -> Result<()> {
         user: "newsroom".into(),
         realname: "Newsroom Research Agent".into(),
         tls: args.tls,
+        device_key_store,
         ..Default::default()
     };
 

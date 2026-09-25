@@ -387,7 +387,10 @@ async fn main() -> anyhow::Result<()> {
     // 1. Connect as a fresh ephemeral identity.
     let (did, private_key) = ephemeral_identity();
     tracing::info!(%did, nick = %args.nick, "ephemeral probe identity");
-    let conn_config = connect_config(&args.server, &args.nick)?;
+    let mut conn_config = connect_config(&args.server, &args.nick)?;
+    // Sign with the key the did:key already is, so the probe keeps one key row.
+    conn_config.device_key_store =
+        freeq_sdk::device_key::DidKeyDeviceKeyStore::for_did_key(&did, &private_key);
     let signer: Arc<dyn ChallengeSigner> = Arc::new(KeySigner::new(did, private_key));
     let (handle, mut events) = client::connect(conn_config, Some(signer));
 
