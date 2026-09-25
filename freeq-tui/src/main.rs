@@ -1520,11 +1520,17 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
         Event::ServerNotice { text } => {
             // The server refused this device's key. A reconnect would offer
             // the same key, so the next disconnect stays down.
-            if text.starts_with("MSGSIG KEY_RETIRED") {
+            let refused = if text.starts_with("MSGSIG KEY_RETIRED") {
+                Some(crate::app::KEY_RETIRED_LINE)
+            } else if text.starts_with("MSGSIG KEY_EXPIRED") {
+                Some(crate::app::KEY_EXPIRED_LINE)
+            } else {
+                None
+            };
+            if let Some(line) = refused {
                 app.signed_out = true;
                 let active = app.active_buffer.clone();
-                app.buffer_mut(&active)
-                    .push_system(crate::app::KEY_RETIRED_LINE);
+                app.buffer_mut(&active).push_system(line);
                 return;
             }
             // Swallow the failure of a speculative "fetch history on view"
@@ -3572,6 +3578,52 @@ mod tests {
                 .values()
                 .flat_map(|b| b.messages.iter())
                 .all(|l| !l.text.contains("KEY_RETIRED")),
+            "the raw notice is not shown"
+        );
+    }
+
+    /// An expired key reaches the TUI as `MSGSIG KEY_EXPIRED <reason>`. The
+    /// TUI says so with its own line, and stays down.
+    #[tokio::test]
+    async fn an_expired_key_shows_the_expired_line_and_does_not_reconnect() {
+        use freeq_sdk::event::Event;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (handle, _events) = freeq_sdk::client::connect_with_stream(
+            freeq_sdk::client::EstablishedConnection::Plain(stream),
+            freeq_sdk::client::ConnectConfig::default(),
+            None,
+        );
+        let mut app = crate::app::App::new("me", false);
+        app.buffer_mut("#room");
+        app.active_buffer = "#room".to_string();
+        for event in [
+            Event::Registered { nick: "me".into() },
+            Event::ServerNotice {
+                text: "MSGSIG KEY_EXPIRED This device's signing key has expired. Sign in again to continue.".into(),
+            },
+            Event::Disconnected {
+                reason: "Signing key expired".into(),
+            },
+        ] {
+            super::process_irc_event(&mut app, event, &handle);
+        }
+
+        assert!(!app.reconnect_pending, "no reconnect is scheduled");
+        let room = &app.buffers["#room"];
+        assert_eq!(
+            room.messages.back().map(|l| l.text.as_str()),
+            Some(
+                "This device's signing key has expired. Restart freeq-tui with --reauth to sign in again."
+            )
+        );
+        assert!(
+            app.buffers
+                .values()
+                .flat_map(|b| b.messages.iter())
+                .all(|l| !l.text.contains("KEY_EXPIRED")),
             "the raw notice is not shown"
         );
     }

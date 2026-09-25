@@ -590,6 +590,11 @@ pub const KEY_UNPUBLISHED_LINE: &str = "Your signing key is not published to you
 /// account signed the device out.
 pub const KEY_RETIRED_LINE: &str = "This device was signed out from another device. Restart freeq-tui with --reauth to sign in again.";
 
+/// What the TUI shows when the server refuses this device's key because it
+/// has expired. Only a fresh sign-in replaces it.
+pub const KEY_EXPIRED_LINE: &str =
+    "This device's signing key has expired. Restart freeq-tui with --reauth to sign in again.";
+
 pub struct App {
     /// Per-channel E2EE keys, keyed by lowercase channel name.
     /// Derived from passphrase via HKDF-SHA256.
