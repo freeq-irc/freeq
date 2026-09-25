@@ -279,6 +279,38 @@ pub fn kick_sessions(
     nicks.into_iter().map(|(_, n)| n).collect()
 }
 
+/// Ban `did` from `channel` by DID: in memory, on disk, and announced to the
+/// live members as `MODE +b` so every client's ban list agrees with the
+/// server's. Returns whether the ban is new; an existing ban is left alone
+/// and nothing is announced twice.
+///
+/// This is what makes removal from a room stick. Taking a DID off the
+/// roster is not enough on its own — a still-valid invite would readmit it
+/// — and revoking every invite to stop one person would punish everyone
+/// else holding the link. KICK and the REST "remove member" call both come
+/// here. The caller decides who may be banned; the founder never is, since
+/// a founder bypasses bans and the ban would not hold.
+pub fn ban_did(state: &SharedState, channel: &str, did: &str, set_by: &str) -> bool {
+    let ban = crate::server::BanEntry::new(did.to_string(), set_by.to_string());
+    let audience: Vec<String> = {
+        let mut channels = state.channels.lock();
+        match channels.get_mut(channel) {
+            Some(ch) if !ch.bans.iter().any(|b| b.mask == did) => {
+                ch.bans.push(ban.clone());
+                ch.members.iter().cloned().collect()
+            }
+            _ => return false,
+        }
+    };
+    let (c, b) = (channel.to_string(), ban);
+    state.with_db(move |db| db.add_ban(&c, &b));
+    let line = format!(":{} MODE {channel} +b {did}\r\n", state.server_name);
+    for sid in &audience {
+        send_to_session(state, sid, &line);
+    }
+    true
+}
+
 /// Delete a room completely: kick the live members, drop the channel from
 /// memory, and remove every row it owned. The messages are ciphertext and
 /// the sealed keys go with them, so after this nothing can be recovered.
@@ -301,6 +333,10 @@ pub fn delete_room(state: &SharedState, channel: &str, reason: &str) {
         db.delete_group_keys(&c)?;
         db.delete_pins(&c)?;
         db.delete_user_channel_rows(&c)?;
+        // The event log holds a row per message too (hash + signature).
+        // Cleared before the `rooms` row goes, because that row is what
+        // keeps these events out of a federated replay in the meantime.
+        db.delete_events_for_venue(&c)?;
         db.delete_room(&c)
     });
     tracing::info!(channel = %channel, reason, "room deleted");
@@ -520,6 +556,23 @@ mod sweeper_tests {
         let state = state();
         let name = "#r-old-a-a";
         room(&state, name, 1000, 2000, &[F, M]);
+        // The fixture's message was logged as an event under the room's
+        // venue; a message elsewhere must survive the room's deletion.
+        let room_msgid = format!("01{}", name.len());
+        state
+            .with_db(|db| {
+                assert!(db.get_event(&room_msgid)?.is_some(), "logged");
+                db.insert_message(
+                    "#public",
+                    "p!p@h",
+                    "stays",
+                    1500,
+                    &HashMap::new(),
+                    Some("01PUBLIC"),
+                    Some(M),
+                )
+            })
+            .unwrap();
         assert_eq!(sweep_once(&state, 2001).deleted, vec![name.to_string()]);
         assert!(!has_room(&state, name));
         state
@@ -531,6 +584,15 @@ mod sweeper_tests {
                 assert!(db.get_messages(name, 10, None)?.is_empty());
                 assert!(db.get_pins(name)?.is_empty());
                 assert!(db.get_user_channels(F)?.is_empty());
+                assert!(db.get_event(&room_msgid)?.is_none(), "unlogged");
+                assert!(
+                    db.events_since(0, 100)?.iter().all(|e| e.venue != name),
+                    "no event of the room is left in the log"
+                );
+                assert!(
+                    db.get_event("01PUBLIC")?.is_some(),
+                    "another venue's log row is untouched"
+                );
                 Ok(())
             })
             .unwrap();
@@ -611,5 +673,48 @@ mod sweeper_tests {
             format!(":{} KICK {name} mem :Room expired\r\n", state.server_name)
         );
         assert!(!state.channels.lock().contains_key(name));
+    }
+
+    /// `ban_did` is the one place a removal becomes a ban: it lands in
+    /// memory, on disk, and on the wire as `MODE +b`, exactly once.
+    #[test]
+    fn banning_a_did_is_in_memory_on_disk_and_announced_once() {
+        let state = state();
+        let name = "#r-ban-a-a";
+        room(&state, name, 1000, 500_000, &[F, M]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+        state.connections.lock().insert("s-f".into(), tx);
+        state.nick_to_session.lock().insert("founder", "s-f");
+        state
+            .channels
+            .lock()
+            .get_mut(name)
+            .unwrap()
+            .members
+            .insert("s-f".into());
+
+        assert!(ban_did(&state, name, M, F), "new ban");
+        let ch = state.channels.lock().get(name).cloned().unwrap();
+        assert!(
+            ch.bans.iter().any(|b| b.mask == M && b.set_by == F),
+            "in memory, attributed to the setter"
+        );
+        assert!(
+            ch.is_banned("mem!m@h", Some(M)),
+            "and it matches the DID, not a hostmask"
+        );
+        let persisted = state.with_db(|db| db.load_channels()).unwrap();
+        assert!(
+            persisted[name].bans.iter().any(|b| b.mask == M),
+            "on disk, so a restart keeps it"
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            format!(":{} MODE {name} +b {M}\r\n", state.server_name)
+        );
+
+        assert!(!ban_did(&state, name, M, F), "already banned");
+        assert!(rx.try_recv().is_err(), "nothing announced twice");
+        assert!(!ban_did(&state, "#r-none-a-a", M, F), "no such room");
     }
 }
