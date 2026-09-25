@@ -37,7 +37,12 @@ class AndroidDeviceKeyStore(private val prefs: SharedPreferences) : DeviceKeySto
             android.util.Log.w("freeq.devicekey", "stored seed unreadable, minting a new key", e)
             return null
         }
-        return StoredDeviceKey(seed, createdAt, prefs.getString(RECORD_URI, null))
+        return StoredDeviceKey(
+            seed,
+            createdAt,
+            prefs.getString(RECORD_URI, null),
+            prefs.getBoolean(REFUSED, false),
+        )
     }
 
     override fun save(key: StoredDeviceKey) {
@@ -45,6 +50,7 @@ class AndroidDeviceKeyStore(private val prefs: SharedPreferences) : DeviceKeySto
             .putString(SEED, wrap(key.seed))
             .putString(CREATED_AT, key.createdAt)
         if (key.recordUri != null) edit.putString(RECORD_URI, key.recordUri) else edit.remove(RECORD_URI)
+        if (key.refused) edit.putBoolean(REFUSED, true) else edit.remove(REFUSED)
         edit.apply()
     }
 
@@ -90,6 +96,7 @@ class AndroidDeviceKeyStore(private val prefs: SharedPreferences) : DeviceKeySto
         const val SEED = "deviceKeySeed"
         const val CREATED_AT = "deviceKeyCreatedAt"
         const val RECORD_URI = "deviceKeyRecordUri"
+        const val REFUSED = "deviceKeyRefused"
     }
 }
 

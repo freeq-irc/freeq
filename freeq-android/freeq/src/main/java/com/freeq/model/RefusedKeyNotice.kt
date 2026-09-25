@@ -2,8 +2,10 @@ package com.freeq.model
 
 /**
  * Classifies the server notice that refuses this device's signing key
- * (FAIL MSGSIG KEY_RETIRED, which the FFI hands on as `MSGSIG KEY_RETIRED
- * <reason>`) and says what follows.
+ * (FAIL MSGSIG KEY_RETIRED or KEY_EXPIRED, which the FFI hands on as
+ * `MSGSIG KEY_RETIRED <reason>`) and says what follows. Either way the saved
+ * login goes: a reconnect on it is not a fresh sign-in, so it would present
+ * the same key, and only a fresh sign-in replaces an expired one.
  *
  * Lives outside `AppState` so the rule can be unit-tested without an
  * Android runtime; the notice handler only applies the result. Mirrors the
@@ -20,10 +22,15 @@ internal object RefusedKeyNotice {
     )
 
     const val LINE = "This device was signed out from another device. Sign in again to continue."
+    const val EXPIRED_LINE = "This device's signing key has expired. Sign in again to continue."
 
     /** The refusal a notice carries; null for any other notice. */
     fun parse(text: String): Refusal? {
-        if (!text.startsWith("MSGSIG KEY_RETIRED")) return null
-        return Refusal(line = LINE, clearsSavedLogin = true, schedulesReconnect = false)
+        val line = when {
+            text.startsWith("MSGSIG KEY_RETIRED") -> LINE
+            text.startsWith("MSGSIG KEY_EXPIRED") -> EXPIRED_LINE
+            else -> return null
+        }
+        return Refusal(line = line, clearsSavedLogin = true, schedulesReconnect = false)
     }
 }
