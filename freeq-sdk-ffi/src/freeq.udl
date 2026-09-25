@@ -98,13 +98,14 @@ dictionary StoredDeviceKey {
     boolean refused = false;
 };
 
-// Where the app keeps this device's signing key between connects.
+// Where the app keeps this device's signing keys between connects: one per
+// account, named by the signed-in DID. Read only once SASL names the account.
 callback interface DeviceKeyStore {
     [Throws=FreeqError]
-    StoredDeviceKey? load();
+    StoredDeviceKey? load(string did);
 
     [Throws=FreeqError]
-    void save(StoredDeviceKey key);
+    void save(string did, StoredDeviceKey key);
 };
 
 // Where the app keeps the key lookup's cache between launches, one JSON

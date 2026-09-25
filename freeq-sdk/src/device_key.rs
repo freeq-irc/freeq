@@ -31,12 +31,14 @@ pub struct StoredDeviceKey {
     pub refused: bool,
 }
 
-/// Where a device keeps its signing key between connects.
+/// Where a device keeps its signing keys between connects: one per account,
+/// named by the signed-in DID. The client reads it only once SASL has named
+/// the account.
 pub trait DeviceKeyStore: Send + Sync {
-    /// The stored key, or `None` when the device has none yet.
-    fn load(&self) -> Result<Option<StoredDeviceKey>>;
-    /// Replace the stored key.
-    fn save(&self, key: &StoredDeviceKey) -> Result<()>;
+    /// `did`'s key on this device, or `None` when it has none yet.
+    fn load(&self, did: &str) -> Result<Option<StoredDeviceKey>>;
+    /// Replace `did`'s key on this device.
+    fn save(&self, did: &str, key: &StoredDeviceKey) -> Result<()>;
 }
 
 /// What publishing a device key came to.
@@ -73,7 +75,9 @@ struct KeyFile {
     refused: bool,
 }
 
-/// A [`DeviceKeyStore`] in one JSON file, readable by its owner only.
+/// A [`DeviceKeyStore`] in one JSON file, readable by its owner only. The
+/// file holds one key, whatever DID asks: its owner gives each sign-in its
+/// own path.
 pub struct FileDeviceKeyStore {
     path: PathBuf,
 }
@@ -85,7 +89,7 @@ impl FileDeviceKeyStore {
 }
 
 impl DeviceKeyStore for FileDeviceKeyStore {
-    fn load(&self) -> Result<Option<StoredDeviceKey>> {
+    fn load(&self, _did: &str) -> Result<Option<StoredDeviceKey>> {
         let text = match std::fs::read_to_string(&self.path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -105,7 +109,7 @@ impl DeviceKeyStore for FileDeviceKeyStore {
         }))
     }
 
-    fn save(&self, key: &StoredDeviceKey) -> Result<()> {
+    fn save(&self, _did: &str, key: &StoredDeviceKey) -> Result<()> {
         let json = serde_json::to_string_pretty(&KeyFile {
             seed: URL_SAFE_NO_PAD.encode(key.seed),
             created_at: key.created_at.clone(),
@@ -138,6 +142,8 @@ impl DeviceKeyStore for FileDeviceKeyStore {
 mod tests {
     use super::*;
 
+    const DID: &str = "did:plc:alice";
+
     fn temp_path(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("freeq-device-key-{}-{}", std::process::id(), name));
@@ -148,7 +154,7 @@ mod tests {
     #[test]
     fn a_missing_file_holds_no_key() {
         let store = FileDeviceKeyStore::new(temp_path("missing"));
-        assert_eq!(store.load().unwrap(), None);
+        assert_eq!(store.load(DID).unwrap(), None);
     }
 
     #[test]
@@ -161,16 +167,16 @@ mod tests {
             record_uri: None,
             refused: false,
         };
-        store.save(&key).unwrap();
-        assert_eq!(store.load().unwrap(), Some(key.clone()));
+        store.save(DID, &key).unwrap();
+        assert_eq!(store.load(DID).unwrap(), Some(key.clone()));
 
         let published = StoredDeviceKey {
             record_uri: Some("at://did:plc:alice/at.freeq.deviceKey/3k".to_string()),
             ..key
         };
-        store.save(&published).unwrap();
+        store.save(DID, &published).unwrap();
         assert_eq!(
-            FileDeviceKeyStore::new(&path).load().unwrap(),
+            FileDeviceKeyStore::new(&path).load(DID).unwrap(),
             Some(published)
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
@@ -187,24 +193,30 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let store = FileDeviceKeyStore::new(&path);
         store
-            .save(&StoredDeviceKey {
-                seed: [1; 32],
-                created_at: "2026-09-11T10:00:00.000Z".to_string(),
-                record_uri: None,
-                refused: false,
-            })
+            .save(
+                DID,
+                &StoredDeviceKey {
+                    seed: [1; 32],
+                    created_at: "2026-09-11T10:00:00.000Z".to_string(),
+                    record_uri: None,
+                    refused: false,
+                },
+            )
             .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
 
         let fresh = temp_path("mode-fresh");
         FileDeviceKeyStore::new(&fresh)
-            .save(&StoredDeviceKey {
-                seed: [2; 32],
-                created_at: "2026-09-11T10:00:00.000Z".to_string(),
-                record_uri: None,
-                refused: false,
-            })
+            .save(
+                DID,
+                &StoredDeviceKey {
+                    seed: [2; 32],
+                    created_at: "2026-09-11T10:00:00.000Z".to_string(),
+                    record_uri: None,
+                    refused: false,
+                },
+            )
             .unwrap();
         let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
@@ -221,7 +233,7 @@ mod tests {
             r#"{"seed":"AAAA","created_at":"2026-09-11T10:00:00.000Z"}"#,
         )
         .unwrap();
-        assert!(FileDeviceKeyStore::new(&path).load().is_err());
+        assert!(FileDeviceKeyStore::new(&path).load(DID).is_err());
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
@@ -235,8 +247,8 @@ mod tests {
             record_uri: Some("at://did:plc:alice/at.freeq.deviceKey/3k".to_string()),
             refused: true,
         };
-        store.save(&key).unwrap();
-        assert_eq!(FileDeviceKeyStore::new(&path).load().unwrap(), Some(key));
+        store.save(DID, &key).unwrap();
+        assert_eq!(FileDeviceKeyStore::new(&path).load(DID).unwrap(), Some(key));
     }
 
     #[test]
@@ -251,7 +263,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let loaded = FileDeviceKeyStore::new(&path).load().unwrap().unwrap();
+        let loaded = FileDeviceKeyStore::new(&path).load(DID).unwrap().unwrap();
         assert!(!loaded.refused);
         assert_eq!(loaded.seed, [4; 32]);
     }

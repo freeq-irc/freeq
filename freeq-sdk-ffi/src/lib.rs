@@ -288,8 +288,8 @@ pub struct EnrollResult {
 
 /// Where the app keeps this device's signing key between connects.
 pub trait DeviceKeyStore: Send + Sync + 'static {
-    fn load(&self) -> Result<Option<StoredDeviceKey>, FreeqError>;
-    fn save(&self, key: StoredDeviceKey) -> Result<(), FreeqError>;
+    fn load(&self, did: String) -> Result<Option<StoredDeviceKey>, FreeqError>;
+    fn save(&self, did: String, key: StoredDeviceKey) -> Result<(), FreeqError>;
 }
 
 /// Writes a device key record to the account.
@@ -603,8 +603,12 @@ pub trait EventHandler: Send + Sync + 'static {
 struct StoreAdapter(Arc<dyn DeviceKeyStore>);
 
 impl freeq_sdk::device_key::DeviceKeyStore for StoreAdapter {
-    fn load(&self) -> anyhow::Result<Option<freeq_sdk::device_key::StoredDeviceKey>> {
-        let Some(stored) = self.0.load().map_err(|e| anyhow::anyhow!("{e}"))? else {
+    fn load(&self, did: &str) -> anyhow::Result<Option<freeq_sdk::device_key::StoredDeviceKey>> {
+        let Some(stored) = self
+            .0
+            .load(did.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+        else {
             return Ok(None);
         };
         let seed: [u8; 32] = stored
@@ -619,14 +623,17 @@ impl freeq_sdk::device_key::DeviceKeyStore for StoreAdapter {
         }))
     }
 
-    fn save(&self, key: &freeq_sdk::device_key::StoredDeviceKey) -> anyhow::Result<()> {
+    fn save(&self, did: &str, key: &freeq_sdk::device_key::StoredDeviceKey) -> anyhow::Result<()> {
         self.0
-            .save(StoredDeviceKey {
-                seed: key.seed.to_vec(),
-                created_at: key.created_at.clone(),
-                record_uri: key.record_uri.clone(),
-                refused: key.refused,
-            })
+            .save(
+                did.to_string(),
+                StoredDeviceKey {
+                    seed: key.seed.to_vec(),
+                    created_at: key.created_at.clone(),
+                    record_uri: key.record_uri.clone(),
+                    refused: key.refused,
+                },
+            )
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
@@ -3645,17 +3652,23 @@ mod tests {
 
     // ── the device key store, the enrollment and the verdict ──
 
+    const ALICE: &str = "did:plc:alice";
+
     /// A store the app supplies, and what it was asked to save.
     struct AppStore {
         key: Mutex<Option<StoredDeviceKey>>,
         saves: Mutex<Vec<StoredDeviceKey>>,
+        /// The DID each load and save named.
+        dids: Mutex<Vec<String>>,
     }
 
     impl DeviceKeyStore for AppStore {
-        fn load(&self) -> Result<Option<StoredDeviceKey>, FreeqError> {
+        fn load(&self, did: String) -> Result<Option<StoredDeviceKey>, FreeqError> {
+            self.dids.lock().unwrap().push(did);
             Ok(self.key.lock().unwrap().clone())
         }
-        fn save(&self, key: StoredDeviceKey) -> Result<(), FreeqError> {
+        fn save(&self, did: String, key: StoredDeviceKey) -> Result<(), FreeqError> {
+            self.dids.lock().unwrap().push(did);
             *self.key.lock().unwrap() = Some(key.clone());
             self.saves.lock().unwrap().push(key);
             Ok(())
@@ -3675,19 +3688,28 @@ mod tests {
                 refused: false,
             })),
             saves: Mutex::new(Vec::new()),
+            dids: Mutex::new(Vec::new()),
         });
         let adapter = StoreAdapter(app.clone());
-        let loaded = adapter.load().unwrap().expect("the app holds a key");
+        let loaded = adapter.load(ALICE).unwrap().expect("the app holds a key");
         assert_eq!(loaded.seed, [7u8; 32]);
         assert_eq!(loaded.created_at, "2026-09-11T10:00:00.000Z");
         assert_eq!(loaded.record_uri, None);
 
         adapter
-            .save(&freeq_sdk::device_key::StoredDeviceKey {
-                record_uri: Some("at://did:plc:alice/at.freeq.deviceKey/3k".to_string()),
-                ..loaded
-            })
+            .save(
+                ALICE,
+                &freeq_sdk::device_key::StoredDeviceKey {
+                    record_uri: Some("at://did:plc:alice/at.freeq.deviceKey/3k".to_string()),
+                    ..loaded
+                },
+            )
             .unwrap();
+        assert_eq!(
+            *app.dids.lock().unwrap(),
+            vec![ALICE.to_string(), ALICE.to_string()],
+            "the account crosses with each call"
+        );
         let saves = app.saves.lock().unwrap().clone();
         assert_eq!(saves.len(), 1);
         assert_eq!(saves[0].seed, vec![7u8; 32]);
@@ -3709,17 +3731,21 @@ mod tests {
                 refused: true,
             })),
             saves: Mutex::new(Vec::new()),
+            dids: Mutex::new(Vec::new()),
         });
         let adapter = StoreAdapter(app.clone());
-        let loaded = adapter.load().unwrap().expect("the app holds a key");
+        let loaded = adapter.load(ALICE).unwrap().expect("the app holds a key");
         assert!(loaded.refused);
         adapter
-            .save(&freeq_sdk::device_key::StoredDeviceKey {
-                refused: false,
-                ..loaded.clone()
-            })
+            .save(
+                ALICE,
+                &freeq_sdk::device_key::StoredDeviceKey {
+                    refused: false,
+                    ..loaded.clone()
+                },
+            )
             .unwrap();
-        adapter.save(&loaded).unwrap();
+        adapter.save(ALICE, &loaded).unwrap();
         let saves: Vec<bool> = app
             .saves
             .lock()
@@ -3742,8 +3768,9 @@ mod tests {
                 refused: false,
             })),
             saves: Mutex::new(Vec::new()),
+            dids: Mutex::new(Vec::new()),
         });
-        assert!(StoreAdapter(app).load().is_err());
+        assert!(StoreAdapter(app).load(ALICE).is_err());
     }
 
     struct AppEnrollment {

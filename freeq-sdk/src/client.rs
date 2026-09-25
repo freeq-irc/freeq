@@ -2141,6 +2141,7 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
 /// no stored copy.
 fn session_signing_key(
     store: Option<&dyn crate::device_key::DeviceKeyStore>,
+    did: &str,
 ) -> (
     ed25519_dalek::SigningKey,
     Option<crate::device_key::StoredDeviceKey>,
@@ -2149,7 +2150,7 @@ fn session_signing_key(
     let Some(store) = store else {
         return (fresh(), None);
     };
-    let stored = match store.load() {
+    let stored = match store.load(did) {
         Ok(Some(stored)) => stored,
         Ok(None) => {
             let key = fresh();
@@ -2159,7 +2160,7 @@ fn session_signing_key(
                 record_uri: None,
                 refused: false,
             };
-            if let Err(e) = store.save(&stored) {
+            if let Err(e) = store.save(did, &stored) {
                 tracing::warn!(error = %e, "device key not saved; signing with a session key");
                 return (key, None);
             }
@@ -2226,7 +2227,7 @@ async fn replace_retired_device_key<P: freeq_oauth::ClientProvider>(
     let (true, Some(store)) = (fresh_sign_in, store) else {
         return;
     };
-    let Ok(Some(stored)) = store.load() else {
+    let Ok(Some(stored)) = store.load(did) else {
         return;
     };
     // Refused by the server as expired, or past its lifetime by its own
@@ -2234,7 +2235,7 @@ async fn replace_retired_device_key<P: freeq_oauth::ClientProvider>(
     // server with a shorter lifetime, or a clock ahead of this one, still
     // converge.
     if stored.refused || past_key_lifetime(&stored.created_at) {
-        save_replacement(store);
+        save_replacement(store, did);
         return;
     }
     let kid = crate::sigtag::derive_kid(
@@ -2252,13 +2253,13 @@ async fn replace_retired_device_key<P: freeq_oauth::ClientProvider>(
         .iter()
         .any(|k| k.kid == kid && k.retired_at.is_some_and(|r| r <= now));
     if retired {
-        save_replacement(store);
+        save_replacement(store, did);
     }
 }
 
 /// Save a new key in place of the stored one, with no record URI, so this
 /// connect presents and publishes it. A store that fails keeps the old key.
-fn save_replacement(store: &dyn crate::device_key::DeviceKeyStore) {
+fn save_replacement(store: &dyn crate::device_key::DeviceKeyStore, did: &str) {
     let key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
     let replacement = crate::device_key::StoredDeviceKey {
         seed: key.to_bytes(),
@@ -2266,7 +2267,7 @@ fn save_replacement(store: &dyn crate::device_key::DeviceKeyStore) {
         record_uri: None,
         refused: false,
     };
-    if let Err(e) = store.save(&replacement) {
+    if let Err(e) = store.save(did, &replacement) {
         tracing::warn!(error = %e, "replacement device key not saved; keeping the old one");
     }
 }
@@ -2277,18 +2278,19 @@ fn save_replacement(store: &dyn crate::device_key::DeviceKeyStore) {
 /// was.
 fn mark_device_key_refused(
     store: Option<&dyn crate::device_key::DeviceKeyStore>,
+    did: Option<&str>,
     presented: Option<[u8; 32]>,
 ) {
-    let (Some(store), Some(presented)) = (store, presented) else {
+    let (Some(store), Some(did), Some(presented)) = (store, did, presented) else {
         return;
     };
-    match store.load() {
+    match store.load(did) {
         Ok(Some(stored)) if stored.seed == presented && !stored.refused => {
             let refused = crate::device_key::StoredDeviceKey {
                 refused: true,
                 ..stored
             };
-            if let Err(e) = store.save(&refused) {
+            if let Err(e) = store.save(did, &refused) {
                 tracing::warn!(error = %e, "the refused device key could not be marked");
             }
         }
@@ -2813,13 +2815,13 @@ fn spawn_enrollment(
                 // Read again: a refusal may have marked the key meanwhile,
                 // and a key replaced meanwhile must not take this key's URI,
                 // or it would read as published.
-                match store.load() {
+                match store.load(&did) {
                     Ok(Some(current)) if current.seed == stored.seed => {
                         let published = crate::device_key::StoredDeviceKey {
                             record_uri: Some(uri),
                             ..current
                         };
-                        if let Err(e) = store.save(&published) {
+                        if let Err(e) = store.save(&did, &published) {
                             tracing::warn!(error = %e, "published device key not saved");
                         }
                     }
@@ -3101,7 +3103,7 @@ where
                                     }
                                 }
                                 let (key, stored) =
-                                    session_signing_key(config.device_key_store.as_deref());
+                                    session_signing_key(config.device_key_store.as_deref(), &did);
                                 presented_seed = stored.as_ref().map(|s| s.seed);
                                 if config.enrollment.is_some() {
                                     pending_enrollment =
@@ -3771,6 +3773,7 @@ where
                             {
                                 mark_device_key_refused(
                                     config.device_key_store.as_deref(),
+                                    msg_signing_did.as_deref(),
                                     presented_seed,
                                 );
                             }
@@ -9257,6 +9260,8 @@ mod device_key_tests {
     struct MemoryStore {
         key: parking_lot::Mutex<Option<StoredDeviceKey>>,
         saves: parking_lot::Mutex<Vec<StoredDeviceKey>>,
+        /// The DID each load and save named.
+        dids: parking_lot::Mutex<Vec<String>>,
     }
 
     impl MemoryStore {
@@ -9269,15 +9274,18 @@ mod device_key_tests {
                     refused: false,
                 })),
                 saves: Default::default(),
+                dids: Default::default(),
             })
         }
     }
 
     impl DeviceKeyStore for MemoryStore {
-        fn load(&self) -> anyhow::Result<Option<StoredDeviceKey>> {
+        fn load(&self, did: &str) -> anyhow::Result<Option<StoredDeviceKey>> {
+            self.dids.lock().push(did.to_string());
             Ok(self.key.lock().clone())
         }
-        fn save(&self, key: &StoredDeviceKey) -> anyhow::Result<()> {
+        fn save(&self, did: &str, key: &StoredDeviceKey) -> anyhow::Result<()> {
+            self.dids.lock().push(did.to_string());
             *self.key.lock() = Some(key.clone());
             self.saves.lock().push(key.clone());
             Ok(())
@@ -9338,6 +9346,11 @@ mod device_key_tests {
     /// loopback socket, against a server that verifies documents:
     /// everything the client wrote and every event it sent.
     async fn connect_once(config: ConnectConfig) -> Connection {
+        connect_as(config, "did:plc:tester").await
+    }
+
+    /// `connect_once`, signed in as `did`.
+    async fn connect_as(config: ConnectConfig, did: &str) -> Connection {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client_side = TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -9350,7 +9363,7 @@ mod device_key_tests {
         for line in [
             format!(":srv CAP * LS :{caps}"),
             format!(":srv CAP * ACK :{caps}"),
-            ":srv 900 tester :You are now logged in as did:plc:tester".to_string(),
+            format!(":srv 900 tester :You are now logged in as {did}"),
             ":srv 903 tester :SASL authentication successful".to_string(),
             ":srv 001 tester :Welcome".to_string(),
         ] {
@@ -9640,6 +9653,92 @@ mod device_key_tests {
         );
     }
 
+    #[tokio::test]
+    async fn load_and_save_get_the_signed_in_did() {
+        let store = Arc::new(MemoryStore::default());
+        let _conn = connect_once(config_with(Some(store.clone()), None)).await;
+        let dids = store.dids.lock().clone();
+        assert!(!dids.is_empty(), "the store was read and written");
+        assert!(
+            dids.iter().all(|d| d == "did:plc:tester"),
+            "every call names the account: {dids:?}"
+        );
+    }
+
+    /// A store keeping one key per account, as the apps do.
+    #[derive(Default)]
+    struct PerAccountStore {
+        keys: parking_lot::Mutex<HashMap<String, StoredDeviceKey>>,
+    }
+
+    impl DeviceKeyStore for PerAccountStore {
+        fn load(&self, did: &str) -> anyhow::Result<Option<StoredDeviceKey>> {
+            Ok(self.keys.lock().get(did).cloned())
+        }
+        fn save(&self, did: &str, key: &StoredDeviceKey) -> anyhow::Result<()> {
+            self.keys.lock().insert(did.to_string(), key.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn two_accounts_on_one_store_get_two_keys() {
+        let store = Arc::new(PerAccountStore::default());
+        let config = || ConnectConfig {
+            device_key_store: Some(store.clone() as Arc<dyn DeviceKeyStore>),
+            ..config_with(None, None)
+        };
+        let alice = connect_as(config(), "did:plc:alice").await;
+        let bob = connect_as(config(), "did:plc:bob").await;
+        let alice_again = connect_as(config(), "did:plc:alice").await;
+        assert_ne!(alice.msgsig(), bob.msgsig(), "a key per account");
+        assert_eq!(alice_again.msgsig(), alice.msgsig(), "each kept");
+        assert_eq!(store.keys.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reads_no_store_before_sasl_names_the_account() {
+        let store = Arc::new(MemoryStore::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_side = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let (_handle, _events) = connect_with_stream(
+            EstablishedConnection::Plain(client_side),
+            config_with(Some(store.clone()), None),
+            None,
+        );
+        let caps = format!("sasl message-tags server-time {MSGSIG_CAP}");
+        for line in [
+            format!(":srv CAP * LS :{caps}"),
+            format!(":srv CAP * ACK :{caps}"),
+            ":srv 900 tester :You are now logged in as did:plc:tester".to_string(),
+        ] {
+            server
+                .write_all(format!("{line}\r\n").as_bytes())
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(store.dids.lock().is_empty(), "nothing read before 903");
+        server
+            .write_all(b":srv 903 tester :SASL authentication successful\r\n")
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if !store.dids.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            store.dids.lock().first().map(String::as_str),
+            Some("did:plc:tester")
+        );
+    }
+
     const EXPIRED: &str = ":srv FAIL MSGSIG KEY_EXPIRED :This device's signing key has expired. Sign in again to continue.";
 
     /// A registered connection kept open: the server's side of the socket,
@@ -9725,14 +9824,14 @@ mod device_key_tests {
     }
 
     impl DeviceKeyStore for FailingFirstLoad {
-        fn load(&self) -> anyhow::Result<Option<StoredDeviceKey>> {
+        fn load(&self, did: &str) -> anyhow::Result<Option<StoredDeviceKey>> {
             if self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 anyhow::bail!("store unavailable");
             }
-            self.inner.load()
+            self.inner.load(did)
         }
-        fn save(&self, key: &StoredDeviceKey) -> anyhow::Result<()> {
-            self.inner.save(key)
+        fn save(&self, did: &str, key: &StoredDeviceKey) -> anyhow::Result<()> {
+            self.inner.save(did, key)
         }
     }
 
