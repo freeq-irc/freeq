@@ -1,7 +1,8 @@
 import Foundation
 import os.log
 
-/// This device's signing key, and the way it reaches the account.
+/// This device's signing keys, one per account, and the way each reaches its
+/// account. Sign-out keeps each account's key.
 ///
 /// The key is one 32-byte seed that outlives a session, so messages from this
 /// device keep signing with the same key and a reader can learn it once. It
@@ -9,15 +10,16 @@ import os.log
 /// after-first-unlock accessibility, and never syncs off the device.
 final class KeychainDeviceKeyStore: DeviceKeyStore {
 
-    private static let seedKey = "deviceKeySeed"
-    private static let createdAtKey = "deviceKeyCreatedAt"
-    private static let recordUriKey = "deviceKeyRecordUri"
-    private static let refusedKey = "deviceKeyRefused"
     private static let log = Logger(subsystem: "at.freeq.ios", category: "devicekey")
 
-    func load() throws -> StoredDeviceKey? {
-        guard let encoded = KeychainHelper.load(key: Self.seedKey),
-              let createdAt = KeychainHelper.load(key: Self.createdAtKey)
+    init() {
+        Self.dropLegacy()
+    }
+
+    func load(did: String) throws -> StoredDeviceKey? {
+        let names = DeviceKeyNames(did: did)
+        guard let encoded = KeychainHelper.load(key: names.seed),
+              let createdAt = KeychainHelper.load(key: names.createdAt)
         else { return nil }
         // An unreadable seed is a key this device no longer has: say so and
         // let the SDK mint a fresh one rather than failing the connect.
@@ -28,28 +30,41 @@ final class KeychainDeviceKeyStore: DeviceKeyStore {
         return StoredDeviceKey(
             seed: seed,
             createdAt: createdAt,
-            recordUri: KeychainHelper.load(key: Self.recordUriKey),
-            refused: KeychainHelper.load(key: Self.refusedKey) != nil
+            recordUri: KeychainHelper.load(key: names.recordUri),
+            refused: KeychainHelper.load(key: names.refused) != nil
         )
     }
 
-    func save(key: StoredDeviceKey) throws {
-        KeychainHelper.save(key: Self.seedKey, value: key.seed.base64EncodedString())
-        KeychainHelper.save(key: Self.createdAtKey, value: key.createdAt)
+    func save(did: String, key: StoredDeviceKey) throws {
+        let names = DeviceKeyNames(did: did)
+        KeychainHelper.save(key: names.seed, value: key.seed.base64EncodedString())
+        KeychainHelper.save(key: names.createdAt, value: key.createdAt)
         if let uri = key.recordUri {
-            KeychainHelper.save(key: Self.recordUriKey, value: uri)
+            KeychainHelper.save(key: names.recordUri, value: uri)
         } else {
-            KeychainHelper.delete(key: Self.recordUriKey)
+            KeychainHelper.delete(key: names.recordUri)
         }
         if key.refused {
-            KeychainHelper.save(key: Self.refusedKey, value: "1")
+            KeychainHelper.save(key: names.refused, value: "1")
         } else {
-            KeychainHelper.delete(key: Self.refusedKey)
+            KeychainHelper.delete(key: names.refused)
         }
     }
 
-    /// Whether the key this device holds is published to the account.
-    var isPublished: Bool { KeychainHelper.load(key: Self.recordUriKey) != nil }
+    /// Whether the key this device holds for `did` is published to that
+    /// account.
+    func isPublished(did: String) -> Bool {
+        KeychainHelper.load(key: DeviceKeyNames(did: did).recordUri) != nil
+    }
+
+    /// The key every account shared before keys were kept per account: every
+    /// account that signed in here signed with it, so it is thrown away, and
+    /// each account makes its own at its next connect.
+    private static func dropLegacy() {
+        for name in DeviceKeyNames.legacy where KeychainHelper.load(key: name) != nil {
+            KeychainHelper.delete(key: name)
+        }
+    }
 }
 
 /// The FFI's word for what `EnrollAnswer` decided.

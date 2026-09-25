@@ -1901,9 +1901,6 @@ class AppState: ObservableObject {
             try client?.setKeyLookupStore(store: FileKeyLookupStore())
             try client?.setVerifySignatures(on: true)
             if freshSignIn { try client?.setFreshSignIn(fresh: true) }
-            // A key that made it to the account clears the dot; nothing else
-            // does, so a refusal stays visible until it is fixed.
-            if deviceKeyStore.isPublished { signingKeyUnpublished = false }
 
             try client?.connect()
             print("[freeq.connect] client?.connect() returned")
@@ -2970,6 +2967,10 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
         case .authenticated(let did):
             state.webTokenRefused = false
             state.authenticatedDID = did
+            // This account's key made it to the account: the dot clears.
+            // Nothing else clears it, so a refusal stays visible until it is
+            // fixed.
+            if state.deviceKeyStore.isPublished(did: did) { state.signingKeyUnpublished = false }
             KeychainHelper.save(key: "did", value: did)
             // Refresh login timestamp so hasSavedSession stays valid
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "freeq.lastLogin")
