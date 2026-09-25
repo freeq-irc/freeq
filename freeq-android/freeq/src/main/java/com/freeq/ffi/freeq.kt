@@ -658,10 +658,10 @@ internal interface UniffiCallbackInterfaceAvEventHandlerMethod0 : com.sun.jna.Ca
     fun callback(`uniffiHandle`: Long,`event`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceDeviceKeyStoreMethod0 : com.sun.jna.Callback {
-    fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+    fun callback(`uniffiHandle`: Long,`did`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceDeviceKeyStoreMethod1 : com.sun.jna.Callback {
-    fun callback(`uniffiHandle`: Long,`key`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+    fun callback(`uniffiHandle`: Long,`did`: RustBuffer.ByValue,`key`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceEnrollmentMethod0 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`recordJson`: RustBuffer.ByValue,`signerPublicKey`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
@@ -1661,10 +1661,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_aveventhandler_on_av_event() != 24538.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_freeq_sdk_ffi_checksum_method_devicekeystore_load() != 50674.toShort()) {
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_devicekeystore_load() != 1330.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_freeq_sdk_ffi_checksum_method_devicekeystore_save() != 53549.toShort()) {
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_devicekeystore_save() != 26093.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_enrollment_publish() != 47066.toShort()) {
@@ -6046,9 +6046,9 @@ public object FfiConverterTypeAvEventHandler: FfiConverterCallbackInterface<AvEv
 
 public interface DeviceKeyStore {
     
-    fun `load`(): StoredDeviceKey?
+    fun `load`(`did`: kotlin.String): StoredDeviceKey?
     
-    fun `save`(`key`: StoredDeviceKey)
+    fun `save`(`did`: kotlin.String, `key`: StoredDeviceKey)
     
     companion object
 }
@@ -6058,10 +6058,11 @@ public interface DeviceKeyStore {
 // Put the implementation in an object so we don't pollute the top-level namespace
 internal object uniffiCallbackInterfaceDeviceKeyStore {
     internal object `load`: UniffiCallbackInterfaceDeviceKeyStoreMethod0 {
-        override fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
+        override fun callback(`uniffiHandle`: Long,`did`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeDeviceKeyStore.handleMap.get(uniffiHandle)
             val makeCall = { ->
                 uniffiObj.`load`(
+                    FfiConverterString.lift(`did`),
                 )
             }
             val writeReturn = { value: StoredDeviceKey? -> uniffiOutReturn.setValue(FfiConverterOptionalTypeStoredDeviceKey.lower(value)) }
@@ -6074,10 +6075,11 @@ internal object uniffiCallbackInterfaceDeviceKeyStore {
         }
     }
     internal object `save`: UniffiCallbackInterfaceDeviceKeyStoreMethod1 {
-        override fun callback(`uniffiHandle`: Long,`key`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+        override fun callback(`uniffiHandle`: Long,`did`: RustBuffer.ByValue,`key`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeDeviceKeyStore.handleMap.get(uniffiHandle)
             val makeCall = { ->
                 uniffiObj.`save`(
+                    FfiConverterString.lift(`did`),
                     FfiConverterTypeStoredDeviceKey.lift(`key`),
                 )
             }

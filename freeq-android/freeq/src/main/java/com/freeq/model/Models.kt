@@ -673,9 +673,6 @@ class AppState(application: Application) : AndroidViewModel(application) {
             client?.setKeyLookupStore(AndroidKeyLookupStore(bufferCacheDir))
             client?.setVerifySignatures(true)
             if (freshSignIn) client?.setFreshSignIn(true)
-            // A key that made it to the account clears the dot; nothing else
-            // does, so a refusal stays visible until it is fixed.
-            if (deviceKeyStore.isPublished()) signingKeyUnpublished.value = false
 
             client?.connect()
         } catch (e: Exception) {
@@ -1524,6 +1521,10 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
             is FreeqEvent.Authenticated -> {
                 state.lastSessionWasGuest = false
                 state.authenticatedDID.value = event.did
+                // This account's key made it to the account: the dot clears.
+                // Nothing else clears it, so a refusal stays visible until it
+                // is fixed.
+                if (state.deviceKeyStore.isPublished(event.did)) state.signingKeyUnpublished.value = false
                 state.securePrefs.edit().putString("did", event.did).apply()
                 // Refresh login timestamp on every successful auth so
                 // hasSavedSession's grace window doesn't expire on a

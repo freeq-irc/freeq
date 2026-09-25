@@ -16,19 +16,45 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 /**
- * This device's signing key: where it is kept, and how it reaches the account.
+ * The `securePrefs` entry names one account's device key is kept under, so
+ * each account signed in on this device has a key of its own.
+ */
+internal object DeviceKeyNames {
+    data class Names(val seed: String, val createdAt: String, val recordUri: String, val refused: String)
+
+    fun forDid(did: String) = Names(
+        seed = "deviceKeySeed:$did",
+        createdAt = "deviceKeyCreatedAt:$did",
+        recordUri = "deviceKeyRecordUri:$did",
+        refused = "deviceKeyRefused:$did",
+    )
+
+    /** The names every account shared before keys were kept per account:
+     *  never read, and deleted once. */
+    val LEGACY = listOf("deviceKeySeed", "deviceKeyCreatedAt", "deviceKeyRecordUri", "deviceKeyRefused")
+}
+
+/**
+ * This device's signing keys, one per account: where they are kept, and how
+ * they reach the account.
  *
- * The key is one 32-byte seed that outlives a session, so messages from this
+ * A key is one 32-byte seed that outlives a session, so messages from this
  * device keep signing with the same key and a reader can learn it once. It is
  * kept the way `brokerToken` is — in `securePrefs` — with one extra turn: the
  * seed is wrapped under an AES key that lives in the Android Keystore and
- * never leaves it, so the stored bytes are useless off this device.
+ * never leaves it, so the stored bytes are useless off this device. Sign-out
+ * keeps each account's key.
  */
 class AndroidDeviceKeyStore(private val prefs: SharedPreferences) : DeviceKeyStore {
 
-    override fun load(): StoredDeviceKey? {
-        val blob = prefs.getString(SEED, null) ?: return null
-        val createdAt = prefs.getString(CREATED_AT, null) ?: return null
+    init {
+        dropLegacy()
+    }
+
+    override fun load(did: String): StoredDeviceKey? {
+        val names = DeviceKeyNames.forDid(did)
+        val blob = prefs.getString(names.seed, null) ?: return null
+        val createdAt = prefs.getString(names.createdAt, null) ?: return null
         // An unreadable seed is a key this device no longer has: say so and
         // let the SDK mint a fresh one rather than failing the connect.
         val seed = try {
@@ -40,22 +66,33 @@ class AndroidDeviceKeyStore(private val prefs: SharedPreferences) : DeviceKeySto
         return StoredDeviceKey(
             seed,
             createdAt,
-            prefs.getString(RECORD_URI, null),
-            prefs.getBoolean(REFUSED, false),
+            prefs.getString(names.recordUri, null),
+            prefs.getBoolean(names.refused, false),
         )
     }
 
-    override fun save(key: StoredDeviceKey) {
+    override fun save(did: String, key: StoredDeviceKey) {
+        val names = DeviceKeyNames.forDid(did)
         val edit = prefs.edit()
-            .putString(SEED, wrap(key.seed))
-            .putString(CREATED_AT, key.createdAt)
-        if (key.recordUri != null) edit.putString(RECORD_URI, key.recordUri) else edit.remove(RECORD_URI)
-        if (key.refused) edit.putBoolean(REFUSED, true) else edit.remove(REFUSED)
+            .putString(names.seed, wrap(key.seed))
+            .putString(names.createdAt, key.createdAt)
+        if (key.recordUri != null) edit.putString(names.recordUri, key.recordUri) else edit.remove(names.recordUri)
+        if (key.refused) edit.putBoolean(names.refused, true) else edit.remove(names.refused)
         edit.apply()
     }
 
-    /** Whether the key this device holds is published to the account. */
-    fun isPublished(): Boolean = prefs.getString(RECORD_URI, null) != null
+    /** Whether the key this device holds for `did` is published to that account. */
+    fun isPublished(did: String): Boolean = prefs.getString(DeviceKeyNames.forDid(did).recordUri, null) != null
+
+    /** The key every account shared before keys were kept per account: every
+     *  account that signed in here signed with it, so it is thrown away, and
+     *  each account makes its own at its next connect. */
+    private fun dropLegacy() {
+        if (DeviceKeyNames.LEGACY.none { prefs.contains(it) }) return
+        val edit = prefs.edit()
+        DeviceKeyNames.LEGACY.forEach { edit.remove(it) }
+        edit.apply()
+    }
 
     private fun wrap(seed: ByteArray): String {
         val cipher = Cipher.getInstance(TRANSFORM)
@@ -93,10 +130,6 @@ class AndroidDeviceKeyStore(private val prefs: SharedPreferences) : DeviceKeySto
     private companion object {
         const val ALIAS = "freeq_device_key_wrap"
         const val TRANSFORM = "AES/GCM/NoPadding"
-        const val SEED = "deviceKeySeed"
-        const val CREATED_AT = "deviceKeyCreatedAt"
-        const val RECORD_URI = "deviceKeyRecordUri"
-        const val REFUSED = "deviceKeyRefused"
     }
 }
 
