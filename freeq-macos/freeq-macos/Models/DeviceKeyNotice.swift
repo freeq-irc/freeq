@@ -1,6 +1,6 @@
 import Foundation
 
-// The two decisions about this device's key that need no Keychain and no
+// The decisions about this device's keys that need no Keychain and no
 // generated bindings, so they compile — and are tested — outside the app
 // target. The Keychain store and the broker call live in `DeviceKey.swift`.
 
@@ -48,4 +48,24 @@ final class SigningKeyNotice {
     func forget() {
         told = false
     }
+}
+
+/// The Keychain names one account's device key is kept under, so each
+/// account signed in on this device has a key of its own.
+struct DeviceKeyNames: Equatable {
+    let seed: String
+    let createdAt: String
+    let recordUri: String
+    let refused: String
+
+    init(did: String) {
+        seed = "deviceKeySeed:\(did)"
+        createdAt = "deviceKeyCreatedAt:\(did)"
+        recordUri = "deviceKeyRecordUri:\(did)"
+        refused = "deviceKeyRefused:\(did)"
+    }
+
+    /// The names every account shared before keys were kept per account:
+    /// never read, and deleted once.
+    static let legacy = ["deviceKeySeed", "deviceKeyCreatedAt", "deviceKeyRecordUri", "deviceKeyRefused"]
 }

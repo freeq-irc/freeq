@@ -697,9 +697,6 @@ class AppState {
             try c.setKeyLookupStore(store: FileKeyLookupStore())
             try c.setVerifySignatures(on: true)
             if freshSignIn { try c.setFreshSignIn(fresh: true) }
-            // A key that made it to the account clears the dot; nothing else
-            // does, so a refusal stays visible until it is fixed.
-            if deviceKeyStore.isPublished { signingKeyUnpublished = false }
             try c.connect()
         } catch {
             connectionState = .disconnected
@@ -1942,6 +1939,10 @@ extension AppState {
 
         case .authenticated(let did):
             authenticatedDID = did
+            // This account's key made it to the account: the dot clears.
+            // Nothing else clears it, so a refusal stays visible until it is
+            // fixed.
+            if deviceKeyStore.isPublished(did: did) { signingKeyUnpublished = false }
             if !KeychainHelper.save(key: "did", value: did) {
                 Log.auth.error("Could not persist authenticated DID")
             }
