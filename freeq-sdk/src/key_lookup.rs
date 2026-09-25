@@ -39,9 +39,10 @@ pub enum KeySource {
 pub struct FoundKey {
     pub public_key: [u8; 32],
     pub source: KeySource,
-    /// When the key was retired, unix seconds: by a retirement or the expiry
-    /// in the signer's records, or the date the origin server says it was
-    /// removed. Only a date at or before the instant asked about.
+    /// When the key stopped counting, unix seconds. From the signer's
+    /// records: its retirement or expiry, only when at or before the instant
+    /// asked about. From the origin server: the earlier of its removal and
+    /// its expiry, which may be later than that instant.
     pub retired_at: Option<i64>,
     /// When the key was made, unix seconds: its record's `createdAt`. Only
     /// the records give one.
@@ -411,12 +412,29 @@ struct Prefetch {
     cell: tokio::sync::OnceCell<()>,
 }
 
-/// The fields of the origin's answer read here.
+/// The fields of the origin's answer read here. The dates are read as any
+/// JSON value, so one that is not a number counts as absent rather than
+/// failing the answer.
 #[derive(serde::Deserialize)]
 struct OriginKey {
     public_key: String,
     #[serde(default)]
-    removed_at: Option<i64>,
+    removed_at: serde_json::Value,
+    #[serde(default)]
+    expires_at: serde_json::Value,
+}
+
+impl OriginKey {
+    /// When the key stopped counting: the earlier of its removal and its
+    /// expiry, whole seconds rounded down. A server from before expiries
+    /// sends no `expires_at`, and its keys are taken as not expiring.
+    fn retired_at(&self) -> Option<i64> {
+        [&self.removed_at, &self.expires_at]
+            .into_iter()
+            .filter_map(|date| date.as_f64())
+            .map(|secs| secs.floor() as i64)
+            .min()
+    }
 }
 
 impl<P: ClientProvider> KeyLookup<P> {
@@ -822,12 +840,12 @@ impl<P: ClientProvider> KeyLookup<P> {
             && let Some(base) = self.origin_base()
         {
             let answer = self.at_origin(base, did, kid).await;
-            let (key, removed_at) = match answer {
-                Ok(Some((key, removed_at))) => (Ok(Some(key)), removed_at),
+            let (key, retired_at) = match answer {
+                Ok(Some((key, retired_at))) => (Ok(Some(key)), retired_at),
                 Ok(None) => (Ok(None), None),
                 Err(e) => (Err(e), None),
             };
-            found = take(key, KeySource::OriginServer, removed_at);
+            found = take(key, KeySource::OriginServer, retired_at);
         }
         Settled {
             records,
@@ -1247,7 +1265,7 @@ impl<P: ClientProvider> KeyLookup<P> {
             .find(|key| derive_kid_bytes(key) == kid))
     }
 
-    /// The key the origin holds for `(did, kid)`, and when it was removed.
+    /// The key the origin holds for `(did, kid)`, and when it stopped counting.
     async fn at_origin(
         &self,
         base: &str,
@@ -1279,7 +1297,7 @@ impl<P: ClientProvider> KeyLookup<P> {
             .decode(&answer.public_key)
             .ok()
             .and_then(|bytes| bytes.try_into().ok())
-            .map(|key| (key, answer.removed_at)))
+            .map(|key| (key, answer.retired_at())))
     }
 }
 
@@ -2572,6 +2590,156 @@ mod tests {
                 created_at: None,
                 expires_at: None,
             })
+        );
+    }
+
+    /// An origin whose key routes answer with the entries of `keys`, by
+    /// (did, kid): each entry's own fields, `public_key` and the dates, as
+    /// the server writes them.
+    struct KeyServer {
+        base: String,
+        keys: Arc<parking_lot::Mutex<HashMap<(String, String), serde_json::Value>>>,
+    }
+
+    impl KeyServer {
+        fn hold(&self, did: &str, kid: String, entry: serde_json::Value) {
+            self.keys.lock().insert((did.to_string(), kid), entry);
+        }
+    }
+
+    /// A key as the origin's routes answer with it, with no dates.
+    fn key_entry(seed: u8) -> serde_json::Value {
+        json!({ "public_key": URL_SAFE_NO_PAD.encode(raw(seed)) })
+    }
+
+    async fn key_server() -> KeyServer {
+        use axum::response::IntoResponse;
+        let keys: Arc<parking_lot::Mutex<HashMap<(String, String), serde_json::Value>>> =
+            Default::default();
+        let answer = |keys: &HashMap<(String, String), serde_json::Value>, did: &str, kid: &str| {
+            keys.get(&(did.to_string(), kid.to_string())).map(|entry| {
+                let mut entry = entry.clone();
+                entry["did"] = json!(did);
+                entry["kid"] = json!(kid);
+                entry
+            })
+        };
+        let router = axum::Router::new().route(
+            "/api/v1/signing-keys/{did}/{kid}",
+            get({
+                let keys = keys.clone();
+                move |Path((did, kid)): Path<(String, String)>| {
+                    let found = answer(&keys.lock(), &did, &kid);
+                    async move {
+                        match found {
+                            Some(entry) => axum::Json(entry).into_response(),
+                            None => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        KeyServer { base, keys }
+    }
+
+    /// A lookup for ALICE whose origin is `server`.
+    fn lookup_at(pds: &Stub, server: &KeyServer) -> KeyLookup<freeq_oauth::SharedClient> {
+        let resolver = DidResolver::static_map(HashMap::from([(ALICE.to_string(), alice_on(pds))]));
+        let reader = RecordReader::new(resolver, freeq_oauth::SharedClient(reqwest::Client::new()));
+        KeyLookup::new(reader, Some(server.base.clone()), HOUR).with_retry_delays(Vec::new())
+    }
+
+    #[tokio::test]
+    async fn takes_a_keys_retirement_from_the_earlier_of_its_removal_and_its_expiry() {
+        let pds = pds(vec![]).await;
+        let server = key_server().await;
+        let dated = |seed: u8, dates: serde_json::Value| {
+            let mut entry = key_entry(seed);
+            for (name, date) in dates.as_object().unwrap() {
+                entry[name] = date.clone();
+            }
+            entry
+        };
+        server.hold(
+            ALICE,
+            kid_of(2),
+            dated(2, json!({ "removed_at": 2_000, "expires_at": 1_000 })),
+        );
+        server.hold(ALICE, kid_of(3), dated(3, json!({ "removed_at": 2_000 })));
+        server.hold(
+            ALICE,
+            kid_of(4),
+            dated(4, json!({ "removed_at": null, "expires_at": null })),
+        );
+        let keys = lookup_at(&pds, &server);
+        let retired = |seed| {
+            let keys = &keys;
+            async move {
+                keys.key_for(ALICE, &kid_of(seed))
+                    .await
+                    .unwrap()
+                    .map(|f| f.retired_at)
+            }
+        };
+        assert_eq!(retired(2).await, Some(Some(1_000)));
+        assert_eq!(
+            retired(3).await,
+            Some(Some(2_000)),
+            "an old server sends no expiry"
+        );
+        assert_eq!(retired(4).await, Some(None));
+    }
+
+    #[tokio::test]
+    async fn reads_the_origins_dates_leniently() {
+        let pds = pds(vec![]).await;
+        let server = key_server().await;
+        let dated = |seed: u8, dates: serde_json::Value| {
+            let mut entry = key_entry(seed);
+            for (name, date) in dates.as_object().unwrap() {
+                entry[name] = date.clone();
+            }
+            entry
+        };
+        server.hold(ALICE, kid_of(2), dated(2, json!({})));
+        server.hold(
+            ALICE,
+            kid_of(3),
+            dated(
+                3,
+                json!({ "removed_at": "2026-01-01", "expires_at": 3_000 }),
+            ),
+        );
+        server.hold(ALICE, kid_of(4), dated(4, json!({ "expires_at": 4_000.9 })));
+        let keys = lookup_at(&pds, &server);
+        let retired = |seed| {
+            let keys = &keys;
+            async move {
+                keys.key_for(ALICE, &kid_of(seed))
+                    .await
+                    .unwrap()
+                    .map(|f| f.retired_at)
+            }
+        };
+        assert_eq!(
+            retired(2).await,
+            Some(None),
+            "neither date: the key does not end"
+        );
+        assert_eq!(
+            retired(3).await,
+            Some(Some(3_000)),
+            "a date that is not a number counts as absent"
+        );
+        assert_eq!(
+            retired(4).await,
+            Some(Some(4_000)),
+            "a fractional date, rounded down"
         );
     }
 
