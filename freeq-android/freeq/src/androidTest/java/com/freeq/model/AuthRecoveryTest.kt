@@ -101,15 +101,15 @@ class AuthRecoveryTest {
         assertNotNull(s.pendingWebToken)
     }
 
-    @Test fun cacheWebToken_then_invalidate_round_trips_through_prefs() {
-        val s = AppState(appContext())
-        s.cacheWebToken("token-abc")
-        assertEquals("token-abc", s.securePrefs.getString("webToken", null))
-        assertTrue(freeqPrefs().getLong("webTokenExpiry", 0L) > 0L)
+    @Test fun init_drops_a_web_token_an_older_version_saved() {
+        val warm = AppState(appContext())
+        warm.securePrefs.edit().putString("webToken", "token-abc").commit()
+        freeqPrefs().edit().putLong("webTokenExpiry", System.currentTimeMillis() + 60_000).commit()
 
-        s.invalidateCachedWebToken()
-        assertNull(s.securePrefs.getString("webToken", null))
+        val fresh = AppState(appContext())
+        assertNull(fresh.securePrefs.getString("webToken", null))
         assertEquals(0L, freeqPrefs().getLong("webTokenExpiry", 0L))
+        assertNull(fresh.pendingWebToken)
     }
 
     @Test fun hasSavedSession_requires_only_brokerToken() {

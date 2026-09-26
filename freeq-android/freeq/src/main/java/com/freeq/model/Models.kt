@@ -328,6 +328,11 @@ class ChannelState(val name: String) {
 
 // ── Connection state ──
 
+/** What the sign-in screen says when a signed-in session has ended; the
+ *  web's line (freeq-app/src/irc/client.ts, SESSION_EXPIRED_LINE). */
+const val SESSION_EXPIRED_LINE =
+    "Your session expired. Sign in with AT Protocol again, or connect as guest."
+
 enum class ConnectionState {
     Disconnected,
     Connecting,
@@ -379,7 +384,13 @@ class AppState(application: Application) : AndroidViewModel(application) {
     var replyingTo = mutableStateOf<ChatMessage?>(null)
     var editingMessage = mutableStateOf<ChatMessage?>(null)
 
-    var pendingWebToken: String? = null
+    /** Which web token the next connect sends; see [WebTokens]. */
+    internal val webTokens = WebTokens()
+
+    /** A token handed over for the next connect and not yet sent. */
+    var pendingWebToken: String?
+        get() = webTokens.pending
+        set(value) { webTokens.pending = value }
     var pendingNavigation = mutableStateOf<String?>(null)
     var pendingJoinChannel: String? = null  // Track user-initiated joins for navigation
     var brokerToken: String? = null
@@ -448,8 +459,7 @@ class AppState(application: Application) : AndroidViewModel(application) {
      *  ping-ponging between transports. Reset on each fresh `connect()`. */
     private var transportFallbackUsed = false
     var loggedOut = mutableStateOf(false)
-    private var cachedWebToken: String? = null
-    private var cachedWebTokenExpiry: Long = 0L  // epoch millis
+
 
     val hasSavedSession: Boolean
         // brokerToken alone is enough — broker /session call returns the real
@@ -573,15 +583,10 @@ class AppState(application: Application) : AndroidViewModel(application) {
         // Load secrets from encrypted storage
         brokerToken = securePrefs.getString("brokerToken", null)
         authenticatedDID.value = securePrefs.getString("did", null)
-        // Restore cached web token if still valid (25 min TTL, server expires at 30 min)
-        val savedExpiry = prefs.getLong("webTokenExpiry", 0L)
-        if (savedExpiry > System.currentTimeMillis()) {
-            cachedWebToken = securePrefs.getString("webToken", null)
-            cachedWebTokenExpiry = savedExpiry
-        } else {
-            securePrefs.edit().remove("webToken").apply()
-            prefs.edit().remove("webTokenExpiry").apply()
-        }
+        // Web tokens are no longer kept between connects (see WebTokens):
+        // drop one an older version saved.
+        securePrefs.edit().remove("webToken").apply()
+        prefs.edit().remove("webTokenExpiry").apply()
 
         // Restore persisted state. If the saved nick is a Guest temp name but
         // we have a DID, the previous session got Guest-renamed and poisoned
@@ -684,9 +689,8 @@ class AppState(application: Application) : AndroidViewModel(application) {
             // (the fallback path triggered by attemptTransportFallback below).
             client?.setWebsocketUrl(if (useWebSocket) ServerConfig.wssServer else "")
 
-            pendingWebToken?.let { token ->
+            webTokens.takeForConnect()?.let { token ->
                 client?.setWebToken(token)
-                pendingWebToken = null
             }
 
             // This device's key, and the way it reaches the account. Both are
@@ -724,7 +728,13 @@ class AppState(application: Application) : AndroidViewModel(application) {
         Log.w("freeq.auth", "WS connect failed; falling back to TCP. reason=$reason")
         client?.disconnect()
         client = null
-        connect(nick.value, useWebSocket = false)
+        when (TransportFallback.connect(signedIn = hasSavedSession, unsentToken = webTokens.forReconnect())) {
+            TransportFallback.Connect.WithoutToken,
+            TransportFallback.Connect.WithUnsentToken -> connect(nick.value, useWebSocket = false)
+            // Through the broker, and its retries, as any reconnect: a
+            // signed-in session never connects without a token.
+            TransportFallback.Connect.FreshTokenFromBroker -> reconnectSavedSession(overWebSocket = false)
+        }
         return true
     }
 
@@ -808,18 +818,11 @@ class AppState(application: Application) : AndroidViewModel(application) {
         authenticatedDID.value = null
     }
 
-    fun cacheWebToken(token: String) {
-        cachedWebToken = token
-        cachedWebTokenExpiry = System.currentTimeMillis() + 25 * 60 * 1000L
-        securePrefs.edit().putString("webToken", token).apply()
-        prefs.edit().putLong("webTokenExpiry", cachedWebTokenExpiry).apply()
-    }
-
-    fun invalidateCachedWebToken() {
-        cachedWebToken = null
-        cachedWebTokenExpiry = 0L
-        securePrefs.edit().remove("webToken").apply()
-        prefs.edit().remove("webTokenExpiry").apply()
+    /** A signed-in session's token was refused on reconnect: sign out as
+     *  logout does, and the sign-in screen says why (the web's words). */
+    fun endExpiredSession() {
+        logout()
+        errorMessage.value = SESSION_EXPIRED_LINE
     }
 
     fun logout() {
@@ -828,10 +831,8 @@ class AppState(application: Application) : AndroidViewModel(application) {
         errorMessage.value = null
         brokerToken = null
         pendingWebToken = null
-        cachedWebToken = null
-        cachedWebTokenExpiry = 0L
-        securePrefs.edit().remove("brokerToken").remove("did").remove("webToken").apply()
-        prefs.edit().remove("nick").remove("webTokenExpiry").remove("lastLoginTime").apply()
+        securePrefs.edit().remove("brokerToken").remove("did").apply()
+        prefs.edit().remove("nick").remove("lastLoginTime").apply()
         nick.value = ""
         disconnect()
         // After disconnect, which flushes: never leave one account's
@@ -843,22 +844,18 @@ class AppState(application: Application) : AndroidViewModel(application) {
      * @param fresh a new reconnect episode (user action, network restored,
      * disconnect event) — resets the broker retry budget. The internal
      * backoff recursion passes false so one episode still caps at 5 tries.
+     * @param overWebSocket false for the plain-connection fallback after a
+     * failed WebSocket connect; kept across the broker retries.
      */
-    fun reconnectSavedSession(fresh: Boolean = true) {
+    fun reconnectSavedSession(fresh: Boolean = true, overWebSocket: Boolean = true) {
         if (!hasSavedSession || connectionState.value != ConnectionState.Disconnected) return
         if (fresh) brokerRetryCount = 0
-        if (pendingWebToken != null) { connect(nick.value); return }
-
-        // Reuse cached web token if still within TTL (avoids broker round-trip)
-        val cached = cachedWebToken
-        if (cached != null && System.currentTimeMillis() < cachedWebTokenExpiry) {
-            pendingWebToken = cached
-            connect(nick.value)
-            return
-        }
+        // A token no connect has sent (the fresh sign-in's); otherwise the
+        // broker mints a fresh one, since the server takes each only once.
+        if (webTokens.forReconnect() != null) { connectFor(nick.value, overWebSocket); return }
 
         val token = brokerToken ?: run {
-            // No broker token and cached web token expired — must sign in again
+            // No broker token — must sign in again
             connectionState.value = ConnectionState.Disconnected
             return
         }
@@ -869,12 +866,11 @@ class AppState(application: Application) : AndroidViewModel(application) {
             try {
                 val session = withContext(Dispatchers.IO) { fetchBrokerSession(token) }
                 brokerRetryCount = 0
-                pendingWebToken = session.token
+                webTokens.fromBroker(session.token)
                 lastSessionWasGuest = false
-                cacheWebToken(session.token)
                 authenticatedDID.value = session.did
                 securePrefs.edit().putString("did", session.did).apply()
-                connect(session.nick)
+                connectFor(session.nick, overWebSocket)
             } catch (e: Exception) {
                 Log.w("freeq.auth", "reconnect: broker /session failed (retry ${brokerRetryCount + 1}): ${e.message}")
                 brokerRetryCount++
@@ -883,13 +879,19 @@ class AppState(application: Application) : AndroidViewModel(application) {
                     connectionState.value = ConnectionState.Disconnected
                     delay(delayMs)
                     if (connectionState.value == ConnectionState.Disconnected) {
-                        reconnectSavedSession(fresh = false)
+                        reconnectSavedSession(fresh = false, overWebSocket = overWebSocket)
                     }
                 } else {
                     connectionState.value = ConnectionState.Disconnected
                 }
             }
         }
+    }
+
+    /** A reconnect's connect: a fresh one over WebSocket, or the fallback's
+     *  plain connection, which keeps the one-fallback-per-connect flag set. */
+    private fun connectFor(nickName: String, overWebSocket: Boolean) {
+        if (overWebSocket) connect(nickName) else connect(nickName, useWebSocket = false)
     }
 
     internal data class BrokerSessionResponse(val token: String, val nick: String, val did: String)
@@ -928,10 +930,8 @@ class AppState(application: Application) : AndroidViewModel(application) {
                 if (consecutive401Count >= 3) {
                     consecutive401Count = 0
                     this.brokerToken = null
-                    cachedWebToken = null
-                    cachedWebTokenExpiry = 0L
-                    securePrefs.edit().remove("brokerToken").remove("webToken").apply()
-                    prefs.edit().remove("webTokenExpiry").remove("lastLoginTime").apply()
+                    securePrefs.edit().remove("brokerToken").apply()
+                    prefs.edit().remove("lastLoginTime").apply()
                     throw Exception("Session expired — please sign in again")
                 } else {
                     throw Exception("Auth failed (attempt $consecutive401Count/3)")
@@ -1517,23 +1517,11 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
             is FreeqEvent.Registered -> {
                 state.reconnectAttempts = 0
                 state.ownJoinHistory.newConnection()
-                // If authenticated user got Guest nick, token was stale — retry broker
-                if (state.authenticatedDID.value != null
-                    && event.nick.startsWith("Guest", ignoreCase = true)) {
-                    state.disconnect()
-                    // The cached web-token we just sent is single-use and the
-                    // server consumed it on the failed SASL attempt. Wipe it
-                    // so reconnectSavedSession falls through to broker
-                    // /session for a fresh token (matches iOS).
-                    state.invalidateCachedWebToken()
-                    state.scope.launch {
-                        delay(2000)
-                        if (state.connectionState.value == ConnectionState.Disconnected
-                            && state.hasSavedSession) {
-                            state.pendingWebToken = null
-                            state.reconnectSavedSession()
-                        }
-                    }
+                // A signed-in session back under a guest nick: the server
+                // did not take its token. Sign out, as the web does.
+                if (GuestReturn.onRegistered(state.authenticatedDID.value, event.nick)
+                    == GuestReturn.Outcome.SignOut) {
+                    state.endExpiredSession()
                     return
                 }
                 state.connectionState.value = ConnectionState.Registered

@@ -1,6 +1,8 @@
 package com.freeq.model
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -65,5 +67,37 @@ class TransportFallbackTest {
             hasSavedSession = true,
             nickIsEmpty = true,
         ))
+    }
+
+    // ── How the plain-connection fallback connects ──
+
+    @Test fun a_signed_in_fallback_asks_the_broker_for_a_fresh_token() {
+        assertEquals(
+            TransportFallback.Connect.FreshTokenFromBroker,
+            TransportFallback.connect(signedIn = true, unsentToken = null),
+        )
+    }
+
+    @Test fun a_signed_in_fallback_never_connects_without_a_token() {
+        for (unsent in listOf(null, "t")) {
+            assertNotEquals(
+                TransportFallback.Connect.WithoutToken,
+                TransportFallback.connect(signedIn = true, unsentToken = unsent),
+            )
+        }
+    }
+
+    @Test fun a_signed_in_fallback_holding_an_unsent_token_uses_it() {
+        assertEquals(
+            TransportFallback.Connect.WithUnsentToken,
+            TransportFallback.connect(signedIn = true, unsentToken = "t"),
+        )
+    }
+
+    @Test fun a_guest_fallback_connects_without_a_token() {
+        assertEquals(
+            TransportFallback.Connect.WithoutToken,
+            TransportFallback.connect(signedIn = false, unsentToken = null),
+        )
     }
 }
