@@ -9454,8 +9454,9 @@ mod device_key_tests {
     /// this the client's own lines wear the origin's verdict for an hour.
     #[tokio::test]
     async fn a_published_enrollment_re_lists_the_clients_own_account() {
-        let (lookup, listings, _proofs) = lookup_counting(repo_holding(&[])).await;
-        let lookup = Arc::new(lookup);
+        let (lookup, listings, _proofs, base) = lookup_counting_at(repo_holding(&[])).await;
+        // The stub answers the origin's key routes with a miss at once.
+        let lookup = Arc::new(lookup.with_retry_delays(Vec::new()));
         let kid = crate::sigtag::derive_kid(
             &ed25519_dalek::SigningKey::from_bytes(&[6; 32]).verifying_key(),
         );
@@ -9470,6 +9471,10 @@ mod device_key_tests {
             "the hourly rule holds the miss"
         );
 
+        // Without an origin, the connect gives the lookup the loopback
+        // default, 127.0.0.1:8080, and the ask after the re-list below would
+        // go to whatever listens there.
+        lookup.set_default_origin_base(base);
         let store = MemoryStore::holding(6, None);
         let enrollment = StubEnrollment::answering(EnrollOutcome::Published {
             uri: "at://did:plc:tester/at.freeq.deviceKey/3kdevice".to_string(),
@@ -10175,6 +10180,21 @@ mod device_key_tests {
         Arc<std::sync::atomic::AtomicUsize>,
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
+        let (lookup, hits, proofs, _) = lookup_counting_at(repo).await;
+        (lookup, hits, proofs)
+    }
+
+    /// `lookup_counting`, with the stub PDS's base URL as well: an origin
+    /// that answers 404 on the key routes, for a test that connects, so the
+    /// lookup does not take the loopback default, where nothing listens.
+    async fn lookup_counting_at(
+        repo: crate::test_support::StubRepo,
+    ) -> (
+        crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        String,
+    ) {
         use axum::response::IntoResponse;
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = hits.clone();
@@ -10223,7 +10243,7 @@ mod device_key_tests {
             None,
             std::time::Duration::from_secs(3600),
         );
-        (lookup, hits, proofs)
+        (lookup, hits, proofs, base)
     }
 
     #[tokio::test]
