@@ -260,14 +260,14 @@ typedef void (*UniffiCallbackInterfaceAvEventHandlerMethod0)(uint64_t, RustBuffe
 #endif
 #ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_DEVICE_KEY_STORE_METHOD0
 #define UNIFFI_FFIDEF_CALLBACK_INTERFACE_DEVICE_KEY_STORE_METHOD0
-typedef void (*UniffiCallbackInterfaceDeviceKeyStoreMethod0)(uint64_t, RustBuffer* _Nonnull, 
+typedef void (*UniffiCallbackInterfaceDeviceKeyStoreMethod0)(uint64_t, RustBuffer, RustBuffer* _Nonnull, 
         RustCallStatus *_Nonnull uniffiCallStatus
     );
 
 #endif
 #ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_DEVICE_KEY_STORE_METHOD1
 #define UNIFFI_FFIDEF_CALLBACK_INTERFACE_DEVICE_KEY_STORE_METHOD1
-typedef void (*UniffiCallbackInterfaceDeviceKeyStoreMethod1)(uint64_t, RustBuffer, void* _Nonnull, 
+typedef void (*UniffiCallbackInterfaceDeviceKeyStoreMethod1)(uint64_t, RustBuffer, RustBuffer, void* _Nonnull, 
         RustCallStatus *_Nonnull uniffiCallStatus
     );
 

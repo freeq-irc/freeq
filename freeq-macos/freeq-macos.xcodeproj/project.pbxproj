@@ -94,7 +94,6 @@
 		C5A5186C1534C70E22BC2912 /* CoordinationCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03305544EF084785B6229CD6 /* CoordinationCard.swift */; };
 		C724476B94820275BA16E55F /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B11355062BDD7B9062AC22F /* ChatView.swift */; };
 		C80F93270D880D40070F235E /* DeviceKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14412954BB0B9B7BDB3FF5F3 /* DeviceKey.swift */; };
-		892E913E44D4E88E40C0111E /* KeyLookupCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFABE390852C82640B8B34D5 /* KeyLookupCache.swift */; };
 		CAF04BC63962B2AD1BCB86FE /* FreeqAppIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99635569CD2711503B3DCF7E /* FreeqAppIntents.swift */; };
 		CB1EC774D4444A86144B5263 /* DmResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49F502D18AE018377ED62923 /* DmResolver.swift */; };
 		CCD46F07817FFF1625133C74 /* Jumbomoji.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06D79754C3E6C19E87D67F6E /* Jumbomoji.swift */; };
@@ -127,6 +126,7 @@
 		F564EDD064F706DA1FED48B0 /* QuickSwitcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B36CCCF8041100BDA937EAB /* QuickSwitcher.swift */; };
 		F804DF96FC5F782461D42394 /* SearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5BFC0A0C4F585C97716A8C4B /* SearchView.swift */; };
 		FDC15A8F819924DB11EA2B88 /* Validation.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2DFA3935D1A36696CF3DBC0 /* Validation.swift */; };
+		FFFF849684AF11BFC9B3E31B /* KeyLookupCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62178848E83EEA18F129364E /* KeyLookupCache.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -174,7 +174,6 @@
 		13C9D32F59D3998D69B16618 /* MediaDeviceSelection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaDeviceSelection.swift; sourceTree = "<group>"; };
 		13CDA12EAAF6604350DEAE49 /* DeviceKeyNotice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceKeyNotice.swift; sourceTree = "<group>"; };
 		14412954BB0B9B7BDB3FF5F3 /* DeviceKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceKey.swift; sourceTree = "<group>"; };
-		EFABE390852C82640B8B34D5 /* KeyLookupCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyLookupCache.swift; sourceTree = "<group>"; };
 		16659A05393DA59C0C3AC3C4 /* BrokerAuth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerAuth.swift; sourceTree = "<group>"; };
 		1A0528F19FEFD2C3985CEB60 /* ChannelPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelPolicy.swift; sourceTree = "<group>"; };
 		1B11355062BDD7B9062AC22F /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
@@ -208,6 +207,7 @@
 		5BFC0A0C4F585C97716A8C4B /* SearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchView.swift; sourceTree = "<group>"; };
 		5EEDAC2E0378A5BD8D01E7F8 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		61EB9E0F12CF280B8BADFA41 /* MainView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainView.swift; sourceTree = "<group>"; };
+		62178848E83EEA18F129364E /* KeyLookupCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyLookupCache.swift; sourceTree = "<group>"; };
 		62B0B9FB9D87D335C6B9327D /* MessageBlocks.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageBlocks.swift; sourceTree = "<group>"; };
 		635E43C3825BFA51AFB89DF6 /* DidDisplay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DidDisplay.swift; sourceTree = "<group>"; };
 		68D19F735EC72757A61B1D6C /* DetailPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DetailPanel.swift; sourceTree = "<group>"; };
@@ -470,7 +470,6 @@
 				03305544EF084785B6229CD6 /* CoordinationCard.swift */,
 				0BD56638DA817D921B8F261C /* DebugBridge.swift */,
 				14412954BB0B9B7BDB3FF5F3 /* DeviceKey.swift */,
-				EFABE390852C82640B8B34D5 /* KeyLookupCache.swift */,
 				13CDA12EAAF6604350DEAE49 /* DeviceKeyNotice.swift */,
 				635E43C3825BFA51AFB89DF6 /* DidDisplay.swift */,
 				49F502D18AE018377ED62923 /* DmResolver.swift */,
@@ -482,6 +481,7 @@
 				49CC1244CD3756E771AE3933 /* IdentityClaim.swift */,
 				06D79754C3E6C19E87D67F6E /* Jumbomoji.swift */,
 				6D0D657E5F637E5EFD232E19 /* KeychainHelper.swift */,
+				62178848E83EEA18F129364E /* KeyLookupCache.swift */,
 				DB1B29BA8601FC220D46B705 /* Logger.swift */,
 				13C9D32F59D3998D69B16618 /* MediaDeviceSelection.swift */,
 				DEE68D36BE8C58FE6D1A14BA /* MenuBarModel.swift */,
@@ -720,7 +720,6 @@
 				111A631DD747383DB85200BF /* DebugBridge.swift in Sources */,
 				40B19B4620E1FFA3196FBFAD /* DetailPanel.swift in Sources */,
 				C80F93270D880D40070F235E /* DeviceKey.swift in Sources */,
-				892E913E44D4E88E40C0111E /* KeyLookupCache.swift in Sources */,
 				83F240564CE8D73332F73F91 /* DeviceKeyNotice.swift in Sources */,
 				07D5F9F88AB063BD44F20162 /* DidDisplay.swift in Sources */,
 				CB1EC774D4444A86144B5263 /* DmResolver.swift in Sources */,
@@ -735,6 +734,7 @@
 				EC17044DE0222489BF5FD85D /* IdentityClaim.swift in Sources */,
 				B8AB7DBFF62520564B9DDE52 /* JoinChannelSheet.swift in Sources */,
 				CCD46F07817FFF1625133C74 /* Jumbomoji.swift in Sources */,
+				FFFF849684AF11BFC9B3E31B /* KeyLookupCache.swift in Sources */,
 				ECC92464E4422B5DCFDC770B /* KeychainHelper.swift in Sources */,
 				D520A6580822EF5314066E14 /* LinkPreview.swift in Sources */,
 				4053A7A7289612A63F58C313 /* Logger.swift in Sources */,

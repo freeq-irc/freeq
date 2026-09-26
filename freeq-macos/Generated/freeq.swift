@@ -3057,13 +3057,15 @@ public struct StoredDeviceKey {
     public var seed: Data
     public var createdAt: String
     public var recordUri: String?
+    public var refused: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(seed: Data, createdAt: String, recordUri: String?) {
+    public init(seed: Data, createdAt: String, recordUri: String?, refused: Bool = false) {
         self.seed = seed
         self.createdAt = createdAt
         self.recordUri = recordUri
+        self.refused = refused
     }
 }
 
@@ -3083,6 +3085,9 @@ extension StoredDeviceKey: Equatable, Hashable {
         if lhs.recordUri != rhs.recordUri {
             return false
         }
+        if lhs.refused != rhs.refused {
+            return false
+        }
         return true
     }
 
@@ -3090,6 +3095,7 @@ extension StoredDeviceKey: Equatable, Hashable {
         hasher.combine(seed)
         hasher.combine(createdAt)
         hasher.combine(recordUri)
+        hasher.combine(refused)
     }
 }
 
@@ -3104,7 +3110,8 @@ public struct FfiConverterTypeStoredDeviceKey: FfiConverterRustBuffer {
             try StoredDeviceKey(
                 seed: FfiConverterData.read(from: &buf), 
                 createdAt: FfiConverterString.read(from: &buf), 
-                recordUri: FfiConverterOptionString.read(from: &buf)
+                recordUri: FfiConverterOptionString.read(from: &buf), 
+                refused: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -3112,6 +3119,7 @@ public struct FfiConverterTypeStoredDeviceKey: FfiConverterRustBuffer {
         FfiConverterData.write(value.seed, into: &buf)
         FfiConverterString.write(value.createdAt, into: &buf)
         FfiConverterOptionString.write(value.recordUri, into: &buf)
+        FfiConverterBool.write(value.refused, into: &buf)
     }
 }
 
@@ -4647,9 +4655,9 @@ public func FfiConverterCallbackInterfaceAvEventHandler_lower(_ v: AvEventHandle
 
 public protocol DeviceKeyStore: AnyObject, Sendable {
     
-    func load() throws  -> StoredDeviceKey?
+    func load(did: String) throws  -> StoredDeviceKey?
     
-    func save(key: StoredDeviceKey) throws 
+    func save(did: String, key: StoredDeviceKey) throws 
     
 }
 
@@ -4665,6 +4673,7 @@ fileprivate struct UniffiCallbackInterfaceDeviceKeyStore {
     static let vtable: [UniffiVTableCallbackInterfaceDeviceKeyStore] = [UniffiVTableCallbackInterfaceDeviceKeyStore(
         load: { (
             uniffiHandle: UInt64,
+            did: RustBuffer,
             uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
             uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
         ) in
@@ -4674,6 +4683,7 @@ fileprivate struct UniffiCallbackInterfaceDeviceKeyStore {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
                 return try uniffiObj.load(
+                     did: try FfiConverterString.lift(did)
                 )
             }
 
@@ -4688,6 +4698,7 @@ fileprivate struct UniffiCallbackInterfaceDeviceKeyStore {
         },
         save: { (
             uniffiHandle: UInt64,
+            did: RustBuffer,
             key: RustBuffer,
             uniffiOutReturn: UnsafeMutableRawPointer,
             uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
@@ -4698,6 +4709,7 @@ fileprivate struct UniffiCallbackInterfaceDeviceKeyStore {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
                 return try uniffiObj.save(
+                     did: try FfiConverterString.lift(did),
                      key: try FfiConverterTypeStoredDeviceKey_lift(key)
                 )
             }
@@ -5853,10 +5865,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_freeq_sdk_ffi_checksum_method_aveventhandler_on_av_event() != 24538) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_freeq_sdk_ffi_checksum_method_devicekeystore_load() != 50674) {
+    if (uniffi_freeq_sdk_ffi_checksum_method_devicekeystore_load() != 1330) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_freeq_sdk_ffi_checksum_method_devicekeystore_save() != 53549) {
+    if (uniffi_freeq_sdk_ffi_checksum_method_devicekeystore_save() != 26093) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freeq_sdk_ffi_checksum_method_enrollment_publish() != 47066) {
