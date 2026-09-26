@@ -119,6 +119,23 @@ impl Drop for TestServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // The tempdir, and the log in it, goes with this server. A failing
+        // test is the one time the log is wanted, so print it first; the test
+        // harness shows it with the failure.
+        if std::thread::panicking() {
+            eprintln!(
+                "── server log: {} ({}) ──\n{}── end server log: {} ──",
+                self.irc_addr,
+                self.args
+                    .iter()
+                    .skip_while(|a| *a != "--server-name")
+                    .nth(1)
+                    .map(String::as_str)
+                    .unwrap_or("?"),
+                server_log(self),
+                self.irc_addr,
+            );
+        }
     }
 }
 
@@ -405,11 +422,18 @@ async fn wait_event(
     desc: &str,
 ) -> Event {
     timeout(EVENT_TIMEOUT, async {
+        let mut last_disconnect: Option<String> = None;
         loop {
             match rx.recv().await {
                 Some(e) if pred(&e) => return e,
+                // The client says why before its channel ends; keep it for
+                // the panic below.
+                Some(Event::Disconnected { reason }) => last_disconnect = Some(reason),
                 Some(_) => continue,
-                None => panic!("channel closed waiting for {desc}"),
+                None => panic!(
+                    "channel closed waiting for {desc} (client disconnect reason: {})",
+                    last_disconnect.as_deref().unwrap_or("none given")
+                ),
             }
         }
     })
