@@ -91,4 +91,26 @@ class RejoinHistoryTest {
         )
         assertEquals("no row doubled", 3, ch.messages.size)
     }
+
+    /**
+     * The rejoin's `CHATHISTORY LATEST` page mostly repeats lines the channel
+     * already holds. Those rows stay the same objects in the same order, so
+     * the list on screen is not rebuilt or re-sorted under the reader; only
+     * the new line is added, after them.
+     */
+    @Test fun a_replayed_page_of_held_lines_leaves_every_held_row_in_place() {
+        val ch = ChannelState("#naptest")
+        for (i in 1..5) ch.appendIfNew(msg("m$i", "line $i", i.toLong()))
+        val before = ch.messages.toList()
+
+        val batch = BatchBuffer(target = "#naptest", batchType = "chathistory")
+        for (i in 1..5) batch.messages.add(msg("m$i", "line $i", i.toLong()))
+        batch.messages.add(msg("m6", "sent while away", 6, from = "bob"))
+        BatchFlush.flushInto(batch, ch)
+
+        assertEquals(listOf("m1", "m2", "m3", "m4", "m5", "m6"), ch.messages.map { it.id })
+        for (i in before.indices) {
+            assertTrue("row ${before[i].id} is the same object", before[i] === ch.messages[i])
+        }
+    }
 }

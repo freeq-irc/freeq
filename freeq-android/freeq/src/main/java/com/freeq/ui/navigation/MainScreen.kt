@@ -1,6 +1,10 @@
 package com.freeq.ui.navigation
 
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Explore
@@ -14,6 +18,8 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.freeq.model.AppState
+import com.freeq.ui.components.ConnectionStatusBar
+import com.freeq.ui.components.rememberConnectionStatusBar
 import com.freeq.ui.screens.ChatsTab
 import com.freeq.ui.screens.ChatDetailScreen
 import com.freeq.ui.screens.DiscoverTab
@@ -25,8 +31,31 @@ private enum class Tab(val route: String, val label: String) {
     Settings("settings", "Settings")
 }
 
+/**
+ * The main screen, kept through a dropped connection: the status bar at the
+ * top says what the connection is doing, and the tabs and any open chat stay
+ * where they were underneath it.
+ */
 @Composable
 fun MainScreen(appState: AppState) {
+    val statusBar = rememberConnectionStatusBar(appState)
+    Column {
+        if (statusBar != null) {
+            ConnectionStatusBar(statusBar, onSignInAgain = { appState.logout() })
+        }
+        MainContent(
+            appState,
+            modifier = Modifier
+                .weight(1f)
+                // The bar takes the status-bar inset while it shows, so the
+                // screens under it do not pad for it again.
+                .then(if (statusBar != null) Modifier.consumeWindowInsets(WindowInsets.statusBars) else Modifier)
+        )
+    }
+}
+
+@Composable
+private fun MainContent(appState: AppState, modifier: Modifier) {
     val navController = rememberNavController()
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route
@@ -59,6 +88,7 @@ fun MainScreen(appState: AppState) {
     }
 
     Scaffold(
+        modifier = modifier,
         snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
             if (showBottomBar) {

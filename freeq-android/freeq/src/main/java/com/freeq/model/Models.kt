@@ -918,8 +918,8 @@ class AppState(application: Application) : AndroidViewModel(application) {
             // wiped, token rotated, manual revoke). That's not a transient
             // failure: no amount of retrying will recover. Clear the bad
             // creds so hasSavedSession flips false and the UI falls back to
-            // ConnectScreen for re-OAuth, instead of spinning on
-            // ReconnectingScreen forever. We still wait for 3 consecutive
+            // ConnectScreen for re-OAuth, instead of retrying under the
+            // status bar forever. We still wait for 3 consecutive
             // 401s in case there's a brief broker glitch, but the 14-day
             // "keep logged in" guard does not apply here — the broker has
             // *explicitly* told us it doesn't know this token.
@@ -1093,6 +1093,9 @@ class AppState(application: Application) : AndroidViewModel(application) {
 
     /** Whether an own JOIN asks for the channel's history; see [OwnJoinHistory]. */
     internal val ownJoinHistory = OwnJoinHistory()
+
+    /** Whether a drop shows its "Disconnected: …" message; see [DisconnectNotice]. */
+    internal val disconnectNotice = DisconnectNotice()
 
     fun requestHistory(channel: String) {
         // Channel history is served to any member, guests included —
@@ -1534,6 +1537,7 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                     return
                 }
                 state.connectionState.value = ConnectionState.Registered
+                state.disconnectNotice.onRegistered()
                 state.nick.value = event.nick
                 // Auto-join saved channels (no navigation - don't override user's position)
                 for (channel in state.autoJoinChannels.toList()) {
@@ -1873,7 +1877,10 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
 
             is FreeqEvent.Disconnected -> {
                 state.connectionState.value = ConnectionState.Disconnected
-                if (event.reason.isNotEmpty() && !state.intentionalDisconnect) {
+                // Once per drop: each failed reconnect attempt is another
+                // Disconnected, and the status bar already says it is retrying.
+                val firstOfDrop = state.disconnectNotice.onDisconnected()
+                if (firstOfDrop && event.reason.isNotEmpty() && !state.intentionalDisconnect) {
                     state.errorMessage.value = "Disconnected: ${event.reason}"
                 }
                 // If the WS handshake failed on this attempt, swap to plain

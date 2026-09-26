@@ -100,33 +100,6 @@ fun ChatsTab(
         }
     ) { padding ->
         Column(modifier = Modifier.padding(padding)) {
-            // Network warning banner
-            val networkConnected by appState.networkMonitor.isConnected
-            if (!networkConnected) {
-                Surface(
-                    color = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(
-                            Icons.Default.WifiOff,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp),
-                            tint = MaterialTheme.colorScheme.onError
-                        )
-                        Text(
-                            "No network connection",
-                            fontSize = 13.sp,
-                            color = MaterialTheme.colorScheme.onError
-                        )
-                    }
-                }
-            }
-
             // Search bar
             OutlinedTextField(
                 value = searchText,
