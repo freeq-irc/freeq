@@ -4,7 +4,7 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.NetworkRequest
+import android.util.Log
 import androidx.compose.runtime.mutableStateOf
 import kotlinx.coroutines.*
 
@@ -16,21 +16,30 @@ class NetworkMonitor(context: Context) {
     private var appState: AppState? = null
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
+    private lateinit var tracker: DefaultNetworkTracker<Network>
+
+    // A default-network callback hears only the network the device is
+    // using, so a second network (a VPN, IMS, Wi-Fi beside mobile data)
+    // coming and going does not flip the banner.
     private val callback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
+            Log.i(TAG, "onAvailable $network")
             scope.launch {
-                isConnected.value = true
                 // Reconnect whenever we're disconnected, not only after a
                 // seen onLost: a dozed process misses connectivity
                 // callbacks entirely, so on wake there may be no recorded
                 // loss — just a dead session and a network that works.
-                attemptReconnect()
+                val reconnect = tracker.onAvailable(network)
+                isConnected.value = tracker.isConnected
+                if (reconnect) attemptReconnect()
             }
         }
 
         override fun onLost(network: Network) {
+            Log.i(TAG, "onLost $network")
             scope.launch {
-                isConnected.value = false
+                tracker.onLost(network)
+                isConnected.value = tracker.isConnected
             }
         }
     }
@@ -40,11 +49,9 @@ class NetworkMonitor(context: Context) {
         val active = connectivityManager.activeNetwork
         val caps = active?.let { connectivityManager.getNetworkCapabilities(it) }
         isConnected.value = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+        tracker = DefaultNetworkTracker(isConnected.value)
 
-        val request = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .build()
-        connectivityManager.registerNetworkCallback(request, callback)
+        connectivityManager.registerDefaultNetworkCallback(callback)
     }
 
     fun bind(appState: AppState) {
@@ -73,5 +80,9 @@ class NetworkMonitor(context: Context) {
     fun destroy() {
         connectivityManager.unregisterNetworkCallback(callback)
         scope.cancel()
+    }
+
+    private companion object {
+        const val TAG = "freeq.net"
     }
 }
