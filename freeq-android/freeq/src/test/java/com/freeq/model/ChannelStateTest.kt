@@ -275,6 +275,17 @@ class ChannelStateTest {
         assertEquals(setOf("carol"), ch.messages[0].reactions["\uD83C\uDF89"])
     }
 
+    @Test fun a_held_row_takes_the_text_of_a_replayed_edit() {
+        val ch = ChannelState("#test")
+        ch.appendIfNew(msg(id = "a", text = "before"))
+        ch.appendIfNew(msg(id = "a", text = "after").copy(isEdited = true))
+        assertEquals("after", ch.messages[0].text)
+        assertEquals(true, ch.messages[0].isEdited)
+        // A plain replayed copy leaves the held text alone.
+        ch.appendIfNew(msg(id = "a", text = "stale"))
+        assertEquals("after", ch.messages[0].text)
+    }
+
     @Test fun a_replayed_copy_with_no_reactions_leaves_the_held_ones() {
         val ch = ChannelState("#test")
         ch.appendIfNew(msg(id = "a"))

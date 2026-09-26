@@ -162,8 +162,8 @@ class ChannelState(val name: String) {
         if (messageIds.contains(msg.id)) {
             // Already held (e.g. the cache copy loaded first). A CHATHISTORY
             // replay may still carry the server's reactions the held copy
-            // lacks: fold them in, as iOS and macOS do.
-            foldReplayedReactions(msg)
+            // lacks, or an edit made since: fold them in.
+            foldReplayed(msg)
             return
         }
         messageIds.add(msg.id)
@@ -261,11 +261,13 @@ class ChannelState(val name: String) {
         return messages[idx].reactions[emoji]?.contains(from) == true
     }
 
-    /** Take a replayed copy's reactions onto the held row: each emoji the
-     *  copy carries with anyone on it replaces the held one. New collections,
-     *  so the list sees a changed row. */
-    private fun foldReplayedReactions(replayed: ChatMessage) {
-        if (replayed.reactions.values.all { it.isEmpty() }) return
+    /** Take what a replayed copy says of a held row: its reactions (each
+     *  emoji the copy carries with anyone on it replaces the held one), and,
+     *  when the copy is an edit folded in from the history batch, its text.
+     *  New collections, so the list sees a changed row. */
+    private fun foldReplayed(replayed: ChatMessage) {
+        val reacted = replayed.reactions.values.any { it.isNotEmpty() }
+        if (!reacted && !replayed.isEdited) return
         val idx = findMessage(replayed.id) ?: return
         val held = messages[idx]
         val folded = mutableMapOf<String, MutableSet<String>>()
@@ -273,7 +275,12 @@ class ChannelState(val name: String) {
         for ((emoji, nicks) in replayed.reactions) {
             if (nicks.isNotEmpty()) folded[emoji] = nicks.toMutableSet()
         }
-        messages[idx] = held.copy(reactions = folded)
+        val edited = replayed.isEdited && !held.isDeleted
+        messages[idx] = held.copy(
+            reactions = folded,
+            text = if (edited) replayed.text else held.text,
+            isEdited = held.isEdited || edited,
+        )
     }
 
     private fun mutateReactions(
@@ -1084,6 +1091,9 @@ class AppState(application: Application) : AndroidViewModel(application) {
      *  asks when it is opened; see [DmHistoryOnOpen]. */
     private val dmHistoryAsked = mutableSetOf<String>()
 
+    /** Whether an own JOIN asks for the channel's history; see [OwnJoinHistory]. */
+    internal val ownJoinHistory = OwnJoinHistory()
+
     fun requestHistory(channel: String) {
         // Channel history is served to any member, guests included —
         // membership is the server's only check. DM history requires an
@@ -1503,6 +1513,7 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
 
             is FreeqEvent.Registered -> {
                 state.reconnectAttempts = 0
+                state.ownJoinHistory.newConnection()
                 // If authenticated user got Guest nick, token was stale — retry broker
                 if (state.authenticatedDID.value != null
                     && event.nick.startsWith("Guest", ignoreCase = true)) {
@@ -1582,8 +1593,7 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                         state.autoJoinChannels.add(event.channel)
                         state.persistChannels()
                     }
-                    // Only request history if channel has no messages yet (avoid duplicate requests)
-                    if (ch.messages.isEmpty()) {
+                    if (state.ownJoinHistory.shouldAsk(ch)) {
                         state.requestHistory(event.channel)
                     }
                 }
@@ -1674,29 +1684,7 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                     val batchId = ircMsg.batchId
                     if (batchId != null) {
                         state.batches[batchId]?.let { batch ->
-                            val idx = batch.messages.indexOfFirst { it.id == editTarget }
-                            if (idx >= 0) {
-                                val held = batch.messages[idx]
-                                // Reactions attach to the msgid the user reacted
-                                // to — usually the latest edit id — so replay
-                                // delivers them ON the edit row; merge them or
-                                // reactions on edited messages vanish every
-                                // relaunch. (The id deliberately stays the
-                                // original's: the flush dedupe is id-only, and
-                                // re-keying would append a duplicate beside a
-                                // held copy after an offline-window edit. An
-                                // edit-anchor merge at flush is the follow-up
-                                // that unlocks re-keying.)
-                                for ((emoji, nicks) in msg.reactions) {
-                                    if (nicks.isNotEmpty()) held.reactions[emoji] = nicks
-                                }
-                                batch.messages[idx] = held.copy(
-                                    text = ircMsg.text,
-                                    isEdited = true,
-                                )
-                            } else {
-                                batch.messages.add(msg)
-                            }
+                            BatchFlush.foldEdit(batch, editTarget, msg, ircMsg.text)
                         }
                         return
                     }
