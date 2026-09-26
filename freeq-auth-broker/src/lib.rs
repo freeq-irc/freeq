@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -365,27 +367,28 @@ pub struct BrokerSessionRecord {
     pub updated_at: i64,
 }
 
+pub type SessionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 /// Where broker sessions (`broker_token → refresh_token/dpop`) are kept.
 /// [`SqliteStore`] is durable (standalone; or embedded opt-in);
 /// [`InMemoryStore`] is ephemeral (embedded default).
-#[async_trait::async_trait]
 pub trait SessionStore: Send + Sync {
-    async fn get(&self, broker_token: &str) -> Option<BrokerSessionRecord>;
-    async fn insert(&self, rec: &BrokerSessionRecord) -> anyhow::Result<()>;
+    fn get<'a>(&'a self, broker_token: &'a str) -> SessionFuture<'a, Option<BrokerSessionRecord>>;
+    fn insert<'a>(&'a self, rec: &'a BrokerSessionRecord) -> SessionFuture<'a, anyhow::Result<()>>;
     /// Persist a rotated refresh token + DPoP nonce (single-use rotation).
-    async fn update_refresh(
-        &self,
-        broker_token: &str,
-        refresh_token: &str,
-        dpop_nonce: Option<&str>,
-    ) -> anyhow::Result<()>;
+    fn update_refresh<'a>(
+        &'a self,
+        broker_token: &'a str,
+        refresh_token: &'a str,
+        dpop_nonce: Option<&'a str>,
+    ) -> SessionFuture<'a, anyhow::Result<()>>;
     /// Forget a session, so `/session` with its token answers 401. Deleting a
     /// token the store never had is not an error — a device can only be
     /// signed out once.
-    async fn delete(&self, broker_token: &str) -> anyhow::Result<()>;
+    fn delete<'a>(&'a self, broker_token: &'a str) -> SessionFuture<'a, anyhow::Result<()>>;
     /// Forget the session whose token hashes to `hash` (see [`token_hash`]),
     /// for a caller that keeps only the hash. No match is not an error.
-    async fn delete_by_token_hash(&self, hash: &str) -> anyhow::Result<()>;
+    fn delete_by_token_hash<'a>(&'a self, hash: &'a str) -> SessionFuture<'a, anyhow::Result<()>>;
 }
 
 /// Durable SQLite store with AES-GCM field encryption at rest. Owns the key.
@@ -414,59 +417,61 @@ impl SqliteStore {
     }
 }
 
-#[async_trait::async_trait]
 impl SessionStore for SqliteStore {
-    async fn get(&self, broker_token: &str) -> Option<BrokerSessionRecord> {
-        let db = self.conn.lock().await;
-        let enc_key = &self.enc_key;
-        let mut stmt = db.prepare(
+    fn get<'a>(&'a self, broker_token: &'a str) -> SessionFuture<'a, Option<BrokerSessionRecord>> {
+        Box::pin(async move {
+            let db = self.conn.lock().await;
+            let enc_key = &self.enc_key;
+            let mut stmt = db.prepare(
             "SELECT broker_token, did, handle, pds_url, token_endpoint, refresh_token, dpop_key_b64, dpop_nonce, created_at, updated_at FROM sessions WHERE broker_token = ?1"
         ).ok()?;
-        let mut rows = stmt.query(rusqlite::params![broker_token]).ok()?;
-        let row = rows.next().ok().flatten()?;
-        let encrypted_refresh: String = row.get(5).ok()?;
-        let encrypted_dpop: String = row.get(6).ok()?;
-        let encrypted_nonce: Option<String> = row.get(7).ok()?;
-        // C-5: decrypt sensitive fields after reading from DB.
-        let refresh_token = decrypt_field(enc_key, &encrypted_refresh)
-            .map_err(|e| tracing::error!("Failed to decrypt refresh_token: {e}"))
-            .ok()?;
-        let dpop_key_b64 = decrypt_field(enc_key, &encrypted_dpop)
-            .map_err(|e| tracing::error!("Failed to decrypt dpop_key_b64: {e}"))
-            .ok()?;
-        let dpop_nonce = encrypted_nonce
-            .map(|n| decrypt_field(enc_key, &n))
-            .transpose()
-            .map_err(|e| tracing::error!("Failed to decrypt dpop_nonce: {e}"))
-            .ok()?;
-        Some(BrokerSessionRecord {
-            broker_token: row.get(0).ok()?,
-            did: row.get(1).ok()?,
-            handle: row.get(2).ok()?,
-            pds_url: row.get(3).ok()?,
-            token_endpoint: row.get(4).ok()?,
-            refresh_token,
-            dpop_key_b64,
-            dpop_nonce,
-            created_at: row.get(8).ok()?,
-            updated_at: row.get(9).ok()?,
-            // Not persisted — the standalone broker (the only SqliteStore user)
-            // rebuilds client_id from its static config on refresh, so it never
-            // reads a stored one. Only the embedded InMemoryStore needs it (its
-            // origin is per-request). A future durable-embedded SQLite store
-            // would add the column then.
-            client_id: String::new(),
+            let mut rows = stmt.query(rusqlite::params![broker_token]).ok()?;
+            let row = rows.next().ok().flatten()?;
+            let encrypted_refresh: String = row.get(5).ok()?;
+            let encrypted_dpop: String = row.get(6).ok()?;
+            let encrypted_nonce: Option<String> = row.get(7).ok()?;
+            // C-5: decrypt sensitive fields after reading from DB.
+            let refresh_token = decrypt_field(enc_key, &encrypted_refresh)
+                .map_err(|e| tracing::error!("Failed to decrypt refresh_token: {e}"))
+                .ok()?;
+            let dpop_key_b64 = decrypt_field(enc_key, &encrypted_dpop)
+                .map_err(|e| tracing::error!("Failed to decrypt dpop_key_b64: {e}"))
+                .ok()?;
+            let dpop_nonce = encrypted_nonce
+                .map(|n| decrypt_field(enc_key, &n))
+                .transpose()
+                .map_err(|e| tracing::error!("Failed to decrypt dpop_nonce: {e}"))
+                .ok()?;
+            Some(BrokerSessionRecord {
+                broker_token: row.get(0).ok()?,
+                did: row.get(1).ok()?,
+                handle: row.get(2).ok()?,
+                pds_url: row.get(3).ok()?,
+                token_endpoint: row.get(4).ok()?,
+                refresh_token,
+                dpop_key_b64,
+                dpop_nonce,
+                created_at: row.get(8).ok()?,
+                updated_at: row.get(9).ok()?,
+                // Not persisted — the standalone broker (the only SqliteStore user)
+                // rebuilds client_id from its static config on refresh, so it never
+                // reads a stored one. Only the embedded InMemoryStore needs it (its
+                // origin is per-request). A future durable-embedded SQLite store
+                // would add the column then.
+                client_id: String::new(),
+            })
         })
     }
 
-    async fn insert(&self, rec: &BrokerSessionRecord) -> anyhow::Result<()> {
-        let enc_key = &self.enc_key;
-        let encrypted_refresh = encrypt_field(enc_key, &rec.refresh_token);
-        let encrypted_dpop = encrypt_field(enc_key, &rec.dpop_key_b64);
-        let encrypted_nonce = rec.dpop_nonce.as_deref().map(|n| encrypt_field(enc_key, n));
-        let db = self.conn.lock().await;
-        // client_id is intentionally not persisted (see `get`).
-        db.execute(
+    fn insert<'a>(&'a self, rec: &'a BrokerSessionRecord) -> SessionFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let enc_key = &self.enc_key;
+            let encrypted_refresh = encrypt_field(enc_key, &rec.refresh_token);
+            let encrypted_dpop = encrypt_field(enc_key, &rec.dpop_key_b64);
+            let encrypted_nonce = rec.dpop_nonce.as_deref().map(|n| encrypt_field(enc_key, n));
+            let db = self.conn.lock().await;
+            // client_id is intentionally not persisted (see `get`).
+            db.execute(
             "INSERT INTO sessions (broker_token, did, handle, pds_url, token_endpoint, refresh_token, dpop_key_b64, dpop_nonce, created_at, updated_at)\
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)\
              ON CONFLICT(broker_token) DO UPDATE SET refresh_token=excluded.refresh_token, updated_at=excluded.updated_at",
@@ -475,51 +480,58 @@ impl SessionStore for SqliteStore {
                 encrypted_refresh, encrypted_dpop, encrypted_nonce, rec.created_at, rec.updated_at,
             ],
         )?;
-        Ok(())
+            Ok(())
+        })
     }
 
-    async fn update_refresh(
-        &self,
-        broker_token: &str,
-        refresh_token: &str,
-        dpop_nonce: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let enc_key = &self.enc_key;
-        let encrypted_refresh = encrypt_field(enc_key, refresh_token);
-        let encrypted_nonce = dpop_nonce.map(|n| encrypt_field(enc_key, n));
-        let now = chrono::Utc::now().timestamp();
-        let db = self.conn.lock().await;
-        db.execute(
+    fn update_refresh<'a>(
+        &'a self,
+        broker_token: &'a str,
+        refresh_token: &'a str,
+        dpop_nonce: Option<&'a str>,
+    ) -> SessionFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let enc_key = &self.enc_key;
+            let encrypted_refresh = encrypt_field(enc_key, refresh_token);
+            let encrypted_nonce = dpop_nonce.map(|n| encrypt_field(enc_key, n));
+            let now = chrono::Utc::now().timestamp();
+            let db = self.conn.lock().await;
+            db.execute(
             "UPDATE sessions SET refresh_token = ?1, dpop_nonce = ?2, updated_at = ?3 WHERE broker_token = ?4",
             rusqlite::params![encrypted_refresh, encrypted_nonce, now, broker_token],
         )?;
-        Ok(())
+            Ok(())
+        })
     }
 
-    async fn delete(&self, broker_token: &str) -> anyhow::Result<()> {
-        let db = self.conn.lock().await;
-        db.execute(
-            "DELETE FROM sessions WHERE broker_token = ?1",
-            rusqlite::params![broker_token],
-        )?;
-        Ok(())
-    }
-
-    async fn delete_by_token_hash(&self, hash: &str) -> anyhow::Result<()> {
-        // Sessions are few, so the tokens are hashed here rather than a hash
-        // column added to a table with no migrations.
-        let db = self.conn.lock().await;
-        let tokens: Vec<String> = db
-            .prepare("SELECT broker_token FROM sessions")?
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
-        for token in tokens.iter().filter(|t| token_hash(t) == hash) {
+    fn delete<'a>(&'a self, broker_token: &'a str) -> SessionFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let db = self.conn.lock().await;
             db.execute(
                 "DELETE FROM sessions WHERE broker_token = ?1",
-                rusqlite::params![token],
+                rusqlite::params![broker_token],
             )?;
-        }
-        Ok(())
+            Ok(())
+        })
+    }
+
+    fn delete_by_token_hash<'a>(&'a self, hash: &'a str) -> SessionFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            // Sessions are few, so the tokens are hashed here rather than a hash
+            // column added to a table with no migrations.
+            let db = self.conn.lock().await;
+            let tokens: Vec<String> = db
+                .prepare("SELECT broker_token FROM sessions")?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            for token in tokens.iter().filter(|t| token_hash(t) == hash) {
+                db.execute(
+                    "DELETE FROM sessions WHERE broker_token = ?1",
+                    rusqlite::params![token],
+                )?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -537,45 +549,52 @@ impl InMemoryStore {
     }
 }
 
-#[async_trait::async_trait]
 impl SessionStore for InMemoryStore {
-    async fn get(&self, broker_token: &str) -> Option<BrokerSessionRecord> {
-        self.sessions.lock().await.get(broker_token).cloned()
+    fn get<'a>(&'a self, broker_token: &'a str) -> SessionFuture<'a, Option<BrokerSessionRecord>> {
+        Box::pin(async move { self.sessions.lock().await.get(broker_token).cloned() })
     }
 
-    async fn insert(&self, rec: &BrokerSessionRecord) -> anyhow::Result<()> {
-        self.sessions
-            .lock()
-            .await
-            .insert(rec.broker_token.clone(), rec.clone());
-        Ok(())
+    fn insert<'a>(&'a self, rec: &'a BrokerSessionRecord) -> SessionFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.sessions
+                .lock()
+                .await
+                .insert(rec.broker_token.clone(), rec.clone());
+            Ok(())
+        })
     }
 
-    async fn update_refresh(
-        &self,
-        broker_token: &str,
-        refresh_token: &str,
-        dpop_nonce: Option<&str>,
-    ) -> anyhow::Result<()> {
-        if let Some(r) = self.sessions.lock().await.get_mut(broker_token) {
-            r.refresh_token = refresh_token.to_string();
-            r.dpop_nonce = dpop_nonce.map(str::to_string);
-            r.updated_at = chrono::Utc::now().timestamp();
-        }
-        Ok(())
+    fn update_refresh<'a>(
+        &'a self,
+        broker_token: &'a str,
+        refresh_token: &'a str,
+        dpop_nonce: Option<&'a str>,
+    ) -> SessionFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            if let Some(r) = self.sessions.lock().await.get_mut(broker_token) {
+                r.refresh_token = refresh_token.to_string();
+                r.dpop_nonce = dpop_nonce.map(str::to_string);
+                r.updated_at = chrono::Utc::now().timestamp();
+            }
+            Ok(())
+        })
     }
 
-    async fn delete(&self, broker_token: &str) -> anyhow::Result<()> {
-        self.sessions.lock().await.remove(broker_token);
-        Ok(())
+    fn delete<'a>(&'a self, broker_token: &'a str) -> SessionFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.sessions.lock().await.remove(broker_token);
+            Ok(())
+        })
     }
 
-    async fn delete_by_token_hash(&self, hash: &str) -> anyhow::Result<()> {
-        self.sessions
-            .lock()
-            .await
-            .retain(|token, _| token_hash(token) != hash);
-        Ok(())
+    fn delete_by_token_hash<'a>(&'a self, hash: &'a str) -> SessionFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.sessions
+                .lock()
+                .await
+                .retain(|token, _| token_hash(token) != hash);
+            Ok(())
+        })
     }
 }
 
@@ -1901,21 +1920,23 @@ pub struct SessionPush<'a> {
 
 /// How a freshly-minted session reaches the freeq-server. Standalone pushes
 /// over HTTP+HMAC ([`RemoteWriter`]); an embedding server writes in-process.
-#[async_trait::async_trait]
 pub trait SessionWriter: Send + Sync {
     /// Mint a one-time SASL web-token for this identity → `(token, nick)`.
     ///
     /// `broker_token` is the login token the web token is minted for. The
     /// server files it beside the web token, so a device signed out later can
     /// have its login token refused.
-    async fn mint_web_token(
-        &self,
-        did: &str,
-        handle: &str,
-        broker_token: Option<&str>,
-    ) -> Result<(String, String), anyhow::Error>;
+    fn mint_web_token<'a>(
+        &'a self,
+        did: &'a str,
+        handle: &'a str,
+        broker_token: Option<&'a str>,
+    ) -> SessionFuture<'a, anyhow::Result<(String, String)>>;
     /// Install / refresh the server-side web session for proxied PDS ops.
-    async fn push_session(&self, push: &SessionPush<'_>) -> Result<(), anyhow::Error>;
+    fn push_session<'a>(
+        &'a self,
+        push: &'a SessionPush<'a>,
+    ) -> SessionFuture<'a, anyhow::Result<()>>;
 }
 
 /// The freeq-server refused a web token for this identity: the device was
@@ -1939,79 +1960,85 @@ pub struct RemoteWriter {
     pub shared_secret: String,
 }
 
-#[async_trait::async_trait]
 impl SessionWriter for RemoteWriter {
-    async fn mint_web_token(
-        &self,
-        did: &str,
-        handle: &str,
-        broker_token: Option<&str>,
-    ) -> Result<(String, String), anyhow::Error> {
-        let body = serde_json::json!({
-            "did": did,
-            "handle": handle,
-            "broker_token": broker_token,
-        });
-        let (sig, ts) = sign_body(&self.shared_secret, &body)?;
-        let url = format!(
-            "{}/auth/broker/web-token",
-            self.freeq_server_url.trim_end_matches('/')
-        );
-        let client = upstream_client()?;
-        let resp = client
-            .post(&url)
-            .header("X-Broker-Signature", sig)
-            .header("X-Broker-Timestamp", ts)
-            .json(&body)
-            .send()
-            .await?;
-        // 401 is the server's verdict on this device, not a failure to reach
-        // it: the caller turns it into a 401 for the device.
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(anyhow::Error::new(WebTokenRefused));
-        }
-        if !resp.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "web-token failed: {}",
-                resp.text().await.unwrap_or_default()
-            ));
-        }
-        let json: serde_json::Value = resp.json().await?;
-        let token = json["token"].as_str().unwrap_or_default().to_string();
-        let nick = json["nick"].as_str().unwrap_or_default().to_string();
-        Ok((token, nick))
+    fn mint_web_token<'a>(
+        &'a self,
+        did: &'a str,
+        handle: &'a str,
+        broker_token: Option<&'a str>,
+    ) -> SessionFuture<'a, anyhow::Result<(String, String)>> {
+        Box::pin(async move {
+            let body = serde_json::json!({
+                "did": did,
+                "handle": handle,
+                "broker_token": broker_token,
+            });
+            let (sig, ts) = sign_body(&self.shared_secret, &body)?;
+            let url = format!(
+                "{}/auth/broker/web-token",
+                self.freeq_server_url.trim_end_matches('/')
+            );
+            let client = upstream_client()?;
+            let resp = client
+                .post(&url)
+                .header("X-Broker-Signature", sig)
+                .header("X-Broker-Timestamp", ts)
+                .json(&body)
+                .send()
+                .await?;
+            // 401 is the server's verdict on this device, not a failure to reach
+            // it: the caller turns it into a 401 for the device.
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(anyhow::Error::new(WebTokenRefused));
+            }
+            if !resp.status().is_success() {
+                return Err(anyhow::anyhow!(
+                    "web-token failed: {}",
+                    resp.text().await.unwrap_or_default()
+                ));
+            }
+            let json: serde_json::Value = resp.json().await?;
+            let token = json["token"].as_str().unwrap_or_default().to_string();
+            let nick = json["nick"].as_str().unwrap_or_default().to_string();
+            Ok((token, nick))
+        })
     }
 
-    async fn push_session(&self, push: &SessionPush<'_>) -> Result<(), anyhow::Error> {
-        let body = serde_json::json!({
-            "did": push.did,
-            "handle": push.handle,
-            "pds_url": push.pds_url,
-            "access_token": push.access_token,
-            "dpop_key_b64": push.dpop_key_b64,
-            "dpop_nonce": push.dpop_nonce,
-            "granted_scope": push.granted_scope,
-        });
-        let (sig, ts) = sign_body(&self.shared_secret, &body)?;
-        let url = format!(
-            "{}/auth/broker/session",
-            self.freeq_server_url.trim_end_matches('/')
-        );
-        let client = upstream_client()?;
-        let resp = client
-            .post(&url)
-            .header("X-Broker-Signature", sig)
-            .header("X-Broker-Timestamp", ts)
-            .json(&body)
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "session push failed: {}",
-                resp.text().await.unwrap_or_default()
-            ));
-        }
-        Ok(())
+    fn push_session<'a>(
+        &'a self,
+        push: &'a SessionPush<'a>,
+    ) -> SessionFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let body = serde_json::json!({
+                "did": push.did,
+                "handle": push.handle,
+                "pds_url": push.pds_url,
+                "access_token": push.access_token,
+                "dpop_key_b64": push.dpop_key_b64,
+                "dpop_nonce": push.dpop_nonce,
+                "granted_scope": push.granted_scope,
+            });
+            let (sig, ts) = sign_body(&self.shared_secret, &body)?;
+            let url = format!(
+                "{}/auth/broker/session",
+                self.freeq_server_url.trim_end_matches('/')
+            );
+            let client = upstream_client()?;
+            let resp = client
+                .post(&url)
+                .header("X-Broker-Signature", sig)
+                .header("X-Broker-Timestamp", ts)
+                .json(&body)
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(anyhow::anyhow!(
+                    "session push failed: {}",
+                    resp.text().await.unwrap_or_default()
+                ));
+            }
+            Ok(())
+        })
     }
 }
 

@@ -2588,7 +2588,6 @@ version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
- "async-trait",
  "axum",
  "base64",
  "chrono",
@@ -2879,7 +2878,6 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
- "async-trait",
  "automerge",
  "axum",
  "base64",

@@ -4014,52 +4014,55 @@ pub struct LocalWriter {
     pub state: Arc<SharedState>,
 }
 
-#[async_trait::async_trait]
 impl freeq_auth_broker::SessionWriter for LocalWriter {
-    async fn mint_web_token(
-        &self,
-        did: &str,
-        handle: &str,
-        broker_token: Option<&str>,
-    ) -> Result<(String, String), anyhow::Error> {
-        let token = generate_random_string(32);
-        self.state.web_auth_tokens.lock().insert(
-            token.clone(),
-            (
-                did.to_string(),
-                handle.to_string(),
-                std::time::Instant::now(),
-                broker_token.map(str::to_string),
-            ),
-        );
-        Ok((token, mobile_nick_from_handle(handle)))
+    fn mint_web_token<'a>(
+        &'a self,
+        did: &'a str,
+        handle: &'a str,
+        broker_token: Option<&'a str>,
+    ) -> freeq_auth_broker::SessionFuture<'a, anyhow::Result<(String, String)>> {
+        Box::pin(async move {
+            let token = generate_random_string(32);
+            self.state.web_auth_tokens.lock().insert(
+                token.clone(),
+                (
+                    did.to_string(),
+                    handle.to_string(),
+                    std::time::Instant::now(),
+                    broker_token.map(str::to_string),
+                ),
+            );
+            Ok((token, mobile_nick_from_handle(handle)))
+        })
     }
 
-    async fn push_session(
-        &self,
-        p: &freeq_auth_broker::SessionPush<'_>,
-    ) -> Result<(), anyhow::Error> {
-        self.state.web_sessions.lock().insert(
-            (p.did.to_string(), crate::server::OauthPurpose::Login),
-            crate::server::WebSession {
-                did: p.did.to_string(),
-                handle: p.handle.to_string(),
-                pds_url: p.pds_url.to_string(),
-                access_token: p.access_token.to_string(),
-                dpop_key_b64: p.dpop_key_b64.to_string(),
-                dpop_nonce: p.dpop_nonce.map(str::to_string),
-                created_at: std::time::Instant::now(),
-                granted_scope: p.granted_scope.to_string(),
-            },
-        );
-        // Upload token for mobile clients that can't prove session ownership
-        // via WebSocket session_dids (stored server-side, 5-min TTL).
-        let upload_token = generate_random_string(32);
-        self.state
-            .upload_tokens
-            .lock()
-            .insert(upload_token, (p.did.to_string(), std::time::Instant::now()));
-        Ok(())
+    fn push_session<'a>(
+        &'a self,
+        p: &'a freeq_auth_broker::SessionPush<'a>,
+    ) -> freeq_auth_broker::SessionFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.state.web_sessions.lock().insert(
+                (p.did.to_string(), crate::server::OauthPurpose::Login),
+                crate::server::WebSession {
+                    did: p.did.to_string(),
+                    handle: p.handle.to_string(),
+                    pds_url: p.pds_url.to_string(),
+                    access_token: p.access_token.to_string(),
+                    dpop_key_b64: p.dpop_key_b64.to_string(),
+                    dpop_nonce: p.dpop_nonce.map(str::to_string),
+                    created_at: std::time::Instant::now(),
+                    granted_scope: p.granted_scope.to_string(),
+                },
+            );
+            // Upload token for mobile clients that can't prove session ownership
+            // via WebSocket session_dids (stored server-side, 5-min TTL).
+            let upload_token = generate_random_string(32);
+            self.state
+                .upload_tokens
+                .lock()
+                .insert(upload_token, (p.did.to_string(), std::time::Instant::now()));
+            Ok(())
+        })
     }
 }
 
