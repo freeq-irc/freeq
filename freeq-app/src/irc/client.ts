@@ -678,9 +678,14 @@ export function sendMessage(target: string, text: string, multiline = false) {
   });
 }
 
-export function sendReply(target: string, replyToMsgId: string, text: string, multiline = false) {
+export function sendReply(
+  target: string,
+  replyToMsgId: string,
+  text: string,
+  options: boolean | { tags?: Record<string, string> } = false,
+) {
   sendToPeer(target, () => {
-    client?.sendReply(target, replyToMsgId, text, multiline);
+    client?.sendReply(target, replyToMsgId, text, options);
     ensureDmThread(target);
   });
 }
