@@ -9,6 +9,10 @@ description = "Generate and manage bot identities for freeq"
 name = "freeq-bot-id"
 path = "src/main.rs"
 
+[[bin]]
+name = "demo-bot"
+path = "src/demo_bot.rs"
+
 [dev-dependencies]
 tempfile = "3"
 
@@ -24,3 +28,5 @@ base64.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 freeq-sdk = { path = "../freeq-sdk" }
+tokio.workspace = true
+tracing-subscriber.workspace = true

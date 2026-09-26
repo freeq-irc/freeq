@@ -2688,6 +2688,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
