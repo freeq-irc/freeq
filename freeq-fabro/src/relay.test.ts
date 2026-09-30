@@ -14,7 +14,7 @@ describe("handleHook", () => {
     await handleHook({ event: "run_start", run_id: "A", workflow_name: "w" }, opts);
     await handleHook({ event: "run_complete", run_id: "B", workflow_name: "w" }, opts);
     expect(lookups).toEqual(["B"]);
-    expect(posted[1]).toBe("fabro: w finished green — PR https://gh/pr/1");
+    expect(posted[1]).toBe("fabro: w [b] finished green — PR https://gh/pr/1");
   });
 });
 
@@ -38,7 +38,7 @@ describe("createRelay", () => {
     });
     expect(res.status).toBe(204);
     await new Promise((r) => setTimeout(r, 20));
-    expect(posted).toEqual(["fabro: dep-audit FAILED: verify failed — fabro inspect R"]);
+    expect(posted).toEqual(["fabro: dep-audit [r] FAILED: verify failed — fabro inspect R"]);
   });
 
   it("404s other paths and tolerates junk bodies", async () => {

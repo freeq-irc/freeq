@@ -14,6 +14,8 @@ export interface HookContext {
 }
 
 export interface FormatOptions {
+  /** For an approval gate: the pending question, already described. */
+  question?: string;
   /** Public base URL of the Fabro web UI, e.g. https://fabro-freeq.boxd.sh.
    *  When set, messages link to the run. */
   webUrl?: string;
@@ -29,13 +31,18 @@ export function runLink(runId: string | undefined, webUrl?: string): string {
   return `fabro inspect ${runId}`;
 }
 
+/** `[x7k2qa]` — the handle owner commands accept (last 6 of the ULID). */
+function tag(runId: string | undefined): string {
+  return runId ? ` [${runId.slice(-6).toLowerCase()}]` : "";
+}
+
 function oneLine(s: string, max: number): string {
   const flat = s.replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
 export function formatHook(ctx: HookContext, opts: FormatOptions = {}): string | null {
-  const wf = ctx.workflow_name ?? "workflow";
+  const wf = `${ctx.workflow_name ?? "workflow"}${tag(ctx.run_id)}`;
   const link = runLink(ctx.run_id, opts.webUrl);
   const tail = link ? ` — ${link}` : "";
 
@@ -53,7 +60,9 @@ export function formatHook(ctx: HookContext, opts: FormatOptions = {}): string |
     case "stage_start": {
       // Only human-gate stages are routed here (hook matcher "^approve").
       const gate = ctx.node_label ?? ctx.node_id ?? "a gate";
-      return `fabro: ${wf} is waiting for your approval at "${gate}"${tail}`;
+      const short = ctx.run_id ? ` ${ctx.run_id.slice(-6).toLowerCase()}` : "";
+      const ask = opts.question ? ` ${opts.question}` : "";
+      return `fabro: ${wf} is waiting for you at "${gate}".${ask} Reply: fabro approve${short} / fabro deny${short}${tail}`;
     }
     default:
       return null;

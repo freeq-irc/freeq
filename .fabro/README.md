@@ -12,7 +12,27 @@ Two ways work reaches it:
   workflow, close the lid; it keeps going on the boxd VM.
 
 Either way, run lifecycle lands in **#freeq-dev** on irc.freeq.at (started,
-finished + PR link, failed + reason, waiting for your approval).
+finished + PR link, failed + reason, waiting for your approval), and you can
+drive Fabro back from any freeq client — including your phone.
+
+## Driving it from freeq
+
+The `fabro` bot in #freeq-dev takes commands from its owner only (checked
+against the sender's server-verified DID; everyone else is ignored). Address
+it in the channel, or DM it without the prefix:
+
+| Command | Does |
+|---|---|
+| `fabro status` | Active runs, and any gate waiting on you |
+| `fabro run bug-hunt` | Fire an upkeep automation now, from `main` |
+| `fabro run feature <goal…>` | Start a workflow with a goal (handoff from your phone) |
+| `fabro approve [id]` / `fabro deny [id]` | Answer a waiting yes/no gate — id optional if only one waits |
+| `fabro answer <id> <choice or text>` | Multiple-choice / freeform gates |
+| `fabro cancel <id>` | Cancel a run |
+| `fabro help` | This list |
+
+`id` is the 6-character tag every notification carries, e.g. `[ndb1qw]`.
+Approval pings include the gate's actual question and the reply to send.
 
 ## The workflows
 

@@ -11,6 +11,8 @@ export interface RelayOptions {
   post: (line: string) => void;
   /** Resolve the run's PR URL, if any (run_complete only). */
   findPr?: (runId: string) => Promise<string | undefined>;
+  /** Describe the question an approval gate is asking (stage_start only). */
+  describeGate?: (runId: string) => Promise<string | undefined>;
   webUrl?: string;
   log?: (msg: string) => void;
 }
@@ -22,7 +24,11 @@ export async function handleHook(ctx: HookContext, opts: RelayOptions): Promise<
     ctx.event === "run_complete" && ctx.run_id && opts.findPr
       ? await opts.findPr(ctx.run_id)
       : undefined;
-  const line = formatHook(ctx, { webUrl: opts.webUrl, prUrl });
+  const question =
+    ctx.event === "stage_start" && ctx.run_id && opts.describeGate
+      ? await opts.describeGate(ctx.run_id).catch(() => undefined)
+      : undefined;
+  const line = formatHook(ctx, { webUrl: opts.webUrl, prUrl, question });
   if (line) opts.post(line);
 }
 
