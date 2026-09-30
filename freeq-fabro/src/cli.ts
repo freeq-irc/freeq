@@ -24,9 +24,11 @@
 //
 // It is also two-way: the owner can drive Fabro from freeq — in the channel
 // by addressing the bot ("fabro status", "fabro approve x7k2qa") or by DM.
-// Commands are accepted ONLY when the sender's DID (freeq's server-verified
-// account tag, falling back to WHOIS) is FREEQ_OWNER_DID; anyone else is
-// ignored in the channel and told so, at most hourly, in DMs.
+// Commands are accepted ONLY when the message's server-attached account tag
+// (IRCv3 account-tag: set by the server for SASL-authed senders, not
+// forgeable by clients) is FREEQ_OWNER_DID. Strict mode — no nick cache or
+// WHOIS fallback, which could trust a nick that just changed hands. Anyone
+// else is ignored in the channel and told so, at most hourly, in DMs.
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -115,7 +117,10 @@ bot.on("message", (target, msg) => {
   };
 
   void (async () => {
-    const senderDid = await bot.resolveSenderDid({ from: msg.from, tags: msg.tags });
+    const senderDid = await bot.resolveSenderDid(
+      { from: msg.from, tags: msg.tags },
+      { cache: false, whois: false },
+    );
     if (senderDid !== ownerDid) {
       log(`ignored command from ${msg.from} (${senderDid ?? "unverified"})`);
       const last = refusedAt.get(msg.from) ?? 0;
