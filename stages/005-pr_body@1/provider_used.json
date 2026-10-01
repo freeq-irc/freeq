@@ -1,0 +1,5 @@
+{
+  "mode": "prompt",
+  "provider": "anthropic",
+  "model": "claude-sonnet-5-5"
+}

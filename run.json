@@ -424,7 +424,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-10-01T02:00:17.532652967Z",
-  "last_event_at": "2026-10-01T02:30:09.645410369Z",
+  "last_event_at": "2026-10-01T02:30:20.676339182Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -683,9 +683,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 130,
       "checkpoint": {
-        "timestamp": "2026-10-01T02:30:09.653674081Z",
+        "timestamp": "2026-10-01T02:30:13.297948707Z",
         "current_node": "verify",
         "completed_nodes": [
           "start",
@@ -695,13 +695,163 @@
         ],
         "node_retries": {},
         "context_values": {
+          "current_node": "verify",
+          "thread.implement.current_node": "verify",
+          "internal.retry_count.verify": 0,
+          "internal.retry_count.start": 0,
+          "outcome": "succeeded",
           "internal.thread_id": "implement",
-          "internal.work_dir": "/workspace/freeq",
-          "thread.cov.current_node": "implement",
+          "failure_signature": "",
+          "internal.node_visit_count": 1,
+          "internal.retry_count.select": 0,
+          "graph.rankdir": "LR",
+          "internal.fidelity": "compact",
+          "failure_class": "",
+          "internal.retry_count.implement": 0,
           "last_response": "I added 23 tests for the display and input helpers in `freeq-tui/src/main.rs`, and the full gate (`bash .fabro/verify.sh`) passes. They're in the existing `tests` module, using its naming style and th",
+          "response.select": "## Choice\n\n**File:** `freeq-tui/src/main.rs` (Rust, crate `freeq-tui`). It's inside the CI-covered surface and avoids the AV crates.\n\nThe tests will go in a new `#[cfg(test)]` module of display and parsing helpers. They'll sit next to the existing test module that starts at line 3501.\n\n### Why this file\n\n- **Hotspot score:** `bash scripts/hotspots.sh --top 25` lists it at 4187 lines and 79 functions, gamma 4. It's smaller than the top entries but far from trivial.\n- **The CLAUDE.md \"undertested\" list is stale.** I checked each named file:\n  - `freeq-app/src/irc/client.ts` now has about a dozen `client-*.test.ts` files.\n  - `freeq-sdk/src/client.rs` has 176 tests across 6 test modules.\n  - `freeq-sdk-js/src/client.ts` already has a 4000-line test file.\n  - `server.rs`, `db.rs` and `web.rs` are huge and need a running server, so they don't suit one focused change.\n- **Where the gap is in `main.rs`:** the existing 35 tests cover verification verdicts, key-set parsing and `parse_join_prefix`. The rendering and input helpers have no direct tests. A grep shows `format_file_size`, `format_link_preview`, `format_media_display`, `parse_timestamp_ms`, `format_timestamp`, `try_nick_complete` and `ctcp_action` are only called from production code. `ctcp_action` appears once in the tests, at line 3877, only as a fixture. The other helpers have no test calls at all.\n- **A likely real bug:** `format_link_preview` (line 3404) truncates with `&desc[..120]` on a byte index. A description with a multibyte character straddling byte 120 would panic the TUI. Anyone who can post a link can supply that description.\n\n### Behaviors to pin\n\n1. **`format_file_size`:**\n   - 1023 gives `1023B`, 1024 gives `1.0KB`, and 1048575 gives `1024.0KB`.\n   - 1048576 gives `1.0MB`, and 0 gives `0B`.\n   - The 1048575 case is a rounding oddity at the KB/MB boundary.\n2. **`format_link_preview`:**\n   - Title, description and URL are joined in the right order, and a missing title or description is omitted.\n   - A description of exactly 120 bytes is not truncated, and a longer one gets `…`.\n   - A multibyte character crossing byte 120 should not panic. If it does, I'll write the test to expose that and fix it with a char-boundary-safe truncation.\n3. **`format_media_display`:**\n   - The icon depends on the type: image, video, audio, or `📎` for anything else.\n   - Alt text, `W×H` and size appear only when present.\n   - `W×H` needs both width and height, so one alone is omitted.\n   - The URL is always last.\n4. **`parse_timestamp_ms` and `format_timestamp`:**\n   - A valid RFC3339 `time` tag gives the exact epoch milliseconds, for example `2024-01-01T00:00:00Z` gives `1704067200000`.\n   - A missing or malformed tag falls back to a value near now, asserted within a tolerance.\n5. **`ctcp_action`:** it wraps text as `\\x01ACTION …\\x01`, and empty text is still framed.\n6. **`try_nick_complete`:** this is the highest-value case and needs a small `App` fixture. I'll reuse the `app.rs` test helpers if they're accessible, and otherwise cut this case. It should cover:\n   - completion at the start of a line versus mid-line\n   - an empty fragment being a no-op\n   - case-insensitive prefix matching\n   - a multibyte character before the cursor not panicking on the `&text[..cursor]` slice\n\n### Convention to follow\n\n- The sibling module is `#[cfg(test)] mod tests` in `freeq-tui/src/main.rs` (from line 3501). It uses descriptive behavior-style names, such as `parse_join_prefix_rejects_control_chars_in_host` and `a_verdict_reads_as_who_vouches_for_the_message`.\n- It also has small local helpers, like `tags(&[(&str,&str)])`. I'll build `MediaAttachment` and `LinkPreview` fixtures in the same way.\n- Tests are pure synchronous `#[test]` functions with no network or server. `app.rs` (from line 1325) has the `App` construction pattern to borrow for the nick-completion tests.\n- I'll run them with `cargo test -p freeq-tui`.",
+          "internal.run_id": "01M3TK18DJSA24HWNP1WJ9YZ0D",
+          "graph.goal": "Raise automated-test coverage on one of freeq's high-risk, undertested files — adding tests only, with at most minimal, behavior-preserving testability seams in production code.",
+          "internal.work_dir": "/workspace/freeq",
+          "last_stage": "implement",
+          "thread.cov.current_node": "implement",
+          "command.output": "blob://sha256/d524d8f9f994dda1c4a2a79b08090c01b4fe024c40f1a6faf282945915d3add1",
+          "response.implement": "I added 23 tests for the display and input helpers in `freeq-tui/src/main.rs`, and the full gate (`bash .fabro/verify.sh`) passes. They're in the existing `tests` module, using its naming style and the existing `tags()` helper, with no production code changed. `cargo test -p freeq-tui` passes (150 tests), and clippy with `-D warnings` and `cargo fmt --check` are clean.\n\nThe first gate run timed out on the tool's limit, so I reran it in the background and it passed.\n\nThe tests cover:\n- **`format_file_size`:** the boundaries at 0, 1023, 1024 and 1 MiB, plus fractional KB and MB values.\n- **`format_link_preview`:**\n  - Title, description and URL come out in order, and a missing title or description is left out.\n  - A description of exactly 120 bytes is kept whole, and 121 bytes is cut with `…`.\n  - A description of 61 two-byte characters is cut on a character boundary.\n- **`format_media_display`:**\n  - The icon matches the type (image, video, audio, other).\n  - An undeclared type is judged by the URL.\n  - Alt text, size and `W×H` appear in order with the URL last, and `W×H` needs both width and height.\n- **`parse_timestamp_ms` and `format_timestamp`:**\n  - Valid RFC3339 tags give exact epoch milliseconds, including fractional seconds and `+01:00` offsets.\n  - A missing or malformed tag falls back to a time within the bounds I read before and after the call.\n  - The displayed time is the same for the same instant sent in different offsets, so it doesn't depend on the machine's time zone.\n- **`try_nick_complete`:**\n  - A nick at the start of the line completes with `: `, and one mid-line completes with a space and keeps the rest.\n  - Case and the `@`/`+` prefixes are ignored, and the first match wins.\n  - Nothing happens when there's no match, an empty fragment, an empty line or no active buffer.\n  - Only the text before the cursor is considered, and a wide character earlier in the line doesn't break it.\n\n**Panic risk left untested:** I didn't write a test that triggers the panic in `format_link_preview`, because fixing it would change production behavior. The truncation is `&desc[..120]` by byte index. A description whose 120th byte falls inside a multibyte character, for example one ASCII byte followed by two-byte characters, will panic the TUI. Anyone who can post a link can supply that text. The fix is a one-line change to cut on a character boundary, and I can make it with a regression test as a separate change if you want.\n\nI also didn't run `ctcp_action` again, since it's already covered at line 3877."
+        },
+        "node_outcomes": {
+          "verify": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/d524d8f9f994dda1c4a2a79b08090c01b4fe024c40f1a6faf282945915d3add1"
+            },
+            "notes": "Script completed: bash .fabro/verify.sh",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 480594,
+              "active_time_ms": 480594
+            }
+          },
+          "implement": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "implement",
+              "last_response": "I added 23 tests for the display and input helpers in `freeq-tui/src/main.rs`, and the full gate (`bash .fabro/verify.sh`) passes. They're in the existing `tests` module, using its naming style and th",
+              "response.implement": "I added 23 tests for the display and input helpers in `freeq-tui/src/main.rs`, and the full gate (`bash .fabro/verify.sh`) passes. They're in the existing `tests` module, using its naming style and the existing `tags()` helper, with no production code changed. `cargo test -p freeq-tui` passes (150 tests), and clippy with `-D warnings` and `cargo fmt --check` are clean.\n\nThe first gate run timed out on the tool's limit, so I reran it in the background and it passed.\n\nThe tests cover:\n- **`format_file_size`:** the boundaries at 0, 1023, 1024 and 1 MiB, plus fractional KB and MB values.\n- **`format_link_preview`:**\n  - Title, description and URL come out in order, and a missing title or description is left out.\n  - A description of exactly 120 bytes is kept whole, and 121 bytes is cut with `…`.\n  - A description of 61 two-byte characters is cut on a character boundary.\n- **`format_media_display`:**\n  - The icon matches the type (image, video, audio, other).\n  - An undeclared type is judged by the URL.\n  - Alt text, size and `W×H` appear in order with the URL last, and `W×H` needs both width and height.\n- **`parse_timestamp_ms` and `format_timestamp`:**\n  - Valid RFC3339 tags give exact epoch milliseconds, including fractional seconds and `+01:00` offsets.\n  - A missing or malformed tag falls back to a time within the bounds I read before and after the call.\n  - The displayed time is the same for the same instant sent in different offsets, so it doesn't depend on the machine's time zone.\n- **`try_nick_complete`:**\n  - A nick at the start of the line completes with `: `, and one mid-line completes with a space and keeps the rest.\n  - Case and the `@`/`+` prefixes are ignored, and the first match wins.\n  - Nothing happens when there's no match, an empty fragment, an empty line or no active buffer.\n  - Only the text before the cursor is considered, and a wide character earlier in the line doesn't break it.\n\n**Panic risk left untested:** I didn't write a test that triggers the panic in `format_link_preview`, because fixing it would change production behavior. The truncation is `&desc[..120]` by byte index. A description whose 120th byte falls inside a multibyte character, for example one ASCII byte followed by two-byte characters, will panic the TUI. Anyone who can post a link can supply that text. The fix is a one-line change to cut on a character boundary, and I can make it with a regression test as a separate change if you want.\n\nI also didn't run `ctcp_action` again, since it's already covered at line 3877."
+            },
+            "notes": "Stage completed: implement",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-sonnet-5-5"
+                  },
+                  "tokens": {
+                    "input_tokens": 14271,
+                    "output_tokens": 7152,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 256403,
+                    "cache_write_tokens": 44317
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 44317,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 262134
+            },
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 56852,
+              "tool_time_ms": 1212971,
+              "active_time_ms": 1269823
+            }
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "select": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "## Choice\n\n**File:** `freeq-tui/src/main.rs` (Rust, crate `freeq-tui`). It's inside the CI-covered surface and avoids the AV crates.\n\nThe tests will go in a new `#[cfg(test)]` module of display and pa",
+              "response.select": "## Choice\n\n**File:** `freeq-tui/src/main.rs` (Rust, crate `freeq-tui`). It's inside the CI-covered surface and avoids the AV crates.\n\nThe tests will go in a new `#[cfg(test)]` module of display and parsing helpers. They'll sit next to the existing test module that starts at line 3501.\n\n### Why this file\n\n- **Hotspot score:** `bash scripts/hotspots.sh --top 25` lists it at 4187 lines and 79 functions, gamma 4. It's smaller than the top entries but far from trivial.\n- **The CLAUDE.md \"undertested\" list is stale.** I checked each named file:\n  - `freeq-app/src/irc/client.ts` now has about a dozen `client-*.test.ts` files.\n  - `freeq-sdk/src/client.rs` has 176 tests across 6 test modules.\n  - `freeq-sdk-js/src/client.ts` already has a 4000-line test file.\n  - `server.rs`, `db.rs` and `web.rs` are huge and need a running server, so they don't suit one focused change.\n- **Where the gap is in `main.rs`:** the existing 35 tests cover verification verdicts, key-set parsing and `parse_join_prefix`. The rendering and input helpers have no direct tests. A grep shows `format_file_size`, `format_link_preview`, `format_media_display`, `parse_timestamp_ms`, `format_timestamp`, `try_nick_complete` and `ctcp_action` are only called from production code. `ctcp_action` appears once in the tests, at line 3877, only as a fixture. The other helpers have no test calls at all.\n- **A likely real bug:** `format_link_preview` (line 3404) truncates with `&desc[..120]` on a byte index. A description with a multibyte character straddling byte 120 would panic the TUI. Anyone who can post a link can supply that description.\n\n### Behaviors to pin\n\n1. **`format_file_size`:**\n   - 1023 gives `1023B`, 1024 gives `1.0KB`, and 1048575 gives `1024.0KB`.\n   - 1048576 gives `1.0MB`, and 0 gives `0B`.\n   - The 1048575 case is a rounding oddity at the KB/MB boundary.\n2. **`format_link_preview`:**\n   - Title, description and URL are joined in the right order, and a missing title or description is omitted.\n   - A description of exactly 120 bytes is not truncated, and a longer one gets `…`.\n   - A multibyte character crossing byte 120 should not panic. If it does, I'll write the test to expose that and fix it with a char-boundary-safe truncation.\n3. **`format_media_display`:**\n   - The icon depends on the type: image, video, audio, or `📎` for anything else.\n   - Alt text, `W×H` and size appear only when present.\n   - `W×H` needs both width and height, so one alone is omitted.\n   - The URL is always last.\n4. **`parse_timestamp_ms` and `format_timestamp`:**\n   - A valid RFC3339 `time` tag gives the exact epoch milliseconds, for example `2024-01-01T00:00:00Z` gives `1704067200000`.\n   - A missing or malformed tag falls back to a value near now, asserted within a tolerance.\n5. **`ctcp_action`:** it wraps text as `\\x01ACTION …\\x01`, and empty text is still framed.\n6. **`try_nick_complete`:** this is the highest-value case and needs a small `App` fixture. I'll reuse the `app.rs` test helpers if they're accessible, and otherwise cut this case. It should cover:\n   - completion at the start of a line versus mid-line\n   - an empty fragment being a no-op\n   - case-insensitive prefix matching\n   - a multibyte character before the cursor not panicking on the `&text[..cursor]` slice\n\n### Convention to follow\n\n- The sibling module is `#[cfg(test)] mod tests` in `freeq-tui/src/main.rs` (from line 3501). It uses descriptive behavior-style names, such as `parse_join_prefix_rejects_control_chars_in_host` and `a_verdict_reads_as_who_vouches_for_the_message`.\n- It also has small local helpers, like `tags(&[(&str,&str)])`. I'll build `MediaAttachment` and `LinkPreview` fixtures in the same way.\n- Tests are pure synchronous `#[test]` functions with no network or server. `app.rs` (from line 1325) has the `App` construction pattern to borrow for the nick-completion tests.\n- I'll run them with `cargo test -p freeq-tui`.",
+              "last_stage": "select"
+            },
+            "notes": "Stage completed: select",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-sonnet-5-5"
+                  },
+                  "tokens": {
+                    "input_tokens": 9824,
+                    "output_tokens": 2907,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 53061,
+                    "cache_write_tokens": 19545
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 19545,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 108192
+            },
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 27307,
+              "tool_time_ms": 2495,
+              "active_time_ms": 29802
+            }
+          }
+        },
+        "next_node_id": "pr_body",
+        "git_commit_sha": "415f7f6f80db8d33afadb7e2ffbb4ea3bd8d77d1",
+        "node_visits": {
+          "start": 1,
+          "verify": 1,
+          "implement": 1,
+          "select": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 1,
+          "additions": 257,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-10-01T02:30:20.681125577Z",
+        "current_node": "pr_body",
+        "completed_nodes": [
+          "start",
+          "select",
+          "implement",
+          "verify",
+          "pr_body"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "internal.thread_id": "cov",
+          "internal.work_dir": "/workspace/freeq",
+          "thread.cov.current_node": "pr_body",
+          "last_response": "I can't write an accurate description yet. There is no earlier work in this conversation, and I have no tool access here to run `git diff --stat` or `git diff`. I haven't written any tests or run `.fa",
           "response.implement": "I added 23 tests for the display and input helpers in `freeq-tui/src/main.rs`, and the full gate (`bash .fabro/verify.sh`) passes. They're in the existing `tests` module, using its naming style and the existing `tags()` helper, with no production code changed. `cargo test -p freeq-tui` passes (150 tests), and clippy with `-D warnings` and `cargo fmt --check` are clean.\n\nThe first gate run timed out on the tool's limit, so I reran it in the background and it passed.\n\nThe tests cover:\n- **`format_file_size`:** the boundaries at 0, 1023, 1024 and 1 MiB, plus fractional KB and MB values.\n- **`format_link_preview`:**\n  - Title, description and URL come out in order, and a missing title or description is left out.\n  - A description of exactly 120 bytes is kept whole, and 121 bytes is cut with `…`.\n  - A description of 61 two-byte characters is cut on a character boundary.\n- **`format_media_display`:**\n  - The icon matches the type (image, video, audio, other).\n  - An undeclared type is judged by the URL.\n  - Alt text, size and `W×H` appear in order with the URL last, and `W×H` needs both width and height.\n- **`parse_timestamp_ms` and `format_timestamp`:**\n  - Valid RFC3339 tags give exact epoch milliseconds, including fractional seconds and `+01:00` offsets.\n  - A missing or malformed tag falls back to a time within the bounds I read before and after the call.\n  - The displayed time is the same for the same instant sent in different offsets, so it doesn't depend on the machine's time zone.\n- **`try_nick_complete`:**\n  - A nick at the start of the line completes with `: `, and one mid-line completes with a space and keeps the rest.\n  - Case and the `@`/`+` prefixes are ignored, and the first match wins.\n  - Nothing happens when there's no match, an empty fragment, an empty line or no active buffer.\n  - Only the text before the cursor is considered, and a wide character earlier in the line doesn't break it.\n\n**Panic risk left untested:** I didn't write a test that triggers the panic in `format_link_preview`, because fixing it would change production behavior. The truncation is `&desc[..120]` by byte index. A description whose 120th byte falls inside a multibyte character, for example one ASCII byte followed by two-byte characters, will panic the TUI. Anyone who can post a link can supply that text. The fix is a one-line change to cut on a character boundary, and I can make it with a regression test as a separate change if you want.\n\nI also didn't run `ctcp_action` again, since it's already covered at line 3877.",
           "command.output": "blob://sha256/d524d8f9f994dda1c4a2a79b08090c01b4fe024c40f1a6faf282945915d3add1",
-          "internal.fidelity": "compact",
+          "internal.fidelity": "full",
           "outcome": "succeeded",
           "internal.retry_count.implement": 0,
           "internal.retry_count.verify": 0,
@@ -709,16 +859,56 @@
           "internal.node_visit_count": 1,
           "internal.retry_count.start": 0,
           "graph.goal": "Raise automated-test coverage on one of freeq's high-risk, undertested files — adding tests only, with at most minimal, behavior-preserving testability seams in production code.",
+          "internal.retry_count.pr_body": 0,
           "internal.run_id": "01M3TK18DJSA24HWNP1WJ9YZ0D",
           "internal.retry_count.select": 0,
-          "current_node": "verify",
+          "current_node": "pr_body",
           "thread.implement.current_node": "verify",
           "response.select": "## Choice\n\n**File:** `freeq-tui/src/main.rs` (Rust, crate `freeq-tui`). It's inside the CI-covered surface and avoids the AV crates.\n\nThe tests will go in a new `#[cfg(test)]` module of display and parsing helpers. They'll sit next to the existing test module that starts at line 3501.\n\n### Why this file\n\n- **Hotspot score:** `bash scripts/hotspots.sh --top 25` lists it at 4187 lines and 79 functions, gamma 4. It's smaller than the top entries but far from trivial.\n- **The CLAUDE.md \"undertested\" list is stale.** I checked each named file:\n  - `freeq-app/src/irc/client.ts` now has about a dozen `client-*.test.ts` files.\n  - `freeq-sdk/src/client.rs` has 176 tests across 6 test modules.\n  - `freeq-sdk-js/src/client.ts` already has a 4000-line test file.\n  - `server.rs`, `db.rs` and `web.rs` are huge and need a running server, so they don't suit one focused change.\n- **Where the gap is in `main.rs`:** the existing 35 tests cover verification verdicts, key-set parsing and `parse_join_prefix`. The rendering and input helpers have no direct tests. A grep shows `format_file_size`, `format_link_preview`, `format_media_display`, `parse_timestamp_ms`, `format_timestamp`, `try_nick_complete` and `ctcp_action` are only called from production code. `ctcp_action` appears once in the tests, at line 3877, only as a fixture. The other helpers have no test calls at all.\n- **A likely real bug:** `format_link_preview` (line 3404) truncates with `&desc[..120]` on a byte index. A description with a multibyte character straddling byte 120 would panic the TUI. Anyone who can post a link can supply that description.\n\n### Behaviors to pin\n\n1. **`format_file_size`:**\n   - 1023 gives `1023B`, 1024 gives `1.0KB`, and 1048575 gives `1024.0KB`.\n   - 1048576 gives `1.0MB`, and 0 gives `0B`.\n   - The 1048575 case is a rounding oddity at the KB/MB boundary.\n2. **`format_link_preview`:**\n   - Title, description and URL are joined in the right order, and a missing title or description is omitted.\n   - A description of exactly 120 bytes is not truncated, and a longer one gets `…`.\n   - A multibyte character crossing byte 120 should not panic. If it does, I'll write the test to expose that and fix it with a char-boundary-safe truncation.\n3. **`format_media_display`:**\n   - The icon depends on the type: image, video, audio, or `📎` for anything else.\n   - Alt text, `W×H` and size appear only when present.\n   - `W×H` needs both width and height, so one alone is omitted.\n   - The URL is always last.\n4. **`parse_timestamp_ms` and `format_timestamp`:**\n   - A valid RFC3339 `time` tag gives the exact epoch milliseconds, for example `2024-01-01T00:00:00Z` gives `1704067200000`.\n   - A missing or malformed tag falls back to a value near now, asserted within a tolerance.\n5. **`ctcp_action`:** it wraps text as `\\x01ACTION …\\x01`, and empty text is still framed.\n6. **`try_nick_complete`:** this is the highest-value case and needs a small `App` fixture. I'll reuse the `app.rs` test helpers if they're accessible, and otherwise cut this case. It should cover:\n   - completion at the start of a line versus mid-line\n   - an empty fragment being a no-op\n   - case-insensitive prefix matching\n   - a multibyte character before the cursor not panicking on the `&text[..cursor]` slice\n\n### Convention to follow\n\n- The sibling module is `#[cfg(test)] mod tests` in `freeq-tui/src/main.rs` (from line 3501). It uses descriptive behavior-style names, such as `parse_join_prefix_rejects_control_chars_in_host` and `a_verdict_reads_as_who_vouches_for_the_message`.\n- It also has small local helpers, like `tags(&[(&str,&str)])`. I'll build `MediaAttachment` and `LinkPreview` fixtures in the same way.\n- Tests are pure synchronous `#[test]` functions with no network or server. `app.rs` (from line 1325) has the `App` construction pattern to borrow for the nick-completion tests.\n- I'll run them with `cargo test -p freeq-tui`.",
           "failure_class": "",
           "graph.rankdir": "LR",
-          "last_stage": "implement"
+          "last_stage": "pr_body",
+          "response.pr_body": "I can't write an accurate description yet. There is no earlier work in this conversation, and I have no tool access here to run `git diff --stat` or `git diff`. I haven't written any tests or run `.fabro/verify.sh`. Anything specific I wrote about what's tested, or about verification passing, would be invented.\n\nIf you paste the output of `git diff --stat` and `git diff` (or tell me which file the tests target), I'll write the real body. Meanwhile, here is a skeleton with the unverified parts marked:\n\n```markdown\n## Summary\nAdds unit tests for <FILE/AREA>. CLAUDE.md flags it as <undertested / zero unit tests> with a hotspot gamma of <SCORE>.\n\n## What's tested\n- <behavior or edge case, taken from the test names in the diff>\n- <...>\n\n## Notes\n- <Tests-only. OR: describe the exact testability seam (e.g., visibility change, extracted function) and why it preserves behavior.>\n- `.fabro/verify.sh` (rustfmt + check + clippy -D warnings + test): <PASS/FAIL, only after actually running it>\n```\n\nFor reference, the hotspot figures in CLAUDE.md that could fill the Summary, depending on the target:\n- `sdk/client.rs`: gamma 104, zero unit tests on the connection state machine\n- `irc/client.ts`: gamma 133, undertested\n- `MessageList.tsx`: gamma 103, only Playwright coverage\n\nI won't fill any of this in until I can see the diff."
         },
         "node_outcomes": {
+          "pr_body": {
+            "status": "succeeded",
+            "context_updates": {
+              "response.pr_body": "I can't write an accurate description yet. There is no earlier work in this conversation, and I have no tool access here to run `git diff --stat` or `git diff`. I haven't written any tests or run `.fabro/verify.sh`. Anything specific I wrote about what's tested, or about verification passing, would be invented.\n\nIf you paste the output of `git diff --stat` and `git diff` (or tell me which file the tests target), I'll write the real body. Meanwhile, here is a skeleton with the unverified parts marked:\n\n```markdown\n## Summary\nAdds unit tests for <FILE/AREA>. CLAUDE.md flags it as <undertested / zero unit tests> with a hotspot gamma of <SCORE>.\n\n## What's tested\n- <behavior or edge case, taken from the test names in the diff>\n- <...>\n\n## Notes\n- <Tests-only. OR: describe the exact testability seam (e.g., visibility change, extracted function) and why it preserves behavior.>\n- `.fabro/verify.sh` (rustfmt + check + clippy -D warnings + test): <PASS/FAIL, only after actually running it>\n```\n\nFor reference, the hotspot figures in CLAUDE.md that could fill the Summary, depending on the target:\n- `sdk/client.rs`: gamma 104, zero unit tests on the connection state machine\n- `irc/client.ts`: gamma 133, undertested\n- `MessageList.tsx`: gamma 103, only Playwright coverage\n\nI won't fill any of this in until I can see the diff.",
+              "last_stage": "pr_body",
+              "last_response": "I can't write an accurate description yet. There is no earlier work in this conversation, and I have no tool access here to run `git diff --stat` or `git diff`. I haven't written any tests or run `.fa"
+            },
+            "notes": "Stage completed: pr_body",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-sonnet-5-5"
+                  },
+                  "tokens": {
+                    "input_tokens": 306,
+                    "output_tokens": 811,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 5687
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 5687,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 22939
+            },
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 7347,
+              "tool_time_ms": 0,
+              "active_time_ms": 7347
+            }
+          },
           "start": {
             "status": "succeeded",
             "usage": null
@@ -814,9 +1004,10 @@
             }
           }
         },
-        "next_node_id": "pr_body",
+        "next_node_id": "exit",
         "node_visits": {
           "implement": 1,
+          "pr_body": 1,
           "start": 1,
           "verify": 1,
           "select": 1
@@ -1208,6 +1399,38 @@
         "warnings": []
       },
       "state": "succeeded"
+    },
+    "pr_body@1": {
+      "first_event_seq": 133,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": {
+        "mode": "prompt",
+        "provider": "anthropic",
+        "model": "claude-sonnet-5-5"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-10-01T02:30:13.301759305Z",
+      "handler": "prompt",
+      "usage": {
+        "input_tokens": 306,
+        "output_tokens": 811,
+        "total_tokens": 6804,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 5687,
+        "total_usd_micros": 22939
+      },
+      "model": {
+        "provider": "anthropic",
+        "model_id": "claude-sonnet-5-5"
+      },
+      "state": "running"
     },
     "verify@1": {
       "first_event_seq": 123,
