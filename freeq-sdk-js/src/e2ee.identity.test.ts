@@ -186,3 +186,62 @@ describe('e2ee identity keys (first login, empty IndexedDB)', () => {
     });
   });
 });
+
+describe('e2ee identity for a browser did:key', () => {
+  // A did:key is checkable: a room member seals the room key only to a bundle
+  // signed by the DID's own key. A browser guest that minted a did:key must
+  // therefore publish a bundle signed with that key, not with the random
+  // signing key the e2ee module would otherwise generate.
+  let bundles: Array<Record<string, any>>;
+
+  beforeEach(() => {
+    globalThis.indexedDB = new IDBFactory();
+    bundles = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url).endsWith('/api/v1/keys') && init?.method === 'POST') {
+        bundles.push(JSON.parse(String(init.body)));
+        return new Response('{}', { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    }));
+  });
+
+  afterEach(() => {
+    shutdown();
+    vi.unstubAllGlobals();
+  });
+
+  async function boundTo(did: string, bundle: Record<string, any>): Promise<boolean> {
+    const { decodeMultibaseEd25519, verifyEd25519 } = await import('./index');
+    const didPub = decodeMultibaseEd25519(did.slice('did:key:'.length));
+    // Bundle fields are base64url, unpadded.
+    const unb64 = (s: string) => {
+      const std = s.replace(/-/g, '+').replace(/_/g, '/');
+      return Uint8Array.from(atob(std + '='.repeat((4 - (std.length % 4)) % 4)), (c) => c.charCodeAt(0));
+    };
+    const signing = unb64(bundle.signing_key);
+    if (signing.length !== didPub.length || signing.some((b, i) => b !== didPub[i])) return false;
+    return verifyEd25519(didPub, unb64(bundle.signed_pre_key), bundle.spk_signature);
+  }
+
+  it('signs its pre-key bundle with the did:key itself', async () => {
+    const { generateDidKey, importDidKeyPair } = await import('./index');
+    const key = await generateDidKey();
+    const pair = await importDidKeyPair(await key.exportSeed());
+    await initialize(key.did, ORIGIN, { signingKey: pair });
+    expect(bundles).toHaveLength(1);
+    expect(await boundTo(key.did, bundles[0].bundle)).toBe(true);
+  });
+
+  it('stays bound on a later visit, when the identity is already stored', async () => {
+    const { generateDidKey, importDidKeyPair } = await import('./index');
+    const key = await generateDidKey();
+    const pair = await importDidKeyPair(await key.exportSeed());
+    await initialize(key.did, ORIGIN, { signingKey: pair });
+    shutdown();
+    await initialize(key.did, ORIGIN, { signingKey: pair });
+    expect(bundles).toHaveLength(2);
+    expect(await boundTo(key.did, bundles[1].bundle)).toBe(true);
+    expect(bundles[1].bundle.signed_pre_key).toBe(bundles[0].bundle.signed_pre_key);
+  });
+});

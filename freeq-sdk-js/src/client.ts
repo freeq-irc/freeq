@@ -1126,7 +1126,7 @@ export class FreeqClient extends EventEmitter {
 
   /** Initialize E2EE for DMs (called automatically after SASL success). */
   async initializeE2EE(did: string): Promise<void> {
-    await e2ee.initialize(did, this.serverOrigin);
+    await e2ee.initialize(did, this.serverOrigin, { signingKey: this.opts.identitySigningKey });
   }
 
   /** Get the E2EE safety number for a DM partner. */
@@ -2481,7 +2481,7 @@ export class FreeqClient extends EventEmitter {
         this.emit('authenticated', this._authDid || '', msg.params[msg.params.length - 1]);
         if (this._authDid) {
           prefetchProfiles([this._authDid]);
-          e2ee.initialize(this._authDid, this.serverOrigin).catch((e) =>
+          e2ee.initialize(this._authDid, this.serverOrigin, { signingKey: this.opts.identitySigningKey }).catch((e) =>
             log.warn('[e2ee] Init failed:', e)
           );
         }

@@ -178,6 +178,12 @@ export interface FreeqClientOptions {
    *  one, a fresh session key is made on every connect. */
   deviceKeyStore?: DeviceKeyStore;
 
+  /** The identity's own Ed25519 key, when this client holds it: a browser
+   *  that minted a did:key for itself. E2EE signs its pre-key bundle with it,
+   *  so peers can bind the bundle to the did:key (instant-room members seal
+   *  the room key only to a bound bundle). */
+  identitySigningKey?: CryptoKeyPair;
+
   /** The published key record's `label`, e.g. the browser's name. */
   deviceLabel?: string;
 
