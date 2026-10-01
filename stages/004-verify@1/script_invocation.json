@@ -1,0 +1,6 @@
+{
+  "script": "bash .fabro/verify.sh",
+  "command": "exec 2>&1\nbash .fabro/verify.sh",
+  "language": "shell",
+  "timeout_ms": 3600000
+}
