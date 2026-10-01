@@ -1,0 +1,469 @@
+{
+  "title": "Find one genuine correctness bug in freeq's CI-covered code, pin it with a regression test that f...",
+  "spec": {
+    "run_id": "01M3TSWZN85A86HDZ4EC0E94Q4",
+    "settings": {
+      "project": {
+        "name": null,
+        "description": null,
+        "metadata": {}
+      },
+      "workflow": {
+        "name": null,
+        "description": null,
+        "graph": "workflow.fabro",
+        "metadata": {}
+      },
+      "run": {
+        "goal": {
+          "type": "inline",
+          "value": "Find one genuine correctness bug in freeq's CI-covered code, pin it with a regression test that fails before the fix, fix it minimally, and verify. Quality over quantity — one real, well-proven bug, never a speculative or cosmetic change."
+        },
+        "working_dir": null,
+        "metadata": {},
+        "inputs": {},
+        "model": {
+          "provider": "anthropic",
+          "name": "claude-sonnet-5-5",
+          "fallbacks": [],
+          "controls": {
+            "reasoning_effort": null,
+            "speed": null
+          }
+        },
+        "git": {
+          "author": null
+        },
+        "prepare": {
+          "commands": [],
+          "timeout_ms": 300000
+        },
+        "execution": {
+          "mode": "normal",
+          "approval": "prompt"
+        },
+        "checkpoint": {
+          "exclude_globs": [],
+          "skip_git_hooks": false
+        },
+        "clone": {
+          "enabled": true
+        },
+        "run_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "meta_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "environment": {
+          "id": "boxd-docker",
+          "provider": "docker",
+          "image": {
+            "docker": "freeq-fabro:tools",
+            "dockerfile": null
+          },
+          "resources": {
+            "cpu": 4,
+            "memory": "13GB",
+            "disk": null
+          },
+          "network": {
+            "mode": "allow_all",
+            "allow": []
+          },
+          "lifecycle": {
+            "preserve": false,
+            "stop_on_terminal": true,
+            "auto_stop": null
+          },
+          "labels": {},
+          "volumes": [],
+          "env": {
+            "CARGO_INCREMENTAL": "0",
+            "CARGO_TERM_COLOR": "always",
+            "SCCACHE_WEBDAV_ENDPOINT": "http://172.17.0.1:8090",
+            "RUSTC_WRAPPER": "sccache",
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+            "CARGO_PROFILE_TEST_DEBUG": "0"
+          }
+        },
+        "notifications": {},
+        "interviews": {
+          "provider": null,
+          "slack": null
+        },
+        "agent": {
+          "fabro_tools": false,
+          "permissions": null,
+          "mcps": {}
+        },
+        "hooks": [
+          {
+            "name": "freeq-run-start",
+            "event": "run_start",
+            "command": null,
+            "type": "http",
+            "url": "http://127.0.0.1:8091/hook",
+            "headers": null,
+            "allowed_env_vars": [],
+            "tls": "off",
+            "matcher": null,
+            "blocking": false,
+            "timeout_ms": null,
+            "sandbox": null
+          },
+          {
+            "name": "freeq-run-complete",
+            "event": "run_complete",
+            "command": null,
+            "type": "http",
+            "url": "http://127.0.0.1:8091/hook",
+            "headers": null,
+            "allowed_env_vars": [],
+            "tls": "off",
+            "matcher": null,
+            "blocking": null,
+            "timeout_ms": null,
+            "sandbox": null
+          },
+          {
+            "name": "freeq-run-failed",
+            "event": "run_failed",
+            "command": null,
+            "type": "http",
+            "url": "http://127.0.0.1:8091/hook",
+            "headers": null,
+            "allowed_env_vars": [],
+            "tls": "off",
+            "matcher": null,
+            "blocking": null,
+            "timeout_ms": null,
+            "sandbox": null
+          },
+          {
+            "name": "freeq-awaiting-approval",
+            "event": "stage_start",
+            "command": null,
+            "type": "http",
+            "url": "http://127.0.0.1:8091/hook",
+            "headers": null,
+            "allowed_env_vars": [],
+            "tls": "off",
+            "matcher": "^approve",
+            "blocking": false,
+            "timeout_ms": null,
+            "sandbox": null
+          }
+        ],
+        "scm": {
+          "provider": null,
+          "owner": null,
+          "repository": null,
+          "github": null
+        },
+        "pull_request": {
+          "enabled": true,
+          "draft": false,
+          "auto_merge": false,
+          "merge_strategy": "squash"
+        },
+        "artifacts": {
+          "include": []
+        },
+        "integrations": {
+          "github": {
+            "permissions": {}
+          }
+        }
+      }
+    },
+    "graph": {
+      "name": "BugHunt",
+      "nodes": {
+        "fix": {
+          "id": "fix",
+          "attrs": {
+            "fidelity": {
+              "String": "full"
+            },
+            "label": {
+              "String": "Repro + fix"
+            },
+            "prompt": {
+              "String": "Now prove and fix the bug you identified.\n\n## Order of operations (regression-test-first)\n\n1. **Write a test that reproduces the bug and FAILS on the current code.** Run\n   it, and confirm it fails for the *right reason* (the defect), not a typo.\n   This is the proof the bug is real — without a failing test, stop and\n   reconsider whether it's actually a bug.\n2. **Make the minimal fix.** Change as little production code as possible to\n   correct the behavior. No refactors, no drive-by cleanups, no reformatting\n   unrelated code. Preserve public API and existing behavior everywhere else.\n3. **Confirm the test now passes** and that you haven't broken neighbors.\n\n## Constraints\n\n- Keep the diff surgical and easy to review: ideally one root-cause fix + its\n  regression test.\n- Honor `-D warnings`: no new clippy warnings, no `#[allow]` to dodge them,\n  rustfmt-clean.\n- If, while fixing, you discover the \"bug\" isn't actually wrong (the behavior\n  is intended elsewhere), back out and clearly report that the hunt was a false\n  alarm rather than forcing a change.\n\n## Build discipline (important — the workspace is large)\n\n- **Iterate with TARGETED commands** while developing: `cargo test -p <crate>\n  <test_name>`, `cargo check -p <crate>`, `cargo clippy -p <crate>`. A full\n  workspace build is slow; don't run it repeatedly.\n- **Do NOT touch build configuration** to speed things up — no\n  `.cargo/config.toml`, no `[profile.*]` / `debuginfo` / `strip` edits, no\n  `CARGO_*` changes. The environment is already tuned. Let slow compiles run.\n\n## Self-verify once, at the end (required)\n\nWhen the regression test fails-before / passes-after and your fix is in, first\n**auto-format and lint-fix** (the gate enforces both):\n\n```\ncargo fmt --all                 # gate runs `cargo fmt --all -- --check`\ncargo clippy -p <crate> --tests # fix warnings, never silence with #[allow]\n```\n\nThen run the full gate **exactly once** to confirm it's green:\n\n```\nbash .fabro/verify.sh\n```\n\nDon't loop the full gate. The next node runs this same gate authoritatively; a\nfailure there produces no PR.\n"
+            },
+            "reasoning_effort": {
+              "String": "high"
+            },
+            "timeout": {
+              "Duration": {
+                "secs": 2400,
+                "nanos": 0
+              }
+            },
+            "thread_id": {
+              "String": "bug"
+            },
+            "shape": {
+              "String": "box"
+            }
+          }
+        },
+        "exit": {
+          "id": "exit",
+          "attrs": {
+            "shape": {
+              "String": "Msquare"
+            },
+            "label": {
+              "String": "Exit"
+            }
+          }
+        },
+        "hunt": {
+          "id": "hunt",
+          "attrs": {
+            "thread_id": {
+              "String": "bug"
+            },
+            "fidelity": {
+              "String": "full"
+            },
+            "reasoning_effort": {
+              "String": "high"
+            },
+            "shape": {
+              "String": "box"
+            },
+            "prompt": {
+              "String": "You are hunting for ONE genuine correctness bug in freeq. This step is\n**read-only** — investigate and report; do not edit yet.\n\nfreeq is an IRC + AT-Protocol stack: a Rust server (`freeq-server`), Rust SDK\n(`freeq-sdk`, `freeq-sdk-ffi`), a React/TS web app (`freeq-app`), a TUI\n(`freeq-tui`), Windows core (`freeq-windows-core`), and bots (`freeq-bots`).\n\n## What counts as a bug (and what doesn't)\n\nA real bug is a defect that produces wrong behavior: a logic error, an\nincorrect edge-case/boundary, a race or ordering hazard, a panic/unwrap on\nreachable input, an off-by-one, a mishandled error path, a protocol-spec\nviolation (see `CLAUDE.md` / `docs/PROTOCOL.md`), an auth/authorization gap, a\nstate-machine inconsistency.\n\nNOT a bug for this purpose: style, naming, formatting, \"could be cleaner\",\nmissing tests alone, speculative \"might be slow\", or anything you cannot\ndemonstrate. **If you cannot find a defect you are confident is real and can\nreproduce with a test, say so explicitly and stop — a false-alarm PR is worse\nthan no PR.**\n\n## Where to look\n\n- Stay in the CI-covered crates. Avoid the AV crates CI excludes (`freeq-av`,\n  `freeq-eliza`, `freeq-av-client`, `freeq-av-image`).\n- High-value surfaces: `freeq-server` SASL/auth, S2S federation merge logic,\n  channel mode/ban/invite enforcement, CHATHISTORY/search authorization;\n  `freeq-sdk` connection state machine and message parsing; `freeq-app` store\n  reducers and IRC client state.\n- `bash scripts/hotspots.sh --top 25` points at the riskiest files.\n- Look for: `unwrap()`/`expect()`/`panic!` on attacker- or peer-controlled\n  input, `unreachable!`, integer truncation/`as` casts, TOCTOU around shared\n  state, case-sensitivity bugs in nick/DID handling, and merge paths that can\n  weaken local protections.\n\n## Report\n\n- The exact location (file:line) and a precise description of the defect.\n- The concrete input/sequence that triggers wrong behavior, and what the\n  correct behavior is.\n- How you will pin it with a test that FAILS on current `main`.\n- Your confidence and how you'll keep the fix minimal.\n"
+            },
+            "model": {
+              "String": "claude-opus-5-5"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "timeout": {
+              "Duration": {
+                "secs": 2400,
+                "nanos": 0
+              }
+            },
+            "label": {
+              "String": "Hunt for a bug"
+            }
+          }
+        },
+        "abort": {
+          "id": "abort",
+          "attrs": {
+            "shape": {
+              "String": "parallelogram"
+            },
+            "goal_gate": {
+              "Boolean": true
+            },
+            "label": {
+              "String": "Stage failed"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "script": {
+              "String": "echo 'a working stage failed - see fabro events' >&2; exit 1"
+            }
+          }
+        },
+        "pr_body": {
+          "id": "pr_body",
+          "attrs": {
+            "thread_id": {
+              "String": "bug"
+            },
+            "fidelity": {
+              "String": "full"
+            },
+            "shape": {
+              "String": "tab"
+            },
+            "label": {
+              "String": "PR description"
+            },
+            "prompt": {
+              "String": "Write the pull-request description for the bug fix. Base it strictly on what\nyou changed (`git diff`). GitHub-flavored markdown:\n\n## The bug\nWhere it was (file:line) and what went wrong — the incorrect behavior and the\ninput/sequence that triggers it.\n\n## Root cause\nWhy it happened, in one or two sentences.\n\n## The fix\nWhat you changed and why it's minimal and behavior-preserving elsewhere.\n\n## Regression test\nThe test you added, and confirmation it fails on `main` (before the fix) and\npasses after — i.e. it actually pins the bug.\n\n## Verification\nState that `.fabro/verify.sh` (CI-mirrored: rustfmt + check + clippy -D\nwarnings + test) passes.\n\nBe precise and factual. If anything about the bug is uncertain, say so — don't\noverstate.\n"
+            }
+          }
+        },
+        "start": {
+          "id": "start",
+          "attrs": {
+            "label": {
+              "String": "Start"
+            },
+            "shape": {
+              "String": "Mdiamond"
+            }
+          }
+        },
+        "verify": {
+          "id": "verify",
+          "attrs": {
+            "script": {
+              "String": "bash .fabro/verify.sh"
+            },
+            "timeout": {
+              "Duration": {
+                "secs": 3600,
+                "nanos": 0
+              }
+            },
+            "label": {
+              "String": "CI gate"
+            },
+            "retry_target": {
+              "String": "fix"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "goal_gate": {
+              "Boolean": true
+            },
+            "max_retries": {
+              "Integer": 2
+            }
+          }
+        }
+      },
+      "edges": [
+        {
+          "from": "abort",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "start",
+          "to": "hunt",
+          "attrs": {}
+        },
+        {
+          "from": "hunt",
+          "to": "fix",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "hunt",
+          "to": "abort",
+          "attrs": {}
+        },
+        {
+          "from": "fix",
+          "to": "verify",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "fix",
+          "to": "abort",
+          "attrs": {}
+        },
+        {
+          "from": "verify",
+          "to": "pr_body",
+          "attrs": {}
+        },
+        {
+          "from": "pr_body",
+          "to": "exit",
+          "attrs": {}
+        }
+      ],
+      "attrs": {
+        "rankdir": {
+          "String": "LR"
+        },
+        "goal": {
+          "String": "Find one genuine correctness bug in freeq's CI-covered code, pin it with a regression test that fails before the fix, fix it minimally, and verify. Quality over quantity — one real, well-proven bug, never a speculative or cosmetic change."
+        }
+      }
+    },
+    "graph_source": "// bug-hunt — find ONE real correctness bug in freeq, prove it with a failing\n// test, fix it, and verify.\n//\n// hunt (opus, read-only): deeply audit one subsystem; identify a concrete,\n//   real bug (not style/nits). If none found with confidence, say so.\n// reproduce+fix: write a test that fails on the bug, then make the minimal fix.\n// verify: authoritative CI-mirror gate (goal_gate).\n// pr_body: explain the bug, the repro, and the fix.\ndigraph BugHunt {\n    graph [goal=\"Find one genuine correctness bug in freeq's CI-covered code, pin it with a regression test that fails before the fix, fix it minimally, and verify. Quality over quantity — one real, well-proven bug, never a speculative or cosmetic change.\"]\n    rankdir=LR\n\n    start [shape=Mdiamond, label=\"Start\"]\n    exit  [shape=Msquare, label=\"Exit\"]\n\n    hunt      [shape=box, label=\"Hunt for a bug\", prompt=\"@prompts/hunt.md\", model=\"claude-opus-5-5\", reasoning_effort=\"high\", thread_id=\"bug\", fidelity=\"full\", timeout=\"2400s\"]\n    fix       [shape=box, label=\"Repro + fix\",    prompt=\"@prompts/fix.md\", thread_id=\"bug\", fidelity=\"full\", reasoning_effort=\"high\", timeout=\"2400s\"]\n    verify    [shape=parallelogram, label=\"CI gate\", script=\"bash .fabro/verify.sh\", goal_gate=true, retry_target=\"fix\", max_retries=2, timeout=\"3600s\"]\n    pr_body   [shape=tab, label=\"PR description\", prompt=\"@prompts/pr_body.md\", thread_id=\"bug\", fidelity=\"full\"]\n\n    // A failed working stage must not fall through to the next one: with\n    // plain unconditional edges an LLM outage \"succeeded\" by running the CI\n    // gate on unchanged main. Each such stage advances only on success and\n    // otherwise drops to `abort`, a failing goal gate, so the run ends FAILED\n    // (and says so in #freeq-dev). Fabro 0.254 requires the unconditional\n    // fallback edge, and ignores graph-level on_failure=\"exit\".\n    abort [shape=parallelogram, label=\"Stage failed\", script=\"echo 'a working stage failed - see fabro events' >&2; exit 1\", goal_gate=true, max_retries=0]\n    abort -> exit\n\n    start -> hunt\n    hunt -> fix [condition=\"outcome=succeeded\"]\n    hunt -> abort\n    fix -> verify [condition=\"outcome=succeeded\"]\n    fix -> abort\n    verify -> pr_body -> exit\n}\n",
+    "workflow_slug": "bug-hunt",
+    "automation": {
+      "id": "bug-hunt",
+      "name": "bug-hunt",
+      "trigger_id": "nightly"
+    },
+    "source_directory": "/home/boxd/.fabro/storage/scratch/automations/automation-bug-hunt-01M3TSWZN85A86HDZ4EC0E94Q4-snaFgx/repo",
+    "provenance": {
+      "server": {
+        "version": "0.254.0"
+      },
+      "subject": {
+        "kind": "system",
+        "system_kind": "engine"
+      }
+    },
+    "manifest_blob": "a3000d38f863acd72d1740879a282c03fd7d904f34ea12f57409be75ed425a10",
+    "definition_blob": "ef11fff008785cea0fc2fd5a747bb893b8ea77043adbc55a7bad9f465fc4d109",
+    "git": {
+      "origin_url": "https://github.com/freeq-irc/freeq",
+      "branch": "main",
+      "sha": "3f611e5e64fbec749b8ad3e0cedf34e8e809b2f9",
+      "dirty": "clean",
+      "push_outcome": {
+        "type": "not_attempted"
+      }
+    }
+  },
+  "web_url": "http://127.0.0.1:32277/runs/01M3TSWZN85A86HDZ4EC0E94Q4",
+  "start": {
+    "start_time": "2026-10-01T04:00:04.784215271Z",
+    "run_branch": "fabro/run/01M3TSWZN85A86HDZ4EC0E94Q4",
+    "base_sha": "3f611e5e64fbec749b8ad3e0cedf34e8e809b2f9"
+  },
+  "status": {
+    "kind": "running"
+  },
+  "status_updated_at": "2026-10-01T04:00:04.784248932Z",
+  "last_event_at": "2026-10-01T04:00:04.784248932Z",
+  "pending_control": null,
+  "checkpoints": [],
+  "conclusion": null,
+  "sandbox": {
+    "kind": "ready",
+    "plan": {
+      "provider": "docker",
+      "image": "freeq-fabro:tools"
+    },
+    "instance": {
+      "provider": "docker",
+      "image": "freeq-fabro:tools",
+      "runtime": {
+        "id": "b96cf592096cba1e173e403dba9bd55f2ed341b79d380c5b06c03b7850aca065",
+        "working_directory": "/workspace/freeq",
+        "repo_cloned": true,
+        "clone_origin_url": "https://github.com/freeq-irc/freeq",
+        "clone_branch": "main",
+        "workspace_root": "/workspace",
+        "repos_root": "/repos",
+        "primary_repo_path": "/repos/freeq-irc/freeq",
+        "primary_repo_link": "/workspace/freeq"
+      }
+    }
+  },
+  "pull_request": null,
+  "superseded_by": null,
+  "pending_interviews": {},
+  "stages": {}
+}
