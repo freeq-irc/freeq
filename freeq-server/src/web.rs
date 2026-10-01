@@ -381,6 +381,7 @@ pub fn router(state: Arc<SharedState>) -> Router {
             axum::routing::delete(api_room_remove_member),
         )
         .route("/r/{name}", get(room_landing_page))
+        .route("/room-landing.js", get(room_landing_js))
         .layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)) // 12MB
         .layer({
             use axum::http::{Method, header};
@@ -3702,6 +3703,22 @@ fn room_landing_markdown(server: &str, channel: &str, expires_at: u64) -> String
 /// travels with it: a plain link would drop it, and a server-side redirect
 /// never sees it. A name that is not a room answers 404 in both forms, with
 /// nothing that distinguishes "no such room" from "not a room".
+/// The landing page's one behaviour: open the app with the invite token.
+/// The token is in the URL fragment (never sent to the server), so a plain
+/// link would drop it; this appends it. Same-origin, because the CSP forbids
+/// inline script.
+const ROOM_LANDING_JS: &str = "document.getElementById('open-room')?.addEventListener('click', function (e) {\n  e.preventDefault();\n  location.href = this.getAttribute('href') + location.hash;\n});\n";
+
+async fn room_landing_js() -> impl axum::response::IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        ROOM_LANDING_JS,
+    )
+}
+
 async fn room_landing_page(
     Path(name): Path<String>,
     State(state): State<Arc<SharedState>>,
@@ -3793,7 +3810,7 @@ code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}}
     <li>Room: <code>{channel_html}</code></li>
     <li>Expires: {expires} (extended by activity)</li>
   </ul>
-  <button class="btn" onclick="location.href='{js_target}'+location.hash">Open in freeq</button>
+  <a class="btn" id="open-room" href="{js_target}">Open in freeq</a>
   <h2>Join with an agent</h2>
   <p>Paste the full URL you were given — including the part after <code>#</code>, which is the invite token and never reaches this server — into:</p>
   <pre><code>npx -y @freeq/mcp room join &lt;paste the full URL you were given, including the part after #&gt;</code></pre>
@@ -3804,6 +3821,7 @@ code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}}
   <p>then call the tool <code>freeq_room_join</code> with the full URL.</p>
   <p class="muted">The same page as markdown: request it with <code>Accept: text/markdown</code>.</p>
 </div>
+<script src="/room-landing.js"></script>
 </body>
 </html>"##
         ))
@@ -10450,11 +10468,22 @@ mod room_rest_tests {
         );
         assert!(text.contains("or open the URL in a browser"), "{text}");
         assert!(text.contains("freeq_room_join"), "{text}");
+        // The button must work under this server's own CSP, which forbids
+        // inline script: an inline onclick here was silently dead. A link to
+        // the app plus a same-origin script that carries the fragment over.
         assert!(
             text.contains(&format!(
-                "onclick=\"location.href='/?room={bare}'+location.hash\">Open in freeq"
+                "<a class=\"btn\" id=\"open-room\" href=\"/?room={bare}\">Open in freeq</a>"
             )),
             "{text}"
+        );
+        assert!(
+            text.contains("<script src=\"/room-landing.js\"></script>"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("onclick"),
+            "inline handlers are blocked by the CSP: {text}"
         );
         assert!(!text.contains(&token));
 
