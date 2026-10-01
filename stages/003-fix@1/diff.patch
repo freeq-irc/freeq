@@ -1,0 +1,182 @@
+diff --git a/freeq-server/src/connection/channel.rs b/freeq-server/src/connection/channel.rs
+index a6597ca..215ead6 100644
+--- a/freeq-server/src/connection/channel.rs
++++ b/freeq-server/src/connection/channel.rs
+@@ -7,7 +7,7 @@ use super::helpers::{
+     s2s_broadcast, s2s_broadcast_mode, s2s_next_event_id,
+ };
+ use crate::irc::{self, Message};
+-use crate::server::SharedState;
++use crate::server::{SharedState, invite_nick_token};
+ use std::sync::Arc;
+ 
+ pub(super) fn handle_join(
+@@ -113,7 +113,7 @@ pub(super) fn handle_join(
+             if !is_did_authority && ch.invite_only {
+                 let has_invite = ch.invites.contains(session_id)
+                     || did.is_some_and(|d| ch.invites.contains(d))
+-                    || ch.invites.contains(&format!("nick:{nick}"));
++                    || ch.invites.contains(&invite_nick_token(nick));
+                 let on_invite_exception = ch.is_invite_excepted(&hostmask, did);
+ 
+                 // Delegated access: an agent may go where the person it acts
+@@ -177,7 +177,7 @@ pub(super) fn handle_join(
+                         {
+                             let channel_owned = channel.to_string();
+                             let did_owned = did.map(str::to_string);
+-                            let nick_token = format!("nick:{nick}");
++                            let nick_token = invite_nick_token(nick);
+                             state.with_db(move |db| {
+                                 if let Some(ref d) = did_owned {
+                                     db.remove_invite(&channel_owned, d)?;
+@@ -189,7 +189,7 @@ pub(super) fn handle_join(
+                         if let Some(d) = did {
+                             ch.invites.remove(d);
+                         }
+-                        ch.invites.remove(&format!("nick:{nick}"));
++                        ch.invites.remove(&invite_nick_token(nick));
+                     }
+                 }
+             }
+@@ -1535,7 +1535,7 @@ pub(super) fn handle_invite(
+                     }
+                 }
+                 // For S2S, prefer DID over nick-based token
+-                did.unwrap_or_else(|| format!("nick:{target_nick}"))
++                did.unwrap_or_else(|| invite_nick_token(target_nick))
+             };
+ 
+             // Durable, because `+i` is. An invite that evaporates on restart
+@@ -1587,11 +1587,11 @@ pub(super) fn handle_invite(
+                     if let Some(ref did) = rm.did {
+                         ch.invites.insert(did.clone());
+                     }
+-                    ch.invites.insert(format!("nick:{target_nick}"));
++                    ch.invites.insert(invite_nick_token(target_nick));
+                 }
+                 rm.did
+                     .clone()
+-                    .unwrap_or_else(|| format!("nick:{target_nick}"))
++                    .unwrap_or_else(|| invite_nick_token(target_nick))
+             };
+ 
+             // Notify inviter (remote target can't be notified directly)
+diff --git a/freeq-server/src/server.rs b/freeq-server/src/server.rs
+index 67428cf..e4f4b53 100644
+--- a/freeq-server/src/server.rs
++++ b/freeq-server/src/server.rs
+@@ -605,6 +605,13 @@ impl BanEntry {
+     }
+ }
+ 
++/// The invite-list token for a nick-only (no DID) invitee. Nicks are
++/// case-insensitive, so the token is lowercased the same way `NickMap` keys
++/// are — otherwise an invite for `bob` never admits `Bob`.
++pub(crate) fn invite_nick_token(nick: &str) -> String {
++    format!("nick:{}", nick.to_lowercase())
++}
++
+ /// Simple wildcard matching (* and ?).
+ fn wildcard_match(pattern: &str, text: &str) -> bool {
+     let pattern = pattern.to_lowercase();
+@@ -7152,7 +7159,7 @@ async fn process_s2s_event(
+                     // Check +i (invite only) — but allow if user has an invite
+                     if ch.invite_only {
+                         let has_invite = did.as_ref().is_some_and(|d| ch.invites.contains(d))
+-                            || ch.invites.contains(&format!("nick:{nick}"));
++                            || ch.invites.contains(&invite_nick_token(&nick));
+                         if !has_invite {
+                             tracing::info!(
+                                 channel = %channel, nick = %nick,
+@@ -7200,7 +7207,7 @@ async fn process_s2s_event(
+                 if let Some(ref d) = did {
+                     ch.invites.remove(d);
+                 }
+-                ch.invites.remove(&format!("nick:{nick}"));
++                ch.invites.remove(&invite_nick_token(&nick));
+                 // Never trust is_op from the peer — determine op status from
+                 // local channel state (founder_did / did_ops) to prevent
+                 // forged operator claims (C-2 mitigation).
+@@ -8369,7 +8376,12 @@ async fn process_s2s_event(
+                 }
+             }
+ 
+-            // Add the invite
++            // Add the invite. A nick token from a peer may carry the inviter's
++            // casing; canonicalize it so the JOIN check can match it.
++            let invitee = match invitee.strip_prefix("nick:") {
++                Some(n) => invite_nick_token(n),
++                None => invitee,
++            };
+             {
+                 let mut channels = state.channels.lock();
+                 if let Some(ch) = channels.get_mut(&channel_key) {
+@@ -11924,6 +11936,68 @@ mod s2s_adversarial_tests {
+         );
+     }
+ 
++    /// Nicks are case-insensitive everywhere else (NickMap, remote_member,
++    /// bans), but the `nick:` invite token was compared byte-for-byte. A guest
++    /// invited as `bob` whose nick is `Bob` was refused by the +i gate.
++    #[tokio::test]
++    async fn s2s_nick_invite_matches_join_case_insensitively() {
++        let state = test_state();
++        let mgr = test_manager();
++        setup_authenticated_peer(&state, &mgr).await;
++
++        const FOUNDER_DID: &str = "did:key:zFounderInviteCase";
++        {
++            let mut channels = state.channels.lock();
++            let ch = channels.entry("#invcase".to_string()).or_default();
++            ch.invite_only = true;
++            ch.founder_did = Some(FOUNDER_DID.to_string());
++        }
++
++        process_s2s_message(
++            &state,
++            &mgr,
++            PEER,
++            S2sMessage::Invite {
++                event_id: format!("{PEER}:case-invite"),
++                channel: "#invcase".to_string(),
++                invitee: "nick:bob".to_string(),
++                invited_by: "alice".to_string(),
++                invited_by_did: Some(FOUNDER_DID.to_string()),
++                origin: PEER.to_string(),
++            },
++        )
++        .await;
++
++        process_s2s_message(
++            &state,
++            &mgr,
++            PEER,
++            S2sMessage::Join {
++                event_id: format!("{PEER}:case-join"),
++                nick: "Bob".to_string(),
++                channel: "#invcase".to_string(),
++                did: None,
++                handle: None,
++                is_op: false,
++                actor_class: None,
++                origin: PEER.to_string(),
++            },
++        )
++        .await;
++
++        let channels = state.channels.lock();
++        let ch = channels.get("#invcase").unwrap();
++        assert!(
++            ch.has_remote_member("Bob"),
++            "an invite for `bob` must admit `Bob` through the +i gate"
++        );
++        assert!(
++            ch.invites.is_empty(),
++            "the one-shot invite must be consumed, got {:?}",
++            ch.invites
++        );
++    }
++
+     #[tokio::test]
+     async fn s2s_pin_from_non_op_rejected() {
+         let state = test_state();
