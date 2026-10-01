@@ -13,6 +13,8 @@ vi.mock('../irc/client', () => ({
     seen.connects.push(args);
   },
   setSaslCredentials: () => {},
+  connectAsRoomGuest: async () => {},
+  savedRoomGuestSession: () => null,
 }));
 
 beforeEach(() => {

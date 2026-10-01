@@ -92,6 +92,9 @@ export interface RoomsDeps {
   /** This browser's X25519 identity; null until e2ee has initialised. */
   identity(): X25519Pair | null;
   systemMessage(channel: string, text: string): void;
+  /** A key was just adopted: decrypt whatever this channel already shows as
+   *  ciphertext (history replayed before the key arrived). */
+  revealCiphertext?(channel: string, cipher: ChannelCipher): void;
   setRoomState(channel: string, patch: Partial<RoomState>): void;
   clearRoomState(channel: string): void;
   /** Where opened secrets persist; null disables persistence. */
@@ -292,6 +295,8 @@ export function createRooms(deps: RoomsDeps): Rooms {
   function adopt(client: RoomsClient, t: Tracked, announce: boolean): void {
     installCipher(client, t);
     persist(client.authDid!, t);
+    const cipher = client.getChannelCipher(t.channel);
+    if (cipher) deps.revealCiphertext?.(t.channel, cipher);
     const held = heldEpoch(t);
     deps.setRoomState(t.channel, { isRoom: true, hasKey: held !== null, heldEpoch: held, waiting: false });
     if (announce && held !== null) deps.systemMessage(t.channel, `🔒 Room key loaded (epoch ${held})`);
@@ -706,6 +711,15 @@ export function getRooms(): Rooms {
         return s && 'secret' in s ? { secret: s.secret, publicKey: s.publicKey } : null;
       },
       systemMessage: (channel, text) => useStore.getState().addSystemMessage(channel, text),
+      revealCiphertext: (channel, cipher) => {
+        const ch = useStore.getState().channels.get(channel.toLowerCase());
+        for (const m of ch?.messages ?? []) {
+          if (!m.text || !cipher.isCiphertext(m.text)) continue;
+          cipher.decrypt(m.text).then((plain) => {
+            if (plain !== null) useStore.getState().revealMessage(channel, m.id, plain);
+          }).catch(() => undefined);
+        }
+      },
       setRoomState: (channel, patch) => useStore.getState().setRoomState(channel, patch),
       clearRoomState: (channel) => useStore.getState().clearRoomState(channel),
       storage: (() => { try { return typeof localStorage !== 'undefined' ? localStorage : null; } catch { return null; } })(),

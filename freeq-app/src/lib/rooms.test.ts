@@ -228,6 +228,24 @@ describe('loading a room key', () => {
     expect(h.states.get(CH)).toMatchObject({ isRoom: true, hasKey: true, heldEpoch: 1, latestEpoch: 1, founderDid: ME, waiting: false });
   });
 
+  it('hands the cipher over so messages that arrived before the key can be read', async () => {
+    // History replays on (re)join before the key is installed; without a
+    // second pass, a returning member sees their own messages as EG1 text.
+    let reveal!: (v: { ch: string; plain: string | null }) => void;
+    const revealed = new Promise<{ ch: string; plain: string | null }>((r) => { reveal = r; });
+    const h = await harness({
+      revealCiphertext: (ch, cipher) => {
+        void (async () => {
+          const wire = await cipher.encrypt('said before the key loaded');
+          reveal({ ch, plain: wire ? await cipher.decrypt(wire) : null });
+        })();
+      },
+    });
+    await sealedToUs(h);
+    expect(await h.rooms.loadRoomKeys(CH)).toBe(true);
+    expect(await revealed).toEqual({ ch: CH, plain: 'said before the key loaded' });
+  });
+
   it('persists the opened secret under the DID and channel', async () => {
     const h = await harness();
     const state = await sealedToUs(h);

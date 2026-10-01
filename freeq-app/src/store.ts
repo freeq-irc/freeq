@@ -432,6 +432,9 @@ export interface Store {
   historyOpeningPage: (channel: string, received: number, limit: number) => void;
   addSystemMessage: (channel: string, text: string) => void;
   editMessage: (channel: string, originalMsgId: string, newText: string, newMsgId?: string, isStreaming?: boolean, editorNick?: string, editorAccount?: string, editTags?: Record<string, string>) => void;
+  /** Replace a message's ciphertext with its plaintext once the key arrives.
+   *  Not an edit: nothing is marked edited and nothing else changes. */
+  revealMessage: (channel: string, msgId: string, plaintext: string) => void;
   deleteMessage: (channel: string, msgId: string, deleterNick?: string, deleterAccount?: string) => void;
   addReaction: (channel: string, msgId: string, emoji: string, fromNick: string) => void;
   removeReaction: (channel: string, msgId: string, emoji: string, fromNick: string) => void;
@@ -1523,6 +1526,18 @@ export const useStore = create<Store>((set, get) => ({
   // `_newMsgId` — the revision's own wire id — is deliberately unused: the
   // message keeps the id it was born with. Still accepted because the wire
   // and the SDK event carry it; droppable once no caller passes it.
+  revealMessage: (channel, msgId, plaintext) => set((s) => {
+    const key = channel.toLowerCase();
+    const ch = s.channels.get(key);
+    if (!ch) return s;
+    const i = ch.messages.findIndex((m) => m.id === msgId);
+    if (i < 0) return s;
+    const messages = ch.messages.slice();
+    messages[i] = { ...messages[i], text: plaintext, encrypted: true };
+    const channels = new Map(s.channels);
+    channels.set(key, { ...ch, messages });
+    return { channels };
+  }),
   editMessage: (channel, originalMsgId, newText, _newMsgId, isStreaming, editorNick, editorAccount, editTags) => set((s) => {
     // Authorship gate: only the original sender may edit. The server
     // enforces this when the thread is persisted; for unpersisted (guest)

@@ -112,6 +112,8 @@ For a channel with `room == true`, evaluated **after** the ban check and
 1. Founder or DID-op: admitted.
 2. Guest (no DID): `477 <nick> <chan> :Cannot join room (identity required)`.
    Rooms are E2EE; there is nothing to seal a key to without an identity.
+   (A browser without an account is not this case: it joins as its own
+   `did:key`. See "Web".)
 3. `JOIN #room <token>` where sha256(token) matches a `room_invites` row that
    is unrevoked, unexpired and under `max_uses`: admitted. `uses += 1`; the
    DID is upserted into `room_members` (`removed_at = NULL`).
@@ -277,8 +279,33 @@ export class RoomManager {
 ## Web (`freeq-app`)
 
 - `/r/<name>#<token>` and `/?room=<name>#<token>` are understood. The pending
-  room survives the OAuth redirect (sessionStorage). Rooms need a DID, so
-  the guest tab explains that and offers login.
+  room survives the OAuth redirect (sessionStorage).
+- **No account needed.** Rooms need a DID, and a browser can be one: "Join as
+  guest" mints a `did:key` for this browser (`lib/guest-identity.ts`, kept in
+  localStorage) and authenticates with the same did:key SASL flow agents use,
+  so this adds no auth path. It signs its messages with that key, and signs
+  its e2ee pre-key bundle with it too (SDK `identitySigningKey`), which is what
+  lets members bind the bundle to the DID and seal it the room key. A browser
+  guest therefore gets the *strong* (did:key) side of the trust model below,
+  not the did:plc one. A reload reconnects as the same guest, who is already
+  on the roster and needs no invite. The plain nick-only guest tab still
+  cannot join a room.
+- **Upgrading to an account, in place** (`lib/room-upgrade.ts`). A guest sees
+  "Sign in as yourself". The invite is re-parked and an upgrade record
+  (guest DID, nick, room, token) bridges the OAuth redirect. Back in the room
+  as the account, the guest's room secrets are copied to the account's slot,
+  so it reads at once without waiting for a steward. The account then posts
+  one link message carrying `[freeq-link:v1 <guest did:key> <sig>]`, an
+  Ed25519 signature by the guest key over
+  `freeq-room-link:v1\n<room>\n<guest DID>\n<account DID>`. Every member's
+  client checks it against the sender's account DID and that room and shows
+  "✓ Verified: <nick> is the guest … who was here before". Nobody's word is
+  needed (the guest key is a did:key), so what the guest said becomes
+  attributable to the account after the fact, and history is not rewritten.
+  A copied link posted by anyone else, or in another room, fails the check.
+- Messages replayed before the room key arrives are decrypted in place once
+  it does (`revealCiphertext`); before, a returning member saw them as `EG1:`
+  text.
 - On joining a `+E` room: `GET groupkeys` → open with the e2ee identity →
   `setChannelCipher`. The web client is also a steward: after its own keys
   load it runs a steward pass for members lacking the latest epoch.

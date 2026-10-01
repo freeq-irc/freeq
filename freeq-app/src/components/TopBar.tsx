@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import type { AvParticipant } from '../store';
 import { useStore, uniqueMemberCount } from '../store';
-import { setTopic as sendTopic, startAvSession, getClient } from '../irc/client';
+import { setTopic as sendTopic, startAvSession, getClient, isRoomGuest, beginRoomUpgrade } from '../irc/client';
 import { getRooms } from '../lib/rooms';
 import { roomInviteUrl } from '../lib/room-link';
 import { showToast } from './Toast';
@@ -137,6 +137,7 @@ export function TopBar({ onToggleSidebar, onToggleMembers, sidebarOpen, membersO
           ) : null;
         })()}
         {isChannel && <VoiceButton channel={activeChannel} />}
+        {isChannel && <RoomGuestSignIn channel={activeChannel} />}
         {isChannel && <RoomInviteButton channel={activeChannel} />}
       </div>
 
@@ -397,3 +398,25 @@ export const TOP_BAR_INLINE_BUTTON = 'whitespace-nowrap font-semibold hover:unde
 
 /** The ✕ that dismisses a bar. */
 export const TOP_BAR_CLOSE = 'shrink-0 whitespace-nowrap text-fg-dim/40 hover:text-fg-dim ml-1';
+
+/**
+ * In a room as a browser guest (a did:key this browser minted, no account):
+ * offer to carry on as yourself. Signing in keeps the room and its key, and
+ * links what the guest said to the account with a signature by the guest key
+ * (lib/room-upgrade.ts).
+ */
+function RoomGuestSignIn({ channel }: { channel: string }) {
+  const room = useStore((s) => s.rooms.get(channel.toLowerCase()));
+  useStore((s) => s.authDid); // re-render when the identity changes
+  if (!room?.isRoom || !isRoomGuest()) return null;
+  return (
+    <button
+      data-testid="room-guest-sign-in"
+      onClick={() => beginRoomUpgrade(channel)}
+      title="You joined as a guest with a key this browser made. Sign in to continue here as yourself — you keep the room, and your guest messages get a verified link to your account."
+      className="shrink-0 text-xs px-2 py-0.5 rounded-md border border-accent/40 text-accent hover:bg-accent/10 whitespace-nowrap"
+    >
+      Guest · Sign in as yourself
+    </button>
+  );
+}

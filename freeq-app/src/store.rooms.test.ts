@@ -93,3 +93,22 @@ describe('room state', () => {
     expect(s().rooms.size).toBe(0);
   });
 });
+
+describe('revealMessage', () => {
+  it('swaps ciphertext for plaintext in place, without marking an edit', () => {
+    s().addChannel('#r-a-b-c');
+    s().addMessage('#r-a-b-c', { id: 'm1', from: 'dana', text: 'EG1:1:abc:def', timestamp: new Date(), tags: {} } as never);
+    s().revealMessage('#r-a-b-c', 'm1', 'hello');
+    const m = s().channels.get('#r-a-b-c')!.messages.find((x) => x.id === 'm1')!;
+    expect(m.text).toBe('hello');
+    expect(m.encrypted).toBe(true);
+    expect(m.editOf).toBeUndefined();
+  });
+
+  it('ignores a message it does not have', () => {
+    s().addChannel('#r-a-b-c');
+    s().revealMessage('#r-a-b-c', 'nope', 'hello');
+    s().revealMessage('#r-unknown', 'm1', 'hello');
+    expect(s().channels.get('#r-a-b-c')!.messages.some((m) => m.text === 'hello')).toBe(false);
+  });
+});
