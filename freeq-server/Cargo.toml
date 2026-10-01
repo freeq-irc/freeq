@@ -18,7 +18,6 @@ aes-gcm = { workspace = true }
 freeq-sdk = { path = "../freeq-sdk" }
 freeq-oauth = { workspace = true }
 freeq-auth-broker = { path = "../freeq-auth-broker" }
-async-trait = "0.1"
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
