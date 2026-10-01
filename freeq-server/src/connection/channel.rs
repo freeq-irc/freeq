@@ -7,7 +7,7 @@ use super::helpers::{
     s2s_broadcast, s2s_broadcast_mode, s2s_next_event_id,
 };
 use crate::irc::{self, Message};
-use crate::server::SharedState;
+use crate::server::{SharedState, invite_nick_token};
 use std::sync::Arc;
 
 pub(super) fn handle_join(
@@ -113,7 +113,7 @@ pub(super) fn handle_join(
             if !is_did_authority && ch.invite_only {
                 let has_invite = ch.invites.contains(session_id)
                     || did.is_some_and(|d| ch.invites.contains(d))
-                    || ch.invites.contains(&format!("nick:{nick}"));
+                    || ch.invites.contains(&invite_nick_token(nick));
                 let on_invite_exception = ch.is_invite_excepted(&hostmask, did);
 
                 // Delegated access: an agent may go where the person it acts
@@ -177,7 +177,7 @@ pub(super) fn handle_join(
                         {
                             let channel_owned = channel.to_string();
                             let did_owned = did.map(str::to_string);
-                            let nick_token = format!("nick:{nick}");
+                            let nick_token = invite_nick_token(nick);
                             state.with_db(move |db| {
                                 if let Some(ref d) = did_owned {
                                     db.remove_invite(&channel_owned, d)?;
@@ -189,7 +189,7 @@ pub(super) fn handle_join(
                         if let Some(d) = did {
                             ch.invites.remove(d);
                         }
-                        ch.invites.remove(&format!("nick:{nick}"));
+                        ch.invites.remove(&invite_nick_token(nick));
                     }
                 }
             }
@@ -1535,7 +1535,7 @@ pub(super) fn handle_invite(
                     }
                 }
                 // For S2S, prefer DID over nick-based token
-                did.unwrap_or_else(|| format!("nick:{target_nick}"))
+                did.unwrap_or_else(|| invite_nick_token(target_nick))
             };
 
             // Durable, because `+i` is. An invite that evaporates on restart
@@ -1587,11 +1587,11 @@ pub(super) fn handle_invite(
                     if let Some(ref did) = rm.did {
                         ch.invites.insert(did.clone());
                     }
-                    ch.invites.insert(format!("nick:{target_nick}"));
+                    ch.invites.insert(invite_nick_token(target_nick));
                 }
                 rm.did
                     .clone()
-                    .unwrap_or_else(|| format!("nick:{target_nick}"))
+                    .unwrap_or_else(|| invite_nick_token(target_nick))
             };
 
             // Notify inviter (remote target can't be notified directly)
