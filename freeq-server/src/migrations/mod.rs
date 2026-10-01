@@ -239,6 +239,7 @@ mod tests {
         migration_ladder().to_version(&mut stepped, 14).unwrap();
         migration_ladder().to_version(&mut stepped, 15).unwrap();
         migration_ladder().to_version(&mut stepped, 16).unwrap();
+        migration_ladder().to_version(&mut stepped, 17).unwrap();
 
         let mut direct = Connection::open_in_memory().unwrap();
         migration_ladder().to_latest(&mut direct).unwrap();
