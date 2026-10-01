@@ -436,7 +436,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-10-01T04:00:04.784248932Z",
-  "last_event_at": "2026-10-01T04:02:01.538035625Z",
+  "last_event_at": "2026-10-01T04:19:32.960128227Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -476,9 +476,9 @@
       "diff": {}
     },
     {
-      "seq": 0,
+      "seq": 94,
       "checkpoint": {
-        "timestamp": "2026-10-01T04:02:01.541620725Z",
+        "timestamp": "2026-10-01T04:02:04.982249606Z",
         "current_node": "hunt",
         "completed_nodes": [
           "start",
@@ -486,21 +486,112 @@
         ],
         "node_retries": {},
         "context_values": {
+          "failure_signature": "",
+          "internal.run_id": "01M3TSWZN85A86HDZ4EC0E94Q4",
+          "internal.node_visit_count": 1,
+          "internal.fidelity": "full",
+          "last_response": "I found one real bug: **nick-based invite tokens are matched case-sensitively, but nicks in freeq are case-insensitive.** On a `+i` channel, a guest invited as `bob` cannot join while their nick is `B",
+          "last_stage": "hunt",
+          "graph.goal": "Find one genuine correctness bug in freeq's CI-covered code, pin it with a regression test that fails before the fix, fix it minimally, and verify. Quality over quantity — one real, well-proven bug, never a speculative or cosmetic change.",
+          "outcome": "succeeded",
+          "response.hunt": "I found one real bug: **nick-based invite tokens are matched case-sensitively, but nicks in freeq are case-insensitive.** On a `+i` channel, a guest invited as `bob` cannot join while their nick is `Bob`. A one-shot invite that was spent can also stay in the DB and come back after a restart. I haven't edited anything or run any tests yet.\n\n## Where it is\n\nTokens are written with the nick exactly as the inviter typed it:\n- `freeq-server/src/connection/mod.rs:1257` passes `msg.params[0]` to `handle_invite` unchanged.\n- `connection/channel.rs:1538`: when a local target has no DID, it persists `nick:{target_nick}` to the DB and sends it to peers.\n- `connection/channel.rs:1590, 1594`: for a remote target, it stores `nick:{target_nick}` in memory and broadcasts it.\n- `server.rs:8376`: the S2S Invite receiver inserts the peer's token as-is.\n\nTokens are checked and consumed with the joiner's actual nick casing:\n- Local JOIN check at `connection/channel.rs:116`, and consumption at `:185` (DB) and `:192` (memory).\n- S2S Join check at `server.rs:7155` and consumption at `server.rs:7203`.\n\nEverywhere else nicks are case-insensitive: `NickMap` (`server.rs:724`), `resolve_network_target` (`helpers.rs:116`), `remote_member()`, and ban matching, where `wildcard_match` lowercases both sides (`server.rs:609`). So `INVITE bob` correctly finds `Bob`, then stores a token that `Bob` can never match.\n\n## What triggers it\n\n1. **Federated guest.** Alice is an op of `+i #room` on server A. Guest `Bob` is on server B. Alice sends `INVITE bob #room`.\n   - Both A and B store `nick:bob`.\n   - When Bob joins on B, the local check looks for `nick:Bob` and he gets `473 ERR_INVITEONLYCHAN`.\n   - Even if B let him in, A's S2S Join handler would drop the event at `server.rs:7155`.\n2. **Local guest: a spent invite comes back.** `INVITE bob #room` for local guest `Bob`.\n   - In memory, the session ID is stored too, so the join works.\n   - Consuming the invite removes `nick:Bob` from the DB, but the row is `nick:bob`, so it is never deleted.\n   - After a restart, `load_invites` brings back a one-shot invite that was already used. That is exactly what the comment at `channel.rs:175` says the code prevents, and it reopens `+i` for anyone who later takes the nick `bob`.\n\n**Correct behaviour:** the invite is matched no matter how either side cases the nick, and using it removes it from both memory and the DB.\n\n## The failing test\n\nI'll add a unit test in `server.rs`'s test module, using the existing `test_state()`, `test_manager()` and `setup_authenticated_peer()` helpers, modelled on `s2s_invite_accepted_from_founder_who_has_already_left` (`server.rs:11852`):\n1. Create `#invcase` with `invite_only = true` and `founder_did = FOUNDER`.\n2. Process `S2sMessage::Invite { invitee: \"nick:bob\", invited_by_did: Some(FOUNDER), .. }`.\n3. Process `S2sMessage::Join { nick: \"Bob\", did: None, .. }`.\n4. Assert `ch.has_remote_member(\"Bob\")` and that the invite was used up.\n\nOn current `main` this fails because the join is rejected at `server.rs:7155`. I can also add an integration test with `start_test_server_with_db` (`tests/integration.rs:3392`) that sends `INVITE <lowercased nick>` and checks the guest gets in. That would cover the local JOIN path.\n\n## Keeping the fix small\n\n- Add one helper, e.g. `invite_nick_token(nick) -> String`, that builds `nick:{nick.to_lowercase()}` using the same lowercasing as `NickMap`.\n- Use it at the eight places that build the token: `channel.rs:116, 185, 192, 1538, 1590, 1594` and `server.rs:7155, 7203`.\n- At `server.rs:8376`, lowercase incoming `nick:` tokens so invites from older peers still match. DID tokens stay untouched.\n\nDB rows already written in mixed case would stay as they are unless I also lowercase them in `load_invites`. That's a one-line change; I'd include it only if you want existing rows fixed too.\n\n**Confidence: high.** The mismatch is plain from reading the code, and ban matching already handles case correctly, so invites are the odd one out.\n\nA smaller issue I noticed but am not proposing: `irc.rs:169` keeps the `\\` on unknown tag escapes, while the IRCv3 spec says to drop it. It has much less impact.",
+          "failure_class": "",
+          "internal.thread_id": "bug",
+          "internal.retry_count.start": 0,
+          "thread.bug.current_node": "hunt",
+          "current_node": "hunt",
+          "graph.rankdir": "LR",
+          "internal.retry_count.hunt": 0,
+          "internal.work_dir": "/workspace/freeq"
+        },
+        "node_outcomes": {
+          "hunt": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "hunt",
+              "last_response": "I found one real bug: **nick-based invite tokens are matched case-sensitively, but nicks in freeq are case-insensitive.** On a `+i` channel, a guest invited as `bob` cannot join while their nick is `B",
+              "response.hunt": "I found one real bug: **nick-based invite tokens are matched case-sensitively, but nicks in freeq are case-insensitive.** On a `+i` channel, a guest invited as `bob` cannot join while their nick is `Bob`. A one-shot invite that was spent can also stay in the DB and come back after a restart. I haven't edited anything or run any tests yet.\n\n## Where it is\n\nTokens are written with the nick exactly as the inviter typed it:\n- `freeq-server/src/connection/mod.rs:1257` passes `msg.params[0]` to `handle_invite` unchanged.\n- `connection/channel.rs:1538`: when a local target has no DID, it persists `nick:{target_nick}` to the DB and sends it to peers.\n- `connection/channel.rs:1590, 1594`: for a remote target, it stores `nick:{target_nick}` in memory and broadcasts it.\n- `server.rs:8376`: the S2S Invite receiver inserts the peer's token as-is.\n\nTokens are checked and consumed with the joiner's actual nick casing:\n- Local JOIN check at `connection/channel.rs:116`, and consumption at `:185` (DB) and `:192` (memory).\n- S2S Join check at `server.rs:7155` and consumption at `server.rs:7203`.\n\nEverywhere else nicks are case-insensitive: `NickMap` (`server.rs:724`), `resolve_network_target` (`helpers.rs:116`), `remote_member()`, and ban matching, where `wildcard_match` lowercases both sides (`server.rs:609`). So `INVITE bob` correctly finds `Bob`, then stores a token that `Bob` can never match.\n\n## What triggers it\n\n1. **Federated guest.** Alice is an op of `+i #room` on server A. Guest `Bob` is on server B. Alice sends `INVITE bob #room`.\n   - Both A and B store `nick:bob`.\n   - When Bob joins on B, the local check looks for `nick:Bob` and he gets `473 ERR_INVITEONLYCHAN`.\n   - Even if B let him in, A's S2S Join handler would drop the event at `server.rs:7155`.\n2. **Local guest: a spent invite comes back.** `INVITE bob #room` for local guest `Bob`.\n   - In memory, the session ID is stored too, so the join works.\n   - Consuming the invite removes `nick:Bob` from the DB, but the row is `nick:bob`, so it is never deleted.\n   - After a restart, `load_invites` brings back a one-shot invite that was already used. That is exactly what the comment at `channel.rs:175` says the code prevents, and it reopens `+i` for anyone who later takes the nick `bob`.\n\n**Correct behaviour:** the invite is matched no matter how either side cases the nick, and using it removes it from both memory and the DB.\n\n## The failing test\n\nI'll add a unit test in `server.rs`'s test module, using the existing `test_state()`, `test_manager()` and `setup_authenticated_peer()` helpers, modelled on `s2s_invite_accepted_from_founder_who_has_already_left` (`server.rs:11852`):\n1. Create `#invcase` with `invite_only = true` and `founder_did = FOUNDER`.\n2. Process `S2sMessage::Invite { invitee: \"nick:bob\", invited_by_did: Some(FOUNDER), .. }`.\n3. Process `S2sMessage::Join { nick: \"Bob\", did: None, .. }`.\n4. Assert `ch.has_remote_member(\"Bob\")` and that the invite was used up.\n\nOn current `main` this fails because the join is rejected at `server.rs:7155`. I can also add an integration test with `start_test_server_with_db` (`tests/integration.rs:3392`) that sends `INVITE <lowercased nick>` and checks the guest gets in. That would cover the local JOIN path.\n\n## Keeping the fix small\n\n- Add one helper, e.g. `invite_nick_token(nick) -> String`, that builds `nick:{nick.to_lowercase()}` using the same lowercasing as `NickMap`.\n- Use it at the eight places that build the token: `channel.rs:116, 185, 192, 1538, 1590, 1594` and `server.rs:7155, 7203`.\n- At `server.rs:8376`, lowercase incoming `nick:` tokens so invites from older peers still match. DID tokens stay untouched.\n\nDB rows already written in mixed case would stay as they are unless I also lowercase them in `load_invites`. That's a one-line change; I'd include it only if you want existing rows fixed too.\n\n**Confidence: high.** The mismatch is plain from reading the code, and ban matching already handles case correctly, so invites are the odd one out.\n\nA smaller issue I noticed but am not proposing: `irc.rs:169` keeps the `\\` on unknown tag escapes, while the IRCv3 spec says to drop it. It has much less impact."
+            },
+            "notes": "Stage completed: hunt",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-5-5"
+                  },
+                  "tokens": {
+                    "input_tokens": 42415,
+                    "output_tokens": 7873,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 506915,
+                    "cache_write_tokens": 81919
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 81919,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 838098
+            },
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 111395,
+              "tool_time_ms": 3232,
+              "active_time_ms": 114627
+            }
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          }
+        },
+        "next_node_id": "fix",
+        "git_commit_sha": "0ce6eb6fd777a08c5131f5edbc51dd2945449888",
+        "node_visits": {
+          "start": 1,
+          "hunt": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 0,
+          "additions": 0,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-10-01T04:19:32.977769866Z",
+        "current_node": "fix",
+        "completed_nodes": [
+          "start",
+          "hunt",
+          "fix"
+        ],
+        "node_retries": {},
+        "context_values": {
           "internal.retry_count.start": 0,
           "graph.rankdir": "LR",
+          "internal.retry_count.fix": 0,
           "graph.goal": "Find one genuine correctness bug in freeq's CI-covered code, pin it with a regression test that fails before the fix, fix it minimally, and verify. Quality over quantity — one real, well-proven bug, never a speculative or cosmetic change.",
           "internal.run_id": "01M3TSWZN85A86HDZ4EC0E94Q4",
-          "last_stage": "hunt",
-          "last_response": "I found one real bug: **nick-based invite tokens are matched case-sensitively, but nicks in freeq are case-insensitive.** On a `+i` channel, a guest invited as `bob` cannot join while their nick is `B",
+          "last_stage": "fix",
+          "last_response": "The bug is real and now fixed: the test failed before the fix, passes after it, and the full gate (`bash .fabro/verify.sh`) passed.\n\n**The bug:** on a `+i` channel, a guest invited by nick was refused",
           "failure_signature": "",
           "response.hunt": "I found one real bug: **nick-based invite tokens are matched case-sensitively, but nicks in freeq are case-insensitive.** On a `+i` channel, a guest invited as `bob` cannot join while their nick is `Bob`. A one-shot invite that was spent can also stay in the DB and come back after a restart. I haven't edited anything or run any tests yet.\n\n## Where it is\n\nTokens are written with the nick exactly as the inviter typed it:\n- `freeq-server/src/connection/mod.rs:1257` passes `msg.params[0]` to `handle_invite` unchanged.\n- `connection/channel.rs:1538`: when a local target has no DID, it persists `nick:{target_nick}` to the DB and sends it to peers.\n- `connection/channel.rs:1590, 1594`: for a remote target, it stores `nick:{target_nick}` in memory and broadcasts it.\n- `server.rs:8376`: the S2S Invite receiver inserts the peer's token as-is.\n\nTokens are checked and consumed with the joiner's actual nick casing:\n- Local JOIN check at `connection/channel.rs:116`, and consumption at `:185` (DB) and `:192` (memory).\n- S2S Join check at `server.rs:7155` and consumption at `server.rs:7203`.\n\nEverywhere else nicks are case-insensitive: `NickMap` (`server.rs:724`), `resolve_network_target` (`helpers.rs:116`), `remote_member()`, and ban matching, where `wildcard_match` lowercases both sides (`server.rs:609`). So `INVITE bob` correctly finds `Bob`, then stores a token that `Bob` can never match.\n\n## What triggers it\n\n1. **Federated guest.** Alice is an op of `+i #room` on server A. Guest `Bob` is on server B. Alice sends `INVITE bob #room`.\n   - Both A and B store `nick:bob`.\n   - When Bob joins on B, the local check looks for `nick:Bob` and he gets `473 ERR_INVITEONLYCHAN`.\n   - Even if B let him in, A's S2S Join handler would drop the event at `server.rs:7155`.\n2. **Local guest: a spent invite comes back.** `INVITE bob #room` for local guest `Bob`.\n   - In memory, the session ID is stored too, so the join works.\n   - Consuming the invite removes `nick:Bob` from the DB, but the row is `nick:bob`, so it is never deleted.\n   - After a restart, `load_invites` brings back a one-shot invite that was already used. That is exactly what the comment at `channel.rs:175` says the code prevents, and it reopens `+i` for anyone who later takes the nick `bob`.\n\n**Correct behaviour:** the invite is matched no matter how either side cases the nick, and using it removes it from both memory and the DB.\n\n## The failing test\n\nI'll add a unit test in `server.rs`'s test module, using the existing `test_state()`, `test_manager()` and `setup_authenticated_peer()` helpers, modelled on `s2s_invite_accepted_from_founder_who_has_already_left` (`server.rs:11852`):\n1. Create `#invcase` with `invite_only = true` and `founder_did = FOUNDER`.\n2. Process `S2sMessage::Invite { invitee: \"nick:bob\", invited_by_did: Some(FOUNDER), .. }`.\n3. Process `S2sMessage::Join { nick: \"Bob\", did: None, .. }`.\n4. Assert `ch.has_remote_member(\"Bob\")` and that the invite was used up.\n\nOn current `main` this fails because the join is rejected at `server.rs:7155`. I can also add an integration test with `start_test_server_with_db` (`tests/integration.rs:3392`) that sends `INVITE <lowercased nick>` and checks the guest gets in. That would cover the local JOIN path.\n\n## Keeping the fix small\n\n- Add one helper, e.g. `invite_nick_token(nick) -> String`, that builds `nick:{nick.to_lowercase()}` using the same lowercasing as `NickMap`.\n- Use it at the eight places that build the token: `channel.rs:116, 185, 192, 1538, 1590, 1594` and `server.rs:7155, 7203`.\n- At `server.rs:8376`, lowercase incoming `nick:` tokens so invites from older peers still match. DID tokens stay untouched.\n\nDB rows already written in mixed case would stay as they are unless I also lowercase them in `load_invites`. That's a one-line change; I'd include it only if you want existing rows fixed too.\n\n**Confidence: high.** The mismatch is plain from reading the code, and ban matching already handles case correctly, so invites are the odd one out.\n\nA smaller issue I noticed but am not proposing: `irc.rs:169` keeps the `\\` on unknown tag escapes, while the IRCv3 spec says to drop it. It has much less impact.",
           "failure_class": "",
-          "thread.bug.current_node": "hunt",
+          "thread.bug.current_node": "fix",
           "internal.node_visit_count": 1,
           "internal.work_dir": "/workspace/freeq",
+          "response.fix": "The bug is real and now fixed: the test failed before the fix, passes after it, and the full gate (`bash .fabro/verify.sh`) passed.\n\n**The bug:** on a `+i` channel, a guest invited by nick was refused if the inviter typed the nick in different case. `INVITE bob #room` stored the token `nick:bob`, but when `Bob` joined, the server looked for `nick:Bob` and returned `473`. Nicks are case-insensitive everywhere else in the server, so invites were the odd one out. The same mismatch meant a used one-shot invite was never deleted from the DB, so it came back after a restart.\n\n**The proof:** the new test `s2s_nick_invite_matches_join_case_insensitively` in `server.rs` sends a peer invite for `nick:bob` to a `+i` channel, then a peer join as `Bob`. Before the fix it failed for the right reason: `an invite for \\`bob\\` must admit \\`Bob\\` through the +i gate`, meaning the join was rejected at the `+i` check. After the fix, Bob is admitted and the invite is used up.\n\n**The fix** touches only `freeq-server`:\n- **New helper** `invite_nick_token(nick)` in `server.rs` builds `nick:{nick.to_lowercase()}`, the same lowercasing the nick table uses.\n- **`connection/channel.rs`:** every place that builds or checks the token now uses the helper. That covers the local JOIN check, removing the used invite from memory and the DB, and both INVITE paths (local and remote target).\n- **`server.rs`, peer messages:** the incoming Join check and consume use the helper. Incoming Invite tokens starting with `nick:` are lowercased, so invites from servers without this fix still match. DID tokens are untouched.\n\n**Checks run:**\n- `cargo test -p freeq-server --lib invite`: 16 passed.\n- `cargo test -p freeq-server --test integration invite`: 10 passed.\n- `cargo fmt --all` and `cargo clippy -p freeq-server --tests` are clean, with no new `#[allow]`.\n\n**Not changed:** I didn't touch `load_invites`, so mixed-case invite rows already in a DB stay as they are. After the fix they can't match any join, so they can't let anyone in; at worst such an invite simply stops working.",
           "outcome": "succeeded",
           "internal.retry_count.hunt": 0,
-          "current_node": "hunt",
+          "current_node": "fix",
           "internal.thread_id": "bug",
           "internal.fidelity": "full"
         },
@@ -546,10 +637,53 @@
               "tool_time_ms": 3232,
               "active_time_ms": 114627
             }
+          },
+          "fix": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "The bug is real and now fixed: the test failed before the fix, passes after it, and the full gate (`bash .fabro/verify.sh`) passed.\n\n**The bug:** on a `+i` channel, a guest invited by nick was refused",
+              "last_stage": "fix",
+              "response.fix": "The bug is real and now fixed: the test failed before the fix, passes after it, and the full gate (`bash .fabro/verify.sh`) passed.\n\n**The bug:** on a `+i` channel, a guest invited by nick was refused if the inviter typed the nick in different case. `INVITE bob #room` stored the token `nick:bob`, but when `Bob` joined, the server looked for `nick:Bob` and returned `473`. Nicks are case-insensitive everywhere else in the server, so invites were the odd one out. The same mismatch meant a used one-shot invite was never deleted from the DB, so it came back after a restart.\n\n**The proof:** the new test `s2s_nick_invite_matches_join_case_insensitively` in `server.rs` sends a peer invite for `nick:bob` to a `+i` channel, then a peer join as `Bob`. Before the fix it failed for the right reason: `an invite for \\`bob\\` must admit \\`Bob\\` through the +i gate`, meaning the join was rejected at the `+i` check. After the fix, Bob is admitted and the invite is used up.\n\n**The fix** touches only `freeq-server`:\n- **New helper** `invite_nick_token(nick)` in `server.rs` builds `nick:{nick.to_lowercase()}`, the same lowercasing the nick table uses.\n- **`connection/channel.rs`:** every place that builds or checks the token now uses the helper. That covers the local JOIN check, removing the used invite from memory and the DB, and both INVITE paths (local and remote target).\n- **`server.rs`, peer messages:** the incoming Join check and consume use the helper. Incoming Invite tokens starting with `nick:` are lowercased, so invites from servers without this fix still match. DID tokens are untouched.\n\n**Checks run:**\n- `cargo test -p freeq-server --lib invite`: 16 passed.\n- `cargo test -p freeq-server --test integration invite`: 10 passed.\n- `cargo fmt --all` and `cargo clippy -p freeq-server --tests` are clean, with no new `#[allow]`.\n\n**Not changed:** I didn't touch `load_invites`, so mixed-case invite rows already in a DB stay as they are. After the fix they can't match any join, so they can't let anyone in; at worst such an invite simply stops working."
+            },
+            "notes": "Stage completed: fix",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-5-5"
+                  },
+                  "tokens": {
+                    "input_tokens": 17293,
+                    "output_tokens": 8569,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 1266318,
+                    "cache_write_tokens": 265429
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 265429,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 1820960
+            },
+            "files_touched": [
+              "/workspace/freeq/freeq-server/src/connection/channel.rs",
+              "/workspace/freeq/freeq-server/src/server.rs"
+            ],
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 126787,
+              "tool_time_ms": 921161,
+              "active_time_ms": 1047948
+            }
           }
         },
-        "next_node_id": "fix",
+        "next_node_id": "verify",
         "node_visits": {
+          "fix": 1,
           "start": 1,
           "hunt": 1
         }
@@ -584,8 +718,8 @@
   "superseded_by": null,
   "pending_interviews": {},
   "stages": {
-    "hunt@1": {
-      "first_event_seq": 20,
+    "fix@1": {
+      "first_event_seq": 97,
       "prompt": null,
       "response": null,
       "completion": null,
@@ -600,15 +734,100 @@
       "script_timing": null,
       "parallel_results": null,
       "output": null,
-      "started_at": "2026-10-01T04:00:06.403614023Z",
+      "started_at": "2026-10-01T04:02:04.982508505Z",
       "handler": "agent",
       "usage": {
-        "input_tokens": 40477,
-        "output_tokens": 6178,
-        "total_tokens": 583769,
+        "input_tokens": 17293,
+        "output_tokens": 8569,
+        "total_tokens": 1557609,
         "reasoning_tokens": 0,
-        "cache_read_tokens": 456230,
-        "cache_write_tokens": 80884
+        "cache_read_tokens": 1266318,
+        "cache_write_tokens": 265429,
+        "total_usd_micros": 1820960
+      },
+      "model": {
+        "provider": "anthropic",
+        "model_id": "claude-opus-5-5"
+      },
+      "permission_level": "full",
+      "context_window": {
+        "provider": "anthropic",
+        "model": "claude-opus-5-5",
+        "context_window_tokens": 1000000,
+        "input_tokens": 71150,
+        "usage_percent": 7.115,
+        "count_method": "response_usage_scaled_breakdown",
+        "staleness": "live",
+        "generated_at": "2026-10-01T04:19:32.957574938Z",
+        "event_seq": 282,
+        "breakdown": [
+          {
+            "category": "system_prompt",
+            "tokens": 2172,
+            "usage_percent": 0.2172
+          },
+          {
+            "category": "tools",
+            "tokens": 2480,
+            "usage_percent": 0.248
+          },
+          {
+            "category": "memory",
+            "tokens": 4134,
+            "usage_percent": 0.4134
+          },
+          {
+            "category": "conversation",
+            "tokens": 62355,
+            "usage_percent": 6.2355
+          },
+          {
+            "category": "other",
+            "tokens": 9,
+            "usage_percent": 0.0009
+          }
+        ],
+        "warnings": []
+      },
+      "state": "running"
+    },
+    "hunt@1": {
+      "first_event_seq": 20,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Stage completed: hunt",
+        "failure_reason": null,
+        "timestamp": "2026-10-01T04:02:01.541472452Z"
+      },
+      "provider_used": {
+        "mode": "agent",
+        "provider": "anthropic",
+        "model": "claude-opus-5-5",
+        "reasoning_effort": "high"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-10-01T04:00:06.403614023Z",
+      "handler": "agent",
+      "timing": {
+        "wall_time_ms": 115137,
+        "inference_time_ms": 111395,
+        "tool_time_ms": 3232,
+        "active_time_ms": 114627
+      },
+      "usage": {
+        "input_tokens": 59708,
+        "output_tokens": 16442,
+        "total_tokens": 2196731,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 1773233,
+        "cache_write_tokens": 347348,
+        "total_usd_micros": 838098
       },
       "model": {
         "provider": "anthropic",
@@ -677,7 +896,7 @@
             "kind": "native"
           },
           "category": "write",
-          "invoked": false
+          "invoked": true
         },
         {
           "name": "glob",
@@ -774,32 +993,32 @@
         "provider": "anthropic",
         "model": "claude-opus-5-5",
         "context_window_tokens": 1000000,
-        "input_tokens": 51722,
-        "usage_percent": 5.1722,
+        "input_tokens": 71150,
+        "usage_percent": 7.115,
         "count_method": "response_usage_scaled_breakdown",
         "staleness": "live",
-        "generated_at": "2026-10-01T04:01:41.095961439Z",
-        "event_seq": 84,
+        "generated_at": "2026-10-01T04:19:32.957574938Z",
+        "event_seq": 281,
         "breakdown": [
           {
             "category": "system_prompt",
-            "tokens": 2366,
-            "usage_percent": 0.2366
+            "tokens": 2172,
+            "usage_percent": 0.2172
           },
           {
             "category": "tools",
-            "tokens": 2701,
-            "usage_percent": 0.2701
+            "tokens": 2480,
+            "usage_percent": 0.248
           },
           {
             "category": "memory",
-            "tokens": 4504,
-            "usage_percent": 0.4504
+            "tokens": 4134,
+            "usage_percent": 0.4134
           },
           {
             "category": "conversation",
-            "tokens": 42142,
-            "usage_percent": 4.2142
+            "tokens": 62355,
+            "usage_percent": 6.2355
           },
           {
             "category": "other",
@@ -809,7 +1028,7 @@
         ],
         "warnings": []
       },
-      "state": "running"
+      "state": "succeeded"
     },
     "start@1": {
       "first_event_seq": 16,
