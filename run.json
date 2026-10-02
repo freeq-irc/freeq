@@ -424,7 +424,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-10-02T02:00:08.705732403Z",
-  "last_event_at": "2026-10-02T02:12:42.180000401Z",
+  "last_event_at": "2026-10-02T02:12:46.183219131Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -552,9 +552,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 127,
       "checkpoint": {
-        "timestamp": "2026-10-02T02:12:42.206428859Z",
+        "timestamp": "2026-10-02T02:12:46.182403695Z",
         "current_node": "implement",
         "completed_nodes": [
           "start",
@@ -563,17 +563,154 @@
         ],
         "node_retries": {},
         "context_values": {
-          "internal.thread_id": "cov",
+          "response.select": "**Chosen file:** `freeq-auth-broker/src/lib.rs`. It's Rust, in the `freeq-auth-broker` crate, which CI covers because it isn't one of the excluded AV crates. The next step adds tests to its existing `#[cfg(test)]` block at about line 2204.\n\n**Why it's high-risk and undertested**\n- The file is 2,396 lines with 74 functions. It sits in the top 25 of `scripts/hotspots.sh`, but it isn't one of the three files `CLAUDE.md` names.\n- I skipped the three files `CLAUDE.md` flags as undertested. `freeq-app/src/irc/client.ts` now has about 14 sibling test files and 600+ lines in `client.test.ts` alone. `MessageList.tsx` has about 12 test files. `sdk/client.rs` has about 176 tests across six `#[cfg(test)]` modules, so the `CLAUDE.md` note looks stale.\n- By contrast, this file has only 9 tests. They cover the SSRF provider, the session stores, the origin guard and enrollment refusal.\n- None of the pure security primitives have a test. They cover crypto, HMAC request auth, redirect validation and SSRF IP classification, so a regression in any of them is a security bug rather than a cosmetic one.\n\n**Behaviors to pin** (all pure functions, no network or server needed)\n1. **`verify_signed_body` / `sign_body`**\n   - A signed body round-trips.\n   - It is rejected when a header is missing, the timestamp is non-numeric, the timestamp is more than 60 s old or in the future (testing 59 s versus 61 s), or the body or secret is tampered with.\n   - The MAC covers the timestamp, so a valid signature can't be reused with a different `ts`.\n2. **`encrypt_field` / `decrypt_field`**\n   - Encrypt then decrypt returns the original text.\n   - Two encryptions of the same text differ because the nonce is random.\n   - Decrypting fails with the wrong key, with flipped ciphertext bits, with input shorter than 13 bytes, and with invalid base64.\n   - `derive_encryption_key` is deterministic and depends on the secret.\n3. **`is_valid_return_to`**\n   - Allowed: the exact allowlisted `https` hosts, and `http://localhost` or `127.0.0.1` on any port.\n   - Rejected: the prefix-bypass `https://irc.freeq.at.evil.example` (the C-6 regression), `//host`, `/\\host`, `http://irc.freeq.at` (wrong scheme), `javascript:` URLs, and unparseable input.\n   - Relative paths like `/foo` are allowed.\n4. **`is_private_ip`**\n   - Private: loopback, RFC1918, link-local, broadcast, unspecified, CGNAT 100.64/10, IPv6 ULA and IPv6 link-local.\n   - Boundaries: `100.63.x` and `100.128.x` are public.\n   - A public IPv4 and a public IPv6 address are not private.\n5. **`token_hash`**: The output is lowercase 64-character hex and matches the known SHA-256 of `\"abc\"`.\n6. **Small helpers**\n   - `is_truthy` accepts `1`, `true` and `yes`, and rejects `None`, `0` and `TRUE`.\n   - `pds_endpoint` returns the `AtprotoPersonalDataServer` service, ignores other service types, and returns `None` when there is none.\n\n**Convention to follow:** the existing `mod tests` at the bottom of `freeq-auth-broker/src/lib.rs`. It uses plain `#[test]` for pure functions and `#[tokio::test]` for async ones, with behavior-sentence names such as `a_retirement_must_be_dated_now` and `a_device_record_may_carry_an_old_date`. The `freeq-tui/src/main.rs` tests use the same naming style. I'd add no new dependencies, since `hmac`, `sha2` and `base64` are already in the crate.\n\nOne caveat: `is_private_ip` and `pds_endpoint` are private, but the in-file test module can reach them. I haven't run any of this, since this step is read-only.",
+          "internal.retry_count.select": 0,
+          "failure_class": "",
+          "internal.node_visit_count": 1,
+          "internal.retry_count.start": 0,
+          "internal.work_dir": "/workspace/freeq",
+          "last_response": "I added 18 tests to the existing `mod tests` block in `freeq-auth-broker/src/lib.rs`. It's the only file changed, and no production code was touched. The crate's unit tests went from 9 to 27 and all p",
+          "response.implement": "I added 18 tests to the existing `mod tests` block in `freeq-auth-broker/src/lib.rs`. It's the only file changed, and no production code was touched. The crate's unit tests went from 9 to 27 and all pass. `cargo fmt`, `cargo clippy -p freeq-auth-broker --tests -- -D warnings` and `bash .fabro/verify.sh` are all clean.\n\nI overstated the gap in my earlier report. `tests/characterization.rs` already covers the return_to allowlist, the encrypt/decrypt round-trip and tamper cases, and the `sign_body` wire format. I left those alone and tested what was actually missing:\n\n- **`verify_signed_body`**\n  - A body signed by `sign_body` verifies.\n  - It refuses a missing signature or timestamp header, and non-numeric timestamps.\n  - The 60-second window is checked both ways with no sleeping: 50 seconds off passes, and 120 seconds off or a timestamp of 0 is expired.\n  - It refuses a tampered body, a wrong secret, a garbage signature, and a valid MAC reused with a different timestamp.\n- **`encrypt_field` / `decrypt_field` / `derive_encryption_key`**\n  - Nonces are fresh on every call.\n  - The empty string round-trips.\n  - Bad base64, empty input, a nonce with no ciphertext, and junk ciphertext are each refused with the right error.\n  - Different secrets derive different keys.\n- **`is_valid_return_to`**\n  - It refuses the `irc.freeq.at@evil.example` userinfo trick, `javascript:`, `data:`, `ftp:`, empty input and `https://`.\n  - It refuses `localhost.evil.example` and `sub.irc.freeq.at`.\n  - It accepts an uppercase host.\n- **`is_private_ip`**\n  - It flags private IPv4 and IPv6 ranges, including `100.64.0.0/10` (carrier-grade NAT) and the metadata IP `169.254.169.254`.\n  - It does not flag the public addresses just outside each boundary, such as `172.15.x`, `172.32.x`, `100.63.x` and `100.128.x`.\n- **Small helpers:** `token_hash` is checked against the known SHA-256 of `\"abc\"`, plus lowercase hex output. `is_truthy` is pinned to `1`, `true` and `yes`. `pds_endpoint` takes the first matching service, returns none when there isn't one, and matches case-sensitively.\n\nI left out `fec0::1`. The deprecated IPv6 site-local range isn't blocked by `is_private_ip`, and a test asserting that would lock in a questionable behavior. It may be worth a separate look.",
+          "graph.rankdir": "LR",
+          "current_node": "implement",
+          "failure_signature": "",
+          "graph.goal": "Raise automated-test coverage on one of freeq's high-risk, undertested files — adding tests only, with at most minimal, behavior-preserving testability seams in production code.",
+          "internal.run_id": "01M3X5DZDENB6DTBYDVEMB7E47",
+          "outcome": "succeeded",
+          "last_stage": "implement",
+          "internal.retry_count.implement": 0,
+          "thread.cov.current_node": "implement",
+          "internal.fidelity": "full",
+          "internal.thread_id": "cov"
+        },
+        "node_outcomes": {
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "select": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "**Chosen file:** `freeq-auth-broker/src/lib.rs`. It's Rust, in the `freeq-auth-broker` crate, which CI covers because it isn't one of the excluded AV crates. The next step adds tests to its existing `",
+              "last_stage": "select",
+              "response.select": "**Chosen file:** `freeq-auth-broker/src/lib.rs`. It's Rust, in the `freeq-auth-broker` crate, which CI covers because it isn't one of the excluded AV crates. The next step adds tests to its existing `#[cfg(test)]` block at about line 2204.\n\n**Why it's high-risk and undertested**\n- The file is 2,396 lines with 74 functions. It sits in the top 25 of `scripts/hotspots.sh`, but it isn't one of the three files `CLAUDE.md` names.\n- I skipped the three files `CLAUDE.md` flags as undertested. `freeq-app/src/irc/client.ts` now has about 14 sibling test files and 600+ lines in `client.test.ts` alone. `MessageList.tsx` has about 12 test files. `sdk/client.rs` has about 176 tests across six `#[cfg(test)]` modules, so the `CLAUDE.md` note looks stale.\n- By contrast, this file has only 9 tests. They cover the SSRF provider, the session stores, the origin guard and enrollment refusal.\n- None of the pure security primitives have a test. They cover crypto, HMAC request auth, redirect validation and SSRF IP classification, so a regression in any of them is a security bug rather than a cosmetic one.\n\n**Behaviors to pin** (all pure functions, no network or server needed)\n1. **`verify_signed_body` / `sign_body`**\n   - A signed body round-trips.\n   - It is rejected when a header is missing, the timestamp is non-numeric, the timestamp is more than 60 s old or in the future (testing 59 s versus 61 s), or the body or secret is tampered with.\n   - The MAC covers the timestamp, so a valid signature can't be reused with a different `ts`.\n2. **`encrypt_field` / `decrypt_field`**\n   - Encrypt then decrypt returns the original text.\n   - Two encryptions of the same text differ because the nonce is random.\n   - Decrypting fails with the wrong key, with flipped ciphertext bits, with input shorter than 13 bytes, and with invalid base64.\n   - `derive_encryption_key` is deterministic and depends on the secret.\n3. **`is_valid_return_to`**\n   - Allowed: the exact allowlisted `https` hosts, and `http://localhost` or `127.0.0.1` on any port.\n   - Rejected: the prefix-bypass `https://irc.freeq.at.evil.example` (the C-6 regression), `//host`, `/\\host`, `http://irc.freeq.at` (wrong scheme), `javascript:` URLs, and unparseable input.\n   - Relative paths like `/foo` are allowed.\n4. **`is_private_ip`**\n   - Private: loopback, RFC1918, link-local, broadcast, unspecified, CGNAT 100.64/10, IPv6 ULA and IPv6 link-local.\n   - Boundaries: `100.63.x` and `100.128.x` are public.\n   - A public IPv4 and a public IPv6 address are not private.\n5. **`token_hash`**: The output is lowercase 64-character hex and matches the known SHA-256 of `\"abc\"`.\n6. **Small helpers**\n   - `is_truthy` accepts `1`, `true` and `yes`, and rejects `None`, `0` and `TRUE`.\n   - `pds_endpoint` returns the `AtprotoPersonalDataServer` service, ignores other service types, and returns `None` when there is none.\n\n**Convention to follow:** the existing `mod tests` at the bottom of `freeq-auth-broker/src/lib.rs`. It uses plain `#[test]` for pure functions and `#[tokio::test]` for async ones, with behavior-sentence names such as `a_retirement_must_be_dated_now` and `a_device_record_may_carry_an_old_date`. The `freeq-tui/src/main.rs` tests use the same naming style. I'd add no new dependencies, since `hmac`, `sha2` and `base64` are already in the crate.\n\nOne caveat: `is_private_ip` and `pds_endpoint` are private, but the in-file test module can reach them. I haven't run any of this, since this step is read-only."
+            },
+            "notes": "Stage completed: select",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-sonnet-5-5"
+                  },
+                  "tokens": {
+                    "input_tokens": 13960,
+                    "output_tokens": 2908,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 69182,
+                    "cache_write_tokens": 21583
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 21583,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 124793
+            },
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 24650,
+              "tool_time_ms": 3427,
+              "active_time_ms": 28077
+            }
+          },
+          "implement": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "implement",
+              "last_response": "I added 18 tests to the existing `mod tests` block in `freeq-auth-broker/src/lib.rs`. It's the only file changed, and no production code was touched. The crate's unit tests went from 9 to 27 and all p",
+              "response.implement": "I added 18 tests to the existing `mod tests` block in `freeq-auth-broker/src/lib.rs`. It's the only file changed, and no production code was touched. The crate's unit tests went from 9 to 27 and all pass. `cargo fmt`, `cargo clippy -p freeq-auth-broker --tests -- -D warnings` and `bash .fabro/verify.sh` are all clean.\n\nI overstated the gap in my earlier report. `tests/characterization.rs` already covers the return_to allowlist, the encrypt/decrypt round-trip and tamper cases, and the `sign_body` wire format. I left those alone and tested what was actually missing:\n\n- **`verify_signed_body`**\n  - A body signed by `sign_body` verifies.\n  - It refuses a missing signature or timestamp header, and non-numeric timestamps.\n  - The 60-second window is checked both ways with no sleeping: 50 seconds off passes, and 120 seconds off or a timestamp of 0 is expired.\n  - It refuses a tampered body, a wrong secret, a garbage signature, and a valid MAC reused with a different timestamp.\n- **`encrypt_field` / `decrypt_field` / `derive_encryption_key`**\n  - Nonces are fresh on every call.\n  - The empty string round-trips.\n  - Bad base64, empty input, a nonce with no ciphertext, and junk ciphertext are each refused with the right error.\n  - Different secrets derive different keys.\n- **`is_valid_return_to`**\n  - It refuses the `irc.freeq.at@evil.example` userinfo trick, `javascript:`, `data:`, `ftp:`, empty input and `https://`.\n  - It refuses `localhost.evil.example` and `sub.irc.freeq.at`.\n  - It accepts an uppercase host.\n- **`is_private_ip`**\n  - It flags private IPv4 and IPv6 ranges, including `100.64.0.0/10` (carrier-grade NAT) and the metadata IP `169.254.169.254`.\n  - It does not flag the public addresses just outside each boundary, such as `172.15.x`, `172.32.x`, `100.63.x` and `100.128.x`.\n- **Small helpers:** `token_hash` is checked against the known SHA-256 of `\"abc\"`, plus lowercase hex output. `is_truthy` is pinned to `1`, `true` and `yes`. `pds_endpoint` takes the first matching service, returns none when there isn't one, and matches case-sensitively.\n\nI left out `fec0::1`. The deprecated IPv6 site-local range isn't blocked by `is_private_ip`, and a test asserting that would lock in a questionable behavior. It may be worth a separate look."
+            },
+            "notes": "Stage completed: implement",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-sonnet-5-5"
+                  },
+                  "tokens": {
+                    "input_tokens": 19209,
+                    "output_tokens": 6875,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 214172,
+                    "cache_write_tokens": 91625
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 91625,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 379064
+            },
+            "files_touched": [
+              "/workspace/freeq/freeq-auth-broker/src/lib.rs"
+            ],
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 51941,
+              "tool_time_ms": 667382,
+              "active_time_ms": 719323
+            }
+          }
+        },
+        "next_node_id": "verify",
+        "git_commit_sha": "7bc9e3b474bcdc28243bb34b083d68a71bb2b39f",
+        "node_visits": {
+          "implement": 1,
+          "select": 1,
+          "start": 1
+        }
+      },
+      "diff": {
+        "patch": "diff --git a/freeq-auth-broker/src/lib.rs b/freeq-auth-broker/src/lib.rs\nindex 6702296..b808909 100644\n--- a/freeq-auth-broker/src/lib.rs\n+++ b/freeq-auth-broker/src/lib.rs\n@@ -2393,4 +2393,295 @@ mod tests {\n         sql.insert(&record(\"R\")).await.unwrap();\n         assert_eq!(sql.get(\"BT\").await.unwrap().client_id, \"\");\n     }\n+\n+    // --- request signing (verify_signed_body) ---\n+\n+    fn now_secs() -> u64 {\n+        std::time::SystemTime::now()\n+            .duration_since(std::time::UNIX_EPOCH)\n+            .unwrap()\n+            .as_secs()\n+    }\n+\n+    /// The MAC a sender would produce for an arbitrary timestamp string, so\n+    /// the 60 s window can be probed without sleeping.\n+    fn sign_at(secret: &str, ts: &str, body: &[u8]) -> String {\n+        use hmac::{Hmac, Mac};\n+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();\n+        mac.update(format!(\"ts={ts}\\n\").as_bytes());\n+        mac.update(body);\n+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())\n+    }\n+\n+    #[test]\n+    fn a_body_signed_by_sign_body_verifies() {\n+        let body = serde_json::json!({\"did\": \"did:plc:x\"});\n+        let (sig, ts) = sign_body(\"s3cret\", &body).unwrap();\n+        let bytes = serde_json::to_vec(&body).unwrap();\n+        assert_eq!(\n+            verify_signed_body(\"s3cret\", Some(&ts), Some(&sig), &bytes),\n+            Ok(())\n+        );\n+    }\n+\n+    #[test]\n+    fn a_signed_body_missing_a_header_is_refused() {\n+        let ts = now_secs().to_string();\n+        let sig = sign_at(\"s\", &ts, b\"{}\");\n+        assert_eq!(\n+            verify_signed_body(\"s\", Some(&ts), None, b\"{}\"),\n+            Err(\"Missing broker signature\")\n+        );\n+        assert_eq!(\n+            verify_signed_body(\"s\", None, Some(&sig), b\"{}\"),\n+            Err(\"Missing X-Broker-Timestamp header\")\n+        );\n+    }\n+\n+    #[test]\n+    fn a_non_numeric_timestamp_is_refused() {\n+        for ts in [\"\", \"soon\", \"-5\", \"1.5\", \"12abc\"] {\n+            assert_eq!(\n+                verify_signed_body(\"s\", Some(ts), Some(\"x\"), b\"{}\"),\n+                Err(\"Invalid X-Broker-Timestamp\"),\n+                \"timestamp {ts:?}\"\n+            );\n+        }\n+    }\n+\n+    #[test]\n+    fn the_timestamp_window_is_sixty_seconds_either_way() {\n+        let now = now_secs();\n+        // Well inside the window (margin absorbs the clock ticking mid-test).\n+        for ts in [now - 50, now + 50] {\n+            let ts = ts.to_string();\n+            let sig = sign_at(\"s\", &ts, b\"{}\");\n+            assert_eq!(\n+                verify_signed_body(\"s\", Some(&ts), Some(&sig), b\"{}\"),\n+                Ok(()),\n+                \"ts {ts}\"\n+            );\n+        }\n+        // Past it: a correctly signed but stale (or far-future) request.\n+        for ts in [now - 120, now + 120, 0] {\n+            let ts = ts.to_string();\n+            let sig = sign_at(\"s\", &ts, b\"{}\");\n+            assert_eq!(\n+                verify_signed_body(\"s\", Some(&ts), Some(&sig), b\"{}\"),\n+                Err(\"Broker request expired (timestamp > 60s)\"),\n+                \"ts {ts}\"\n+            );\n+        }\n+    }\n+\n+    #[test]\n+    fn a_tampered_signed_request_is_refused() {\n+        let ts = now_secs().to_string();\n+        let sig = sign_at(\"s\", &ts, br#\"{\"did\":\"a\"}\"#);\n+        let invalid = Err(\"Invalid broker signature\");\n+        // Altered body.\n+        assert_eq!(\n+            verify_signed_body(\"s\", Some(&ts), Some(&sig), br#\"{\"did\":\"b\"}\"#),\n+            invalid\n+        );\n+        // Wrong secret.\n+        assert_eq!(\n+            verify_signed_body(\"other\", Some(&ts), Some(&sig), br#\"{\"did\":\"a\"}\"#),\n+            invalid\n+        );\n+        // The MAC covers the timestamp: a fresh ts can't reuse an old MAC.\n+        let later = (now_secs() + 1).to_string();\n+        assert_eq!(\n+            verify_signed_body(\"s\", Some(&later), Some(&sig), br#\"{\"did\":\"a\"}\"#),\n+            invalid\n+        );\n+        // Garbage signature.\n+        assert_eq!(\n+            verify_signed_body(\"s\", Some(&ts), Some(\"!!\"), br#\"{\"did\":\"a\"}\"#),\n+            invalid\n+        );\n+    }\n+\n+    // --- field encryption edge cases ---\n+\n+    #[test]\n+    fn encrypting_twice_gives_different_ciphertexts() {\n+        let key = derive_encryption_key(\"k\");\n+        let (a, b) = (encrypt_field(&key, \"same\"), encrypt_field(&key, \"same\"));\n+        assert_ne!(a, b, \"nonce must be fresh per call\");\n+        assert_eq!(decrypt_field(&key, &a).unwrap(), \"same\");\n+        assert_eq!(decrypt_field(&key, &b).unwrap(), \"same\");\n+    }\n+\n+    #[test]\n+    fn the_empty_string_round_trips() {\n+        let key = derive_encryption_key(\"k\");\n+        assert_eq!(decrypt_field(&key, &encrypt_field(&key, \"\")).unwrap(), \"\");\n+    }\n+\n+    #[test]\n+    fn malformed_encrypted_fields_are_refused() {\n+        let key = derive_encryption_key(\"k\");\n+        let err = |s: &str| decrypt_field(&key, s).unwrap_err().to_string();\n+        assert!(err(\"not base64 !!\").contains(\"base64\"));\n+        assert!(err(\"\").contains(\"too short\"));\n+        // 12-byte nonce with no ciphertext at all is still too short.\n+        let nonce_only = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 12]);\n+        assert!(err(&nonce_only).contains(\"too short\"));\n+        // Long enough, but not a valid AES-GCM message.\n+        let junk = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 40]);\n+        assert!(err(&junk).contains(\"decryption failed\"));\n+    }\n+\n+    #[test]\n+    fn different_secrets_derive_different_keys() {\n+        assert_ne!(derive_encryption_key(\"a\"), derive_encryption_key(\"b\"));\n+    }\n+\n+    // --- return_to edge cases the allowlist test doesn't cover ---\n+\n+    #[test]\n+    fn return_to_rejects_userinfo_scheme_and_garbage_tricks() {\n+        for url in [\n+            // Userinfo makes the real host evil.example.\n+            \"https://irc.freeq.at@evil.example/\",\n+            \"https://irc.freeq.at:pw@evil.example/\",\n+            \"javascript:alert(1)\",\n+            \"data:text/html,hi\",\n+            \"ftp://irc.freeq.at/\",\n+            \"irc.freeq.at\",\n+            \"\",\n+            \"https://\",\n+            \"http://localhost.evil.example\",\n+            \"http://127.0.0.1.evil.example\",\n+        ] {\n+            assert!(!is_valid_return_to(url), \"must reject {url:?}\");\n+        }\n+        // Host match is exact, but case-insensitive after URL parsing.\n+        assert!(is_valid_return_to(\"https://IRC.FREEQ.AT/\"));\n+        assert!(!is_valid_return_to(\"https://sub.irc.freeq.at/\"));\n+    }\n+\n+    // --- token hash ---\n+\n+    #[test]\n+    fn token_hash_is_lowercase_hex_sha256() {\n+        assert_eq!(\n+            token_hash(\"abc\"),\n+            \"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\"\n+        );\n+        let h = token_hash(\"\");\n+        assert_eq!(h.len(), 64);\n+        assert!(\n+            h.bytes()\n+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))\n+        );\n+        assert_ne!(token_hash(\"a\"), token_hash(\"b\"));\n+    }\n+\n+    // --- SSRF address classification ---\n+\n+    fn private(addr: &str) -> bool {\n+        is_private_ip(&addr.parse().unwrap())\n+    }\n+\n+    #[test]\n+    fn private_and_internal_ipv4_ranges_are_refused() {\n+        for ip in [\n+            \"127.0.0.1\",\n+            \"127.255.255.254\",\n+            \"10.0.0.1\",\n+            \"172.16.0.1\",\n+            \"172.31.255.255\",\n+            \"192.168.1.1\",\n+            \"169.254.169.254\",\n+            \"255.255.255.255\",\n+            \"0.0.0.0\",\n+            \"100.64.0.1\",\n+            \"100.127.255.255\",\n+        ] {\n+            assert!(private(ip), \"{ip} must be private\");\n+        }\n+    }\n+\n+    #[test]\n+    fn public_ipv4_neighbours_of_private_ranges_are_allowed() {\n+        for ip in [\n+            \"8.8.8.8\",\n+            \"1.1.1.1\",\n+            \"172.15.255.255\",\n+            \"172.32.0.1\",\n+            \"100.63.255.255\",\n+            \"100.128.0.1\",\n+            \"192.169.0.1\",\n+            \"11.0.0.1\",\n+        ] {\n+            assert!(!private(ip), \"{ip} must be public\");\n+        }\n+    }\n+\n+    #[test]\n+    fn private_and_internal_ipv6_ranges_are_refused() {\n+        for ip in [\"::1\", \"::\", \"fc00::1\", \"fd12:3456::1\", \"fe80::1\", \"febf::1\"] {\n+            assert!(private(ip), \"{ip} must be private\");\n+        }\n+    }\n+\n+    #[test]\n+    fn public_ipv6_addresses_are_allowed() {\n+        for ip in [\"2606:4700:4700::1111\", \"2001:4860:4860::8888\"] {\n+            assert!(!private(ip), \"{ip} must be public\");\n+        }\n+    }\n+\n+    // --- small helpers ---\n+\n+    #[test]\n+    fn only_the_documented_spellings_are_truthy() {\n+        for v in [\"1\", \"true\", \"yes\"] {\n+            assert!(is_truthy(Some(v)), \"{v}\");\n+        }\n+        for v in [\n+            None,\n+            Some(\"\"),\n+            Some(\"0\"),\n+            Some(\"false\"),\n+            Some(\"TRUE\"),\n+            Some(\"on\"),\n+        ] {\n+            assert!(!is_truthy(v), \"{v:?}\");\n+        }\n+    }\n+\n+    fn did_doc(services: &[(&str, &str)]) -> DidDocument {\n+        DidDocument {\n+            service: services\n+                .iter()\n+                .map(|(t, e)| DidService {\n+                    service_type: (*t).into(),\n+                    service_endpoint: (*e).into(),\n+                })\n+                .collect(),\n+        }\n+    }\n+\n+    #[test]\n+    fn the_pds_is_the_atproto_personal_data_server_service() {\n+        let doc = did_doc(&[\n+            (\"SomethingElse\", \"https://other.example\"),\n+            (\"AtprotoPersonalDataServer\", \"https://pds.example\"),\n+            (\"AtprotoPersonalDataServer\", \"https://second.example\"),\n+        ]);\n+        assert_eq!(pds_endpoint(&doc).as_deref(), Some(\"https://pds.example\"));\n+    }\n+\n+    #[test]\n+    fn a_did_document_without_a_pds_names_none() {\n+        assert_eq!(pds_endpoint(&did_doc(&[])), None);\n+        assert_eq!(\n+            pds_endpoint(&did_doc(&[(\"atprotopersonaldataserver\", \"https://x\")])),\n+            None,\n+            \"service type match is case-sensitive\"\n+        );\n+    }\n }\n",
+        "summary": {
+          "files_changed": 1,
+          "additions": 291,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-10-02T02:20:32.934089890Z",
+        "current_node": "verify",
+        "completed_nodes": [
+          "start",
+          "select",
+          "implement",
+          "verify"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "internal.thread_id": "implement",
           "failure_signature": "",
           "internal.retry_count.select": 0,
           "failure_class": "",
           "thread.cov.current_node": "implement",
+          "command.output": "blob://sha256/e47d6cf63aed7edb8fc82a384e6cbd6d930c83107116576c15479862e8125da7",
+          "internal.retry_count.verify": 0,
           "internal.node_visit_count": 1,
           "last_response": "I added 18 tests to the existing `mod tests` block in `freeq-auth-broker/src/lib.rs`. It's the only file changed, and no production code was touched. The crate's unit tests went from 9 to 27 and all p",
           "graph.goal": "Raise automated-test coverage on one of freeq's high-risk, undertested files — adding tests only, with at most minimal, behavior-preserving testability seams in production code.",
-          "internal.fidelity": "full",
+          "internal.fidelity": "compact",
           "internal.retry_count.start": 0,
-          "current_node": "implement",
+          "current_node": "verify",
           "outcome": "succeeded",
           "response.select": "**Chosen file:** `freeq-auth-broker/src/lib.rs`. It's Rust, in the `freeq-auth-broker` crate, which CI covers because it isn't one of the excluded AV crates. The next step adds tests to its existing `#[cfg(test)]` block at about line 2204.\n\n**Why it's high-risk and undertested**\n- The file is 2,396 lines with 74 functions. It sits in the top 25 of `scripts/hotspots.sh`, but it isn't one of the three files `CLAUDE.md` names.\n- I skipped the three files `CLAUDE.md` flags as undertested. `freeq-app/src/irc/client.ts` now has about 14 sibling test files and 600+ lines in `client.test.ts` alone. `MessageList.tsx` has about 12 test files. `sdk/client.rs` has about 176 tests across six `#[cfg(test)]` modules, so the `CLAUDE.md` note looks stale.\n- By contrast, this file has only 9 tests. They cover the SSRF provider, the session stores, the origin guard and enrollment refusal.\n- None of the pure security primitives have a test. They cover crypto, HMAC request auth, redirect validation and SSRF IP classification, so a regression in any of them is a security bug rather than a cosmetic one.\n\n**Behaviors to pin** (all pure functions, no network or server needed)\n1. **`verify_signed_body` / `sign_body`**\n   - A signed body round-trips.\n   - It is rejected when a header is missing, the timestamp is non-numeric, the timestamp is more than 60 s old or in the future (testing 59 s versus 61 s), or the body or secret is tampered with.\n   - The MAC covers the timestamp, so a valid signature can't be reused with a different `ts`.\n2. **`encrypt_field` / `decrypt_field`**\n   - Encrypt then decrypt returns the original text.\n   - Two encryptions of the same text differ because the nonce is random.\n   - Decrypting fails with the wrong key, with flipped ciphertext bits, with input shorter than 13 bytes, and with invalid base64.\n   - `derive_encryption_key` is deterministic and depends on the secret.\n3. **`is_valid_return_to`**\n   - Allowed: the exact allowlisted `https` hosts, and `http://localhost` or `127.0.0.1` on any port.\n   - Rejected: the prefix-bypass `https://irc.freeq.at.evil.example` (the C-6 regression), `//host`, `/\\host`, `http://irc.freeq.at` (wrong scheme), `javascript:` URLs, and unparseable input.\n   - Relative paths like `/foo` are allowed.\n4. **`is_private_ip`**\n   - Private: loopback, RFC1918, link-local, broadcast, unspecified, CGNAT 100.64/10, IPv6 ULA and IPv6 link-local.\n   - Boundaries: `100.63.x` and `100.128.x` are public.\n   - A public IPv4 and a public IPv6 address are not private.\n5. **`token_hash`**: The output is lowercase 64-character hex and matches the known SHA-256 of `\"abc\"`.\n6. **Small helpers**\n   - `is_truthy` accepts `1`, `true` and `yes`, and rejects `None`, `0` and `TRUE`.\n   - `pds_endpoint` returns the `AtprotoPersonalDataServer` service, ignores other service types, and returns `None` when there is none.\n\n**Convention to follow:** the existing `mod tests` at the bottom of `freeq-auth-broker/src/lib.rs`. It uses plain `#[test]` for pure functions and `#[tokio::test]` for async ones, with behavior-sentence names such as `a_retirement_must_be_dated_now` and `a_device_record_may_carry_an_old_date`. The `freeq-tui/src/main.rs` tests use the same naming style. I'd add no new dependencies, since `hmac`, `sha2` and `base64` are already in the crate.\n\nOne caveat: `is_private_ip` and `pds_endpoint` are private, but the in-file test module can reach them. I haven't run any of this, since this step is read-only.",
           "response.implement": "I added 18 tests to the existing `mod tests` block in `freeq-auth-broker/src/lib.rs`. It's the only file changed, and no production code was touched. The crate's unit tests went from 9 to 27 and all pass. `cargo fmt`, `cargo clippy -p freeq-auth-broker --tests -- -D warnings` and `bash .fabro/verify.sh` are all clean.\n\nI overstated the gap in my earlier report. `tests/characterization.rs` already covers the return_to allowlist, the encrypt/decrypt round-trip and tamper cases, and the `sign_body` wire format. I left those alone and tested what was actually missing:\n\n- **`verify_signed_body`**\n  - A body signed by `sign_body` verifies.\n  - It refuses a missing signature or timestamp header, and non-numeric timestamps.\n  - The 60-second window is checked both ways with no sleeping: 50 seconds off passes, and 120 seconds off or a timestamp of 0 is expired.\n  - It refuses a tampered body, a wrong secret, a garbage signature, and a valid MAC reused with a different timestamp.\n- **`encrypt_field` / `decrypt_field` / `derive_encryption_key`**\n  - Nonces are fresh on every call.\n  - The empty string round-trips.\n  - Bad base64, empty input, a nonce with no ciphertext, and junk ciphertext are each refused with the right error.\n  - Different secrets derive different keys.\n- **`is_valid_return_to`**\n  - It refuses the `irc.freeq.at@evil.example` userinfo trick, `javascript:`, `data:`, `ftp:`, empty input and `https://`.\n  - It refuses `localhost.evil.example` and `sub.irc.freeq.at`.\n  - It accepts an uppercase host.\n- **`is_private_ip`**\n  - It flags private IPv4 and IPv6 ranges, including `100.64.0.0/10` (carrier-grade NAT) and the metadata IP `169.254.169.254`.\n  - It does not flag the public addresses just outside each boundary, such as `172.15.x`, `172.32.x`, `100.63.x` and `100.128.x`.\n- **Small helpers:** `token_hash` is checked against the known SHA-256 of `\"abc\"`, plus lowercase hex output. `is_truthy` is pinned to `1`, `true` and `yes`. `pds_endpoint` takes the first matching service, returns none when there isn't one, and matches case-sensitively.\n\nI left out `fec0::1`. The deprecated IPv6 site-local range isn't blocked by `is_private_ip`, and a test asserting that would lock in a questionable behavior. It may be worth a separate look.",
@@ -581,6 +718,7 @@
           "internal.retry_count.implement": 0,
           "internal.work_dir": "/workspace/freeq",
           "last_stage": "implement",
+          "thread.implement.current_node": "verify",
           "internal.run_id": "01M3X5DZDENB6DTBYDVEMB7E47"
         },
         "node_outcomes": {
@@ -663,16 +801,31 @@
               "active_time_ms": 719323
             }
           },
+          "verify": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/e47d6cf63aed7edb8fc82a384e6cbd6d930c83107116576c15479862e8125da7"
+            },
+            "notes": "Script completed: bash .fabro/verify.sh",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 466714,
+              "active_time_ms": 466714
+            }
+          },
           "start": {
             "status": "succeeded",
             "usage": null
           }
         },
-        "next_node_id": "verify",
+        "next_node_id": "pr_body",
         "node_visits": {
           "start": 1,
-          "select": 1,
-          "implement": 1
+          "implement": 1,
+          "verify": 1,
+          "select": 1
         }
       },
       "diff": {}
@@ -709,7 +862,12 @@
       "first_event_seq": 58,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Stage completed: implement",
+        "failure_reason": null,
+        "timestamp": "2026-10-02T02:12:42.206313365Z"
+      },
       "provider_used": {
         "mode": "agent",
         "provider": "anthropic",
@@ -723,6 +881,12 @@
       "output": null,
       "started_at": "2026-10-02T02:00:42.848554883Z",
       "handler": "agent",
+      "timing": {
+        "wall_time_ms": 719357,
+        "inference_time_ms": 51941,
+        "tool_time_ms": 667382,
+        "active_time_ms": 719323
+      },
       "usage": {
         "input_tokens": 19209,
         "output_tokens": 6875,
@@ -776,7 +940,7 @@
         ],
         "warnings": []
       },
-      "state": "running"
+      "state": "succeeded"
     },
     "start@1": {
       "first_event_seq": 17,
@@ -1050,6 +1214,34 @@
         "warnings": []
       },
       "state": "succeeded"
+    },
+    "verify@1": {
+      "first_event_seq": 130,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "bash .fabro/verify.sh",
+        "command": "exec 2>&1\nbash .fabro/verify.sh",
+        "language": "shell",
+        "timeout_ms": 3600000
+      },
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-10-02T02:12:46.183084268Z",
+      "handler": "command",
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "running"
     }
   }
 }
