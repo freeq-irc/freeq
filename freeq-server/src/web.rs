@@ -250,8 +250,6 @@ pub fn router(state: Arc<SharedState>) -> Router {
             "/.well-known/http-message-signatures-directory",
             get(crate::agent_surfaces::web_bot_auth_directory),
         )
-        // This server's did:web document: its signing key and key set.
-        .route("/.well-known/did.json", get(did_document))
         // Private media spaces. Returns a 404 if the feature is unconfigured.
         .route(
             "/xrpc/com.atproto.simplespace.checkUserAccess",
@@ -310,12 +308,6 @@ pub fn router(state: Arc<SharedState>) -> Router {
             axum::routing::post(api_device_sign_out),
         )
         .route("/api/v1/signing-key", get(api_signing_key))
-        .route("/api/v1/signing-keys", get(api_signing_keys_batch))
-        .route("/api/v1/signing-keys/{did}", get(api_did_signing_key))
-        .route(
-            "/api/v1/signing-keys/{did}/{kid}",
-            get(api_did_signing_key_by_kid),
-        )
         .route("/api/v1/records", get(api_records_batch))
         .route("/api/v1/records/{did}", get(api_records_account))
         .route(
@@ -391,6 +383,29 @@ pub fn router(state: Arc<SharedState>) -> Router {
                 ])
                 .allow_credentials(true)
         });
+
+    // This server's did:web document, and the key routes it points at. Keys
+    // are public, so any page may read them: the web app checks a ruling on
+    // a task another server referees against that server's own key list
+    // (`/api/v1/signing-keys/{did}`); its general key lookup asks only its own
+    // page's server, so the batch and per-key routes are open only because
+    // public keys need no guard. Any origin and no credentials, as `/mcp`
+    // below; the app's origin list stays on every other route.
+    app = app.merge(
+        Router::new()
+            .route("/.well-known/did.json", get(did_document))
+            .route("/api/v1/signing-keys", get(api_signing_keys_batch))
+            .route("/api/v1/signing-keys/{did}", get(api_did_signing_key))
+            .route(
+                "/api/v1/signing-keys/{did}/{kid}",
+                get(api_did_signing_key_by_kid),
+            )
+            .layer(
+                CorsLayer::new()
+                    .allow_origin(tower_http::cors::Any)
+                    .allow_methods([axum::http::Method::GET, axum::http::Method::OPTIONS]),
+            ),
+    );
 
     // Remote MCP (Streamable HTTP). Zero-install: an agent points its MCP
     // client at the URL instead of cloning the repo to build the stdio server.
@@ -8881,5 +8896,105 @@ mod verify_catchall_tests {
             .unwrap();
         assert_eq!(resp.status(), 503);
         assert!(!resp.text().await.unwrap().contains("<script"));
+    }
+}
+
+#[cfg(test)]
+mod key_endpoint_cors_tests {
+    use crate::server::test_state_with_db;
+
+    /// Serve the real router on loopback and send one GET with `origin`.
+    async fn get_from(
+        state: std::sync::Arc<crate::server::SharedState>,
+        origin: &str,
+        paths: &[&str],
+    ) -> Vec<reqwest::header::HeaderMap> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = super::router(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+        let client = reqwest::Client::new();
+        let mut headers = Vec::new();
+        for path in paths {
+            let response = client
+                .get(format!("http://{addr}{path}"))
+                .header("Origin", origin)
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_success(),
+                "{path}: {}",
+                response.status()
+            );
+            headers.push(response.headers().clone());
+        }
+        headers
+    }
+
+    /// A server's keys are public, so a page on any origin may read them: the
+    /// web app checks another server's ruling with that server's own keys.
+    #[tokio::test]
+    async fn the_key_endpoints_answer_any_origin_without_credentials() {
+        let state = test_state_with_db();
+        let key = [7u8; 32];
+        state.with_db(|db| {
+            db.save_signing_key_from("did:plc:cors", &key, "local-session", 10, None)
+        });
+        let kid = freeq_sdk::act::derive_kid_bytes(&key);
+        let by_kid = format!("/api/v1/signing-keys/did:plc:cors/{kid}");
+        let batch = format!("/api/v1/signing-keys?keys=did:plc:cors/{kid}");
+        let paths = [
+            "/.well-known/did.json",
+            "/api/v1/signing-keys/did:plc:cors",
+            &by_kid,
+            &batch,
+        ];
+        for (path, headers) in paths
+            .iter()
+            .zip(get_from(state, "https://elsewhere.example", &paths).await)
+        {
+            assert_eq!(
+                headers
+                    .get("access-control-allow-origin")
+                    .and_then(|v| v.to_str().ok()),
+                Some("*"),
+                "{path}"
+            );
+            assert!(
+                headers.get("access-control-allow-credentials").is_none(),
+                "{path}: no credentials"
+            );
+        }
+    }
+
+    /// Every other route keeps the origin list it had.
+    #[tokio::test]
+    async fn other_routes_keep_the_origin_list() {
+        let stranger = get_from(
+            test_state_with_db(),
+            "https://elsewhere.example",
+            &["/api/v1/signing-key"],
+        )
+        .await;
+        assert!(stranger[0].get("access-control-allow-origin").is_none());
+        let ours = get_from(
+            test_state_with_db(),
+            "https://irc.freeq.at",
+            &["/api/v1/signing-key"],
+        )
+        .await;
+        assert_eq!(
+            ours[0]
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://irc.freeq.at")
+        );
     }
 }
