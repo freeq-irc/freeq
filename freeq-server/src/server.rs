@@ -626,6 +626,22 @@ fn wildcard_match_inner(pattern: &[u8], text: &[u8]) -> bool {
     }
 }
 
+/// The invite token that admits a DID-less user by nick. Nicks are
+/// case-insensitive, so the nick is folded the same way `NickMap` folds it:
+/// an invite to `bob` must admit `Bob`.
+pub(crate) fn nick_invite_token(nick: &str) -> String {
+    format!("nick:{}", nick.to_lowercase())
+}
+
+/// Fold the nick in a `nick:` token received from a peer, which may still
+/// send it in the inviter's spelling. Other tokens pass through unchanged.
+fn normalize_invite_token(token: &str) -> String {
+    match token.strip_prefix("nick:") {
+        Some(nick) => nick_invite_token(nick),
+        None => token.to_string(),
+    }
+}
+
 impl ChannelState {
     /// Check if a user is banned from this channel.
     pub fn is_banned(&self, hostmask: &str, did: Option<&str>) -> bool {
@@ -7152,7 +7168,7 @@ async fn process_s2s_event(
                     // Check +i (invite only) — but allow if user has an invite
                     if ch.invite_only {
                         let has_invite = did.as_ref().is_some_and(|d| ch.invites.contains(d))
-                            || ch.invites.contains(&format!("nick:{nick}"));
+                            || ch.invites.contains(&nick_invite_token(&nick));
                         if !has_invite {
                             tracing::info!(
                                 channel = %channel, nick = %nick,
@@ -7200,7 +7216,7 @@ async fn process_s2s_event(
                 if let Some(ref d) = did {
                     ch.invites.remove(d);
                 }
-                ch.invites.remove(&format!("nick:{nick}"));
+                ch.invites.remove(&nick_invite_token(&nick));
                 // Never trust is_op from the peer — determine op status from
                 // local channel state (founder_did / did_ops) to prevent
                 // forged operator claims (C-2 mitigation).
@@ -7914,7 +7930,7 @@ async fn process_s2s_event(
                             if ch.invites.len() >= 500 {
                                 break;
                             }
-                            ch.invites.insert(invite.clone());
+                            ch.invites.insert(normalize_invite_token(invite));
                         }
                     } else if !info.invites.is_empty() {
                         tracing::warn!(
@@ -8373,7 +8389,7 @@ async fn process_s2s_event(
             {
                 let mut channels = state.channels.lock();
                 if let Some(ch) = channels.get_mut(&channel_key) {
-                    ch.invites.insert(invitee.clone());
+                    ch.invites.insert(normalize_invite_token(&invitee));
                     tracing::debug!(
                         channel = %channel_key, invitee = %invitee,
                         invited_by = %invited_by,
@@ -11921,6 +11937,68 @@ mod s2s_adversarial_tests {
         assert!(
             ch.invites.is_empty(),
             "a DID that is not the founder or an op must not pass the +i gate"
+        );
+    }
+
+    /// Nicks are case-insensitive: an invite to `bob` must admit `Bob`. The
+    /// inviter's spelling became the `nick:` token while the join checked the
+    /// joiner's display nick, so a guest invited in the "wrong" case was
+    /// refused on a +i channel.
+    #[tokio::test]
+    async fn s2s_nick_invite_admits_joiner_regardless_of_case() {
+        let state = test_state();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+
+        const FOUNDER_DID: &str = "did:key:zFounderInviteCase";
+        {
+            let mut channels = state.channels.lock();
+            let ch = channels.entry("#invcase".to_string()).or_default();
+            ch.invite_only = true;
+            ch.founder_did = Some(FOUNDER_DID.to_string());
+        }
+
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Invite {
+                event_id: format!("{PEER}:case-invite"),
+                channel: "#invcase".to_string(),
+                invitee: "nick:bob".to_string(),
+                invited_by: "alice".to_string(),
+                invited_by_did: Some(FOUNDER_DID.to_string()),
+                origin: PEER.to_string(),
+            },
+        )
+        .await;
+
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Join {
+                event_id: format!("{PEER}:case-join"),
+                nick: "Bob".to_string(),
+                channel: "#invcase".to_string(),
+                did: None,
+                handle: None,
+                is_op: false,
+                actor_class: None,
+                origin: PEER.to_string(),
+            },
+        )
+        .await;
+
+        let channels = state.channels.lock();
+        let ch = channels.get("#invcase").unwrap();
+        assert!(
+            ch.has_remote_member("Bob"),
+            "an invite to `bob` must admit `Bob` on a +i channel"
+        );
+        assert!(
+            ch.invites.is_empty(),
+            "the one-shot invite must be consumed"
         );
     }
 
