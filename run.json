@@ -424,7 +424,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-10-02T02:00:08.705732403Z",
-  "last_event_at": "2026-10-02T02:20:36.755892791Z",
+  "last_event_at": "2026-10-02T02:20:49.088827413Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -838,9 +838,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 147,
       "checkpoint": {
-        "timestamp": "2026-10-02T02:20:45.212414180Z",
+        "timestamp": "2026-10-02T02:20:49.063895314Z",
         "current_node": "pr_body",
         "completed_nodes": [
           "start",
@@ -851,70 +851,32 @@
         ],
         "node_retries": {},
         "context_values": {
-          "internal.thread_id": "cov",
-          "failure_signature": "",
-          "internal.retry_count.select": 0,
-          "internal.retry_count.pr_body": 0,
-          "failure_class": "",
-          "thread.cov.current_node": "pr_body",
-          "command.output": "blob://sha256/e47d6cf63aed7edb8fc82a384e6cbd6d930c83107116576c15479862e8125da7",
-          "internal.retry_count.verify": 0,
-          "internal.node_visit_count": 1,
-          "last_response": "I can't write this PR body yet. Nothing in this conversation shows me adding tests: I have no `git diff --stat` or `git diff` output, and I haven't run `.fabro/verify.sh`. Describing specific tests or",
-          "graph.goal": "Raise automated-test coverage on one of freeq's high-risk, undertested files — adding tests only, with at most minimal, behavior-preserving testability seams in production code.",
-          "response.pr_body": "I can't write this PR body yet. Nothing in this conversation shows me adding tests: I have no `git diff --stat` or `git diff` output, and I haven't run `.fabro/verify.sh`. Describing specific tests or claiming the verify script passes would be fabrication.\n\nIf you paste the diff (or the `--stat` and the test file contents) and the verify output, I'll write it against what actually changed. Below is a skeleton with only the facts I can source from CLAUDE.md. Everything in `<…>` needs to be filled from the real diff.\n\n---\n\n## Summary\nAdds unit tests for `<file/area>`, which CLAUDE.md flags as `<UNDERTESTED / ZERO unit tests>` (hotspot gamma `<score>`). `<One sentence on why that matters, e.g. connection state machine / message rendering logic changes frequently with no coverage.>`\n\n## What's tested\n- `<behavior or edge case 1>`\n- `<behavior or edge case 2>`\n- `<error / malformed-input case>`\n\n## Notes\n- `<Tests-only. | Describes the exact testability seam added (e.g. a `pub(crate)` visibility change or extracted helper), and why it doesn't change behavior.>`\n- `.fabro/verify.sh` (rustfmt + check + clippy `-D warnings` + test, CI-mirrored) `<passes / not yet run>`.\n\n---\n\nReference points from CLAUDE.md if they apply: `sdk/client.rs` (gamma 104, zero unit tests on the connection state machine), `irc/client.ts` (gamma 133), `MessageList.tsx` (gamma 103). If the tests are TypeScript, the verify script as described only covers Rust, so I'd need to know how the vitest run was verified before stating it.",
-          "internal.fidelity": "full",
-          "internal.retry_count.start": 0,
-          "current_node": "pr_body",
-          "outcome": "succeeded",
           "response.select": "**Chosen file:** `freeq-auth-broker/src/lib.rs`. It's Rust, in the `freeq-auth-broker` crate, which CI covers because it isn't one of the excluded AV crates. The next step adds tests to its existing `#[cfg(test)]` block at about line 2204.\n\n**Why it's high-risk and undertested**\n- The file is 2,396 lines with 74 functions. It sits in the top 25 of `scripts/hotspots.sh`, but it isn't one of the three files `CLAUDE.md` names.\n- I skipped the three files `CLAUDE.md` flags as undertested. `freeq-app/src/irc/client.ts` now has about 14 sibling test files and 600+ lines in `client.test.ts` alone. `MessageList.tsx` has about 12 test files. `sdk/client.rs` has about 176 tests across six `#[cfg(test)]` modules, so the `CLAUDE.md` note looks stale.\n- By contrast, this file has only 9 tests. They cover the SSRF provider, the session stores, the origin guard and enrollment refusal.\n- None of the pure security primitives have a test. They cover crypto, HMAC request auth, redirect validation and SSRF IP classification, so a regression in any of them is a security bug rather than a cosmetic one.\n\n**Behaviors to pin** (all pure functions, no network or server needed)\n1. **`verify_signed_body` / `sign_body`**\n   - A signed body round-trips.\n   - It is rejected when a header is missing, the timestamp is non-numeric, the timestamp is more than 60 s old or in the future (testing 59 s versus 61 s), or the body or secret is tampered with.\n   - The MAC covers the timestamp, so a valid signature can't be reused with a different `ts`.\n2. **`encrypt_field` / `decrypt_field`**\n   - Encrypt then decrypt returns the original text.\n   - Two encryptions of the same text differ because the nonce is random.\n   - Decrypting fails with the wrong key, with flipped ciphertext bits, with input shorter than 13 bytes, and with invalid base64.\n   - `derive_encryption_key` is deterministic and depends on the secret.\n3. **`is_valid_return_to`**\n   - Allowed: the exact allowlisted `https` hosts, and `http://localhost` or `127.0.0.1` on any port.\n   - Rejected: the prefix-bypass `https://irc.freeq.at.evil.example` (the C-6 regression), `//host`, `/\\host`, `http://irc.freeq.at` (wrong scheme), `javascript:` URLs, and unparseable input.\n   - Relative paths like `/foo` are allowed.\n4. **`is_private_ip`**\n   - Private: loopback, RFC1918, link-local, broadcast, unspecified, CGNAT 100.64/10, IPv6 ULA and IPv6 link-local.\n   - Boundaries: `100.63.x` and `100.128.x` are public.\n   - A public IPv4 and a public IPv6 address are not private.\n5. **`token_hash`**: The output is lowercase 64-character hex and matches the known SHA-256 of `\"abc\"`.\n6. **Small helpers**\n   - `is_truthy` accepts `1`, `true` and `yes`, and rejects `None`, `0` and `TRUE`.\n   - `pds_endpoint` returns the `AtprotoPersonalDataServer` service, ignores other service types, and returns `None` when there is none.\n\n**Convention to follow:** the existing `mod tests` at the bottom of `freeq-auth-broker/src/lib.rs`. It uses plain `#[test]` for pure functions and `#[tokio::test]` for async ones, with behavior-sentence names such as `a_retirement_must_be_dated_now` and `a_device_record_may_carry_an_old_date`. The `freeq-tui/src/main.rs` tests use the same naming style. I'd add no new dependencies, since `hmac`, `sha2` and `base64` are already in the crate.\n\nOne caveat: `is_private_ip` and `pds_endpoint` are private, but the in-file test module can reach them. I haven't run any of this, since this step is read-only.",
-          "response.implement": "I added 18 tests to the existing `mod tests` block in `freeq-auth-broker/src/lib.rs`. It's the only file changed, and no production code was touched. The crate's unit tests went from 9 to 27 and all pass. `cargo fmt`, `cargo clippy -p freeq-auth-broker --tests -- -D warnings` and `bash .fabro/verify.sh` are all clean.\n\nI overstated the gap in my earlier report. `tests/characterization.rs` already covers the return_to allowlist, the encrypt/decrypt round-trip and tamper cases, and the `sign_body` wire format. I left those alone and tested what was actually missing:\n\n- **`verify_signed_body`**\n  - A body signed by `sign_body` verifies.\n  - It refuses a missing signature or timestamp header, and non-numeric timestamps.\n  - The 60-second window is checked both ways with no sleeping: 50 seconds off passes, and 120 seconds off or a timestamp of 0 is expired.\n  - It refuses a tampered body, a wrong secret, a garbage signature, and a valid MAC reused with a different timestamp.\n- **`encrypt_field` / `decrypt_field` / `derive_encryption_key`**\n  - Nonces are fresh on every call.\n  - The empty string round-trips.\n  - Bad base64, empty input, a nonce with no ciphertext, and junk ciphertext are each refused with the right error.\n  - Different secrets derive different keys.\n- **`is_valid_return_to`**\n  - It refuses the `irc.freeq.at@evil.example` userinfo trick, `javascript:`, `data:`, `ftp:`, empty input and `https://`.\n  - It refuses `localhost.evil.example` and `sub.irc.freeq.at`.\n  - It accepts an uppercase host.\n- **`is_private_ip`**\n  - It flags private IPv4 and IPv6 ranges, including `100.64.0.0/10` (carrier-grade NAT) and the metadata IP `169.254.169.254`.\n  - It does not flag the public addresses just outside each boundary, such as `172.15.x`, `172.32.x`, `100.63.x` and `100.128.x`.\n- **Small helpers:** `token_hash` is checked against the known SHA-256 of `\"abc\"`, plus lowercase hex output. `is_truthy` is pinned to `1`, `true` and `yes`. `pds_endpoint` takes the first matching service, returns none when there isn't one, and matches case-sensitively.\n\nI left out `fec0::1`. The deprecated IPv6 site-local range isn't blocked by `is_private_ip`, and a test asserting that would lock in a questionable behavior. It may be worth a separate look.",
-          "graph.rankdir": "LR",
           "internal.retry_count.implement": 0,
           "internal.work_dir": "/workspace/freeq",
-          "last_stage": "pr_body",
+          "response.implement": "I added 18 tests to the existing `mod tests` block in `freeq-auth-broker/src/lib.rs`. It's the only file changed, and no production code was touched. The crate's unit tests went from 9 to 27 and all pass. `cargo fmt`, `cargo clippy -p freeq-auth-broker --tests -- -D warnings` and `bash .fabro/verify.sh` are all clean.\n\nI overstated the gap in my earlier report. `tests/characterization.rs` already covers the return_to allowlist, the encrypt/decrypt round-trip and tamper cases, and the `sign_body` wire format. I left those alone and tested what was actually missing:\n\n- **`verify_signed_body`**\n  - A body signed by `sign_body` verifies.\n  - It refuses a missing signature or timestamp header, and non-numeric timestamps.\n  - The 60-second window is checked both ways with no sleeping: 50 seconds off passes, and 120 seconds off or a timestamp of 0 is expired.\n  - It refuses a tampered body, a wrong secret, a garbage signature, and a valid MAC reused with a different timestamp.\n- **`encrypt_field` / `decrypt_field` / `derive_encryption_key`**\n  - Nonces are fresh on every call.\n  - The empty string round-trips.\n  - Bad base64, empty input, a nonce with no ciphertext, and junk ciphertext are each refused with the right error.\n  - Different secrets derive different keys.\n- **`is_valid_return_to`**\n  - It refuses the `irc.freeq.at@evil.example` userinfo trick, `javascript:`, `data:`, `ftp:`, empty input and `https://`.\n  - It refuses `localhost.evil.example` and `sub.irc.freeq.at`.\n  - It accepts an uppercase host.\n- **`is_private_ip`**\n  - It flags private IPv4 and IPv6 ranges, including `100.64.0.0/10` (carrier-grade NAT) and the metadata IP `169.254.169.254`.\n  - It does not flag the public addresses just outside each boundary, such as `172.15.x`, `172.32.x`, `100.63.x` and `100.128.x`.\n- **Small helpers:** `token_hash` is checked against the known SHA-256 of `\"abc\"`, plus lowercase hex output. `is_truthy` is pinned to `1`, `true` and `yes`. `pds_endpoint` takes the first matching service, returns none when there isn't one, and matches case-sensitively.\n\nI left out `fec0::1`. The deprecated IPv6 site-local range isn't blocked by `is_private_ip`, and a test asserting that would lock in a questionable behavior. It may be worth a separate look.",
+          "internal.run_id": "01M3X5DZDENB6DTBYDVEMB7E47",
+          "graph.goal": "Raise automated-test coverage on one of freeq's high-risk, undertested files — adding tests only, with at most minimal, behavior-preserving testability seams in production code.",
+          "internal.retry_count.pr_body": 0,
+          "internal.retry_count.start": 0,
+          "graph.rankdir": "LR",
+          "internal.retry_count.select": 0,
+          "thread.cov.current_node": "pr_body",
+          "failure_class": "",
+          "command.output": "blob://sha256/e47d6cf63aed7edb8fc82a384e6cbd6d930c83107116576c15479862e8125da7",
+          "last_response": "I can't write this PR body yet. Nothing in this conversation shows me adding tests: I have no `git diff --stat` or `git diff` output, and I haven't run `.fabro/verify.sh`. Describing specific tests or",
+          "current_node": "pr_body",
+          "response.pr_body": "I can't write this PR body yet. Nothing in this conversation shows me adding tests: I have no `git diff --stat` or `git diff` output, and I haven't run `.fabro/verify.sh`. Describing specific tests or claiming the verify script passes would be fabrication.\n\nIf you paste the diff (or the `--stat` and the test file contents) and the verify output, I'll write it against what actually changed. Below is a skeleton with only the facts I can source from CLAUDE.md. Everything in `<…>` needs to be filled from the real diff.\n\n---\n\n## Summary\nAdds unit tests for `<file/area>`, which CLAUDE.md flags as `<UNDERTESTED / ZERO unit tests>` (hotspot gamma `<score>`). `<One sentence on why that matters, e.g. connection state machine / message rendering logic changes frequently with no coverage.>`\n\n## What's tested\n- `<behavior or edge case 1>`\n- `<behavior or edge case 2>`\n- `<error / malformed-input case>`\n\n## Notes\n- `<Tests-only. | Describes the exact testability seam added (e.g. a `pub(crate)` visibility change or extracted helper), and why it doesn't change behavior.>`\n- `.fabro/verify.sh` (rustfmt + check + clippy `-D warnings` + test, CI-mirrored) `<passes / not yet run>`.\n\n---\n\nReference points from CLAUDE.md if they apply: `sdk/client.rs` (gamma 104, zero unit tests on the connection state machine), `irc/client.ts` (gamma 133), `MessageList.tsx` (gamma 103). If the tests are TypeScript, the verify script as described only covers Rust, so I'd need to know how the vitest run was verified before stating it.",
           "thread.implement.current_node": "verify",
-          "internal.run_id": "01M3X5DZDENB6DTBYDVEMB7E47"
+          "internal.retry_count.verify": 0,
+          "outcome": "succeeded",
+          "internal.node_visit_count": 1,
+          "failure_signature": "",
+          "internal.thread_id": "cov",
+          "internal.fidelity": "full",
+          "last_stage": "pr_body"
         },
         "node_outcomes": {
-          "pr_body": {
-            "status": "succeeded",
-            "context_updates": {
-              "last_response": "I can't write this PR body yet. Nothing in this conversation shows me adding tests: I have no `git diff --stat` or `git diff` output, and I haven't run `.fabro/verify.sh`. Describing specific tests or",
-              "last_stage": "pr_body",
-              "response.pr_body": "I can't write this PR body yet. Nothing in this conversation shows me adding tests: I have no `git diff --stat` or `git diff` output, and I haven't run `.fabro/verify.sh`. Describing specific tests or claiming the verify script passes would be fabrication.\n\nIf you paste the diff (or the `--stat` and the test file contents) and the verify output, I'll write it against what actually changed. Below is a skeleton with only the facts I can source from CLAUDE.md. Everything in `<…>` needs to be filled from the real diff.\n\n---\n\n## Summary\nAdds unit tests for `<file/area>`, which CLAUDE.md flags as `<UNDERTESTED / ZERO unit tests>` (hotspot gamma `<score>`). `<One sentence on why that matters, e.g. connection state machine / message rendering logic changes frequently with no coverage.>`\n\n## What's tested\n- `<behavior or edge case 1>`\n- `<behavior or edge case 2>`\n- `<error / malformed-input case>`\n\n## Notes\n- `<Tests-only. | Describes the exact testability seam added (e.g. a `pub(crate)` visibility change or extracted helper), and why it doesn't change behavior.>`\n- `.fabro/verify.sh` (rustfmt + check + clippy `-D warnings` + test, CI-mirrored) `<passes / not yet run>`.\n\n---\n\nReference points from CLAUDE.md if they apply: `sdk/client.rs` (gamma 104, zero unit tests on the connection state machine), `irc/client.ts` (gamma 133), `MessageList.tsx` (gamma 103). If the tests are TypeScript, the verify script as described only covers Rust, so I'd need to know how the vitest run was verified before stating it."
-            },
-            "notes": "Stage completed: pr_body",
-            "usage": {
-              "input": {
-                "usage": {
-                  "model": {
-                    "provider": "anthropic",
-                    "model_id": "claude-sonnet-5-5"
-                  },
-                  "tokens": {
-                    "input_tokens": 306,
-                    "output_tokens": 913,
-                    "reasoning_tokens": 0,
-                    "cache_read_tokens": 0,
-                    "cache_write_tokens": 5687
-                  }
-                },
-                "facts": {
-                  "algorithm": "anthropic",
-                  "cache_write_5m_tokens": 5687,
-                  "cache_write_1h_tokens": 0
-                }
-              },
-              "total_usd_micros": 23959
-            },
-            "timing": {
-              "wall_time_ms": 0,
-              "inference_time_ms": 8436,
-              "tool_time_ms": 0,
-              "active_time_ms": 8436
-            }
-          },
           "select": {
             "status": "succeeded",
             "context_updates": {
@@ -951,6 +913,44 @@
               "inference_time_ms": 24650,
               "tool_time_ms": 3427,
               "active_time_ms": 28077
+            }
+          },
+          "pr_body": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "I can't write this PR body yet. Nothing in this conversation shows me adding tests: I have no `git diff --stat` or `git diff` output, and I haven't run `.fabro/verify.sh`. Describing specific tests or",
+              "last_stage": "pr_body",
+              "response.pr_body": "I can't write this PR body yet. Nothing in this conversation shows me adding tests: I have no `git diff --stat` or `git diff` output, and I haven't run `.fabro/verify.sh`. Describing specific tests or claiming the verify script passes would be fabrication.\n\nIf you paste the diff (or the `--stat` and the test file contents) and the verify output, I'll write it against what actually changed. Below is a skeleton with only the facts I can source from CLAUDE.md. Everything in `<…>` needs to be filled from the real diff.\n\n---\n\n## Summary\nAdds unit tests for `<file/area>`, which CLAUDE.md flags as `<UNDERTESTED / ZERO unit tests>` (hotspot gamma `<score>`). `<One sentence on why that matters, e.g. connection state machine / message rendering logic changes frequently with no coverage.>`\n\n## What's tested\n- `<behavior or edge case 1>`\n- `<behavior or edge case 2>`\n- `<error / malformed-input case>`\n\n## Notes\n- `<Tests-only. | Describes the exact testability seam added (e.g. a `pub(crate)` visibility change or extracted helper), and why it doesn't change behavior.>`\n- `.fabro/verify.sh` (rustfmt + check + clippy `-D warnings` + test, CI-mirrored) `<passes / not yet run>`.\n\n---\n\nReference points from CLAUDE.md if they apply: `sdk/client.rs` (gamma 104, zero unit tests on the connection state machine), `irc/client.ts` (gamma 133), `MessageList.tsx` (gamma 103). If the tests are TypeScript, the verify script as described only covers Rust, so I'd need to know how the vitest run was verified before stating it."
+            },
+            "notes": "Stage completed: pr_body",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-sonnet-5-5"
+                  },
+                  "tokens": {
+                    "input_tokens": 306,
+                    "output_tokens": 913,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 5687
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 5687,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 23959
+            },
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 8436,
+              "tool_time_ms": 0,
+              "active_time_ms": 8436
             }
           },
           "implement": {
@@ -994,6 +994,10 @@
               "active_time_ms": 719323
             }
           },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
           "verify": {
             "status": "succeeded",
             "context_updates": {
@@ -1007,25 +1011,109 @@
               "tool_time_ms": 466714,
               "active_time_ms": 466714
             }
-          },
-          "start": {
-            "status": "succeeded",
-            "usage": null
           }
         },
         "next_node_id": "exit",
+        "git_commit_sha": "93caf0f03f26d56829ed51a2af249faa9266d509",
         "node_visits": {
-          "start": 1,
-          "implement": 1,
           "verify": 1,
+          "implement": 1,
+          "pr_body": 1,
           "select": 1,
-          "pr_body": 1
+          "start": 1
         }
       },
-      "diff": {}
+      "diff": {
+        "summary": {
+          "files_changed": 1,
+          "additions": 291,
+          "deletions": 0
+        }
+      }
     }
   ],
-  "conclusion": null,
+  "conclusion": {
+    "timestamp": "2026-10-02T02:20:49.094792299Z",
+    "status": "succeeded",
+    "timing": {
+      "wall_time_ms": 1240396,
+      "inference_time_ms": 85027,
+      "tool_time_ms": 1137523,
+      "active_time_ms": 1222550
+    },
+    "final_git_commit_sha": "93caf0f03f26d56829ed51a2af249faa9266d509",
+    "stages": [
+      {
+        "stage_id": "start",
+        "stage_label": "start",
+        "timing": {
+          "wall_time_ms": 0,
+          "inference_time_ms": 0,
+          "tool_time_ms": 0,
+          "active_time_ms": 0
+        },
+        "retries": 0
+      },
+      {
+        "stage_id": "select",
+        "stage_label": "select",
+        "timing": {
+          "wall_time_ms": 28740,
+          "inference_time_ms": 24650,
+          "tool_time_ms": 3427,
+          "active_time_ms": 28077
+        },
+        "billing_usd_micros": 124793,
+        "retries": 0
+      },
+      {
+        "stage_id": "implement",
+        "stage_label": "implement",
+        "timing": {
+          "wall_time_ms": 719357,
+          "inference_time_ms": 51941,
+          "tool_time_ms": 667382,
+          "active_time_ms": 719323
+        },
+        "billing_usd_micros": 379064,
+        "retries": 0
+      },
+      {
+        "stage_id": "verify",
+        "stage_label": "verify",
+        "timing": {
+          "wall_time_ms": 466747,
+          "inference_time_ms": 0,
+          "tool_time_ms": 466714,
+          "active_time_ms": 466714
+        },
+        "retries": 0
+      },
+      {
+        "stage_id": "pr_body",
+        "stage_label": "pr_body",
+        "timing": {
+          "wall_time_ms": 8470,
+          "inference_time_ms": 8436,
+          "tool_time_ms": 0,
+          "active_time_ms": 8436
+        },
+        "billing_usd_micros": 23959,
+        "retries": 0
+      }
+    ],
+    "billing": {
+      "input_tokens": 52684,
+      "output_tokens": 17571,
+      "total_tokens": 778301,
+      "reasoning_tokens": 0,
+      "cache_read_tokens": 497526,
+      "cache_write_tokens": 210520,
+      "total_usd_micros": 527816
+    },
+    "total_retries": 0,
+    "diff": {}
+  },
   "sandbox": {
     "kind": "ready",
     "plan": {
@@ -1409,6 +1497,40 @@
       },
       "state": "succeeded"
     },
+    "exit@1": {
+      "first_event_seq": 150,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": null,
+        "failure_reason": null,
+        "timestamp": "2026-10-02T02:20:49.064066061Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-10-02T02:20:49.064042466Z",
+      "handler": "exit",
+      "timing": {
+        "wall_time_ms": 0,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
+    },
     "verify@1": {
       "first_event_seq": 130,
       "prompt": null,
@@ -1462,7 +1584,12 @@
       "first_event_seq": 140,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Stage completed: pr_body",
+        "failure_reason": null,
+        "timestamp": "2026-10-02T02:20:45.211106283Z"
+      },
       "provider_used": {
         "mode": "prompt",
         "provider": "anthropic",
@@ -1475,15 +1602,26 @@
       "output": null,
       "started_at": "2026-10-02T02:20:36.740962017Z",
       "handler": "prompt",
+      "timing": {
+        "wall_time_ms": 8470,
+        "inference_time_ms": 8436,
+        "tool_time_ms": 0,
+        "active_time_ms": 8436
+      },
       "usage": {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
+        "input_tokens": 306,
+        "output_tokens": 913,
+        "total_tokens": 6906,
         "reasoning_tokens": 0,
         "cache_read_tokens": 0,
-        "cache_write_tokens": 0
+        "cache_write_tokens": 5687,
+        "total_usd_micros": 23959
       },
-      "state": "running"
+      "model": {
+        "provider": "anthropic",
+        "model_id": "claude-sonnet-5-5"
+      },
+      "state": "succeeded"
     }
   }
 }
