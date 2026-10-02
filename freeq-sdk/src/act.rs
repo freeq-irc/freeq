@@ -1205,6 +1205,63 @@ mod tests {
                 target: "#swarm",
                 id: "01JFORFEITEVENTID000000000",
             },
+            Case {
+                // An opener naming its referee: the server it was posted on,
+                // by the `did:web:` name that server signs its rulings under.
+                name: "offer-naming-its-home",
+                seed: 19,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "offer"),
+                    ("+freeq.at/from", "did:plc:eliza"),
+                    ("+freeq.at/act-title", "Triage the overnight alerts"),
+                    ("+freeq.at/act-home", "did:web:irc.example"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JHOMEOFFEREVENTID0000000",
+            },
+            Case {
+                // The home's rulings on one task are numbered in one sequence:
+                // a receipt, an expiry and a closed review window alike.
+                name: "receipt-numbered",
+                seed: 5,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "confirm"),
+                    ("+freeq.at/from", "did:web:irc.example"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                    ("+freeq.at/act-subject", "01JACCEPTEVENTID0000000000"),
+                    ("+freeq.at/act-seq", "1"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JCONFIRMSEQEVENTID000000",
+            },
+            Case {
+                name: "expire-numbered",
+                seed: 5,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "expire"),
+                    ("+freeq.at/from", "did:web:irc.example"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                    ("+freeq.at/act-seq", "2"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JEXPIRESEQEVENTID0000000",
+            },
+            Case {
+                name: "review-timeout-accept-numbered",
+                seed: 5,
+                tags: vec![
+                    ("+freeq.at/act", "bounty"),
+                    ("+freeq.at/act-verb", "auto-accept"),
+                    ("+freeq.at/from", "did:web:irc.example"),
+                    ("+freeq.at/act-id", BOUNTY_ID),
+                    ("+freeq.at/act-seq", "3"),
+                ],
+                target: "#swarm",
+                id: "01JAUTOACCEPTSEQEVENTID000",
+            },
         ]
     }
 
