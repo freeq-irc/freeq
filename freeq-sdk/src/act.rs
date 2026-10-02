@@ -150,7 +150,7 @@ impl From<crate::sigtag::SigError> for ActSigError {
 }
 
 /// Strip the client-tag vendor prefix from a tag name, if present.
-fn stripped_name(tag_name: &str) -> &str {
+pub(crate) fn stripped_name(tag_name: &str) -> &str {
     tag_name
         .strip_prefix(CLIENT_TAG_PREFIX)
         .or_else(|| tag_name.strip_prefix(TAG_PREFIX))

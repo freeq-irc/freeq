@@ -1897,6 +1897,398 @@ describe('inbound: coordinationEvent payload shapes', () => {
   });
 });
 
+describe('outbound: sendAct names the server a task is opened on', () => {
+  const TASK = '01JABCDEF000000000000000EF';
+
+  /** A signing client, welcomed by `server` when one is given. */
+  async function client(server?: string) {
+    const { FreeqClient } = await import('./client.js');
+    const c = new FreeqClient({ url: 'wss://test/irc', nick: 'eliza', skipInitialBrokerRefresh: true });
+    c.signing.setSigningDid('did:plc:eliza');
+    const pub = (await c.signing.generateSigningKey())!;
+    c.connect();
+    await flushAsync();
+    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    ws.recv(':srv CAP * LS :message-tags');
+    await flushAsync();
+    ws.recv(':srv CAP * ACK :message-tags');
+    await flushAsync();
+    if (server) {
+      ws.recv(`:${server} 001 eliza :Welcome`);
+      await flushAsync();
+    }
+    ws.sent.length = 0;
+    return { client: c, ws, pub };
+  }
+
+  /** The tags of the last task event sent, waiting for it to go out. */
+  async function sent(ws: MockWebSocket): Promise<Record<string, string>> {
+    for (let i = 0; i < 100 && !ws.sent.some((l) => l.includes('TAGMSG')); i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const { parse } = await import('./parser.js');
+    return parse(ws.sent.filter((l) => l.includes('TAGMSG')).pop()!).tags;
+  }
+
+  it('an opener carries act-home for the server that welcomed it, inside the signature', async () => {
+    const { client: c, ws, pub } = await client('irc.example');
+    expect(c.serverName).toBe('irc.example');
+    const id = await c.sendAct('#ops', actTags('handoff', 'offer', undefined, 'did:plc:eliza', { title: 'x' }), {
+      humanText: '',
+    });
+    const tags = await sent(ws);
+    expect(tags['+freeq.at/act-home']).toBe('did:web:irc.example');
+    const signing = await import('./signing.js');
+    const { verifyEd25519 } = await import('./did-key.js');
+    const canonical = signing.actCanonical(tags, '#ops', id)!;
+    expect(JSON.parse(canonical)['act-home']).toBe('did:web:irc.example');
+    const ok = await verifyEd25519(
+      new Uint8Array(Buffer.from(pub, 'base64url')),
+      new TextEncoder().encode(canonical),
+      tags['+freeq.at/sig']!.split(':')[2]!,
+    );
+    expect(ok).toBe(true);
+  });
+
+  it('a follow-up carries none', async () => {
+    const { client: c, ws } = await client('irc.example');
+    await c.sendAct('#ops', actTags('handoff', 'claim', TASK, 'did:plc:eliza', {}), { humanText: '' });
+    const tags = await sent(ws);
+    expect(tags['+freeq.at/act-home']).toBeUndefined();
+    expect(tags['act-home']).toBeUndefined();
+  });
+
+  it("keeps the caller's own act-home, under either spelling", async () => {
+    const { client: c, ws } = await client('irc.example');
+    await c.sendAct(
+      '#ops',
+      actTags('handoff', 'offer', undefined, 'did:plc:eliza', { title: 'x', home: 'did:web:mine.example' }),
+      { humanText: '' },
+    );
+    expect((await sent(ws))['+freeq.at/act-home']).toBe('did:web:mine.example');
+    ws.sent.length = 0;
+    await c.sendAct(
+      '#ops',
+      { ...actTags('handoff', 'offer', undefined, 'did:plc:eliza', { title: 'y' }), 'act-home': 'did:web:bare.example' },
+      { humanText: '' },
+    );
+    const bare = await sent(ws);
+    expect(bare['act-home']).toBe('did:web:bare.example');
+    expect(bare['+freeq.at/act-home']).toBeUndefined();
+  });
+
+  it("keeps the caller's own act-home spelled freeq.at/, and reads its act-id that way", async () => {
+    const { client: c, ws } = await client('irc.example');
+    await c.sendAct(
+      '#ops',
+      {
+        ...actTags('handoff', 'offer', undefined, 'did:plc:eliza', { title: 'z' }),
+        'freeq.at/act-home': 'did:web:spelled.example',
+      },
+      { humanText: '' },
+    );
+    const spelled = await sent(ws);
+    expect(spelled['freeq.at/act-home']).toBe('did:web:spelled.example');
+    expect(spelled['+freeq.at/act-home'], 'adds none').toBeUndefined();
+    ws.sent.length = 0;
+    // A follow-up naming its task as freeq.at/act-id opens nothing.
+    const { ['+freeq.at/act-id']: _id, ...claim } = actTags('handoff', 'claim', TASK, 'did:plc:eliza', {});
+    await c.sendAct('#ops', { ...claim, 'freeq.at/act-id': TASK }, { humanText: '' });
+    expect((await sent(ws))['+freeq.at/act-home']).toBeUndefined();
+  });
+
+  it('holds an opener sent before the welcome until it, and names the server then', async () => {
+    const { FreeqClient } = await import('./client.js');
+    const c = new FreeqClient({ url: 'wss://test/irc', nick: 'eliza', skipInitialBrokerRefresh: true });
+    c.setSaslCredentials({ token: 't', did: 'did:plc:eliza', pdsUrl: 'https://pds.example', method: 'oauth' });
+    c.connect();
+    await flushAsync();
+    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    ws.recv(':srv CAP * LS :sasl message-tags freeq.at/msgsig');
+    await flushAsync();
+    ws.recv(':srv CAP * ACK :sasl message-tags freeq.at/msgsig');
+    await flushAsync();
+    ws.recv(':srv 903 eliza :SASL authentication successful');
+    await flushAsync();
+    ws.sent.length = 0;
+    expect(c.serverName).toBeNull();
+    const sending = c.sendAct('#ops', actTags('handoff', 'offer', undefined, 'did:plc:eliza', { title: 'x' }), {
+      humanText: '',
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(ws.sent.filter((l) => l.includes('TAGMSG')), 'nothing before the welcome').toEqual([]);
+    ws.recv(':irc.example 001 eliza :Welcome');
+    const id = await sending;
+    const tags = await sent(ws);
+    expect(tags['+freeq.at/eventid']).toBe(id);
+    expect(tags['+freeq.at/act-home']).toBe('did:web:irc.example');
+    const msgsig = ws.sent.findIndex((l) => l.startsWith('MSGSIG '));
+    expect(msgsig, 'after the key it is signed with').toBeGreaterThanOrEqual(0);
+    expect(msgsig).toBeLessThan(ws.sent.findIndex((l) => l.includes('TAGMSG')));
+    c.disconnect();
+  });
+
+  it('sends a task event after a welcome with no server name, naming no home, as the Rust SDK does', async () => {
+    const { FreeqClient } = await import('./client.js');
+    const c = new FreeqClient({ url: 'wss://test/irc', nick: 'eliza', skipInitialBrokerRefresh: true });
+    c.setSaslCredentials({ token: 't', did: 'did:plc:eliza', pdsUrl: 'https://pds.example', method: 'oauth' });
+    c.connect();
+    await flushAsync();
+    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    ws.recv(':srv CAP * LS :sasl message-tags freeq.at/msgsig');
+    await flushAsync();
+    ws.recv(':srv CAP * ACK :sasl message-tags freeq.at/msgsig');
+    await flushAsync();
+    ws.recv(':srv 903 eliza :SASL authentication successful');
+    await flushAsync();
+    // Sent before the welcome: it waits for it, name or no name.
+    const early = c.sendAct('#ops', actTags('handoff', 'offer', undefined, 'did:plc:eliza', { title: 'x' }), {
+      humanText: '',
+    });
+    ws.recv('001 eliza :Welcome');
+    const timedOut = new Promise<string>((r) => setTimeout(() => r('hung'), 1000));
+    expect(await Promise.race([early, timedOut]), 'the early send goes out').not.toBe('hung');
+    expect(c.serverName).toBeNull();
+    // Sent after it: it goes out at once.
+    ws.sent.length = 0;
+    const late = c.sendAct('#ops', actTags('handoff', 'offer', undefined, 'did:plc:eliza', { title: 'y' }), {
+      humanText: '',
+    });
+    expect(await Promise.race([late, timedOut.then(() => 'hung')]), 'the late send goes out').not.toBe('hung');
+    expect((await sent(ws))['+freeq.at/act-home'], 'no name, no home').toBeUndefined();
+    c.disconnect();
+  });
+
+  it('fails a task event held for the welcome when its connection ends first, and sends it on no other', async () => {
+    const { FreeqClient } = await import('./client.js');
+    const c = new FreeqClient({ url: 'wss://test/irc', nick: 'eliza', skipInitialBrokerRefresh: true });
+    const signIn = async () => {
+      c.setSaslCredentials({ token: 't', did: 'did:plc:eliza', pdsUrl: 'https://pds.example', method: 'oauth' });
+      c.connect();
+      await flushAsync();
+      const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+      ws.recv(':srv CAP * LS :sasl message-tags freeq.at/msgsig');
+      await flushAsync();
+      ws.recv(':srv CAP * ACK :sasl message-tags freeq.at/msgsig');
+      await flushAsync();
+      ws.recv(':srv 903 eliza :SASL authentication successful');
+      await flushAsync();
+      return ws;
+    };
+    const first = await signIn();
+    const sending = c.sendAct('#ops', actTags('handoff', 'offer', undefined, 'did:plc:eliza', { title: 'x' }), {
+      humanText: '',
+    });
+    let outcome: string | undefined;
+    sending.then(
+      () => (outcome = 'sent'),
+      (e: Error) => (outcome = e.message),
+    );
+    first.close();
+    await new Promise((r) => setTimeout(r, 200));
+    expect(outcome, 'the send fails with its connection').toMatch(/connection ended/);
+    expect(first.sent.filter((l) => l.includes('TAGMSG'))).toEqual([]);
+
+    c.disconnect();
+    const next = await signIn();
+    next.recv(':irc.example 001 eliza :Welcome');
+    await new Promise((r) => setTimeout(r, 100));
+    expect(next.sent.filter((l) => l.includes('TAGMSG')), 'nothing on the next connection').toEqual([]);
+    c.disconnect();
+  });
+
+  it('fails a task event sent while disconnected at once, and sends it on no later connection', async () => {
+    const { FreeqClient } = await import('./client.js');
+    const c = new FreeqClient({ url: 'wss://test/irc', nick: 'eliza', skipInitialBrokerRefresh: true });
+    await expect(
+      c.sendAct('#ops', actTags('handoff', 'offer', undefined, 'did:plc:eliza', { title: 'x' }), { humanText: '' }),
+    ).rejects.toThrow(/connection ended/);
+    c.setSaslCredentials({ token: 't', did: 'did:plc:eliza', pdsUrl: 'https://pds.example', method: 'oauth' });
+    c.connect();
+    await flushAsync();
+    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    ws.recv(':srv CAP * LS :sasl message-tags freeq.at/msgsig');
+    await flushAsync();
+    ws.recv(':srv CAP * ACK :sasl message-tags freeq.at/msgsig');
+    await flushAsync();
+    ws.recv(':srv 903 eliza :SASL authentication successful');
+    await flushAsync();
+    ws.recv(':irc.example 001 eliza :Welcome');
+    await new Promise((r) => setTimeout(r, 100));
+    expect(ws.sent.filter((l) => l.includes('TAGMSG'))).toEqual([]);
+    c.disconnect();
+  });
+
+  it('fails a task event whose connection drops while it waits for its turn, and sends it on no later connection', async () => {
+    const { FreeqClient } = await import('./client.js');
+    const c = new FreeqClient({ url: 'wss://test/irc', nick: 'eliza', skipInitialBrokerRefresh: true });
+    c.setSaslCredentials({ token: 't', did: 'did:plc:eliza', pdsUrl: 'https://pds.example', method: 'oauth' });
+    c.connect();
+    await flushAsync();
+    const first = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    first.recv(':srv CAP * LS :sasl message-tags freeq.at/msgsig');
+    await flushAsync();
+    first.recv(':srv CAP * ACK :sasl message-tags freeq.at/msgsig');
+    await flushAsync();
+    first.recv(':srv 903 eliza :SASL authentication successful');
+    await flushAsync();
+    // Welcomed, its session key not yet registered: the send takes its turn
+    // behind that, and the socket drops meanwhile.
+    first.recv(':irc.example 001 eliza :Welcome');
+    await flushAsync();
+    expect((c as unknown as { _welcomed: boolean })._welcomed).toBe(true);
+    expect((c as unknown as { msgSigReady: unknown }).msgSigReady, 'the key is not registered yet').not.toBeNull();
+    const sending = c.sendAct('#ops', actTags('handoff', 'claim', '01JABCDEF000000000000000EF', 'did:plc:eliza', {}), {
+      humanText: '',
+    });
+    let outcome: string | undefined;
+    sending.then(
+      () => (outcome = 'sent'),
+      (e: Error) => (outcome = e.message),
+    );
+    first.close();
+    for (let i = 0; i < 200 && outcome === undefined; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(outcome, 'fails at the drop').toBe('the connection ended before the task event was sent');
+    expect(first.sent.filter((l) => l.includes('TAGMSG'))).toEqual([]);
+    for (let i = 0; i < 400 && MockWebSocket.instances.length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+    const next = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    next.recv(':irc.example 001 eliza :Welcome');
+    await new Promise((r) => setTimeout(r, 100));
+    expect(next.sent.filter((l) => l.includes('TAGMSG')), 'nothing on the next connection').toEqual([]);
+    c.disconnect();
+  });
+
+  it('fails a task event whose connection drops between signing and the write, though the next one is welcomed', async () => {
+    const { client: c, ws } = await client('irc.example');
+    // Signing is held until the socket has dropped and the next connection
+    // has been welcomed.
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => (release = r));
+    const signAct = c.signing.signAct.bind(c.signing);
+    c.signing.signAct = async (...args: Parameters<typeof signAct>) => {
+      const signed = await signAct(...args);
+      await held;
+      return signed;
+    };
+    const sending = c.sendAct('#ops', actTags('handoff', 'claim', '01JABCDEF000000000000000EF', 'did:plc:eliza', {}), {
+      humanText: '',
+    });
+    let outcome: string | undefined;
+    sending.then(
+      () => (outcome = 'sent'),
+      (e: Error) => (outcome = e.message),
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    ws.close();
+    for (let i = 0; i < 400 && MockWebSocket.instances.length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+    const next = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    next.recv(':srv CAP * LS :message-tags');
+    await flushAsync();
+    next.recv(':srv CAP * ACK :message-tags');
+    await flushAsync();
+    next.recv(':irc.example 001 eliza :Welcome');
+    await flushAsync();
+    release();
+    for (let i = 0; i < 200 && outcome === undefined; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(outcome).toBe('the connection ended before the task event was sent');
+    expect(ws.sent.filter((l) => l.includes('TAGMSG'))).toEqual([]);
+    expect(next.sent.filter((l) => l.includes('TAGMSG')), 'nor on the next connection').toEqual([]);
+    c.disconnect();
+  });
+
+  /** Hold `ws`'s close back, as a browser delivers it later: `arrive` then
+   *  fires whatever close handler is hooked by that time. */
+  function lateClose(ws: MockWebSocket): { arrive: () => void } {
+    ws.close = () => {
+      ws.readyState = 3;
+    };
+    return { arrive: () => ws.onclose?.({}) };
+  }
+
+  /** `c`'s next socket, welcomed by irc.example. */
+  async function welcomedAgain(): Promise<MockWebSocket> {
+    for (let i = 0; i < 400 && MockWebSocket.instances.length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+    const next = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    await flushAsync();
+    next.recv(':srv CAP * LS :message-tags');
+    await flushAsync();
+    next.recv(':srv CAP * ACK :message-tags');
+    await flushAsync();
+    next.recv(':irc.example 001 eliza :Welcome');
+    await flushAsync();
+    next.sent.length = 0;
+    return next;
+  }
+
+  it("leaves the next connection sending task events when a replaced socket's close arrives after its welcome", async () => {
+    const { client: c, ws: old } = await client('irc.example');
+    const late = lateClose(old);
+    c.reconnect();
+    const next = await welcomedAgain();
+    late.arrive();
+    await flushAsync();
+    await c.sendAct('#ops', actTags('handoff', 'claim', TASK, 'did:plc:eliza', {}), { humanText: '' });
+    expect((await sent(next))['+freeq.at/act-id']).toBe(TASK);
+    c.disconnect();
+  });
+
+  it('leaves the next connection working when a socket the heartbeat gave up on closes after the app reconnected', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
+    try {
+      const { client: c, ws: dropped } = await client('irc.example');
+      const late = lateClose(dropped);
+      const states: string[] = [];
+      c.on('connectionStateChanged', (s) => states.push(s));
+      // Silent past the dead timeout: the heartbeat gives up.
+      vi.advanceTimersByTime(60_000);
+      expect(states, 'the give-up reports the drop itself').toEqual(['disconnected']);
+      c.reconnect();
+      vi.useRealTimers();
+      const next = await welcomedAgain();
+      late.arrive();
+      await flushAsync();
+      await c.sendAct('#ops', actTags('handoff', 'claim', TASK, 'did:plc:eliza', {}), { humanText: '' });
+      expect((await sent(next))['+freeq.at/act-id']).toBe(TASK);
+      c.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reconnects after a heartbeat give-up with no app reconnect, at the first backoff step, once', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    try {
+      const { client: c } = await client('irc.example');
+      // The heartbeat's fifth tick finds the socket silent past 45 s.
+      vi.advanceTimersByTime(50_000);
+      await flushAsync();
+      expect(MockWebSocket.instances.length, 'not before the first step').toBe(1);
+      vi.advanceTimersByTime(999);
+      expect(MockWebSocket.instances.length).toBe(1);
+      vi.advanceTimersByTime(1);
+      await flushAsync();
+      expect(MockWebSocket.instances.length, 'one second after the give-up').toBe(2);
+      vi.advanceTimersByTime(30_000);
+      await flushAsync();
+      expect(MockWebSocket.instances.length, 'and only once').toBe(2);
+      c.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('forgets the name when the connection ends', async () => {
+    const dropped = await client('irc.example');
+    dropped.ws.close();
+    await flushAsync();
+    expect(dropped.client.serverName).toBeNull();
+
+    const ended = await client('irc.example');
+    ended.client.disconnect();
+    expect(ended.client.serverName).toBeNull();
+  });
+});
+
 describe('outbound: sendAct', () => {
   /** A registered client with a real session key, so a task event can be
    *  signed and put on the wire. */

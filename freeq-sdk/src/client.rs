@@ -2854,6 +2854,11 @@ where
     // Our own confirmed nick (001, self-NICK) — needed to tell which end of
     // a DM is the peer when computing dm_key.
     let mut own_nick = String::new();
+    // The name the server put in the source of this connection's welcome:
+    // the name it signs under as `did:web:<name>`, and the referee every task
+    // opened here names (`name_home`). This loop is one connection, so a new
+    // one starts without it.
+    let mut server_name: Option<String> = None;
     let mut nick_tries: u32 = 0;
     let mut web_token = config.web_token.clone();
     let mut authenticated_did: Option<String> = None;
@@ -3205,6 +3210,7 @@ where
                         "001" => {
                             let nick = msg.params.first().cloned().unwrap_or_default();
                             own_nick = nick.clone();
+                            server_name = msg.prefix.clone().filter(|name| !name.is_empty());
                             let _ = event_tx.send(Event::Registered { nick }).await;
                             registered = true;
                             // Register the session's message-signing key now
@@ -3235,7 +3241,8 @@ where
                             }
                             // Flush any commands that were queued before registration
                             let verifies = caps_acked.lock().acked.contains(MSGSIG_CAP);
-                            for cmd in pending_commands.drain(..) {
+                            for mut cmd in pending_commands.drain(..) {
+                                name_home(&mut cmd, server_name.as_deref());
                                 // A task event held back before registration
                                 // waits like any other: it queues here and the
                                 // line follows the server's answer.
@@ -3795,8 +3802,9 @@ where
 
                 line_buf.clear();
             }
-            Some(cmd) = cmd_rx.recv() => {
+            Some(mut cmd) = cmd_rx.recv() => {
                 if registered || matches!(cmd, Command::Quit(_)) {
+                    name_home(&mut cmd, server_name.as_deref());
                     let verifies = caps_acked.lock().acked.contains(MSGSIG_CAP);
                     // A task event whose line waits for the answer is started
                     // here, not in `execute_command`: the answer arrives on the
@@ -4391,6 +4399,27 @@ fn defers_companion(cmd: &Command, caps_acked: &CapsAcked) -> bool {
             !human_text.is_empty() && caps_acked.lock().acked.contains("echo-message")
         }
         _ => false,
+    }
+}
+
+/// Name the server a task is opened on as its referee: a task event naming
+/// no task (`act-id`) opens one, and gets `act-home` set to
+/// `did:web:<server_name>`, the name this connection was welcomed under, so
+/// it is signed with the rest. A caller's own `act-home`, under either
+/// spelling, stands; with no welcome yet nothing is added.
+fn name_home(cmd: &mut Command, server_name: Option<&str>) {
+    let (Command::Act { tags, .. }, Some(name)) = (cmd, server_name) else {
+        return;
+    };
+    // Read as the signature reads them, under any of their spellings.
+    let has = |field: &str| {
+        tags.keys()
+            .any(|name| crate::act::stripped_name(name) == field)
+    };
+    let opens = !has("act-id");
+    let named = has("act-home");
+    if opens && !named {
+        tags.insert("+freeq.at/act-home".to_string(), format!("did:web:{name}"));
     }
 }
 
@@ -8820,6 +8849,106 @@ mod did_maps_tests {
             Some("01OFFER"),
             "a follow-up's companion names the action, not this event: {wire}"
         );
+    }
+
+    /// An event naming no task opens one, and names the server it is opened
+    /// on as the task's referee, inside the signature; a follow-up names
+    /// none, a caller's own name stands under either spelling, and with no
+    /// name from a welcome nothing is added.
+    #[tokio::test]
+    async fn an_opener_names_its_server_as_its_home_inside_the_signature() {
+        let opener =
+            || crate::act::act_tags("handoff", "offer", None, "did:plc:eliza", &[("title", "t")]);
+        let named = |tags: std::collections::HashMap<String, String>, name: Option<&str>| {
+            let mut cmd = Command::Act {
+                target: "#room".to_string(),
+                event_id: crate::chatsig::new_event_id(),
+                tags,
+                human_text: String::new(),
+                done: tokio::sync::oneshot::channel().0,
+            };
+            name_home(&mut cmd, name);
+            let Command::Act { tags, .. } = cmd else {
+                unreachable!()
+            };
+            tags
+        };
+        let home = |tags: &std::collections::HashMap<String, String>| {
+            tags.get("+freeq.at/act-home").cloned()
+        };
+
+        assert_eq!(
+            home(&named(opener(), Some("irc.example"))).as_deref(),
+            Some("did:web:irc.example")
+        );
+        let follow_up =
+            crate::act::act_tags("handoff", "claim", Some("01OFFER"), "did:plc:eliza", &[]);
+        assert_eq!(home(&named(follow_up, Some("irc.example"))), None);
+        let mut own = opener();
+        own.insert("+freeq.at/act-home".into(), "did:web:mine.example".into());
+        assert_eq!(
+            home(&named(own, Some("irc.example"))).as_deref(),
+            Some("did:web:mine.example")
+        );
+        let mut bare = opener();
+        bare.insert("act-home".into(), "did:web:bare.example".into());
+        let bare = named(bare, Some("irc.example"));
+        assert_eq!(
+            (home(&bare), bare.get("act-home").map(String::as_str)),
+            (None, Some("did:web:bare.example"))
+        );
+        // `freeq.at/` is a third spelling of the same field, for both.
+        let mut spelled = opener();
+        spelled.insert("freeq.at/act-home".into(), "did:web:spelled.example".into());
+        assert_eq!(home(&named(spelled, Some("irc.example"))), None);
+        let mut follow_up =
+            crate::act::act_tags("handoff", "claim", Some("01OFFER"), "did:plc:eliza", &[]);
+        let task = follow_up
+            .remove("+freeq.at/act-id")
+            .expect("names its task");
+        follow_up.insert("freeq.at/act-id".into(), task);
+        assert_eq!(home(&named(follow_up, Some("irc.example"))), None);
+        assert_eq!(home(&named(opener(), None)), None, "no welcome, no name");
+
+        // And the signature covers it.
+        let (id, wire) = sent_act(named(opener(), Some("irc.example")), Some("")).await;
+        let id = id.expect("the event was sent");
+        let event = crate::irc::Message::parse(wire.lines().next().unwrap()).expect("parses");
+        assert_eq!(home(&event.tags).as_deref(), Some("did:web:irc.example"));
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        crate::act::verify_act(
+            event.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            &crate::chatsig::channel_venue("#room"),
+            &id,
+            event.tags.get(crate::sigtag::SIG_TAG).unwrap(),
+            &key.verifying_key(),
+        )
+        .expect("the signature covers act-home");
+    }
+
+    /// The name is the source of this connection's welcome.
+    #[tokio::test]
+    async fn an_opener_names_the_server_that_welcomed_this_connection() {
+        let (handle, mut server) =
+            answering_session("message-tags freeq.at/act freeq.at/msgsig").await;
+        let opener = crate::act::act_tags(
+            "handoff",
+            "offer",
+            None,
+            "did:plc:tester",
+            &[("title", "t")],
+        );
+        let sending = tokio::spawn(async move { handle.send_act("#room", opener, Some("")).await });
+        let wire = wire_since(&mut server, 400).await;
+        let event =
+            crate::irc::Message::parse(wire.lines().find(|l| l.contains("TAGMSG")).expect("sent"))
+                .expect("parses");
+        assert_eq!(
+            event.tags.get("+freeq.at/act-home").map(String::as_str),
+            Some("did:web:srv"),
+            "{wire}"
+        );
+        sending.await.unwrap().expect("sent");
     }
 
     /// An opener names no action, so its companion names the event itself —

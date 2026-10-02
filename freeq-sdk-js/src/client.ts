@@ -169,6 +169,14 @@ export class FreeqClient extends EventEmitter {
   private _apiBearer: string | null = null;
   private _connectionState: TransportState = 'disconnected';
   private _registered = false;
+  /** The name the server put in the source of this connection's welcome
+   *  (001): the name it signs under as `did:web:<name>`. Null until the
+   *  welcome, and again once the connection ends. */
+  private _serverName: string | null = null;
+  /** Whether this connection has been welcomed (001), with a server name or
+   *  without one; cleared where `_serverName` is. A task event waits for it,
+   *  not for the name, as the Rust SDK queues it until registration. */
+  private _welcomed = false;
   private opts: FreeqClientOptions;
 
   private ackedCaps = new Set<string>();
@@ -310,6 +318,8 @@ export class FreeqClient extends EventEmitter {
 
   /** Whether IRC registration is complete (001 received). */
   get registered(): boolean { return this._registered; }
+  /** The server's own name, from this connection's welcome; null before it. */
+  get serverName(): string | null { return this._serverName; }
 
   /** Set of channels we're currently in (lowercase). */
   get joinedChannels(): ReadonlySet<string> { return this._joinedChannels; }
@@ -384,6 +394,8 @@ export class FreeqClient extends EventEmitter {
     this._authDid = null;
     this._apiBearer = null;
     this._registered = false;
+    this._serverName = null;
+    this._welcomed = false;
     this._saslFailed = false;
     this.ackedCaps.clear();
     this.sasl = null;
@@ -1135,7 +1147,18 @@ export class FreeqClient extends EventEmitter {
 
     // A batch left open when the socket drops never gets its `BATCH -id`.
     // Every report, the second and late ones too; the second finds nothing.
-    if (state === 'disconnected') this.endOpenBatches();
+    // A send waiting behind the key-registration gate is freed too, so a
+    // task event among them fails now, at its turn's connection check,
+    // rather than after the next connection's sign-in.
+    if (state === 'disconnected') {
+      this.endOpenBatches();
+      this.msgSigRegistered();
+    }
+    // A new socket has not been welcomed yet; a dropped one never will be.
+    if (state !== 'connected' || prev !== 'connected') {
+      this._serverName = null;
+      this._welcomed = false;
+    }
 
     if (state === 'connected') {
       this.ackedCaps.clear();
@@ -1615,12 +1638,6 @@ export class FreeqClient extends EventEmitter {
    * one send it could belong to.
    */
   private actAnswerChain: Promise<unknown> = Promise.resolve();
-
-  /**
-   * Task events' signatures, one at a time in call order, so each event
-   * reaches the wire (or `actAnswerChain`) in the order `sendAct` was called.
-   */
-  private actSignChain: Promise<unknown> = Promise.resolve();
 
   /**
    * Resolves once this session's key registration has reached the wire.
@@ -2488,6 +2505,8 @@ export class FreeqClient extends EventEmitter {
         this.guestFallbackCount = 0;
         this._nick = serverNick;
         this._registered = true;
+        this._serverName = msg.prefix || null;
+        this._welcomed = true;
         this._hadSession = true;
         this._awaitingWelcome = false;
         this.clearNickResume();
@@ -4131,6 +4150,28 @@ export class FreeqClient extends EventEmitter {
     await this.writeSignedMessage('PRIVMSG', channel, humanText, { ...tags });
   }
 
+  /** Resolves at this connection's welcome (001); rejects if the connection
+   *  ends first. */
+  private welcomeOfThisConnection(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const done = (): void => {
+        this.off('registered', onWelcome);
+        this.off('connectionStateChanged', onState);
+      };
+      const onWelcome = (): void => {
+        done();
+        resolve();
+      };
+      const onState = (state: TransportState): void => {
+        if (state !== 'disconnected') return;
+        done();
+        reject(new Error('the connection ended before the task event was sent'));
+      };
+      this.on('registered', onWelcome);
+      this.on('connectionStateChanged', onState);
+    });
+  }
+
   /**
    * Put a task event on the wire: the signed TAGMSG that *is* the event, then
    * the plain-text companion that renders it for people.
@@ -4149,11 +4190,46 @@ export class FreeqClient extends EventEmitter {
     opts: { humanText?: string; taskId?: string } = {},
   ): Promise<string> {
     const eventId = signing.newEventId();
-    // Signed in call order: a signature takes as long as the platform takes,
-    // and an event signed sooner must not go out ahead of one sent before it.
-    const signing_ = this.actSignChain.then(() => this.signing.signAct(target, actTags, eventId));
-    this.actSignChain = signing_.catch(() => undefined);
-    const signed = await signing_;
+    // A task event sent before the welcome belongs to the connection it was
+    // made on: it waits for that connection's welcome, and fails if the
+    // connection ends first, as the Rust SDK queues it per connection.
+    if (!this._welcomed) {
+      // With no connection at all there is none for it to belong to.
+      if (this._connectionState === 'disconnected') {
+        throw new Error('the connection ended before the task event was sent');
+      }
+      await this.welcomeOfThisConnection();
+    }
+    // The connection it belongs to, checked again at its turn and before its
+    // line is written: it fails as the Rust SDK's does if that connection has
+    // ended. `_welcomed` alone would pass on a later connection's welcome;
+    // each connection steps the epoch.
+    const epoch = this.enrollmentEpoch;
+    const onItsConnection = (): void => {
+      if (!this._welcomed || this.enrollmentEpoch !== epoch) {
+        throw new Error('the connection ended before the task event was sent');
+      }
+    };
+    // Signed in call order, on the chain every signed send takes its turn on:
+    // a signature takes as long as the platform takes, and an event signed
+    // sooner must not go out ahead of one sent before it. A send made before
+    // the welcome waits there until the session key is registered, after
+    // 001, as the Rust SDK queues commands until registration.
+    let signed = null as Awaited<ReturnType<typeof this.signing.signAct>>;
+    await this.enqueueSend(async () => {
+      onItsConnection();
+      // An event naming no task opens one, and names the server it is opened
+      // on as the task's referee: the name this connection was welcomed
+      // under, signed with the rest. A caller's own `act-home` stands.
+      // Read as the signature reads them, under any of their spellings.
+      const fields = new Set(Object.keys(actTags).map((name) => signing.strippedTagName(name)));
+      const opens = !fields.has('act-id');
+      const named = fields.has('act-home');
+      if (opens && !named && this._serverName) {
+        actTags = { ...actTags, '+freeq.at/act-home': `did:web:${this._serverName}` };
+      }
+      signed = await this.signing.signAct(target, actTags, eventId);
+    });
     if (!signed) {
       throw new Error(
         'a task event must be signed: authenticate, register a signing key, ' +
@@ -4191,14 +4267,15 @@ export class FreeqClient extends EventEmitter {
     // own event was taken, and a caller who asked for no line has none to
     // hold back. Both halves go out as they always did.
     if (!humanText || !this.ackedCaps.has('echo-message')) {
+      onItsConnection();
       this.raw(format('TAGMSG', [target], wireTags));
       if (humanText) await this.writeActCompanion(target, humanText, ref);
       return eventId;
     }
 
     const settled = this.actAnswerChain.then(
-      () => this.writeActAwaitingAnswer(target, wireTags, humanText, ref, eventId),
-      () => this.writeActAwaitingAnswer(target, wireTags, humanText, ref, eventId),
+      () => this.writeActAwaitingAnswer(target, wireTags, humanText, ref, eventId, onItsConnection),
+      () => this.writeActAwaitingAnswer(target, wireTags, humanText, ref, eventId, onItsConnection),
     );
     // A refused send must not wedge every act send after it.
     this.actAnswerChain = settled.catch(() => undefined);
@@ -4218,7 +4295,8 @@ export class FreeqClient extends EventEmitter {
    * The server gates the event and not the line, so a line sent beside a
    * refused step is prose about something that never happened — and no card
    * can ever attach to it. Throws the refusal, so the caller of `sendAct`
-   * hears what the server said.
+   * hears what the server said, and throws before writing anything when the
+   * send's connection has ended (`onItsConnection`).
    */
   private async writeActAwaitingAnswer(
     target: string,
@@ -4226,7 +4304,9 @@ export class FreeqClient extends EventEmitter {
     humanText: string,
     ref: string,
     eventId: string,
+    onItsConnection: () => void,
   ): Promise<void> {
+    onItsConnection();
     // Armed before the event goes out: the answer is a line off the same
     // socket, and the listener has to be there when it lands.
     const answer = this.actAnswer(eventId);
