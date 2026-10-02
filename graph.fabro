@@ -1,0 +1,35 @@
+// test-coverage — raise test coverage on freeq's undertested hotspots.
+//
+// select (read-only): run scripts/hotspots.sh + read CLAUDE.md's hotspot list,
+//   pick ONE high-risk, undertested file.
+// implement: write focused tests following existing conventions; self-verify.
+// verify: authoritative CI-mirror gate (goal_gate — a failure opens no PR).
+// pr_body: compose the PR description from what actually changed.
+digraph TestCoverage {
+    graph [goal="Raise automated-test coverage on one of freeq's high-risk, undertested files — adding tests only, with at most minimal, behavior-preserving testability seams in production code."]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    select    [shape=box, label="Select target", prompt="@prompts/select.md", thread_id="cov", fidelity="full", reasoning_effort="medium"]
+    implement [shape=box, label="Write tests",  prompt="@prompts/implement.md", thread_id="cov", fidelity="full", reasoning_effort="high", timeout="2400s"]
+    verify    [shape=parallelogram, label="CI gate", script="bash .fabro/verify.sh", goal_gate=true, retry_target="implement", max_retries=2, timeout="3600s"]
+    pr_body   [shape=tab, label="PR description", prompt="@prompts/pr_body.md", thread_id="cov", fidelity="full"]
+
+    // A failed working stage must not fall through to the next one: with
+    // plain unconditional edges an LLM outage "succeeded" by running the CI
+    // gate on unchanged main. Each such stage advances only on success and
+    // otherwise drops to `abort`, a failing goal gate, so the run ends FAILED
+    // (and says so in #freeq-dev). Fabro 0.254 requires the unconditional
+    // fallback edge, and ignores graph-level on_failure="exit".
+    abort [shape=parallelogram, label="Stage failed", script="echo 'a working stage failed - see fabro events' >&2; exit 1", goal_gate=true, max_retries=0]
+    abort -> exit
+
+    start -> select
+    select -> implement [condition="outcome=succeeded"]
+    select -> abort
+    implement -> verify [condition="outcome=succeeded"]
+    implement -> abort
+    verify -> pr_body -> exit
+}
