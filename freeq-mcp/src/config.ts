@@ -24,13 +24,13 @@ export interface FreeqMcpConfig {
    * Owner DID, recorded in the agent's delegation certificate.
    *
    * When unset the identity is still a real `did:key`, but self-owned: the
-   * certificate names the agent's own DID, and `freeq_whoami` says plainly
-   * that it speaks for no human rather than implying otherwise.
+   * certificate names the agent's own DID as creator, and `freeq_whoami` says
+   * plainly that it speaks for no human rather than implying otherwise.
    */
   ownerDid?: string;
   /**
    * Connect as a nick-only guest (no SASL, no key, nothing attributable).
-   * Off by default; `FREEQ_GUEST=1` opts in.
+   * Off by default; `FREEQ_GUEST=1` opts in. Guests cannot use rooms.
    */
   guest: boolean;
   /** Bearer token for authenticated REST calls (uploads, favorites, budgets). */

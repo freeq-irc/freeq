@@ -731,7 +731,7 @@ describe("FreeqBot constructor option passthrough", () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it("auto-joins channels on connect (forwarded to SDK)", async () => {
+  it("auto-joins channels on connect, after PROVENANCE is answered (not via the SDK autojoin)", async () => {
     const { FreeqBot } = await import("./bot.js");
     const bot = await FreeqBot.create({
       name: "test-bot",
@@ -747,6 +747,12 @@ describe("FreeqBot constructor option passthrough", () => {
     const ws = MockWebSocket.instances[0]!;
     await driveToReady(ws, "test-bot");
     await startPromise;
+
+    // The SDK's pre-'ready' autojoin is off: nothing joined yet. (See
+    // bot.announce-order.test.ts for the ordering guarantees.)
+    expect(ws.sent.some((l) => l.startsWith("JOIN "))).toBe(false);
+    ws.recv(":srv NOTICE test-bot :Provenance verified: ok");
+    await flushAsync();
 
     expect(ws.sent.some((l) => l === "JOIN #mychan")).toBe(true);
     expect(ws.sent.some((l) => l === "JOIN #other")).toBe(true);

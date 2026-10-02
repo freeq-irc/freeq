@@ -896,6 +896,35 @@ pub enum S2sMessage {
     },
 }
 
+impl S2sMessage {
+    /// The channel this event is about, when it is about one. `Privmsg` and
+    /// `Tagmsg` name a target that may be a nick instead, so those only
+    /// count when the target is a channel. Used to keep instant rooms off
+    /// the federation entirely (`connection::helpers::s2s_broadcast`).
+    pub fn channel_name(&self) -> Option<&str> {
+        match self {
+            S2sMessage::Pin { channel, .. }
+            | S2sMessage::Join { channel, .. }
+            | S2sMessage::ChannelCreated { channel, .. }
+            | S2sMessage::Part { channel, .. }
+            | S2sMessage::Topic { channel, .. }
+            | S2sMessage::Mode { channel, .. }
+            | S2sMessage::Kick { channel, .. }
+            | S2sMessage::Ban { channel, .. }
+            | S2sMessage::InviteException { channel, .. }
+            | S2sMessage::PolicySync { channel, .. }
+            | S2sMessage::Invite { channel, .. }
+            | S2sMessage::AvSessionCreated { channel, .. } => Some(channel.as_str()),
+            S2sMessage::Privmsg { target, .. } | S2sMessage::Tagmsg { target, .. }
+                if target.starts_with('#') =>
+            {
+                Some(target.as_str())
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Per-user info in a channel sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncNick {

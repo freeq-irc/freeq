@@ -18,6 +18,7 @@ import {
   deviceKeyHistory,
   format,
   makeDidResolver,
+  MemoryDeviceKeyStore,
   recordKeyOf,
   type DeviceKeyRecord,
   type DeviceKeyStore,
@@ -31,6 +32,20 @@ import { prefetchProfiles } from '@freeq/sdk';
 import { shouldRejoinCall, AV_REJOIN_WINDOW_MS, type PendingCallRejoin } from '../lib/av-mesh';
 import { fetchFavorites, pushFavorites, mergeFavorites, favoritesEqual } from '../lib/favorites-sync';
 import { createDmSendGate, dmThreadKey } from './dm-resolve';
+import { getRooms, setRoomsClientProvider } from '../lib/rooms';
+import { isRoomChannel, clearPendingRoom, loadPendingRoom, savePendingRoom } from '../lib/room-link';
+import { loadOrCreateGuestIdentity, type GuestIdentity } from '../lib/guest-identity';
+import {
+  carryRoomKeys,
+  clearRoomUpgrade,
+  formatLinkMessage,
+  loadRoomUpgrade,
+  parseLinkMessage,
+  saveRoomUpgrade,
+  signRoomLink,
+  verifyRoomLink,
+} from '../lib/room-upgrade';
+import { showToast } from '../components/Toast';
 
 // ── This device's signing key ──────────────────────────────────────────
 //
@@ -568,6 +583,9 @@ async function syncFavorites(c: FreeqClient): Promise<void> {
 // ── Singleton SDK client ──
 
 let client: FreeqClient | null = null;
+// Instant rooms reach the live client through this rather than importing
+// the bridge back (see lib/rooms.ts).
+setRoomsClientProvider(() => client);
 
 /**
  * How long a first DM waits to learn its peer. Long enough for a WHOIS
@@ -705,26 +723,35 @@ export function connect(url: string, desiredNick: string, channels?: string[], f
 
   const store = useStore.getState();
   store.reset();
+  getRooms().reset();
 
   // The key this device signs with, and the lookup that checks what others
   // send. A guest signs nothing and publishes nothing, so neither is set up
   // for one.
-  const deviceKeyStore = saslState.did ? chosenStoreFor(saslState.did) : undefined;
+  // A room guest signs with its did:key itself (and its e2ee bundle too, so
+  // members can bind it to the DID and seal it the room key).
+  const asGuest = roomGuest && saslState.did === roomGuest.did ? roomGuest : null;
+  // Signed in (or a plain guest) now: a reload must not revert to the room guest.
+  if (!asGuest) { try { localStorage.removeItem(ROOM_GUEST_SESSION_KEY); } catch { /* ignore */ } }
+  const deviceKeyStore: DeviceKeyStore | undefined = asGuest
+    ? new MemoryDeviceKeyStore({ keyPair: asGuest.pair, createdAt: new Date().toISOString() })
+    : saslState.did ? chosenStoreFor(saslState.did) : undefined;
   // Every lookup, a guest's too, keeps what it found across page loads. The
   // last connect's lookup writes what it holds and stops before this one
   // reads the shared snapshot, so neither overwrites the other.
   const keyLookup = newKeyLookup(connectKeyLookup?.flush());
   connectKeyLookup = keyLookup;
-  if (saslState.did) accountKeyLookup = { did: saslState.did, lookup: keyLookup };
+  if (saslState.did && !asGuest) accountKeyLookup = { did: saslState.did, lookup: keyLookup };
 
   client = new FreeqClient({
     url,
     nick: desiredNick,
     channels,
-    brokerUrl: localStorage.getItem('freeq-broker-base') || undefined,
-    brokerToken: localStorage.getItem('freeq-broker-token') || undefined,
+    brokerUrl: asGuest ? undefined : localStorage.getItem('freeq-broker-base') || undefined,
+    brokerToken: asGuest ? undefined : localStorage.getItem('freeq-broker-token') || undefined,
     skipInitialBrokerRefresh: !!saslState.skipBrokerRefresh,
     ...(deviceKeyStore ? { deviceKeyStore, deviceLabel: browserLabel() } : {}),
+    ...(asGuest ? { identitySigningKey: asGuest.pair } : {}),
     freshSignIn,
     keyLookup,
   });
@@ -737,6 +764,7 @@ export function connect(url: string, desiredNick: string, channels?: string[], f
       did: saslState.did,
       pdsUrl: saslState.pdsUrl,
       method: saslState.method,
+      ...(asGuest ? { signer: asGuest.key.signer } : {}),
     });
   }
 
@@ -774,6 +802,7 @@ export function connect(url: string, desiredNick: string, channels?: string[], f
 export function disconnect() {
   client?.disconnect();
   client = null;
+  roomGuest = null;
   dmSendGate = null;
   saslState = { token: '', did: '', pdsUrl: '', method: '', skipBrokerRefresh: false };
   hadSignedInSession = false;
@@ -811,6 +840,88 @@ export function reconnect() {
 
 // SASL state (set before connect)
 let saslState = { token: '', did: '', pdsUrl: '', method: '', skipBrokerRefresh: false };
+
+// ── Room guests ────────────────────────────────────────────────────────
+//
+// Someone who opened a room link without an account joins as a did:key this
+// browser mints for itself (lib/guest-identity.ts), and can later sign in and
+// carry on as themselves (lib/room-upgrade.ts).
+
+/** The did:key this connection is a room guest as, or null. */
+let roomGuest: GuestIdentity | null = null;
+
+/** Remembers that this tab was a room guest, so a reload reconnects as the
+ *  same guest instead of dropping them at the connect screen. */
+export const ROOM_GUEST_SESSION_KEY = 'freeq-room-guest-session';
+
+/** Join through a room link with no account: this browser's own did:key.
+ *  `channels` rejoins rooms the guest is already a member of (a reload);
+ *  a first visit's room is joined by App from the parked invite. */
+export async function connectAsRoomGuest(url: string, desiredNick: string, channels: string[] = []): Promise<void> {
+  const guest = await loadOrCreateGuestIdentity();
+  roomGuest = guest;
+  saslState = { token: '', did: guest.did, pdsUrl: '', method: 'crypto', skipBrokerRefresh: true };
+  try { localStorage.setItem(ROOM_GUEST_SESSION_KEY, JSON.stringify({ nick: desiredNick, url })); } catch { /* quota */ }
+  connect(url, desiredNick, channels);
+}
+
+/** The remembered room-guest session, if this tab was one. */
+export function savedRoomGuestSession(): { nick: string; url: string } | null {
+  try {
+    const raw = localStorage.getItem(ROOM_GUEST_SESSION_KEY);
+    if (!raw) return null;
+    const v = JSON.parse(raw) as { nick?: unknown; url?: unknown };
+    return typeof v.nick === 'string' && typeof v.url === 'string' ? { nick: v.nick, url: v.url } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** True while connected as a room guest rather than a signed-in account. */
+export function isRoomGuest(): boolean {
+  return !!roomGuest && saslState.did === roomGuest.did;
+}
+
+/**
+ * Leave as the guest to sign in, keeping this room. The upgrade record and the
+ * re-parked invite survive the sign-in redirect; once the account is in the
+ * room, `channelJoined` carries the room key over and posts the link.
+ */
+export function beginRoomUpgrade(channel: string): void {
+  if (!roomGuest || !client) return;
+  const token = useStore.getState().rooms.get(channel.toLowerCase())?.inviteToken ?? loadPendingRoom()?.token ?? null;
+  saveRoomUpgrade({ guestDid: roomGuest.did, guestNick: client.nick, channel: channel.toLowerCase(), token });
+  savePendingRoom({ channel: channel.toLowerCase(), token });
+  disconnect();
+}
+
+/** After an upgrade: the account is in the room and holds its key, so post
+ *  the link signed by the guest key. Once per upgrade. */
+async function postRoomLink(channel: string): Promise<void> {
+  const up = loadRoomUpgrade();
+  const did = saslState.did;
+  if (!up || up.channel !== channel.toLowerCase() || !did || did === up.guestDid) return;
+  const ok = await getRooms().loadRoomKeys(channel);
+  if (!ok) return; // no key yet: nothing could be sent; the record keeps for a retry
+  const guest = await loadOrCreateGuestIdentity();
+  if (guest.did !== up.guestDid) { clearRoomUpgrade(); return; }
+  const sig = await signRoomLink(guest.key.signer, guest.did, did, channel);
+  clearRoomUpgrade();
+  client?.sendMessage(channel, formatLinkMessage(up.guestNick, guest.did, sig));
+}
+
+/** A link message in a room: check it and say plainly what it proves. */
+async function noteRoomLink(channel: string, text: string, senderDid: string | undefined, senderNick: string): Promise<void> {
+  const parsed = parseLinkMessage(text);
+  if (!parsed || !senderDid || !isRoomChannel(channel)) return;
+  const linked = await verifyRoomLink(text, senderDid, channel);
+  useStore.getState().addSystemMessage(
+    channel,
+    linked
+      ? `✓ Verified: ${senderNick} is the guest ${parsed.guestDid.slice(0, 20)}… who was here before — the guest's own key signed that it became ${senderDid}.`
+      : `⚠ ${senderNick} posted an identity link that does not verify. Treat it as an unproven claim.`,
+  );
+}
 
 /** Whether this page has registered as the signed-in account, so a later
  *  connection that loses the account is a reconnect refused its token. */
@@ -1400,6 +1511,23 @@ function wireEvents(c: FreeqClient) {
     }
     saveJoinedChannels();
 
+    // An instant room (or any +E channel with group keys): fetch the key
+    // sealed to us and install the cipher. The invite that brought us here
+    // has done its job; the token stays in the store for "Copy invite link".
+    const pending = loadPendingRoom();
+    if (pending && pending.channel === channel.toLowerCase()) {
+      clearPendingRoom();
+      if (pending.token) s().setRoomState(channel, { isRoom: true, inviteToken: pending.token });
+    }
+    // Back in a room after signing in from it as a guest: what the guest
+    // could read, the account can read at once.
+    const upgrade = loadRoomUpgrade();
+    const upgrading = !!upgrade && upgrade.channel === channel.toLowerCase()
+      && !!saslState.did && saslState.did !== upgrade.guestDid;
+    if (upgrading) carryRoomKeys(upgrade!.guestDid, saslState.did, upgrade!.channel);
+    getRooms().onChannelJoined(channel, s().channels.get(channel.toLowerCase())?.isEncrypted ?? false);
+    if (upgrading) postRoomLink(channel).catch(() => undefined);
+
     // If a blip dropped us mid-call in this channel, rejoin the same AV
     // session with the same instance — the server held the slot in its grace
     // window, so this re-enters in place and instance-keyed peers see media
@@ -1420,12 +1548,15 @@ function wireEvents(c: FreeqClient) {
   });
 
   c.on('channelLeft', (channel) => {
+    getRooms().onChannelLeft(channel);
     s().removeChannel(channel);
     saveJoinedChannels();
   });
 
   c.on('memberJoined', (channel, member) => {
     if (channel) s().addMember(channel, member);
+    // Steward duty: a newcomer to a room we can read gets the key from us.
+    if (channel) getRooms().onMemberJoined(channel, member.nick);
     // A WHOIS answer arrives as a channel-less "join": it is how we learn the
     // actor class of somebody who was already in the room when we got here
     // (NAMES never carries it). Dropping these is what left agents rendered
@@ -1460,6 +1591,27 @@ function wireEvents(c: FreeqClient) {
 
   c.on('modeChanged', (channel, mode, arg, setBy) => {
     s().handleMode(channel, mode, arg, setBy);
+    getRooms().onModeChanged(channel, mode);
+  });
+
+  // A refused JOIN (473 invite-only / 475 bad key / 477 identity or policy):
+  // show the reason where the user is looking — in the buffer `joinChannel`
+  // opened — and take that buffer off the sidebar, since nothing was joined.
+  c.on('joinRejected', (channel, numeric, reason) => {
+    if (c !== client || !channel) return;
+    const room = isRoomChannel(channel);
+    const text = room
+      ? numeric === '477'
+        ? `Cannot join ${channel}: rooms are end-to-end encrypted and need an identity — sign in with AT Protocol to join.`
+        : numeric === '473'
+          ? `Cannot join ${channel}: an invite link is required (this one may have expired or been revoked).`
+          : `Cannot join ${channel}: ${reason} (${numeric})`
+      : `Cannot join ${channel}: ${reason} (${numeric})`;
+    s().markJoinRejected(channel, text);
+    showToast(text, 'error', 6000);
+    // Keep the invite parked only when signing in would make it work.
+    const pending = loadPendingRoom();
+    if (pending && pending.channel === channel.toLowerCase() && numeric !== '477') clearPendingRoom();
   });
 
   c.on('membersList', (channel, members) => {
@@ -1532,6 +1684,9 @@ function wireEvents(c: FreeqClient) {
       s().addChannel(channel);
     }
     s().addMessage(channel, message as import('../store').Message);
+    if (message.text.includes('[freeq-link:v1 ')) {
+      noteRoomLink(channel, message.text, message.tags?.account, message.from).catch(() => undefined);
+    }
 
     // Mention/DM notification
     const isMention = !message.isSelf && message.text.toLowerCase().includes(c.nick.toLowerCase());
@@ -1799,6 +1954,8 @@ function wireEvents(c: FreeqClient) {
   });
 
   c.on('joinGateRequired', (channel) => {
+    // A room's 477 means "identity required", not a policy gate.
+    if (isRoomChannel(channel)) return;
     if (useStore.getState().authDid) {
       s().setJoinGateChannel(channel);
     }
@@ -1806,6 +1963,7 @@ function wireEvents(c: FreeqClient) {
 
   c.on('userKicked', (channel, kicked, _by, _reason) => {
     s().removeMember(channel, kicked);
+    if (kicked.toLowerCase() === c.nick.toLowerCase()) getRooms().onChannelLeft(channel);
   });
 
   c.on('error', (message) => {

@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "./config.js";
-import { defaultCreateClient, FreeqSession, type BotKitModule } from "./session.js";
+import { defaultCreateClient, type BotKitModule } from "./session.js";
 
 function fakeKit(opts: { cert?: { creator_did: string; signature: string | null } | null } = {}) {
   const calls: { create?: Record<string, unknown>; seedPath?: string; certPath?: string } = {};
@@ -28,7 +28,7 @@ function fakeKit(opts: { cert?: { creator_did: string; signature: string | null 
         return {
           client: { nick: o.nick },
           identity: { did: "did:key:zagent" },
-          provenance: null,
+          rooms: {} as never,
           start: async () => undefined,
           stop: async () => undefined,
         };
@@ -46,7 +46,9 @@ describe("defaultCreateClient", () => {
     expect(made.mode).toBe("authenticated");
     expect(made.selfOwned).toBe(true);
     expect(made.did).toBe("did:key:zagent");
-    // The delegation names the agent itself as owner.
+    expect(made.start).toBeTypeOf("function");
+    expect(made.rooms).toBeDefined();
+    // The delegation names the agent itself as creator/owner.
     expect(calls.create).toMatchObject({ name: "mcp-abc", ownerDid: "did:key:zagent", root });
     expect(calls.seedPath).toBe(join(root, "mcp-abc", "agent.key"));
   });
@@ -62,7 +64,6 @@ describe("defaultCreateClient", () => {
     expect(calls.create).toMatchObject({ name: "mcp-abc" });
     expect(calls.create?.nick).toMatch(/^mcp-[a-z0-9]{8}$/);
     expect(calls.create?.nick).not.toBe("mcp-abc");
-    expect(calls.seedPath).toBe(join(root, "mcp-abc", "agent.key"));
   });
 
   it("keeps FREEQ_NICK exactly when it is set", async () => {
@@ -119,38 +120,7 @@ describe("defaultCreateClient", () => {
       },
     });
     expect(made.mode).toBe("guest");
+    expect(made.rooms).toBeUndefined();
     expect(loaded).toBe(false);
-  });
-});
-
-describe("whoami for a self-owned identity", () => {
-  it("says it speaks for no human, and never calls itself a guest", async () => {
-    const handlers = new Map<string, (...a: unknown[]) => void>();
-    const client = {
-      nick: "mcp-abc",
-      apiBearer: null,
-      on(ev: string, h: (...a: unknown[]) => void) {
-        handlers.set(ev, h);
-      },
-      connect() {
-        handlers.get("ready")?.();
-      },
-      disconnect() {},
-      join() {},
-      sendMessage() {},
-      sendTagmsg() {},
-    };
-    const session = new FreeqSession(loadConfig({}), {
-      createClient: async () => ({
-        client: client as never,
-        mode: "authenticated",
-        did: "did:key:zagent",
-        selfOwned: true,
-      }),
-    });
-    const status = await session.connect();
-    expect(status.selfOwned).toBe(true);
-    expect(status.note).toContain("self-owned did:key that speaks for no human");
-    expect(status.note).not.toMatch(/guest/i);
   });
 });

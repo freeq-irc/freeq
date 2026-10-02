@@ -113,6 +113,25 @@ export interface ActEventInput {
   fields: Record<string, string>;
 }
 
+/** Per-room UI state; see `lib/rooms.ts` for the key handling behind it. */
+export interface RoomState {
+  channel: string;
+  /** Confirmed a room (`#r-…` name or the rooms endpoint answered). */
+  isRoom: boolean;
+  /** We hold at least one epoch and the cipher is installed. */
+  hasKey: boolean;
+  /** Highest epoch we hold. */
+  heldEpoch: number | null;
+  /** The server's latest epoch (null until the first epoch exists). */
+  latestEpoch: number | null;
+  founderDid: string | null;
+  /** The invite token we joined with, or one we minted. Memory only. */
+  inviteToken: string | null;
+  expiresAt: number | null;
+  /** Polling for a member to seal the key to us. */
+  waiting: boolean;
+}
+
 export interface Channel {
   name: string;
   topic: string;
@@ -413,6 +432,9 @@ export interface Store {
   historyOpeningPage: (channel: string, received: number, limit: number) => void;
   addSystemMessage: (channel: string, text: string) => void;
   editMessage: (channel: string, originalMsgId: string, newText: string, newMsgId?: string, isStreaming?: boolean, editorNick?: string, editorAccount?: string, editTags?: Record<string, string>) => void;
+  /** Replace a message's ciphertext with its plaintext once the key arrives.
+   *  Not an edit: nothing is marked edited and nothing else changes. */
+  revealMessage: (channel: string, msgId: string, plaintext: string) => void;
   deleteMessage: (channel: string, msgId: string, deleterNick?: string, deleterAccount?: string) => void;
   addReaction: (channel: string, msgId: string, emoji: string, fromNick: string) => void;
   removeReaction: (channel: string, msgId: string, emoji: string, fromNick: string) => void;
@@ -483,6 +505,16 @@ export interface Store {
   // Join gate
   joinGateChannel: string | null;
   setJoinGateChannel: (channel: string | null) => void;
+
+  // Instant rooms (docs/INSTANT-ROOMS.md): what the UI needs to know about a
+  // `+E` room — whether we hold its key, who founded it, and the invite
+  // token we arrived with (kept in memory only, for "Copy invite link").
+  rooms: Map<string, RoomState>;
+  setRoomState: (channel: string, patch: Partial<RoomState>) => void;
+  clearRoomState: (channel: string) => void;
+  /** A JOIN the server refused (473/475/477): keep the buffer so the reason
+   *  is readable, but it is not a joined channel and leaves the sidebar. */
+  markJoinRejected: (channel: string, text: string) => void;
 
   // Channel settings
   channelSettingsOpen: string | null;
@@ -768,6 +800,7 @@ export const useStore = create<Store>((set, get) => ({
   sidebarRevealChannel: null,
   joinGateChannel: null,
   channelSettingsOpen: null,
+  rooms: new Map(),
 
   // Connection
   // A dropped connection ends every question that was out on it, so nothing
@@ -789,6 +822,7 @@ export const useStore = create<Store>((set, get) => ({
     registered: false,
     connectedServer: null,
     channels: new Map(),
+    rooms: new Map(),
     activeChannel: 'server',
     serverMessages: [],
     batches: new Map(),
@@ -821,6 +855,7 @@ export const useStore = create<Store>((set, get) => ({
     threadChannel: null,
     joinGateChannel: null,
     channelSettingsOpen: null,
+    rooms: new Map(),
     avSessions: new Map(),
     activeAvSession: null,
     theme: s.theme, messageDensity: s.messageDensity, loadExternalMedia: s.loadExternalMedia, favorites: s.favorites, mutedChannels: s.mutedChannels, blockedDids: s.blockedDids, blockedNicks: s.blockedNicks, bookmarks: s.bookmarks, bookmarksPanelOpen: false, // preserve across reconnects
@@ -1491,6 +1526,18 @@ export const useStore = create<Store>((set, get) => ({
   // `_newMsgId` — the revision's own wire id — is deliberately unused: the
   // message keeps the id it was born with. Still accepted because the wire
   // and the SDK event carry it; droppable once no caller passes it.
+  revealMessage: (channel, msgId, plaintext) => set((s) => {
+    const key = channel.toLowerCase();
+    const ch = s.channels.get(key);
+    if (!ch) return s;
+    const i = ch.messages.findIndex((m) => m.id === msgId);
+    if (i < 0) return s;
+    const messages = ch.messages.slice();
+    messages[i] = { ...messages[i], text: plaintext, encrypted: true };
+    const channels = new Map(s.channels);
+    channels.set(key, { ...ch, messages });
+    return { channels };
+  }),
   editMessage: (channel, originalMsgId, newText, _newMsgId, isStreaming, editorNick, editorAccount, editTags) => set((s) => {
     // Authorship gate: only the original sender may edit. The server
     // enforces this when the thread is persisted; for unpersisted (guest)
@@ -1945,5 +1992,64 @@ export const useStore = create<Store>((set, get) => ({
   setSidebarRevealChannel: (name) => set({ sidebarRevealChannel: name }),
 
   setJoinGateChannel: (channel) => set({ joinGateChannel: channel }),
+
+  setRoomState: (channel, patch) => set((s) => {
+    const key = channel.toLowerCase();
+    const rooms = new Map(s.rooms);
+    const prev = rooms.get(key) ?? {
+      channel: key,
+      isRoom: false,
+      hasKey: false,
+      heldEpoch: null,
+      latestEpoch: null,
+      founderDid: null,
+      inviteToken: null,
+      expiresAt: null,
+      waiting: false,
+    };
+    const next = { ...prev, ...patch, channel: key };
+    rooms.set(key, next);
+    // A room is +E from birth; the mode may not have reached us yet, but the
+    // lock badge and the encrypted composer must not wait for it.
+    const ch = s.channels.get(key);
+    if (next.isRoom && ch && !ch.isEncrypted) {
+      const channels = new Map(s.channels);
+      channels.set(key, { ...ch, isEncrypted: true, modes: new Set([...ch.modes, 'E']) });
+      return { rooms, channels };
+    }
+    return { rooms };
+  }),
+
+  clearRoomState: (channel) => set((s) => {
+    const rooms = new Map(s.rooms);
+    rooms.delete(channel.toLowerCase());
+    return { rooms };
+  }),
+
+  markJoinRejected: (channel, text) => {
+    const key = channel.toLowerCase();
+    set((s) => {
+      const channels = new Map(s.channels);
+      const ch = getOrCreateChannel(channels, channel);
+      // The SDK already filed its own generic "Cannot join …" line for
+      // 473/475 into this buffer; say it once, with the more specific text.
+      const last = ch.messages[ch.messages.length - 1];
+      const dup = !!last?.isSystem && /^Cannot join/i.test(last.text);
+      const line = {
+        id: dup ? last.id : crypto.randomUUID(),
+        from: '',
+        text,
+        timestamp: dup ? last.timestamp : new Date(),
+        tags: {},
+        isSystem: true,
+      };
+      channels.set(key, {
+        ...ch,
+        isJoined: false,
+        messages: dup ? [...ch.messages.slice(0, -1), line] : [...ch.messages, line],
+      });
+      return { channels };
+    });
+  },
   setChannelSettingsOpen: (channel) => set({ channelSettingsOpen: channel }),
 }));

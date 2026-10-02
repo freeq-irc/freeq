@@ -60,6 +60,13 @@ export default defineConfig({
         target: FREEQ_WEB,
         changeOrigin: REMOTE_TARGET,
       },
+      // Instant-room share links: the server's `/r/<name>` landing page
+      // forwards a browser to `/?room=<name>` (fragment preserved), which
+      // the SPA handles itself.
+      '^/r(/|$)': {
+        target: FREEQ_WEB,
+        changeOrigin: REMOTE_TARGET,
+      },
     },
   },
 })

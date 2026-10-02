@@ -87,6 +87,9 @@ describe("an owner-configured session", () => {
     ws.recv(":irc.test 001 mcp-test :Welcome");
     await flush();
     ws.recv(":irc.test 376 mcp-test :End of MOTD");
+    // A real server issues the REST bearer after login; the session waits
+    // (bounded) for it to publish the room pre-key before connect resolves.
+    ws.recv(":irc.test NOTICE mcp-test :API-BEARER test-bearer");
     await connecting;
     await flush();
 
