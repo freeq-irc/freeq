@@ -4402,6 +4402,19 @@ fn judge_relayed_task_event(
         return (TaskEventAction::Drop, None);
     }
 
+    // One act field under two spellings has no single document: the
+    // canonical keeps whichever is read last.
+    if let Some(field) =
+        freeq_sdk::act::repeated_field(tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+    {
+        tracing::warn!(
+            peer = %peer, event_id = %event_id, %field,
+            "Refused a relayed task event carrying one field under two spellings — \
+             not filed, not delivered"
+        );
+        return (TaskEventAction::Drop, None);
+    }
+
     let dm_recipient = (!(target.starts_with('#') || target.starts_with('&')))
         .then(|| crate::connection::routing::recipient_did_for_target(state, target))
         .flatten();
@@ -18822,6 +18835,35 @@ mod relayed_task_verdict_tests {
         assert_eq!(
             filed.payload_json, r#"{"description":"ship it"}"#,
             "the payload is decoded on the way in, as it is locally"
+        );
+    }
+
+    /// A relayed task event carrying one act field under two spellings has
+    /// no single document (the canonical keeps whichever is read last), so
+    /// it is neither filed nor shown.
+    #[tokio::test]
+    async fn a_relayed_event_with_a_field_under_two_spellings_is_not_filed() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let mut rx = capable_member(&state, "#twospell");
+        let key = key_on_file(&state, SIGNER);
+        let act_id = "01TWOSPELLINGS000000000000";
+        // Signed with the title under one spelling; the same title again
+        // under another reads as the same document whichever is kept, so the
+        // signature checks and only the two spellings refuse it.
+        let mut tags = signed_offer_tags("#twospell", act_id, &key);
+        tags.insert("act-title".to_string(), "verdict wiring".to_string());
+        relay(&state, &mgr, "#twospell", act_id, tags).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "not shown"
+        );
+        assert!(
+            !state.with_db(|db| db.is_act_event(act_id)).unwrap(),
+            "not filed"
         );
     }
 }

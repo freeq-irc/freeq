@@ -783,6 +783,24 @@ pub(super) fn gate(
         );
         return Gate::Refused;
     }
+    // The document keeps one value per field, so a field sent under two of
+    // its prefixes has no single document to check or file.
+    if let Some(field) =
+        freeq_sdk::act::repeated_field(tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+    {
+        tracing::debug!(
+            session = %conn.id, target = %target, field = %field,
+            "Refused a task message that carries a task tag twice"
+        );
+        refuse(
+            conn,
+            "TAGMSG",
+            "REPEATED_TAG",
+            "A task message must carry each task tag only once",
+            state,
+        );
+        return Gate::Refused;
+    }
 
     // ── Who sent it ──
     //
@@ -1071,6 +1089,29 @@ pub(super) fn gate(
                 "Refused a task message that cannot open a task"
             );
             refuse(conn, "TAGMSG", code, sentence, state);
+            return Gate::Refused;
+        }
+        // The server an opener names as its home referees the task, and
+        // this server referees only what is posted here. Refused at the door,
+        // so a task's named home is fixed when it is created. An opener that
+        // names none is accepted as it always was.
+        // Read as the signature reads it, under any of its spellings.
+        let home = freeq_sdk::act::parse_event(tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .and_then(|event| event.fields.get("act-home").cloned());
+        if let Some(home) = home
+            && home != crate::server::server_did(&state.server_name)
+        {
+            tracing::debug!(
+                session = %conn.id, did = %did, kind = %kind, home = %home,
+                "Refused an opener naming another server as its home"
+            );
+            refuse(
+                conn,
+                "TAGMSG",
+                "WRONG_HOME",
+                "A task opened here must name this server as its home",
+                state,
+            );
             return Gate::Refused;
         }
     } else if !freeq_sdk::act_transitions::knows_verb(kind, verb) {

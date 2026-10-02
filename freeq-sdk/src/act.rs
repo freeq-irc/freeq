@@ -157,6 +157,22 @@ fn stripped_name(tag_name: &str) -> &str {
         .unwrap_or(tag_name)
 }
 
+/// An act field a line carries under more than one spelling (`+freeq.at/x`,
+/// `freeq.at/x`, `x`): the canonical keeps only one of them, and which one
+/// depends on the order the tags are read in, so such a line has no single
+/// document. `None` when every act field is spelled once.
+pub fn repeated_field<'a, I>(tags: I) -> Option<String>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let mut seen = std::collections::BTreeSet::new();
+    tags.into_iter()
+        .filter(|(name, _)| is_act_tag(name))
+        .map(|(name, _)| stripped_name(name))
+        .find(|field| !seen.insert(*field))
+        .map(str::to_string)
+}
+
 /// Whether a (possibly prefixed) tag name is covered by the act canonical.
 fn is_act_tag(tag_name: &str) -> bool {
     let name = stripped_name(tag_name);
@@ -454,6 +470,26 @@ mod tests {
 
     fn test_key(byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[byte; 32])
+    }
+
+    /// A field under two of its three spellings is named; spelled once
+    /// each, nothing is.
+    #[test]
+    fn a_field_under_two_spellings_is_found() {
+        let once = [
+            ("+freeq.at/act", "handoff"),
+            ("act-home", "did:web:a"),
+            ("+freeq.at/from", "x"),
+        ];
+        assert_eq!(repeated_field(once), None);
+        for other in ["+freeq.at/act-home", "freeq.at/act-home"] {
+            let twice = [("act-home", "did:web:a"), (other, "did:web:b")];
+            assert_eq!(
+                repeated_field(twice).as_deref(),
+                Some("act-home"),
+                "{other}"
+            );
+        }
     }
 
     /// The venue and the signer-minted event id of the directed-offer vector.
