@@ -21,19 +21,27 @@
 //   FABRO_TOKEN_FILE  default ~/.fabro/storage/server.dev-token
 //   FABRO_BIN         default ~/.fabro/bin/fabro
 //   FABRO_REPO_DIR    default ~/freeq — checkout used to launch goal runs
+//   FABRO_TRUST_FILE  default ~/.config/freeq-fabro.trust.json — who else may
+//                     command the bot, and how far (see trust.ts)
 //
-// It is also two-way: the owner can drive Fabro from freeq — in the channel
-// by addressing the bot ("fabro status", "fabro approve x7k2qa") or by DM.
-// Commands are accepted ONLY when the message's server-attached account tag
+// It is also two-way: people can drive Fabro from freeq — in the channel by
+// addressing the bot ("fabro status", "fabro approve x7k2qa") or by DM.
+// Who may do what is decided by tier (trust.ts): the owner is `control`,
+// others come from the trust file, and anyone unlisted is ignored. A
+// sender's DID is taken ONLY from the message's server-attached account tag
 // (IRCv3 account-tag: set by the server for SASL-authed senders, not
-// forgeable by clients) is FREEQ_OWNER_DID. Strict mode — no nick cache or
-// WHOIS fallback, which could trust a nick that just changed hands. Anyone
-// else is ignored in the channel and told so, at most hourly, in DMs.
+// forgeable by clients) — strict mode, no nick cache or WHOIS fallback,
+// which could trust a nick that just changed hands.
+//
+// Privacy: #freeq-dev is readable by anyone who accepts its rules, so the
+// channel only hears that things happened. Failure reasons and gate
+// questions go to the owner by DM, and channel replies never include them.
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { FreeqBot } from "@freeq/bot-kit";
 import { addressed, describeQuestion, execute, parseCommand } from "./commands.js";
+import { allows, loadTrust, requiredTier, tierFor } from "./trust.js";
 import { FabroApi } from "./fabro-api.js";
 import { launchWithGoal, listWorkflows } from "./launch.js";
 import { findRunPr } from "./pr.js";
@@ -60,6 +68,7 @@ const fabroUrl = env("FABRO_URL", "http://127.0.0.1:32276");
 const tokenFile = env("FABRO_TOKEN_FILE", join(homedir(), ".fabro/storage/server.dev-token"));
 const fabroBin = env("FABRO_BIN", join(homedir(), ".fabro/bin/fabro"));
 const repoDir = env("FABRO_REPO_DIR", join(homedir(), "freeq"));
+const trustFile = env("FABRO_TRUST_FILE", join(homedir(), ".config/freeq-fabro.trust.json"));
 
 const log = (msg: string): void => console.log(`${new Date().toISOString()} ${msg}`);
 
@@ -109,7 +118,9 @@ bot.on("message", (target, msg) => {
   if (msg.isSelf || msg.isSystem || msg.editOf) return;
   const isChannel = target.startsWith("#") || target.startsWith("&");
   if (isChannel && target.toLowerCase() !== channel.toLowerCase()) return;
-  const body = isChannel ? addressed(msg.text, bot.client.nick || nick) : msg.text.trim();
+  // In the channel the bot must be addressed; in a DM the prefix is optional.
+  const named = addressed(msg.text, bot.client.nick || nick);
+  const body = isChannel ? named : (named ?? msg.text.trim());
   if (body === null) return;
   const replyTo = isChannel ? target : msg.from;
   const reply = (lines: string[]): void => {
@@ -121,28 +132,46 @@ bot.on("message", (target, msg) => {
       { from: msg.from, tags: msg.tags },
       { cache: false, whois: false },
     );
-    if (senderDid !== ownerDid) {
+    let tier;
+    try {
+      tier = tierFor(senderDid, ownerDid, await loadTrust(trustFile));
+    } catch (err) {
+      // A broken trust file fails closed for everyone but the owner.
+      log(`trust file unreadable (${String(err)}) — owner only`);
+      tier = tierFor(senderDid, ownerDid, {});
+    }
+    if (!tier) {
       log(`ignored command from ${msg.from} (${senderDid ?? "unverified"})`);
       const last = refusedAt.get(msg.from) ?? 0;
       if (!isChannel && Date.now() - last > 3_600_000) {
         refusedAt.set(msg.from, Date.now());
-        reply(["I only take commands from my owner."]);
+        reply(["I only take commands from people my owner has authorized."]);
       }
       return;
     }
     const cmd = parseCommand(body);
-    log(`owner command: ${cmd.kind} ${JSON.stringify(cmd)}`);
+    const needed = requiredTier(cmd);
+    if (!allows(tier, needed)) {
+      log(`refused ${cmd.kind} from ${msg.from} (${senderDid}): has ${tier}, needs ${needed}`);
+      reply([`that needs ${needed} access; you have ${tier}`]);
+      return;
+    }
+    log(`command from ${msg.from} (${tier}): ${JSON.stringify(cmd)}`);
     try {
       reply(
-        await execute(cmd, {
-          api,
-          launchWithGoal: (wf, goal) => launchWithGoal(wf, goal, { repoDir, fabroBin }),
-          workflows: () => listWorkflows(repoDir),
-        }),
+        await execute(
+          cmd,
+          {
+            api,
+            launchWithGoal: (wf, goal) => launchWithGoal(wf, goal, { repoDir, fabroBin }),
+            workflows: () => listWorkflows(repoDir),
+          },
+          { private: !isChannel },
+        ),
       );
     } catch (err) {
       log(`command failed: ${String(err)}`);
-      reply([`that failed: ${String((err as Error).message ?? err).slice(0, 300)}`]);
+      reply([`that failed${isChannel ? " — details logged" : `: ${String((err as Error).message ?? err).slice(0, 300)}`}`]);
     }
   })();
 });
@@ -164,6 +193,16 @@ const relay = createRelay({
       log(`posted: ${line}`);
     } catch (err) {
       log(`post failed (${String(err)}): ${line}`);
+    }
+  },
+  // Owner DMs are addressed by DID; the server routes them to whichever
+  // session the owner is signed in on.
+  postOwner: (line) => {
+    try {
+      bot.client.sendMessage(ownerDid, line);
+      log(`sent owner: ${line}`);
+    } catch (err) {
+      log(`owner DM failed (${String(err)}): ${line}`);
     }
   },
   findPr: (runId) => findRunPr(runId, { repo, token: process.env.GITHUB_TOKEN }),

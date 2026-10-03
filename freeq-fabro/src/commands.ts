@@ -15,13 +15,14 @@ export type Command =
   | { kind: "unknown"; text: string };
 
 export const HELP = [
-  "fabro commands (owner only):",
+  "fabro commands (address me in the channel, or DM me without the prefix):",
   "  status — active runs, and anything waiting on you",
   "  run <workflow> — start test-coverage / bug-hunt / dep-audit from main",
   "  run <workflow> <goal…> — start any workflow with a goal (e.g. run feature harden uploads)",
   "  approve [id] | deny [id] — answer a waiting gate (id optional if only one is waiting)",
   "  answer <id> <option or text> — for multiple-choice / freeform gates",
   "  cancel <id>",
+  "access is per person: observe → status; request → run; handoff → run with a goal; control → approve/deny/answer/cancel",
 ];
 
 /** If `text` addresses the bot in a channel (`fabro …`, `fabro: …`,
@@ -69,6 +70,12 @@ export function parseCommand(input: string): Command {
     default:
       return { kind: "unknown", text };
   }
+}
+
+/** Where a reply will be read. Channel replies never carry gate questions
+ *  (they can summarize a plan); a DM can. */
+export interface ReplyContext {
+  private: boolean;
 }
 
 export interface CommandDeps {
@@ -137,7 +144,11 @@ async function pickPending(deps: CommandDeps, handle: string | undefined): Promi
   return `${pending.length} gates are waiting — say which: ${pending.map((p) => shortId(p.run.id)).join(", ")}`;
 }
 
-export async function execute(cmd: Command, deps: CommandDeps): Promise<string[]> {
+export async function execute(
+  cmd: Command,
+  deps: CommandDeps,
+  ctx: ReplyContext = { private: true },
+): Promise<string[]> {
   switch (cmd.kind) {
     case "help":
       return HELP;
@@ -152,7 +163,8 @@ export async function execute(cmd: Command, deps: CommandDeps): Promise<string[]
       const pending = await pendingQuestions(deps, active);
       return active.map((r) => {
         const q = pending.find((p) => p.run.id === r.id);
-        return `${shortId(r.id)} ${r.workflow} ${r.status}${q ? ` — waiting: ${describeQuestion(q.question)}` : ""}`;
+        const wait = !q ? "" : ctx.private ? ` — waiting: ${describeQuestion(q.question)}` : " — waiting on the owner";
+        return `${shortId(r.id)} ${r.workflow} ${r.status}${wait}`;
       });
     }
 
@@ -179,7 +191,9 @@ export async function execute(cmd: Command, deps: CommandDeps): Promise<string[]
       if (typeof p === "string") return [p];
       const q = p.question;
       if (q.question_type !== "yes_no" && q.question_type !== "confirmation") {
-        return [`[${shortId(p.run.id)}] asks ${describeQuestion(q)} — reply: fabro answer ${shortId(p.run.id)} <choice>`];
+        return ctx.private
+          ? [`[${shortId(p.run.id)}] asks ${describeQuestion(q)} — reply: answer ${shortId(p.run.id)} <choice>`]
+          : [`[${shortId(p.run.id)}] needs a choice, not yes/no — DM me "status" to see it`];
       }
       await deps.api.answer(p.run.id, q.id, { kind: cmd.kind === "approve" ? "yes" : "no" });
       return [`${cmd.kind === "approve" ? "approved" : "denied"} ${p.run.workflow} [${shortId(p.run.id)}]`];

@@ -9,6 +9,8 @@ import { formatHook, type HookContext } from "./format.js";
 export interface RelayOptions {
   /** Deliver one line to the channel. */
   post: (line: string) => void;
+  /** Deliver one line to the owner only (DM). */
+  postOwner?: (line: string) => void;
   /** Resolve the run's PR URL, if any (run_complete only). */
   findPr?: (runId: string) => Promise<string | undefined>;
   /** Describe the question an approval gate is asking (stage_start only). */
@@ -28,8 +30,9 @@ export async function handleHook(ctx: HookContext, opts: RelayOptions): Promise<
     ctx.event === "stage_start" && ctx.run_id && opts.describeGate
       ? await opts.describeGate(ctx.run_id).catch(() => undefined)
       : undefined;
-  const line = formatHook(ctx, { webUrl: opts.webUrl, prUrl, question });
-  if (line) opts.post(line);
+  const notice = formatHook(ctx, { webUrl: opts.webUrl, prUrl, question });
+  if (notice.channel) opts.post(notice.channel);
+  if (notice.owner) opts.postOwner?.(notice.owner);
 }
 
 export function createRelay(opts: RelayOptions): Server {

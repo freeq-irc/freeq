@@ -73,6 +73,17 @@ describe("execute", () => {
     ]);
   });
 
+  it("never shows a gate's question in a channel reply", async () => {
+    const q = gate({ text: "Rotate the signing keys?" });
+    const { deps } = fake([R1], { [R1.id]: [q] });
+    const pub = await execute({ kind: "status" }, deps, { private: false });
+    expect(pub).toEqual(["x7k2qa feature blocked — waiting on the owner"]);
+    const mc = fake([R1], { [R1.id]: [gate({ text: "Pick a key", question_type: "multiple_choice", options: [{ key: "a", label: "A" }] })] });
+    const [hint] = await execute({ kind: "approve" }, mc.deps, { private: false });
+    expect(hint).not.toContain("Pick a key");
+    expect(hint).toContain("DM me");
+  });
+
   it("approve with no id answers the only waiting gate", async () => {
     const { deps, answers } = fake([R1, R2], { [R1.id]: [gate()] });
     expect(await execute({ kind: "approve" }, deps)).toEqual(["approved feature [x7k2qa]"]);
@@ -96,7 +107,7 @@ describe("execute", () => {
     const q = gate({ question_type: "multiple_choice", options: [{ key: "a", label: "Plan A" }, { key: "b", label: "Plan B" }] });
     const { deps, answers } = fake([R1], { [R1.id]: [q] });
     const [hint] = await execute({ kind: "approve" }, deps);
-    expect(hint).toContain("fabro answer x7k2qa <choice>");
+    expect(hint).toContain("answer x7k2qa <choice>");
     expect(await execute({ kind: "answer", run: "x7k2qa", text: "plan b" }, deps)).toEqual(["answered feature [x7k2qa]"]);
     expect(answers).toEqual([[R1.id, "q1", { kind: "selected", option_key: "b" }]]);
   });
