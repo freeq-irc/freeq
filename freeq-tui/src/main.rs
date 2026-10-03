@@ -3506,6 +3506,12 @@ mod tests {
         server_did_from_signing_key, server_kid_from_public_key, server_kids_from_key_set,
         signature_of, verify_answer_line, verify_api_base,
     };
+    use super::{
+        format_file_size, format_link_preview, format_media_display, format_timestamp,
+        parse_timestamp_ms, try_nick_complete,
+    };
+    use crate::app::{App, Buffer};
+    use freeq_sdk::media::{LinkPreview, MediaAttachment};
     use std::collections::{HashMap, HashSet};
 
     fn session() -> freeq_sdk::oauth::OAuthSession {
@@ -4183,5 +4189,256 @@ mod tests {
         let huge_nick = "n".repeat(8192);
         let line = format!(":{huge_nick}!~u@freeq/plc/abc JOIN #room");
         assert!(parse_join_prefix(&line).is_none(), "must reject giant nick");
+    }
+
+    #[test]
+    fn file_sizes_switch_unit_at_each_power_of_1024() {
+        assert_eq!(format_file_size(0), "0B");
+        assert_eq!(format_file_size(1023), "1023B");
+        assert_eq!(format_file_size(1024), "1.0KB");
+        assert_eq!(format_file_size(1536), "1.5KB");
+        assert_eq!(format_file_size(1024 * 1024), "1.0MB");
+        assert_eq!(format_file_size(5 * 1024 * 1024 + 512 * 1024), "5.5MB");
+    }
+
+    fn preview(title: Option<&str>, description: Option<&str>) -> LinkPreview {
+        LinkPreview {
+            url: "https://example.test/page".to_string(),
+            title: title.map(str::to_string),
+            description: description.map(str::to_string),
+            thumb_url: None,
+        }
+    }
+
+    #[test]
+    fn a_link_preview_reads_title_then_description_then_url() {
+        let line = format_link_preview(&preview(Some("Title"), Some("About it")));
+        assert_eq!(line, "🔗 Title — About it (https://example.test/page)");
+    }
+
+    #[test]
+    fn a_link_preview_leaves_out_what_the_page_did_not_give() {
+        assert_eq!(
+            format_link_preview(&preview(None, None)),
+            "🔗 (https://example.test/page)"
+        );
+        assert_eq!(
+            format_link_preview(&preview(Some("Only title"), None)),
+            "🔗 Only title (https://example.test/page)"
+        );
+        assert_eq!(
+            format_link_preview(&preview(None, Some("Only text"))),
+            "🔗 — Only text (https://example.test/page)"
+        );
+    }
+
+    #[test]
+    fn a_link_description_is_cut_only_past_120_bytes() {
+        let exact = "d".repeat(120);
+        let line = format_link_preview(&preview(None, Some(&exact)));
+        assert!(line.contains(&format!("— {exact} (")), "{line}");
+        assert!(!line.contains('…'), "{line}");
+
+        let long = "d".repeat(121);
+        let line = format_link_preview(&preview(None, Some(&long)));
+        assert!(
+            line.contains(&format!("— {}… (", "d".repeat(120))),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_link_description_of_wide_characters_is_cut_on_a_character() {
+        // 61 two-byte characters: byte 120 falls between characters.
+        let wide = "é".repeat(61);
+        let line = format_link_preview(&preview(None, Some(&wide)));
+        assert!(line.contains(&format!("— {}… (", "é".repeat(60))), "{line}");
+    }
+
+    fn media(content_type: &str, url: &str) -> MediaAttachment {
+        MediaAttachment {
+            content_type: content_type.to_string(),
+            url: url.to_string(),
+            alt: None,
+            width: None,
+            height: None,
+            blurhash: None,
+            size: None,
+            filename: None,
+        }
+    }
+
+    #[test]
+    fn media_is_marked_by_what_kind_of_thing_it_is() {
+        let icon = |ct: &str, url: &str| {
+            format_media_display(&media(ct, url))
+                .chars()
+                .next()
+                .unwrap()
+        };
+        assert_eq!(icon("image/png", "https://x.test/a"), '🖼');
+        assert_eq!(icon("video/mp4", "https://x.test/a"), '🎬');
+        assert_eq!(icon("audio/ogg", "https://x.test/a"), '🎵');
+        assert_eq!(icon("application/pdf", "https://x.test/a"), '📎');
+        // An undeclared type is judged by the URL, as the SDK does.
+        assert_eq!(
+            icon("application/octet-stream", "https://x.test/cat.png"),
+            '🖼'
+        );
+        assert_eq!(
+            icon("application/octet-stream", "https://x.test/blob"),
+            '📎'
+        );
+    }
+
+    #[test]
+    fn media_with_nothing_but_a_url_shows_its_type_and_url() {
+        assert_eq!(
+            format_media_display(&media("audio/ogg", "https://x.test/a.ogg")),
+            "🎵 [audio/ogg] https://x.test/a.ogg"
+        );
+    }
+
+    #[test]
+    fn media_details_appear_in_order_with_the_url_last() {
+        let mut m = media("image/png", "https://x.test/a.png");
+        m.alt = Some("a cat".to_string());
+        m.width = Some(640);
+        m.height = Some(480);
+        m.size = Some(2048);
+        assert_eq!(
+            format_media_display(&m),
+            "🖼 [image/png] a cat 640×480 2.0KB https://x.test/a.png"
+        );
+    }
+
+    #[test]
+    fn media_dimensions_need_both_sides() {
+        let mut m = media("image/png", "https://x.test/a.png");
+        m.width = Some(640);
+        assert_eq!(
+            format_media_display(&m),
+            "🖼 [image/png] https://x.test/a.png"
+        );
+        m.width = None;
+        m.height = Some(480);
+        assert_eq!(
+            format_media_display(&m),
+            "🖼 [image/png] https://x.test/a.png"
+        );
+    }
+
+    #[test]
+    fn a_server_time_tag_gives_its_exact_instant() {
+        let at = tags(&[("time", "2024-01-01T00:00:00Z")]);
+        assert_eq!(parse_timestamp_ms(&at), 1_704_067_200_000);
+        let with_millis = tags(&[("time", "2024-01-01T00:00:00.250Z")]);
+        assert_eq!(parse_timestamp_ms(&with_millis), 1_704_067_200_250);
+        let offset = tags(&[("time", "2024-01-01T01:00:00+01:00")]);
+        assert_eq!(parse_timestamp_ms(&offset), 1_704_067_200_000);
+    }
+
+    #[test]
+    fn a_missing_or_garbled_time_tag_falls_back_to_now() {
+        for t in [
+            tags(&[]),
+            tags(&[("time", "yesterday")]),
+            tags(&[("time", "")]),
+        ] {
+            let before = chrono::Local::now().timestamp_millis();
+            let got = parse_timestamp_ms(&t);
+            let after = chrono::Local::now().timestamp_millis();
+            assert!(
+                (before..=after).contains(&got),
+                "{got} not in {before}..={after}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_displayed_time_is_the_same_instant_whatever_offset_it_was_sent_in() {
+        let utc = format_timestamp(&tags(&[("time", "2024-06-01T12:00:00Z")]));
+        let offset = format_timestamp(&tags(&[("time", "2024-06-01T14:00:00+02:00")]));
+        let later = format_timestamp(&tags(&[("time", "2024-06-01T12:00:01Z")]));
+        assert_eq!(utc, offset);
+        assert_ne!(utc, later);
+        assert_eq!(utc.len(), 8, "{utc}");
+        assert_eq!(utc.matches(':').count(), 2, "{utc}");
+    }
+
+    fn completing(nicks: &[&str], text: &str, cursor: usize) -> App {
+        let mut app = App::new("me", false);
+        let mut room = Buffer::new("#room");
+        room.nicks = nicks.iter().map(|n| n.to_string()).collect();
+        app.buffers.insert("#room".to_string(), room);
+        app.active_buffer = "#room".to_string();
+        app.editor.text = text.to_string();
+        app.editor.cursor = cursor;
+        try_nick_complete(&mut app);
+        app
+    }
+
+    #[test]
+    fn a_nick_at_the_start_of_the_line_completes_with_a_colon() {
+        let app = completing(&["alice", "bob"], "al", 2);
+        assert_eq!(app.editor.text, "alice: ");
+        assert_eq!(app.editor.cursor, 7);
+    }
+
+    #[test]
+    fn a_nick_mid_line_completes_with_a_space_and_keeps_the_rest() {
+        let app = completing(&["alice"], "hi al there", 5);
+        assert_eq!(app.editor.text, "hi alice  there");
+        assert_eq!(app.editor.cursor, 9);
+    }
+
+    #[test]
+    fn nick_completion_ignores_case_and_status_prefixes() {
+        let app = completing(&["@Alice", "+bob"], "AL", 2);
+        assert_eq!(app.editor.text, "Alice: ");
+        let app = completing(&["@Alice", "+bob"], "b", 1);
+        assert_eq!(app.editor.text, "bob: ");
+    }
+
+    #[test]
+    fn nick_completion_takes_the_first_nick_that_matches() {
+        let app = completing(&["alex", "alice"], "al", 2);
+        assert_eq!(app.editor.text, "alex: ");
+    }
+
+    #[test]
+    fn nick_completion_leaves_the_line_alone_when_nothing_fits() {
+        let none = completing(&["alice"], "zed", 3);
+        assert_eq!((none.editor.text.as_str(), none.editor.cursor), ("zed", 3));
+        // Nothing typed since the last space: no fragment to complete.
+        let empty = completing(&["alice"], "hi ", 3);
+        assert_eq!(
+            (empty.editor.text.as_str(), empty.editor.cursor),
+            ("hi ", 3)
+        );
+        let blank = completing(&["alice"], "", 0);
+        assert_eq!(blank.editor.text, "");
+    }
+
+    #[test]
+    fn nick_completion_only_looks_before_the_cursor() {
+        let app = completing(&["alice"], "al zed", 2);
+        assert_eq!(app.editor.text, "alice:  zed");
+    }
+
+    #[test]
+    fn nick_completion_does_nothing_without_a_buffer_to_take_nicks_from() {
+        let mut app = App::new("me", false);
+        app.active_buffer = "#gone".to_string();
+        app.editor.text = "al".to_string();
+        app.editor.cursor = 2;
+        try_nick_complete(&mut app);
+        assert_eq!(app.editor.text, "al");
+    }
+
+    #[test]
+    fn nick_completion_handles_wide_characters_before_the_fragment() {
+        let app = completing(&["alice"], "é al", "é al".len());
+        assert_eq!(app.editor.text, "é alice ");
     }
 }
