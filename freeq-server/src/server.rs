@@ -605,6 +605,13 @@ impl BanEntry {
     }
 }
 
+/// The invite-list token for a nick-only (no DID) invitee. Nicks are
+/// case-insensitive, so the token is lowercased the same way `NickMap` keys
+/// are — otherwise an invite for `bob` never admits `Bob`.
+pub(crate) fn invite_nick_token(nick: &str) -> String {
+    format!("nick:{}", nick.to_lowercase())
+}
+
 /// Simple wildcard matching (* and ?).
 fn wildcard_match(pattern: &str, text: &str) -> bool {
     let pattern = pattern.to_lowercase();
@@ -7152,7 +7159,7 @@ async fn process_s2s_event(
                     // Check +i (invite only) — but allow if user has an invite
                     if ch.invite_only {
                         let has_invite = did.as_ref().is_some_and(|d| ch.invites.contains(d))
-                            || ch.invites.contains(&format!("nick:{nick}"));
+                            || ch.invites.contains(&invite_nick_token(&nick));
                         if !has_invite {
                             tracing::info!(
                                 channel = %channel, nick = %nick,
@@ -7200,7 +7207,7 @@ async fn process_s2s_event(
                 if let Some(ref d) = did {
                     ch.invites.remove(d);
                 }
-                ch.invites.remove(&format!("nick:{nick}"));
+                ch.invites.remove(&invite_nick_token(&nick));
                 // Never trust is_op from the peer — determine op status from
                 // local channel state (founder_did / did_ops) to prevent
                 // forged operator claims (C-2 mitigation).
@@ -8369,7 +8376,12 @@ async fn process_s2s_event(
                 }
             }
 
-            // Add the invite
+            // Add the invite. A nick token from a peer may carry the inviter's
+            // casing; canonicalize it so the JOIN check can match it.
+            let invitee = match invitee.strip_prefix("nick:") {
+                Some(n) => invite_nick_token(n),
+                None => invitee,
+            };
             {
                 let mut channels = state.channels.lock();
                 if let Some(ch) = channels.get_mut(&channel_key) {
@@ -11921,6 +11933,68 @@ mod s2s_adversarial_tests {
         assert!(
             ch.invites.is_empty(),
             "a DID that is not the founder or an op must not pass the +i gate"
+        );
+    }
+
+    /// Nicks are case-insensitive everywhere else (NickMap, remote_member,
+    /// bans), but the `nick:` invite token was compared byte-for-byte. A guest
+    /// invited as `bob` whose nick is `Bob` was refused by the +i gate.
+    #[tokio::test]
+    async fn s2s_nick_invite_matches_join_case_insensitively() {
+        let state = test_state();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+
+        const FOUNDER_DID: &str = "did:key:zFounderInviteCase";
+        {
+            let mut channels = state.channels.lock();
+            let ch = channels.entry("#invcase".to_string()).or_default();
+            ch.invite_only = true;
+            ch.founder_did = Some(FOUNDER_DID.to_string());
+        }
+
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Invite {
+                event_id: format!("{PEER}:case-invite"),
+                channel: "#invcase".to_string(),
+                invitee: "nick:bob".to_string(),
+                invited_by: "alice".to_string(),
+                invited_by_did: Some(FOUNDER_DID.to_string()),
+                origin: PEER.to_string(),
+            },
+        )
+        .await;
+
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Join {
+                event_id: format!("{PEER}:case-join"),
+                nick: "Bob".to_string(),
+                channel: "#invcase".to_string(),
+                did: None,
+                handle: None,
+                is_op: false,
+                actor_class: None,
+                origin: PEER.to_string(),
+            },
+        )
+        .await;
+
+        let channels = state.channels.lock();
+        let ch = channels.get("#invcase").unwrap();
+        assert!(
+            ch.has_remote_member("Bob"),
+            "an invite for `bob` must admit `Bob` through the +i gate"
+        );
+        assert!(
+            ch.invites.is_empty(),
+            "the one-shot invite must be consumed, got {:?}",
+            ch.invites
         );
     }
 
