@@ -1,0 +1,22 @@
+# The Fabro server (runs, automations, web UI) on the executor VM.
+# boxd VMs don't keep a persistent journal, so stdout/stderr go to a file —
+# without it a worker that dies mid-run leaves no trace.
+[Unit]
+Description=Fabro server (freeq around-the-clock agents)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=boxd
+Environment=HOME=/home/boxd
+Environment=PATH=/home/boxd/.fabro/bin:/home/boxd/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/home/boxd/.fabro/storage/server.env
+ExecStart=/home/boxd/.fabro/bin/fabro server start --foreground --no-upgrade-check
+StandardOutput=append:/home/boxd/.fabro/storage/logs/fabro-server.log
+StandardError=append:/home/boxd/.fabro/storage/logs/fabro-server.log
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -11,10 +11,10 @@ digraph DepAudit {
     start [shape=Mdiamond, label="Start"]
     exit  [shape=Msquare, label="Exit"]
 
-    audit     [shape=box, label="Audit + triage", prompt="@prompts/audit.md", thread_id="dep", fidelity="full", reasoning_effort="medium", timeout="1800s"]
-    patch     [shape=box, label="Patch dep",      prompt="@prompts/patch.md", thread_id="dep", fidelity="full", reasoning_effort="high", timeout="2400s"]
+    audit     [shape=box, label="Audit + triage", model="claude-sonnet-5-5", prompt="@prompts/audit.md", thread_id="dep", fidelity="full", reasoning_effort="medium", timeout="1800s"]
+    patch     [shape=box, label="Patch dep",      model="claude-sonnet-5-5", prompt="@prompts/patch.md", thread_id="dep", fidelity="full", reasoning_effort="high", timeout="2400s"]
     verify    [shape=parallelogram, label="CI gate", script="bash .fabro/verify.sh", goal_gate=true, retry_target="patch", max_retries=2, timeout="3600s"]
-    pr_body   [shape=tab, label="PR description", prompt="@prompts/pr_body.md", thread_id="dep", fidelity="full"]
+    pr_body   [shape=tab, label="PR description", model="claude-sonnet-5-5", prompt="@prompts/pr_body.md", thread_id="dep", fidelity="full"]
 
     // A failed working stage must not fall through to the next one: with
     // plain unconditional edges an LLM outage "succeeded" by running the CI

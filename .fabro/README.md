@@ -53,10 +53,12 @@ implementer for up to 2 bounded retries first.
 ## PR policy and models
 
 Set in [`project.toml`](project.toml): PRs open **ready for review**,
-squash-merge, **never auto-merged**. Default model `claude-sonnet-5-5`;
-hunt/explore/plan/implement nodes use `claude-opus-5-5`. Fabro 0.254 (the
-latest stable) predates the 5.5 family, so both are declared as custom models
-on the executor ([`executor/models.toml`](executor/models.toml)).
+squash-merge, **never auto-merged**. Every node names its model —
+`claude-sonnet-5-5`, or `claude-opus-5-5` for hunt/explore/plan/implement.
+The run-level default stays `claude-sonnet-4-6` because Fabro writes the PR
+title/body with a forced tool call, which the 5.5 family rejects. Fabro 0.254
+(the latest stable) predates the 5.5 family, so both are declared as custom
+models on the executor ([`executor/models.toml`](executor/models.toml)).
 
 ## Handoff from the laptop
 

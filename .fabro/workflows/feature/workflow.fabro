@@ -48,7 +48,7 @@ digraph Feature {
     address [shape=box, label="Address review", prompt="@prompts/address.md", model="claude-opus-5-5", reasoning_effort="high", thread_id="feat", fidelity="full", timeout="3600s"]
     verify2 [shape=parallelogram, label="Final CI gate", script="bash .fabro/verify.sh", goal_gate=true, retry_target="address", max_retries=1, timeout="5400s"]
 
-    pr_body [shape=tab, label="PR description", prompt="@prompts/pr_body.md", thread_id="feat", fidelity="full"]
+    pr_body [shape=tab, label="PR description", model="claude-sonnet-5-5", prompt="@prompts/pr_body.md", thread_id="feat", fidelity="full"]
 
     // ── Wiring (fan-out / fan-in) ────────────────────────────────────────
     // A failed working stage must not fall through to the next one: with

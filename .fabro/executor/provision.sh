@@ -17,6 +17,16 @@ sudo install -m 0644 "$HERE/sccache-webdav.service" /etc/systemd/system/
 echo '17 3 * * * boxd find /var/cache/sccache -type f -atime +14 -delete' \
   | sudo tee /etc/cron.d/sccache-prune >/dev/null
 
+# ── Disk hygiene ──────────────────────────────────────────────────────────
+# Fabro's docker provider stops a run's container when the run ends but never
+# removes it, and each one keeps its Rust target (~9 GB). Ten of them filled
+# the 98 GB disk and killed a run mid-flight. Run work lives on its git
+# branch, so stopped sandboxes older than 12h are disposable.
+printf '%s\n' \
+  '23 * * * * boxd docker container prune -f --filter until=12h >/dev/null 2>&1' \
+  '47 3 * * * boxd docker builder prune -f --filter until=72h >/dev/null 2>&1' \
+  | sudo tee /etc/cron.d/fabro-docker-prune >/dev/null
+
 # ── Custom model catalog (Claude 5.5 isn't built into Fabro 0.254) ───────
 if ! grep -q 'llm.models."claude-opus-5-5"' ~/.fabro/settings.toml; then
   { echo; cat "$HERE/models.toml"; } >> ~/.fabro/settings.toml
@@ -54,6 +64,14 @@ FREEQ_ACCEPT_POLICY=1
 ENV
 fi
 sudo install -m 0644 "$HERE/freeq-fabro.service" /etc/systemd/system/
+if ! cmp -s "$HERE/fabro-server.service" /etc/systemd/system/fabro-server.service; then
+  sudo install -m 0644 "$HERE/fabro-server.service" /etc/systemd/system/
+  RESTART_FABRO=1
+fi
+# Keep the server log from growing without bound.
+printf '%s\n' '/home/boxd/.fabro/storage/logs/fabro-server.log /home/boxd/.config/freeq-fabro.log {' \
+  '  weekly' '  rotate 4' '  compress' '  missingok' '  copytruncate' '}' \
+  | sudo tee /etc/logrotate.d/fabro >/dev/null
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now sccache-webdav

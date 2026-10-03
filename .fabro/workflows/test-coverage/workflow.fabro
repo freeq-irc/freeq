@@ -12,10 +12,10 @@ digraph TestCoverage {
     start [shape=Mdiamond, label="Start"]
     exit  [shape=Msquare, label="Exit"]
 
-    select    [shape=box, label="Select target", prompt="@prompts/select.md", thread_id="cov", fidelity="full", reasoning_effort="medium"]
-    implement [shape=box, label="Write tests",  prompt="@prompts/implement.md", thread_id="cov", fidelity="full", reasoning_effort="high", timeout="2400s"]
+    select    [shape=box, label="Select target", model="claude-sonnet-5-5", prompt="@prompts/select.md", thread_id="cov", fidelity="full", reasoning_effort="medium"]
+    implement [shape=box, label="Write tests",  model="claude-sonnet-5-5", prompt="@prompts/implement.md", thread_id="cov", fidelity="full", reasoning_effort="high", timeout="2400s"]
     verify    [shape=parallelogram, label="CI gate", script="bash .fabro/verify.sh", goal_gate=true, retry_target="implement", max_retries=2, timeout="3600s"]
-    pr_body   [shape=tab, label="PR description", prompt="@prompts/pr_body.md", thread_id="cov", fidelity="full"]
+    pr_body   [shape=tab, label="PR description", model="claude-sonnet-5-5", prompt="@prompts/pr_body.md", thread_id="cov", fidelity="full"]
 
     // A failed working stage must not fall through to the next one: with
     // plain unconditional edges an LLM outage "succeeded" by running the CI
