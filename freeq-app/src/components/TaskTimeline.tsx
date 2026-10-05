@@ -1,14 +1,15 @@
 /**
  * TaskTimeline — focused view for a single task.
  *
- * The task is fetched from `/api/v1/actions/{id}` and shown as what it is —
+ * The task is read from `/api/v1/actions/{id}` through the SDK, which leaves
+ * out every ruling that fails its referee check, and shown as what it is —
  * the moves made on it, each under the word for the verb it carried.
  */
 import { useEffect, useState } from 'react';
 import { VerifySignaturePanel } from './VerifySignaturePanel';
 import { displayNameForKey } from '../lib/display-name';
 import { actHeadline } from '../lib/act-verbs';
-import { apiFetch } from '../lib/api';
+import { getClient } from '../irc/client';
 import { useStore } from '../store';
 
 export function TaskTimeline(props: { actId: string; onClose: () => void }) {
@@ -37,12 +38,14 @@ function ActionTimeline({ actId, onClose }: { actId: string; onClose: () => void
   const setScrollToMsgId = useStore(s => s.setScrollToMsgId);
 
   useEffect(() => {
-    // Authed: an action in a direct conversation is readable only by the two
-    // people in it, and the server tells them apart by the session bearer. A
-    // bare fetch 403s, and the panel shows a participant "Task not found".
-    apiFetch(`/api/v1/actions/${encodeURIComponent(actId)}`)
-      .then(r => r.ok ? r.json() : null)
-      .then(d => { setData(d); setLoading(false); })
+    // The SDK reads it with the session bearer: an action in a direct
+    // conversation is readable only by the two people in it. Under the page's
+    // own origin, as the panel always read it. No client before the first
+    // connection, and a read that fails, both show "Task not found."
+    const read = getClient()?.taskHistory(actId, { origin: window.location.origin });
+    if (!read) { setLoading(false); return; }
+    read
+      .then(d => { setData(d as { task: any; events: ActionEvent[] }); setLoading(false); })
       .catch(() => setLoading(false));
   }, [actId]);
 

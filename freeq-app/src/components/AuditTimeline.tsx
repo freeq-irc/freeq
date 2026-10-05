@@ -1,10 +1,11 @@
 /**
  * AuditTimeline — shows chronological audit trail for a channel.
- * Fetches from GET /api/v1/channels/{name}/audit
+ * Reads GET /api/v1/channels/{name}/audit through the SDK, which leaves out
+ * what fails its check.
  */
 import { Fragment, useEffect, useState } from 'react';
 import { displayNameForKey } from '../lib/display-name';
-import { apiFetch } from '../lib/api';
+import { getClient } from '../irc/client';
 import { VerifySignaturePanel } from './VerifySignaturePanel';
 import { Seal, SealPanel } from './ActCards';
 import { actHeadline, actEmoji } from '../lib/act-verbs';
@@ -66,19 +67,22 @@ export function AuditTimeline({ channel, onClose }: AuditTimelineProps) {
 
   useEffect(() => {
     setLoading(true);
-    const params = new URLSearchParams({ limit: '200' });
-    if (actorFilter) params.set('actor', actorFilter);
-
     setRefused(null);
-    apiFetch(`/api/v1/channels/${encodeURIComponent(channel.replace(/^#/, ''))}/audit?${params}`)
-      .then(r => {
-        if (r.ok) return r.json();
-        // A refusal is not an empty audit: say which it was.
-        setRefused(r.status === 401 || r.status === 403 ? 'forbidden' : 'failed');
-        return { events: [] };
-      })
+    // An answer that lands after a newer read has started is not drawn: a
+    // slow filtered answer never replaces a newer unfiltered one.
+    let current = true;
+    // The SDK reads it with the session bearer, under the page's own origin,
+    // as the panel always read it. No client before the first connection.
+    const read = getClient()?.channelAudit(channel, {
+      actor: actorFilter || undefined,
+      limit: 200,
+      origin: window.location.origin,
+    });
+    if (!read) { setRefused('failed'); setLoading(false); return; }
+    read
       .then(data => {
-        const rows: AuditEvent[] = data.timeline || data.events || [];
+        if (!current) return;
+        const rows = (data.timeline || data.events || []) as AuditEvent[];
         setEvents(rows);
         // The menu lists who the room has, not who the current filter left
         // standing: rebuilding it from a filtered answer leaves one name in
@@ -96,7 +100,14 @@ export function AuditTimeline({ channel, onClose }: AuditTimelineProps) {
         }
         setLoading(false);
       })
-      .catch(() => { setRefused('failed'); setLoading(false); });
+      .catch(err => {
+        if (!current) return;
+        // A refusal is not an empty audit: say which it was.
+        const status = (err as { status?: number } | null)?.status;
+        setRefused(status === 401 || status === 403 ? 'forbidden' : 'failed');
+        setLoading(false);
+      });
+    return () => { current = false; };
   }, [channel, actorFilter]);
 
   // The route filters by actor and by window; the kind of row is filtered

@@ -12,7 +12,13 @@ import { render, cleanup, waitFor, fireEvent } from '@testing-library/react';
 import { TaskTimeline } from './TaskTimeline';
 import { useStore } from '../store';
 import type { Message } from '../store';
-import * as api from '../lib/api';
+
+// The panel asks the SDK client for the task's history.
+const taskHistory = vi.fn();
+vi.mock('../irc/client', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../irc/client')>()),
+  getClient: () => ({ apiBearer: null, getNickForDid: () => undefined, taskHistory }),
+}));
 
 /** The id an event minted at that moment carries: a ULID, time first. A
  *  companion is paired with the event of its own second, so the ids and the
@@ -103,10 +109,7 @@ function seed() {
 }
 
 function open(onClose: () => void) {
-  vi.spyOn(api, 'apiFetch').mockResolvedValue({
-    ok: true,
-    json: () => Promise.resolve({ task: null, events: served() }),
-  } as unknown as Response);
+  taskHistory.mockResolvedValue({ act_id: OPENER, task: null, events: served() });
   return render(<TaskTimeline actId={OPENER} onClose={onClose} />);
 }
 
@@ -155,9 +158,7 @@ describe('public receipt permalink', () => {
     // The in-app panel proves a signature to whoever is already logged in.
     // This is the version you paste to someone who is not, and who has no
     // reason to take our word for anything.
-    vi.spyOn(api, 'apiFetch').mockResolvedValue(
-      new Response(JSON.stringify({ task: null, events: served() }), { status: 200 }),
-    );
+    taskHistory.mockResolvedValue({ act_id: OPENER, task: null, events: served() });
     const { container } = render(<TaskTimeline actId={OPENER} onClose={() => {}} />);
     await waitFor(() => expect(container.querySelector('a[href^="/act/"]')).toBeTruthy());
 
