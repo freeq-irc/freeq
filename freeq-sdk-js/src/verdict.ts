@@ -11,7 +11,7 @@
 // identity-claim.ts).
 import model from './verdict-model.json' with { type: 'json' };
 import { verifyEd25519 } from './did-key.js';
-import type { KeyLookup, KeySource } from './key-lookup.js';
+import { type KeyLookup, type KeySource, keyList } from './key-lookup.js';
 import * as signing from './signing.js';
 
 /** What checking a message's signature came to. */
@@ -325,16 +325,7 @@ export class SignatureChecker {
     if (typeof did !== 'string' || !/^did:web:[A-Za-z0-9.\-_:%]+$/.test(did)) return;
     const set = await get(`${origin}/api/v1/signing-keys/${did}`);
     if (set === null) return;
-    const publicKeys: unknown[] = [];
-    if (Array.isArray(set['keys'])) {
-      for (const k of set['keys'] as { public_key?: unknown }[]) publicKeys.push(k.public_key);
-    }
-    publicKeys.push(set['public_key']);
-    for (const b64 of publicKeys) {
-      if (typeof b64 !== 'string') continue;
-      const key = base64UrlDecode(b64);
-      if (key?.length === 32) this.serverKeys.set(await signing.deriveKid(key), key);
-    }
+    for (const [kid, { key }] of (await keyList(set)) ?? []) this.serverKeys.set(kid, key);
   }
 }
 
@@ -351,16 +342,4 @@ async function serverVerdict(signed: Signed, key: Uint8Array): Promise<Verdict> 
   const ok = await checkSigned(signed, key);
   const state: VerdictState = ok === true ? 'server' : ok === false ? 'invalid' : 'unverifiable';
   return { state, kid: signed.kid };
-}
-
-function base64UrlDecode(text: string): Uint8Array | null {
-  if (!/^[A-Za-z0-9_-]*$/.test(text)) return null;
-  const padded = text.replace(/-/g, '+').replace(/_/g, '/');
-  try {
-    return Uint8Array.from(atob(padded + '='.repeat((4 - (padded.length % 4)) % 4)), (c) =>
-      c.charCodeAt(0),
-    );
-  } catch {
-    return null;
-  }
 }

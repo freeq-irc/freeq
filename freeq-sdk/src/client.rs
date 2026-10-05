@@ -2505,29 +2505,11 @@ async fn fetch_server_key_set(
     let Some(set) = get(format!("{origin}/api/v1/signing-keys/{did}")).await else {
         return HashMap::new();
     };
-    let decode = |b64: &str| -> Option<[u8; 32]> {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(b64)
-            .ok()?
-            .try_into()
-            .ok()
-    };
-    let mut keys: HashMap<String, [u8; 32]> = set
-        .get("keys")
-        .and_then(|v| v.as_array())
+    crate::key_lookup::key_list(&set)
+        .unwrap_or_default()
         .into_iter()
-        .flatten()
-        .filter_map(|k| decode(k.get("public_key")?.as_str()?))
-        .map(|key| (crate::sigtag::derive_kid_bytes(&key), key))
-        .collect();
-    if let Some(key) = set
-        .get("public_key")
-        .and_then(|v| v.as_str())
-        .and_then(decode)
-    {
-        keys.insert(crate::sigtag::derive_kid_bytes(&key), key);
-    }
-    keys
+        .map(|(kid, (key, _))| (kid, key))
+        .collect()
 }
 
 /// The DID a server publishes its key set under, from its
@@ -9685,6 +9667,7 @@ mod device_key_tests {
             records: vec![("did:plc:tester".to_string(), now)],
             refreshed: vec![("did:plc:tester".to_string(), now)],
             proven: Vec::new(),
+            referees: Vec::new(),
         };
         let store = Arc::new(crate::key_lookup::MemoryKeyLookupStore::default());
         store

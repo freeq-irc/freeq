@@ -79,6 +79,10 @@ export interface KeyLookupSnapshot {
   records: [string, number][];
   refreshed: [string, number][];
   proven: string[];
+  /** Each ruling referee's key list as its own site listed it: its keys by
+   *  kid, and the kids the list was read for. Absent from a snapshot written
+   *  before lists were kept. */
+  referees?: [string, { keys: [string, ListedKey][]; readFor: string[] }][];
 }
 
 /** The snapshot shape this code reads and writes. */
@@ -136,6 +140,36 @@ export type KeyPair = [did: string, kid: string, server?: boolean];
 /** Most keys one request to the origin's batch key route names. */
 export const MAX_KEYS_PER_REQUEST = 50;
 
+/** What a ruling referee's own site says about one of its keys. */
+export type OwnHostAnswer =
+  /** Its key list holds the key; `retiredAt`, unix seconds, is when it stopped counting. */
+  | { state: 'listed'; publicKey: Uint8Array; retiredAt: number | null }
+  /** Its key list, read since the key was first asked about, lacks it. */
+  | { state: 'not-listed' }
+  /** The name is not a plain public host, or the list could not be read. */
+  | { state: 'cannot-answer' };
+
+/** Most referees whose key lists are kept at once. */
+const REFEREES_HELD = 1024;
+
+/** A key from a server's key list: its bytes, and when it stopped counting. */
+export interface ListedKey {
+  key: Uint8Array;
+  retiredAt: number | null;
+}
+
+/**
+ * One referee's key list, as its own site last listed it: the server's key
+ * set (`SignatureChecker`) for a server not connected to.
+ */
+export interface RefereeKeys {
+  keys: Map<string, ListedKey>;
+  /** Kids the list has been read for, once each. */
+  readFor: Set<string>;
+  /** The read in flight, shared by every ask meanwhile; true once read. */
+  reading: Promise<boolean> | null;
+}
+
 /**
  * Looks keys up by (DID, kid). A miss, when every source answered without the
  * key, is cached for `ttlMs`; a key found is cached without expiry, and one
@@ -190,6 +224,9 @@ export class KeyLookup {
   /** The origin answered its batch key route with a 404: a server from
    *  before it, asked key by key for the rest of this lookup's life. */
   private batchRouteMissing = false;
+  /** Each ruling referee's key list as its own site last listed it, by
+   *  `did:web:` name, least recently asked about first; see `ownHostAnswer`. */
+  private readonly referees = new Map<string, RefereeKeys>();
 
   /** `originBase` is the origin server's base URL; the reader's `fetch` serves its requests. */
   constructor(
@@ -220,6 +257,16 @@ export class KeyLookup {
             if (!this.refreshed.has(did)) this.refreshed.set(did, at);
           }
           for (const cid of snapshot.proven) this.proven.add(cid);
+          for (const [did, kept] of snapshot.referees ?? []) {
+            let referee = this.referees.get(did);
+            if (referee === undefined) {
+              referee = { keys: new Map(), readFor: new Set(), reading: null };
+              this.referees.set(did, referee);
+            }
+            for (const [kid, key] of kept.keys) if (!referee.keys.has(kid)) referee.keys.set(kid, key);
+            for (const kid of kept.readFor) referee.readFor.add(kid);
+          }
+          boundReferees(this.referees, REFEREES_HELD);
         },
         () => undefined,
       );
@@ -245,6 +292,10 @@ export class KeyLookup {
       records: [...this.records].map(([did, listed]) => [did, listed.at]),
       refreshed: [...this.refreshed],
       proven: [...this.proven],
+      referees: [...this.referees].map(([did, referee]) => [
+        did,
+        { keys: [...referee.keys], readFor: [...referee.readFor] },
+      ]),
     };
   }
 
@@ -963,6 +1014,113 @@ export class KeyLookup {
     if (answer === null) throw new Error('the origin answer is not a key');
     return [answer.key, answer.retiredAt];
   }
+
+  /**
+   * What a ruling referee's own site says about its key `kid`: its key list
+   * at `https://<host>/api/v1/signing-keys/<did>`, read whole and kept for
+   * the life of the lookup, as the connected server's key set is kept for a
+   * connection. A kid on the list is answered from it; a kid not on it reads
+   * the list once more, once per kid, and is not listed if still missing. A
+   * read that fails is not kept. One read per referee at a time; asks
+   * meanwhile share it. Never rejects. Twin of the Rust `own_host_answer`.
+   */
+  async ownHostAnswer(did: string, kid: string): Promise<OwnHostAnswer> {
+    const host = plainDidWebHost(did);
+    if (host === null) return { state: 'cannot-answer' };
+    await this.load();
+    for (;;) {
+      let referee = this.referees.get(did);
+      if (referee === undefined) {
+        boundReferees(this.referees, REFEREES_HELD - 1);
+        referee = { keys: new Map(), readFor: new Set(), reading: null };
+      }
+      // Kept in the order last asked about, for the bound.
+      this.referees.delete(did);
+      this.referees.set(did, referee);
+      const held = heldAnswer(referee, kid);
+      if (held !== null) return held;
+      const startedHere = referee.reading === null;
+      if (startedHere) {
+        const reading = referee;
+        reading.reading = (async () => {
+          const keys = await this.readRefereeList(host, did);
+          reading.reading = null;
+          if (keys === null) return false;
+          // A later list's dates win: a key retired since is learned at the
+          // next read.
+          for (const [listedKid, listedKey] of keys) reading.keys.set(listedKid, listedKey);
+          reading.readFor.add(kid);
+          return true;
+        })();
+      }
+      if (!(await referee.reading)) return { state: 'cannot-answer' };
+      // A read this ask started, or one for the same kid, has answered it.
+      // One that was already under way for another kid may predate the key:
+      // the loop reads once more for this one.
+      let after = heldAnswer(referee, kid);
+      if (after === null && startedHere) {
+        referee.readFor.add(kid);
+        after = { state: 'not-listed' };
+      }
+      if (after !== null) {
+        // Kept with the found keys, under the same write rule.
+        await this.save();
+        return after;
+      }
+    }
+  }
+
+  /** One read of a referee's key list, with no time limit of its own, as
+   *  the SDK's other reads have none: a ruling's check bounds its wait.
+   *  Null when it fails, is refused, or is not a key list. */
+  private async readRefereeList(host: string, did: string): Promise<Map<string, ListedKey> | null> {
+    try {
+      // The list comes only from the referee's own site: a redirect is a
+      // failed read, as in the Rust SDK. A reader that does not pass the
+      // option on still has its answer refused when it was redirected.
+      const res = await this.reader.fetch(`https://${host}/api/v1/signing-keys/${did}`, {
+        redirect: 'error',
+      });
+      return res.ok && !res.redirected ? await keyList(await res.json()) : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
+/**
+ * The host of a `did:web:` name that is a plain public host: no port, no
+ * path, not `localhost` or a name under it, and not an IPv4 literal (whose
+ * last label a URL parser reads as a number). The name comes off a line
+ * anyone can send, and JS cannot resolve it to check the address.
+ */
+function plainDidWebHost(did: string): string | null {
+  const host = did.startsWith('did:web:') ? did.slice('did:web:'.length) : '';
+  if (!/^[A-Za-z0-9.-]+$/.test(host)) return null;
+  const name = host.toLowerCase().replace(/\.+$/, '');
+  // A public host has a dot: a single label is a local name.
+  if (!name.includes('.')) return null;
+  const last = name.split('.').pop() ?? '';
+  if (name === 'localhost' || name.endsWith('.localhost') || /^(0x[0-9a-f]*|[0-9]+)$/.test(last)) {
+    return null;
+  }
+  return host;
+}
+
+/** What a referee's held list says about `kid`, or null to read it. */
+function heldAnswer(referee: RefereeKeys, kid: string): OwnHostAnswer | null {
+  const found = referee.keys.get(kid);
+  if (found !== undefined) return { state: 'listed', publicKey: found.key, retiredAt: found.retiredAt };
+  return referee.readFor.has(kid) ? { state: 'not-listed' } : null;
+}
+
+/** Drop the referees asked about longest ago until at most `cap` are left;
+ *  one being read is never dropped. */
+export function boundReferees(held: Map<string, RefereeKeys>, cap: number): void {
+  for (const [did, referee] of held) {
+    if (held.size <= cap) return;
+    if (referee.reading === null) held.delete(did);
+  }
 }
 
 /** A key the origin answered, and when it stopped counting (unix seconds). */
@@ -986,6 +1144,34 @@ function originAnswer(entry: Record<string, unknown>): OriginAnswer | null {
     key: base64UrlDecode(entry.public_key),
     retiredAt: dates.length === 0 ? null : Math.min(...dates),
   };
+}
+
+/**
+ * The keys a server's key list (`/api/v1/signing-keys/{did}`) holds, by kid,
+ * each with when it stopped counting: every `keys[]` entry, and the top-level
+ * `public_key`, the only key a server from before the list sends. A key is
+ * filed under the kid its bytes hash to. Null for a body that is not a key
+ * list. Twin of the Rust `key_list`.
+ */
+export async function keyList(body: unknown): Promise<Map<string, ListedKey> | null> {
+  if (typeof body !== 'object' || body === null) return null;
+  const set = body as Record<string, unknown>;
+  const entries = Array.isArray(set['keys']) ? (set['keys'] as unknown[]) : null;
+  const current = typeof set['public_key'] === 'string' ? set['public_key'] : null;
+  if (entries === null && current === null) return null;
+  const keys = new Map<string, ListedKey>();
+  for (const entry of entries ?? []) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const answer = originAnswer(entry as Record<string, unknown>);
+    if (answer?.key?.length !== 32) continue;
+    keys.set(await deriveKid(answer.key), { key: answer.key, retiredAt: answer.retiredAt });
+  }
+  const key = current === null ? null : base64UrlDecode(current);
+  if (key?.length === 32) {
+    const kid = await deriveKid(key);
+    if (!keys.has(kid)) keys.set(kid, { key, retiredAt: null });
+  }
+  return keys;
 }
 
 /**

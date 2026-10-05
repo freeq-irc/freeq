@@ -635,7 +635,13 @@ export type ResolveDid = (did: string) => Promise<DidDocument>;
  * One HTTP GET. The PDS address comes from a DID document anyone can write,
  * so a caller that must refuse private addresses does it in this function.
  */
-export type Fetch = (url: string) => Promise<Response>;
+export type Fetch = (url: string, init?: FetchInit) => Promise<Response>;
+
+/** The one request option a reader passes on: `redirect: 'error'` makes a
+ *  redirect a failed request rather than one followed elsewhere. */
+export interface FetchInit {
+  redirect?: 'error';
+}
 
 /** One `listRecords` entry: where the record sits, the CID the PDS gives it, and the record. */
 export interface ListedRecord {
