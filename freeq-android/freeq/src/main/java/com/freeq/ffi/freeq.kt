@@ -3757,7 +3757,8 @@ data class ActEvent (
     var `sigTag`: kotlin.String?, 
     var `replayed`: kotlin.Boolean, 
     var `dmKey`: kotlin.String?, 
-    var `verdict`: SignatureVerdict? = null
+    var `verdict`: SignatureVerdict? = null, 
+    var `ruling`: kotlin.String? = null
 ) {
     
     companion object
@@ -3781,6 +3782,7 @@ public object FfiConverterTypeActEvent: FfiConverterRustBuffer<ActEvent> {
             FfiConverterBoolean.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalTypeSignatureVerdict.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -3796,7 +3798,8 @@ public object FfiConverterTypeActEvent: FfiConverterRustBuffer<ActEvent> {
             FfiConverterOptionalString.allocationSize(value.`sigTag`) +
             FfiConverterBoolean.allocationSize(value.`replayed`) +
             FfiConverterOptionalString.allocationSize(value.`dmKey`) +
-            FfiConverterOptionalTypeSignatureVerdict.allocationSize(value.`verdict`)
+            FfiConverterOptionalTypeSignatureVerdict.allocationSize(value.`verdict`) +
+            FfiConverterOptionalString.allocationSize(value.`ruling`)
     )
 
     override fun write(value: ActEvent, buf: ByteBuffer) {
@@ -3812,6 +3815,7 @@ public object FfiConverterTypeActEvent: FfiConverterRustBuffer<ActEvent> {
             FfiConverterBoolean.write(value.`replayed`, buf)
             FfiConverterOptionalString.write(value.`dmKey`, buf)
             FfiConverterOptionalTypeSignatureVerdict.write(value.`verdict`, buf)
+            FfiConverterOptionalString.write(value.`ruling`, buf)
     }
 }
 

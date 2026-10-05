@@ -23,6 +23,7 @@ import {
   type OwnHostAnswer,
   type RefereeKeys,
   boundReferees,
+  READ_FOR_HELD,
   makeDidResolver,
 } from './key-lookup.js';
 import { deriveKid } from './signing.js';
@@ -1476,6 +1477,22 @@ describe('KeyLookup.ownHostAnswer', () => {
     // Another kid not on file reads the list once more.
     expect(await lookup.ownHostAnswer(REFEREE, await kidOf(75))).toEqual({ state: 'not-listed' });
     expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the kids read for and not found bounded, oldest out', async () => {
+    const { fetch, list } = site();
+    await list([[71, null, null]]);
+    const lookup = lookupOn(fetch);
+    for (let i = 0; i <= READ_FOR_HELD; i++) {
+      expect(await lookup.ownHostAnswer(REFEREE, `missing-${i}`)).toEqual({ state: 'not-listed' });
+    }
+    expect(fetch).toHaveBeenCalledTimes(READ_FOR_HELD + 1);
+    expect(await lookup.ownHostAnswer(REFEREE, `missing-${READ_FOR_HELD}`)).toEqual({ state: 'not-listed' });
+    expect(fetch, 'the newest is held').toHaveBeenCalledTimes(READ_FOR_HELD + 1);
+    expect(await lookup.ownHostAnswer(REFEREE, 'missing-0')).toEqual({ state: 'not-listed' });
+    expect(fetch, 'the oldest went, and is read for again').toHaveBeenCalledTimes(READ_FOR_HELD + 2);
+    expect(await lookup.ownHostAnswer(REFEREE, await kidOf(71))).toEqual(await listed(71));
+    expect(fetch, 'a found key is not among them').toHaveBeenCalledTimes(READ_FOR_HELD + 2);
   });
 
   it("learns a held key's retirement at the read for a new kid", async () => {

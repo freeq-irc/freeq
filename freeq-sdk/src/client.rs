@@ -238,6 +238,14 @@ pub enum Command {
         human_text: String,
         done: tokio::sync::oneshot::Sender<Result<()>>,
     },
+    /// A task's history, its failing rulings left out
+    /// ([`ClientHandle::task_history`]). Answered off the read loop, by the
+    /// connection's task-event line, which holds the checker and the bearer;
+    /// nothing is written.
+    TaskHistory {
+        act_id: String,
+        done: tokio::sync::oneshot::Sender<std::result::Result<TaskHistory, ()>>,
+    },
     Raw(String),
     Quit(Option<String>),
 }
@@ -484,6 +492,14 @@ fn dm_key_for(maps: &DidMaps, own_nick: &str, from: &str, target: &str) -> Optio
     };
     Some(maps.lock().dm_key(peer))
 }
+
+/// A task's history as the connected server answers
+/// `GET /api/v1/actions/{id}` (`act_id`, `venue`, `task`, and `events`, each
+/// with `event_id`, `canonical`, `signature`, `actor_did`, `venue`,
+/// `confirm_state` and `timestamp`), every field it sent, with each ruling
+/// that fails its referee check and each receipt marked ignored left out of
+/// `events` ([`ClientHandle::task_history`]).
+pub type TaskHistory = serde_json::Value;
 
 /// A handle to a running IRC client connection.
 #[derive(Clone)]
@@ -804,6 +820,29 @@ impl ClientHandle {
             anyhow::anyhow!("the connection ended before the task event was sent")
         })??;
         Ok(event_id)
+    }
+
+    /// The history of the task `act_id` as the connected server holds it,
+    /// with every ruling in it that fails its referee check left out, as a
+    /// failing ruling never goes up as an [`Event::Act`]; a ruling that
+    /// counts or cannot be checked stays. A receipt the server filed and
+    /// marked ignored is left out too. Read with the session bearer within
+    /// 10 s, as the read of the connected server's key set. Fails when the
+    /// history cannot be read or does not answer in that time, when this
+    /// client checks no signatures (no [`ConnectConfig::key_lookup`]), and
+    /// when the connection ends first.
+    pub async fn task_history(&self, act_id: &str) -> Result<TaskHistory> {
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(Command::TaskHistory {
+                act_id: act_id.to_string(),
+                done,
+            })
+            .await?;
+        answer
+            .await
+            .map_err(|_| anyhow::anyhow!("the connection ended before the task history was read"))?
+            .map_err(|()| anyhow::anyhow!("the task history could not be read"))
     }
 
     /// Start a new AV (voice/video) call in `channel`. The server
@@ -2303,9 +2342,13 @@ struct SignatureChecker {
 #[derive(Default)]
 struct ServerKeySet {
     fetched: bool,
-    keys: HashMap<String, [u8; 32]>,
-    /// Kids the set has been fetched again for, once each per session.
-    refetched: HashSet<String>,
+    /// The DID the set is published under.
+    did: Option<String>,
+    /// Each key, with when it stopped counting.
+    keys: HashMap<String, crate::key_lookup::ListedKey>,
+    /// Kids the set has been fetched again for, once each per session, and
+    /// whether that read succeeded.
+    refetched: HashMap<String, bool>,
 }
 
 impl SignatureChecker {
@@ -2325,9 +2368,9 @@ impl SignatureChecker {
             FirstLook::Unsigned => plain_verdict(VerdictState::Unsigned, None),
             FirstLook::Unverifiable(kid) => plain_verdict(VerdictState::Unverifiable, kid.clone()),
             FirstLook::Check(signed) => {
-                let server_key = self.server_keys.lock().keys.get(&signed.kid).copied();
+                let server_key = self.server_key(&signed.kid);
                 match server_key {
-                    Some(key) => server_verdict(signed, &key),
+                    Some(key) => self.own_key_verdict(signed, &key),
                     None => plain_verdict(VerdictState::Pending, Some(signed.kid.clone())),
                 }
             }
@@ -2339,7 +2382,7 @@ impl SignatureChecker {
         use crate::verdict::{KeyLayer, Verdict, VerdictState};
         self.fetch_server_keys(false).await;
         if let Some(key) = self.server_key(&signed.kid) {
-            return server_verdict(signed, &key);
+            return self.own_key_verdict(signed, &key);
         }
 
         let at_ms = crate::sigtag::msgid_timestamp_ms(&signed.msgid)
@@ -2419,35 +2462,134 @@ impl SignatureChecker {
 
         // A kid no source holds may be a key the server rotated to since its
         // set was read: read it again, once per kid.
-        let first_time = self.server_keys.lock().refetched.insert(signed.kid.clone());
+        let first_time = {
+            let mut set = self.server_keys.lock();
+            !set.refetched.contains_key(&signed.kid)
+                && set.refetched.insert(signed.kid.clone(), false).is_none()
+        };
         if first_time {
-            self.fetch_server_keys(true).await;
+            if self.fetch_server_keys(true).await {
+                self.server_keys
+                    .lock()
+                    .refetched
+                    .insert(signed.kid.clone(), true);
+            }
             if let Some(key) = self.server_key(&signed.kid) {
-                return server_verdict(signed, &key);
+                return self.own_key_verdict(signed, &key);
             }
         }
         plain_verdict(VerdictState::Unverifiable, Some(signed.kid.clone()))
     }
 
+    /// The verdict on a signature made with one of the connected server's
+    /// own keys. "Signed by the server" is a chat verdict, for a server
+    /// signing a chat line on a sender's behalf: a task message counts only
+    /// signed by the author it names with that author's own key, so a task
+    /// document naming anyone but the server itself reads invalid under the
+    /// server's key, whatever the check says. The server's own task
+    /// documents keep the server verdict.
+    fn own_key_verdict(
+        &self,
+        signed: &crate::verdict::Signed,
+        key: &[u8; 32],
+    ) -> crate::verdict::Verdict {
+        use crate::verdict::{SignedDoc, VerdictState};
+        if matches!(signed.doc, SignedDoc::Act { .. }) && !self.is_server(&signed.did) {
+            return plain_verdict(VerdictState::Invalid, Some(signed.kid.clone()));
+        }
+        server_verdict(signed, key)
+    }
+
     fn server_key(&self, kid: &str) -> Option<[u8; 32]> {
+        self.server_keys.lock().keys.get(kid).map(|(key, _)| *key)
+    }
+
+    /// What the connected server's own key set says about `kid`, for a
+    /// ruling made under the server's own name `home`: as a referee's own
+    /// site answers (`KeyLookup::own_host_answer`). A kid the set lacks reads
+    /// it once more, once per kid, counted only when that read succeeds; a
+    /// read that fails cannot answer, and the next ruling under the kid
+    /// reads again. A set published under another name is not the
+    /// referee's list: `None`, and the referee's own site is asked.
+    async fn server_ruling_key(
+        &self,
+        home: &str,
+        kid: &str,
+    ) -> Option<crate::key_lookup::OwnHostAnswer> {
+        use crate::key_lookup::OwnHostAnswer;
+        self.fetch_server_keys(false).await;
+        if !self.answered_for(kid) {
+            let _one_at_a_time = self.fetching.lock().await;
+            // A read that finished while this ask waited may have answered it.
+            if !self.answered_for(kid) {
+                if !self.read_server_keys().await {
+                    return Some(OwnHostAnswer::CannotAnswer);
+                }
+                self.server_keys
+                    .lock()
+                    .refetched
+                    .insert(kid.to_string(), true);
+            }
+        }
+        // Read with the set's lock released before the name is compared,
+        // which takes it again.
+        let found = self.server_key_dated(kid);
+        match (found, self.is_server(home)) {
+            (Some((public_key, retired_at)), true) => Some(OwnHostAnswer::Listed {
+                public_key,
+                retired_at,
+            }),
+            (None, true) => Some(OwnHostAnswer::NotListed),
+            (_, false) => None,
+        }
+    }
+
+    /// Whether the held set answers for `kid`: it holds the key, or a read
+    /// made for this kid succeeded.
+    fn answered_for(&self, kid: &str) -> bool {
+        let set = self.server_keys.lock();
+        set.keys.contains_key(kid) || set.refetched.get(kid) == Some(&true)
+    }
+
+    /// The connected server's own key under `kid`, with when it stopped
+    /// counting.
+    fn server_key_dated(&self, kid: &str) -> Option<crate::key_lookup::ListedKey> {
         self.server_keys.lock().keys.get(kid).copied()
+    }
+
+    /// Whether `did` is the name the connected server publishes its keys
+    /// under.
+    fn is_server(&self, did: &str) -> bool {
+        self.server_keys.lock().did.as_deref() == Some(did)
     }
 
     /// Read the server's key set: `/api/v1/signing-key` names the DID it is
     /// published under, `/api/v1/signing-keys/{did}` lists every key, current
-    /// and retired. Once, unless `again`.
-    async fn fetch_server_keys(&self, again: bool) {
+    /// and retired. Once, unless `again`. Whether the set was read.
+    async fn fetch_server_keys(&self, again: bool) -> bool {
         let _one_at_a_time = self.fetching.lock().await;
         if self.server_keys.lock().fetched && !again {
-            return;
+            return true;
         }
-        let keys = match self.lookup.origin_base() {
+        self.read_server_keys().await
+    }
+
+    /// One read of the server's key set, for a caller holding `fetching`.
+    async fn read_server_keys(&self) -> bool {
+        let read = match self.lookup.origin_base() {
             Some(origin) => fetch_server_key_set(&self.lookup, origin).await,
-            None => HashMap::new(),
+            None => None,
         };
         let mut set = self.server_keys.lock();
         set.fetched = true;
-        set.keys.extend(keys);
+        match read {
+            Some((did, keys)) => {
+                set.did = Some(did);
+                set.keys.extend(keys);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -2474,12 +2616,13 @@ fn server_verdict(signed: &crate::verdict::Signed, key: &[u8; 32]) -> crate::ver
     plain_verdict(state, Some(signed.kid.clone()))
 }
 
-/// Every key in the server's published key set, by kid. Empty when the
-/// server names no usable DID or publishes no set.
+/// The DID the server publishes its key set under, and every key in the
+/// set by kid, with when each stopped counting. `None` when the server
+/// names no usable DID or publishes no set.
 async fn fetch_server_key_set(
     lookup: &crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>,
     origin: &str,
-) -> HashMap<String, [u8; 32]> {
+) -> Option<(String, HashMap<String, crate::key_lookup::ListedKey>)> {
     use freeq_oauth::ClientProvider;
     let origin = origin.trim_end_matches('/');
     let get = |url: String| async move {
@@ -2495,21 +2638,12 @@ async fn fetch_server_key_set(
         }
         resp.json::<serde_json::Value>().await.ok()
     };
-    let Some(did) = get(format!("{origin}/api/v1/signing-key"))
+    let did = get(format!("{origin}/api/v1/signing-key"))
         .await
         .as_ref()
-        .and_then(server_did_from_signing_key)
-    else {
-        return HashMap::new();
-    };
-    let Some(set) = get(format!("{origin}/api/v1/signing-keys/{did}")).await else {
-        return HashMap::new();
-    };
-    crate::key_lookup::key_list(&set)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(kid, (key, _))| (kid, key))
-        .collect()
+        .and_then(server_did_from_signing_key)?;
+    let set = get(format!("{origin}/api/v1/signing-keys/{did}")).await?;
+    Some((did, crate::key_lookup::key_list(&set)?))
 }
 
 /// The DID a server publishes its key set under, from its
@@ -2541,17 +2675,7 @@ fn verdict_at_delivery(
     let Some(checker) = checker else {
         return (None, None);
     };
-    let look = {
-        let maps = maps.lock();
-        let target_did = maps.nick_to_did.get(&target.to_lowercase()).cloned();
-        crate::verdict::first_look(&crate::verdict::Line {
-            tags,
-            target,
-            body,
-            own_did: maps.own_did.as_deref(),
-            target_did: target_did.as_deref(),
-        })
-    };
+    let look = first_look_at(maps, tags, target, body);
     let verdict = checker.at_delivery(&look);
     let follow_up = match look {
         crate::verdict::FirstLook::Check(signed)
@@ -2562,6 +2686,25 @@ fn verdict_at_delivery(
         _ => None,
     };
     (Some(verdict), follow_up)
+}
+
+/// What a received line's signature covers, as far as can be said before
+/// any key is fetched.
+fn first_look_at(
+    maps: &DidMaps,
+    tags: &HashMap<String, String>,
+    target: &str,
+    body: Option<&str>,
+) -> crate::verdict::FirstLook {
+    let maps = maps.lock();
+    let target_did = maps.nick_to_did.get(&target.to_lowercase()).cloned();
+    crate::verdict::first_look(&crate::verdict::Line {
+        tags,
+        target,
+        body,
+        own_did: maps.own_did.as_deref(),
+        target_did: target_did.as_deref(),
+    })
 }
 
 /// Whether a delivered verdict is a signature from the sender's device.
@@ -2576,6 +2719,28 @@ fn is_device(verdict: &Option<crate::verdict::Verdict>) -> bool {
 struct HeldCheck {
     signed: crate::verdict::Signed,
     taught: Option<(String, String)>,
+    act: Option<ActHooks>,
+}
+
+/// What a task event waiting in its connection's [`ActLine`] needs from its
+/// line's check: a ruling's final verdict, and to have gone up before that
+/// verdict is sent, so an app never has a pending verdict replace the
+/// final one.
+struct ActHooks {
+    settled: Option<tokio::sync::oneshot::Sender<crate::verdict::Verdict>>,
+    /// Fires, or is dropped, once the event has gone up or been dropped.
+    up: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// One open batch's held checks, the rulings read inside it, each told
+/// when it closes, and its other task events, which go up at its close;
+/// rulings and events dropped unsent when the connection ends with it open.
+#[derive(Default)]
+struct HeldBatch {
+    checks: Vec<HeldCheck>,
+    rulings: Vec<tokio::sync::oneshot::Sender<()>>,
+    /// Each an `Event::Act`, in wire order.
+    acts: Vec<Event>,
 }
 
 /// Open batches other than `draft/multiline`, by batch id, with the checks
@@ -2583,7 +2748,7 @@ struct HeldCheck {
 /// signers; holding the checks until it closes turns one lookup per line into
 /// one batch request for the lot. As the JS client does (`checkLater` and
 /// `startDeferredChecks`).
-type DeferredBatches = HashMap<String, Vec<HeldCheck>>;
+type DeferredBatches = HashMap<String, HeldBatch>;
 
 /// The open batches and the checks they hold, with what it takes to start
 /// them. Dropped when the read loop ends, however it ends — a `break`, an
@@ -2596,6 +2761,8 @@ struct HeldChecksOnExit {
     checker: Option<Arc<SignatureChecker>>,
     maps: DidMaps,
     event_tx: mpsc::Sender<Event>,
+    /// The connection's task events still in line, ended here too.
+    acts: Option<Arc<ActLine>>,
 }
 
 impl Drop for HeldChecksOnExit {
@@ -2606,6 +2773,9 @@ impl Drop for HeldChecksOnExit {
             &self.maps,
             &self.event_tx,
         );
+        if let Some(acts) = &self.acts {
+            acts.end();
+        }
     }
 }
 
@@ -2616,8 +2786,11 @@ fn start_every_held_check(
     maps: &DidMaps,
     event_tx: &mpsc::Sender<Event>,
 ) {
+    // A ruling read inside a batch the connection's end cut off is dropped
+    // with it: its sender goes unsent. So are its held task events, for the
+    // replay to bring back.
     for (_, held) in batches.drain() {
-        start_deferred_checks(held, checker, maps, event_tx);
+        start_deferred_checks(held.checks, checker, maps, event_tx);
     }
 }
 
@@ -2628,6 +2801,7 @@ fn check_now_or_hold(
     checker: Option<&Arc<SignatureChecker>>,
     signed: Option<crate::verdict::Signed>,
     taught: Option<(String, String)>,
+    act: Option<ActHooks>,
     maps: &DidMaps,
     event_tx: &mpsc::Sender<Event>,
 ) {
@@ -2635,13 +2809,14 @@ fn check_now_or_hold(
         && let Some(id) = batch_id
         && let Some(held) = batches.get_mut(id)
     {
-        held.push(HeldCheck {
+        held.checks.push(HeldCheck {
             signed: signed.clone(),
             taught,
+            act,
         });
         return;
     }
-    spawn_verdict_check(checker, signed, taught, maps, event_tx);
+    spawn_verdict_check(checker, signed, taught, act, maps, event_tx);
 }
 
 /// Start the checks held on a closed batch, once its signers' records are
@@ -2692,6 +2867,7 @@ fn start_deferred_checks(
                 Some(&checker),
                 Some(check.signed),
                 check.taught,
+                check.act,
                 &maps,
                 &event_tx,
             );
@@ -2702,11 +2878,14 @@ fn start_deferred_checks(
 /// Finish a pending check off the receive path and send its verdict.
 ///
 /// `taught` is the (nick, DID) pairing the line's account tag taught; a
-/// device verdict for that DID makes the pairing a verified one.
+/// device verdict for that DID makes the pairing a verified one. A task
+/// event waiting in line (`act`) is told the verdict, and the verdict is
+/// sent once the event has gone up.
 fn spawn_verdict_check(
     checker: Option<&Arc<SignatureChecker>>,
     signed: Option<crate::verdict::Signed>,
     taught: Option<(String, String)>,
+    act: Option<ActHooks>,
     maps: &DidMaps,
     event_tx: &mpsc::Sender<Event>,
 ) {
@@ -2726,6 +2905,12 @@ fn spawn_verdict_check(
             && maps.lock().learn(&nick, &did, true)
         {
             let _ = event_tx.send(Event::MemberDid { nick, did }).await;
+        }
+        if let Some(act) = act {
+            if let Some(settled) = act.settled {
+                let _ = settled.send(verdict.clone());
+            }
+            let _ = act.up.await;
         }
         let _ = event_tx
             .send(Event::Verdict {
@@ -2848,7 +3033,9 @@ where
     // Task event ids already handed up. The same event arrives up to three
     // times — our own echo, the replay a channel hands a joiner, and the
     // history that joiner asks for next — and only the first is an event.
-    let mut seen_act_events: SeenActEvents = SeenActEvents::default();
+    // Shared with the task-event line, which records what it sends up; a
+    // ruling that fails its check never goes up, so is never recorded.
+    let seen_act_events: Arc<parking_lot::Mutex<SeenActEvents>> = Default::default();
     // Session message-signing keypair (generated after SASL success)
     let mut msg_signing_key: Option<ed25519_dalek::SigningKey> = None;
     // The seed of the stored device key this connection presented; `None`
@@ -2873,11 +3060,19 @@ where
     // and emits a single Event::Message with the assembled body.
     // Checks held on open batches other than `draft/multiline`, by batch id.
     // The guard starts whatever is still held when this loop ends.
+    // Rulings, and the task events behind them, wait here before going up.
+    let acts = ActLine::new(
+        event_tx.clone(),
+        checker.clone(),
+        did_maps.clone(),
+        seen_act_events.clone(),
+    );
     let mut deferred = HeldChecksOnExit {
         batches: std::collections::HashMap::new(),
         checker: checker.clone(),
         maps: did_maps.clone(),
         event_tx: event_tx.clone(),
+        acts: Some(acts.clone()),
     };
     let mut multiline_batches: std::collections::HashMap<String, InboundMultilineBatch> =
         std::collections::HashMap::new();
@@ -3177,8 +3372,21 @@ where
                                         .await;
                                     } else {
                                         if let Some(held) = deferred.batches.remove(id) {
+                                            // Its task events, in wire order, then
+                                            // its rulings, as the web does. A copy of
+                                            // one already up is left out.
+                                            for act in held.acts {
+                                                if let Event::Act { event_id, .. } = &act
+                                                    && seen_act_events.lock().first_sighting(event_id)
+                                                {
+                                                    let _ = event_tx.send(act).await;
+                                                }
+                                            }
+                                            for ruling in held.rulings {
+                                                let _ = ruling.send(());
+                                            }
                                             start_deferred_checks(
-                                                held,
+                                                held.checks,
                                                 checker.as_ref(),
                                                 &did_maps,
                                                 &event_tx,
@@ -3530,6 +3738,16 @@ where
                                 let is_server_notice = msg.command == "NOTICE"
                                     && !prefix.contains('!');
                                 if is_server_notice {
+                                    // The session's bearer, sent after
+                                    // sign-in: kept for the task history a
+                                    // ruling's check may need to read.
+                                    if let Some(bearer) = msg.params[1]
+                                        .strip_prefix("API-BEARER ")
+                                        .map(str::trim)
+                                        .filter(|b| !b.is_empty())
+                                    {
+                                        acts.set_bearer(bearer);
+                                    }
                                     // Server NOTICE (no hostmask in prefix) → ServerNotice
                                     let text = msg.params[1].clone();
                                     let _ = event_tx.send(Event::ServerNotice { text }).await;
@@ -3627,6 +3845,7 @@ where
                                         checker.as_ref(),
                                         follow_up,
                                         taught,
+                                        None,
                                         &did_maps,
                                         &event_tx,
                                     );
@@ -3646,7 +3865,7 @@ where
                                 // just as well. The JS SDK learns here too;
                                 // leaving it out would mean a peer known to
                                 // one client and nameless to the other.
-                                let (verdict, follow_up) = verdict_at_delivery(
+                                let (mut verdict, mut follow_up) = verdict_at_delivery(
                                     checker.as_ref(), &did_maps, &msg.tags, &target, None,
                                 );
                                 let taught = msg
@@ -3671,12 +3890,96 @@ where
                                 // A task event is handed up as its own event
                                 // as well as the raw TAGMSG, the way a
                                 // coordination TAGMSG is — once per event id.
+                                // A ruling, and an event on a task with one
+                                // still waiting ahead of it, waits in line
+                                // (`ActLine`); any other goes up now, or at
+                                // the close of the history batch it is in.
+                                let in_batch = msg.tags.get("batch").cloned();
+                                let mut act_hooks = None;
+                                let mut opener_naming = None;
                                 if let Some(act) = crate::act::parse_event(
                                     msg.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-                                ) && seen_act_events.first_sighting(&act.event_id)
+                                ) && !seen_act_events.lock().went_up(&act.event_id)
                                 {
-                                    let _ = event_tx
-                                        .send(Event::Act {
+                                    let look = acts
+                                        .checks()
+                                        .then(|| first_look_at(&did_maps, &msg.tags, &target, None));
+                                    // A DM line signed in a readable form, with
+                                    // its signer named, whose venue cannot be
+                                    // built only because this session's own DID
+                                    // is not known yet.
+                                    let no_session_venue = matches!(
+                                        look,
+                                        Some(crate::verdict::FirstLook::Unverifiable(Some(_)))
+                                    ) && !(target.starts_with('#') || target.starts_with('&'))
+                                        && did_maps.lock().own_did.is_none()
+                                        && (msg.tags.contains_key("+freeq.at/from")
+                                            || msg.tags.contains_key("freeq.at/from"));
+                                    let signed = match look {
+                                        Some(crate::verdict::FirstLook::Check(signed)) => Some(signed),
+                                        _ => None,
+                                    };
+                                    // An opener names its task's referee once its
+                                    // signature checks (`ActLine::name_once_checked`).
+                                    let opener = (act.task_id == act.event_id).then(|| {
+                                        let venue = match &signed {
+                                            Some(crate::verdict::Signed {
+                                                doc: crate::verdict::SignedDoc::Act { venue, .. },
+                                                ..
+                                            }) => Some(venue.clone()),
+                                            _ => None,
+                                        };
+                                        (act.task_id.clone(), act.fields.get("act-home").cloned(), venue)
+                                    });
+                                    opener_naming = opener;
+                                    let ruling = acts.checks()
+                                        && crate::act_transitions::is_ruling(&act.verb);
+                                    if ruling || acts.waiting(&act.task_id) {
+                                        let (up, up_rx) = tokio::sync::oneshot::channel();
+                                        // A ruling's verdict is the line's to find,
+                                        // under its task's own document.
+                                        let verdict_gate = match ruling {
+                                            true => {
+                                                if let Some(signed) = &signed {
+                                                    verdict = Some(plain_verdict(
+                                                        crate::verdict::VerdictState::Pending,
+                                                        Some(signed.kid.clone()),
+                                                    ));
+                                                }
+                                                follow_up = None;
+                                                Some(up_rx)
+                                            }
+                                            false => {
+                                                act_hooks = Some(ActHooks { settled: None, up: up_rx });
+                                                None
+                                            }
+                                        };
+                                        let batch = in_batch
+                                            .as_ref()
+                                            .filter(|_| ruling)
+                                            .and_then(|id| deferred.batches.get_mut(id))
+                                            .map(|held| {
+                                                let (closed, closes) = tokio::sync::oneshot::channel();
+                                                held.rulings.push(closed);
+                                                closes
+                                            });
+                                        let own_did = did_maps.lock().own_did.clone();
+                                        acts.enqueue(ArrivedAct {
+                                            from: from.clone(),
+                                            target: target.clone(),
+                                            act,
+                                            dm_key: dm_key.clone(),
+                                            delivered: verdict.clone(),
+                                            signed: signed.filter(|_| ruling),
+                                            no_session_venue,
+                                            own_did,
+                                            verdict_gate,
+                                            batch,
+                                            up,
+                                        });
+                                    } else {
+                                        let event_id = act.event_id.clone();
+                                        let up = Event::Act {
                                             from: from.clone(),
                                             target: target.clone(),
                                             kind: act.kind,
@@ -3689,16 +3992,38 @@ where
                                             replayed: act.replayed,
                                             dm_key: dm_key.clone(),
                                             verdict: verdict.clone(),
-                                        })
-                                        .await;
+                                            ruling: None,
+                                        };
+                                        // Inside an open history batch: held to its
+                                        // close, as the web holds it, and taken as
+                                        // seen only as it goes up.
+                                        match in_batch.as_ref().and_then(|id| deferred.batches.get_mut(id)) {
+                                            Some(held) => held.acts.push(up),
+                                            None => {
+                                                seen_act_events.lock().first_sighting(&event_id);
+                                                let _ = event_tx.send(up).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some((task, home, venue)) = opener_naming {
+                                    act_hooks = acts.name_once_checked(
+                                        task,
+                                        home,
+                                        venue,
+                                        verdict.as_ref(),
+                                        follow_up.is_some(),
+                                        act_hooks,
+                                    );
                                 }
                                 let _ = event_tx.send(Event::TagMsg { from, target, tags: msg.tags.clone(), dm_key, verdict }).await;
                                 check_now_or_hold(
                                         &mut deferred.batches,
-                                        msg.tags.get("batch"),
+                                        in_batch.as_ref(),
                                         checker.as_ref(),
                                         follow_up,
                                         taught,
+                                        act_hooks,
                                         &did_maps,
                                         &event_tx,
                                     );
@@ -3785,7 +4110,15 @@ where
                 line_buf.clear();
             }
             Some(mut cmd) = cmd_rx.recv() => {
-                if registered || matches!(cmd, Command::Quit(_)) {
+                // On a task of its own, so the read loop does not wait for
+                // the read or the check; at any point of the connection,
+                // since it writes nothing.
+                if let Command::TaskHistory { act_id, done } = cmd {
+                    let acts = acts.clone();
+                    tokio::spawn(async move {
+                        let _ = done.send(acts.task_history(&act_id).await);
+                    });
+                } else if registered || matches!(cmd, Command::Quit(_)) {
                     name_home(&mut cmd, server_name.as_deref());
                     let verifies = caps_acked.lock().acked.contains(MSGSIG_CAP);
                     // A task event whose line waits for the answer is started
@@ -3886,12 +4219,1087 @@ async fn dispatch_assembled_multiline(
         checker,
         follow_up,
         taught,
+        None,
         maps,
         event_tx,
     );
     // Nested-batch parent (e.g. multiline inside CHATHISTORY) is
     // exposed to the consumer via the `batch` tag so UI layers can
     // attach the assembled message to the outer batch.
+}
+
+/// How long a ruling waits for its verdict and its check before it goes up
+/// with what it has, once its history batch, if it came in one, has closed.
+const RULING_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+#[cfg(test)]
+thread_local! {
+    /// A shorter [`RULING_WAIT`] for the connections a test opens on its own
+    /// thread.
+    static RULING_WAIT_FOR_TEST: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The longest a ruling's check takes as a whole: its task's history when
+/// its opener was not seen ([`TASK_HISTORY_WAIT`]), then the connected
+/// server's key set for its own rulings, or the referee's key list
+/// (`key_lookup::OWN_HOST_WAIT`). Shorter than [`RULING_WAIT`], so a check
+/// that runs out does so before the ruling's wait does.
+const RULING_CHECK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The longest a task's history read takes.
+const TASK_HISTORY_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// The longest [`ClientHandle::task_history`]'s read takes, as the read of
+/// the connected server's key set (`fetch_server_key_set`).
+const TASK_HISTORY_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Most tasks whose referee a connection keeps.
+const TASK_HOMES_HELD: usize = 4096;
+
+/// What a task's opener says about the task's rulings: the referee it names
+/// (`act-home`, `None` when it names none), and the venue it was posted to,
+/// which a server signs its own events about the task for.
+#[derive(Debug, Clone, Default)]
+struct TaskOpener {
+    home: Option<String>,
+    venue: Option<String>,
+    /// Learned from a copy read from the task's history, not from a live
+    /// opener whose signature checked.
+    fetched: bool,
+    /// The fetched copy's signature contradicts its key: every ruling on the
+    /// task fails, and nothing else it says is read.
+    altered: bool,
+}
+
+/// What judging a ruling comes to inside the SDK: a [`RulingCheck`], or
+/// that the app cannot know the task's referee, because its opening post is
+/// missing from what it has and could read, is signed under a key nobody
+/// can find or trusted only through the server, or, in a DM, the pair it
+/// would have given is unknown. Such a ruling is hidden where a failing one
+/// is, so only `Counts` and `CannotCheck` (the referee known, its site not
+/// answering in time) go up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Judgment {
+    Ruled(crate::verdict::RulingCheck),
+    RefereeUnknown,
+}
+
+impl Judgment {
+    /// Whether the ruling is hidden: it fails, or its referee cannot be
+    /// known.
+    fn hidden(self) -> bool {
+        matches!(
+            self,
+            Judgment::Ruled(crate::verdict::RulingCheck::Fails) | Judgment::RefereeUnknown
+        )
+    }
+}
+
+/// A task's opener as [`TaskOpener`] gives it, or a history read of it that
+/// failed.
+type HomeCell = Arc<tokio::sync::OnceCell<Result<TaskOpener, ()>>>;
+
+/// What each task's opener named as its referee, and its venue, learned from
+/// the opener as it arrives or read from the task's history on the connected
+/// server. Kept per connection, bounded, oldest out: a ruling can arrive any
+/// time after its opener, and reading the history for every ruling would be
+/// a request per ruling. A read that fails is not kept.
+#[derive(Default)]
+struct TaskHomes {
+    cells: HashMap<String, HomeCell>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl TaskHomes {
+    fn cell(&mut self, task: &str) -> HomeCell {
+        if let Some(cell) = self.cells.get(task) {
+            return cell.clone();
+        }
+        let cell: HomeCell = Arc::new(tokio::sync::OnceCell::new());
+        self.cells.insert(task.to_string(), cell.clone());
+        self.order.push_back(task.to_string());
+        while self.cells.len() > TASK_HOMES_HELD {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.cells.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        cell
+    }
+
+    /// Name `task`'s opener from a live opener whose signature checked. An
+    /// answer from such an opener already held stands; anything else, a
+    /// cell with none yet, a history read still in flight or one that
+    /// failed, or an answer from a fetched copy (one found altered too), is
+    /// replaced by one holding `opener`, and a ruling waiting on that read
+    /// looks again (`home_of`). A replace keeps the task's place in `order`.
+    fn name(&mut self, task: &str, opener: TaskOpener) {
+        match self.cells.get(task).map(|cell| {
+            cell.get()
+                .is_some_and(|held| held.as_ref().is_ok_and(|held| !held.fetched))
+        }) {
+            Some(true) => {}
+            Some(false) => {
+                self.cells.insert(
+                    task.to_string(),
+                    Arc::new(tokio::sync::OnceCell::new_with(Some(Ok(opener)))),
+                );
+            }
+            None => {
+                let _ = self.cell(task).set(Ok(opener));
+            }
+        }
+    }
+
+    /// Drop a read that failed, so the next ruling of the task reads again.
+    fn forget(&mut self, task: &str, cell: &HomeCell) {
+        if self
+            .cells
+            .get(task)
+            .is_some_and(|held| Arc::ptr_eq(held, cell))
+        {
+            self.cells.remove(task);
+            self.order.retain(|t| t != task);
+        }
+    }
+}
+
+/// A task event read off the wire that waits in its connection's
+/// [`ActLine`] before going up as `Event::Act`.
+struct ArrivedAct {
+    from: String,
+    target: String,
+    act: crate::act::ActEvent,
+    dm_key: Option<String>,
+    /// The verdict it was delivered with.
+    delivered: Option<crate::verdict::Verdict>,
+    /// A ruling's: what its signature covers, as rebuilt from the line;
+    /// none for a signature that is missing or cannot be read.
+    signed: Option<crate::verdict::Signed>,
+    /// A DM ruling whose venue cannot be built only because this session's
+    /// own DID is not known yet: it cannot be checked, which is not a
+    /// failure.
+    no_session_venue: bool,
+    /// A ruling's: this session's DID when it arrived, which a DM task's
+    /// venue must name for a ruling to be checked under it.
+    own_did: Option<String>,
+    /// A ruling's: the gate its own verdict check waits on before sending
+    /// its verdict, so the verdict follows the event.
+    verdict_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// A ruling's in an open history batch: told when the batch closes,
+    /// dropped when the connection ends with it open.
+    batch: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Sent, or dropped, once the event has gone up or been dropped, so its
+    /// line's verdict follows it.
+    up: tokio::sync::oneshot::Sender<()>,
+}
+
+/// One connection's task events that wait before going up. Only a ruling
+/// waits for its check: for its history batch, if one is open, to close;
+/// then, at most [`RULING_WAIT`], for its verdict and whether it counts.
+/// An event on the same task that arrives while a ruling ahead of it waits
+/// goes up right after that ruling, in wire order; every other task event
+/// goes up on the read loop, before its `TagMsg`, or, read inside an open
+/// history batch, at the batch's close (`HeldBatch`). When
+/// the connection ends, a ruling of a batch it cut off, and a ruling still
+/// being checked, is dropped with the events behind it on its task, and the
+/// replay after reconnecting brings them back to be checked; none goes up
+/// unchecked. Nothing waits into the next connection.
+///
+/// A line, because nothing else holds a task event to its check: a line
+/// goes up with a pending verdict and the final one follows separately, so an
+/// app could not leave out a ruling whose check fails, and an event after the
+/// ruling must not overtake it, since the apps take a task's step from the
+/// last event they were given.
+struct ActLine {
+    event_tx: mpsc::Sender<Event>,
+    checker: Option<Arc<SignatureChecker>>,
+    /// For the ruling checks the line starts itself.
+    maps: DidMaps,
+    wait: std::time::Duration,
+    /// Per task, the last event in line's number and the signal it sends
+    /// once it has gone up (`true`) or been dropped (`false`).
+    tails: parking_lot::Mutex<HashMap<String, (u64, tokio::sync::oneshot::Receiver<bool>)>>,
+    numbered: std::sync::atomic::AtomicU64,
+    ended: tokio::sync::watch::Sender<bool>,
+    homes: parking_lot::Mutex<TaskHomes>,
+    /// The session bearer the server sent after sign-in, for the task
+    /// history of a DM or a private channel.
+    bearer: parking_lot::Mutex<Option<String>>,
+    /// The connection's repeat filter: an event is recorded as it goes up,
+    /// so a ruling thrown out failing is never recorded, and a copy of its
+    /// id cannot hide the genuine ruling.
+    seen: Arc<parking_lot::Mutex<SeenActEvents>>,
+}
+
+impl ActLine {
+    fn new(
+        event_tx: mpsc::Sender<Event>,
+        checker: Option<Arc<SignatureChecker>>,
+        maps: DidMaps,
+        seen: Arc<parking_lot::Mutex<SeenActEvents>>,
+    ) -> Arc<Self> {
+        #[cfg(test)]
+        let wait = RULING_WAIT_FOR_TEST
+            .with(|w| w.get())
+            .unwrap_or(RULING_WAIT);
+        #[cfg(not(test))]
+        let wait = RULING_WAIT;
+        Arc::new(Self {
+            event_tx,
+            checker,
+            maps,
+            wait,
+            tails: parking_lot::Mutex::new(HashMap::new()),
+            numbered: std::sync::atomic::AtomicU64::new(0),
+            ended: tokio::sync::watch::channel(false).0,
+            homes: parking_lot::Mutex::new(TaskHomes::default()),
+            bearer: parking_lot::Mutex::new(None),
+            seen,
+        })
+    }
+
+    fn set_bearer(&self, bearer: &str) {
+        *self.bearer.lock() = Some(bearer.to_string());
+    }
+
+    /// Whether the client checks rulings at all: it does when it checks
+    /// signatures.
+    fn checks(&self) -> bool {
+        self.checker.is_some()
+    }
+
+    /// Keep what an opener whose signature checked says about its task: the
+    /// referee it names, signed by its poster and checked at the door of the
+    /// server it was posted on, and the venue its own check rebuilt. Called
+    /// only once the opener checks (`name_once_checked`).
+    fn name_home(&self, task: &str, home: Option<String>, venue: Option<String>) {
+        let opener = TaskOpener {
+            home,
+            venue,
+            ..TaskOpener::default()
+        };
+        self.homes.lock().name(task, opener);
+    }
+
+    /// Name `task`'s referee from its opener once the opener's signature
+    /// checks: at once when its delivered verdict is final and checks; when
+    /// its check (`pending`) settles and checks, through that check's
+    /// `settled` hook, which this returns with `hooks`, the history read
+    /// instead when it does not; never from an opener that does not check.
+    /// The first opener's answer is kept; a history read under way or failed
+    /// is replaced by it.
+    fn name_once_checked(
+        self: &Arc<Self>,
+        task: String,
+        home: Option<String>,
+        venue: Option<String>,
+        delivered: Option<&crate::verdict::Verdict>,
+        pending: bool,
+        hooks: Option<ActHooks>,
+    ) -> Option<ActHooks> {
+        if !pending {
+            if delivered.is_some_and(checks_out) {
+                self.name_home(&task, home, venue);
+            }
+            return hooks;
+        }
+        let (settled, checked) = tokio::sync::oneshot::channel();
+        let hooks = match hooks {
+            Some(hooks) => ActHooks {
+                settled: Some(settled),
+                ..hooks
+            },
+            // Nothing in line waits on it: its gate is open.
+            None => ActHooks {
+                settled: Some(settled),
+                up: tokio::sync::oneshot::channel().1,
+            },
+        };
+        let line = self.clone();
+        let (cell, read_under_way) = {
+            let mut homes = self.homes.lock();
+            let held = homes.cells.contains_key(&task);
+            (homes.cell(&task), held)
+        };
+        // A history read, or an earlier opener's answer, is already there:
+        // this opener's check is awaited on its own, and names the referee
+        // if it checks, replacing a read that has not answered.
+        if read_under_way {
+            tokio::spawn(async move {
+                if checked.await.is_ok_and(|verdict| checks_out(&verdict)) {
+                    line.name_home(&task, home, venue);
+                }
+            });
+            return Some(hooks);
+        }
+        // The task's referee is this check's to answer: a ruling asking
+        // meanwhile waits for it rather than racing to the history, which is
+        // read only if the opener does not check.
+        tokio::spawn(async move {
+            let named = cell
+                .get_or_init(|| async {
+                    match checked.await {
+                        Ok(verdict) if checks_out(&verdict) => Ok(TaskOpener {
+                            home,
+                            venue,
+                            ..TaskOpener::default()
+                        }),
+                        _ => line.read_home(&task).await,
+                    }
+                })
+                .await;
+            if named.is_err() {
+                line.homes.lock().forget(&task, &cell);
+            }
+        });
+        Some(hooks)
+    }
+
+    /// Whether an event of `task` is still in line.
+    fn waiting(&self, task: &str) -> bool {
+        self.tails.lock().contains_key(task)
+    }
+
+    /// The connection has ended: every ruling still being checked is dropped
+    /// now.
+    fn end(&self) {
+        self.ended.send_replace(true);
+    }
+
+    /// Put a task event in line behind the one before it on its task.
+    /// Called on the read loop, in wire order.
+    fn enqueue(self: &Arc<Self>, arrived: ArrivedAct) {
+        let task = arrived.act.task_id.clone();
+        let number = self
+            .numbered
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (gone, gone_rx) = tokio::sync::oneshot::channel();
+        let before = self
+            .tails
+            .lock()
+            .insert(task.clone(), (number, gone_rx))
+            .map(|(_, before)| before);
+        let line = self.clone();
+        tokio::spawn(async move {
+            let went_up = line.carry(arrived, before).await;
+            let _ = gone.send(went_up);
+            let mut tails = line.tails.lock();
+            if tails.get(&task).is_some_and(|(n, _)| *n == number) {
+                tails.remove(&task);
+            }
+        });
+    }
+
+    /// Wait as [`ActLine`] says, then send the event up unless it is a
+    /// ruling whose batch was cut, or waits behind an event that was
+    /// dropped: the replay brings both back, in order. Whether it went up.
+    async fn carry(
+        &self,
+        arrived: ArrivedAct,
+        before: Option<tokio::sync::oneshot::Receiver<bool>>,
+    ) -> bool {
+        let ArrivedAct {
+            from,
+            target,
+            act,
+            dm_key,
+            delivered,
+            signed,
+            no_session_venue,
+            own_did,
+            verdict_gate,
+            batch,
+            up,
+        } = arrived;
+        let cut = match batch {
+            Some(closed) => closed.await.is_err(),
+            None => false,
+        };
+        let mut dropped = cut;
+        let (verdict, ruling) = match (crate::act_transitions::is_ruling(&act.verb), cut) {
+            // Nothing to check under, and nothing to wait for: the pair the
+            // opener would have given is unknown.
+            (true, false) if no_session_venue => (delivered, Some(Judgment::RefereeUnknown)),
+            (true, false) => match self
+                .settle_ruling(
+                    &act.task_id,
+                    delivered.clone(),
+                    signed,
+                    own_did.as_deref(),
+                    verdict_gate,
+                )
+                .await
+            {
+                Some((verdict, ruling)) => (verdict, Some(ruling)),
+                // Still being checked when the connection ended: dropped, as
+                // a cut batch's ruling is, for the replay to bring back.
+                None => {
+                    dropped = true;
+                    (delivered, None)
+                }
+            },
+            (true, true) => {
+                self.check_dropped_line(&act.task_id, &delivered, signed, own_did.as_deref());
+                (delivered, None)
+            }
+            (false, _) => (delivered, None),
+        };
+        // A signal lost with its task counts as gone up, as before.
+        let ahead_went_up = match before {
+            Some(before) => before.await.unwrap_or(true),
+            None => true,
+        };
+        if dropped || !ahead_went_up {
+            return false;
+        }
+        // A ruling that fails its check, or whose referee cannot be known, is
+        // thrown out here, before any app or bot sees it, and is not taken as
+        // seen, so a copy of its id cannot hide the genuine ruling and a
+        // replay or history read checks it again. What waits behind it goes
+        // on as if it had gone up, and its line's verdict follows (`up` is
+        // dropped).
+        if ruling.is_some_and(Judgment::hidden) {
+            return true;
+        }
+        let ruling = match ruling {
+            Some(Judgment::Ruled(ruling)) => Some(ruling),
+            _ => None,
+        };
+        // Taken as seen as it goes up, so a copy that arrived while this one
+        // waited is judged on its own; a repeat of one already up is left
+        // out, and counts as gone up.
+        if !self.seen.lock().first_sighting(&act.event_id) {
+            return true;
+        }
+        let _ = self
+            .event_tx
+            .send(Event::Act {
+                from,
+                target,
+                kind: act.kind,
+                verb: act.verb,
+                did: act.did,
+                event_id: act.event_id,
+                task_id: act.task_id,
+                fields: act.fields,
+                sig_tag: act.sig_tag,
+                replayed: act.replayed,
+                dm_key,
+                verdict,
+                ruling,
+            })
+            .await;
+        let _ = up.send(());
+        true
+    }
+
+    /// A ruling's verdict and whether it counts, once both have settled, or
+    /// what has settled when the wait runs out or the connection ends: the
+    /// verdict delivered (pending) only if none settled, and cannot check
+    /// unless the check finished. The ruling's own verdict check starts here,
+    /// once its task's opener is known, so its verdict and its judgment check
+    /// one document: for a DM task, the task's own venue.
+    async fn settle_ruling(
+        &self,
+        task: &str,
+        delivered: Option<crate::verdict::Verdict>,
+        signed: Option<crate::verdict::Signed>,
+        own_did: Option<&str>,
+        verdict_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> Option<(Option<crate::verdict::Verdict>, Judgment)> {
+        use crate::verdict::RulingCheck;
+        let check_by = tokio::time::Instant::now() + RULING_CHECK_WAIT;
+        let deadline = tokio::time::sleep(self.wait);
+        tokio::pin!(deadline);
+        let mut ended = self.ended.subscribe();
+        let opener = tokio::select! {
+            biased;
+            opener = tokio::time::timeout_at(check_by, self.home_of(task)) => opener.ok().flatten(),
+            _ = ended.wait_for(|ended| *ended) => {
+                // Dropped mid-check; its line still gets its verdict.
+                self.check_dropped_line(task, &delivered, signed, own_did);
+                return None;
+            }
+        };
+        let pending = delivered
+            .as_ref()
+            .is_some_and(|v| v.state == crate::verdict::VerdictState::Pending);
+        // Its task's opening post proven altered: thrown out at once, before
+        // the venue step, which in a DM needs that post. Its line still gets
+        // its verdict, as every thrown-out ruling's does: under the venue
+        // its target gives in a channel, unverifiable in a DM.
+        if opener.as_ref().is_some_and(|opener| opener.altered) {
+            if pending {
+                self.check_line_unrefereed(signed, own_did, verdict_gate);
+            }
+            return Some((delivered, Judgment::Ruled(RulingCheck::Fails)));
+        }
+        // Its DM pair unknown: the check cannot run, and its line's verdict
+        // is the one an unbuildable venue gets, with no key looked up.
+        let msgid = signed.as_ref().map(|signed| signed.msgid.clone());
+        let look = signed.map(|signed| under_task_venue(signed, opener.as_ref(), own_did));
+        if let Some(look @ crate::verdict::FirstLook::Unverifiable(_)) = &look {
+            let verdict = self
+                .checker
+                .as_ref()
+                .map(|checker| checker.at_delivery(look));
+            if pending && let (Some(verdict), Some(msgid)) = (verdict.clone(), msgid) {
+                self.send_verdict_after(verdict_gate, msgid, verdict);
+            }
+            return Some((verdict.or(delivered), Judgment::RefereeUnknown));
+        }
+        let signed = match look {
+            Some(crate::verdict::FirstLook::Check(signed)) => Some(signed),
+            _ => None,
+        };
+        // Started whatever happens below, so the line gets a final verdict.
+        // A line delivered final has none to wait for: its sender goes, so
+        // the wait below does not hold the ruling.
+        let (tell, told) = tokio::sync::oneshot::channel();
+        if !pending {
+            drop(tell);
+        } else {
+            spawn_verdict_check(
+                self.checker.as_ref(),
+                signed.clone(),
+                None,
+                Some(ActHooks {
+                    settled: Some(tell),
+                    up: verdict_gate.unwrap_or_else(|| tokio::sync::oneshot::channel().1),
+                }),
+                &self.maps,
+                &self.event_tx,
+            );
+        }
+        let fallback = delivered.clone();
+        let verdict_in = async move { told.await.ok().or(delivered) };
+        let judged = tokio::time::timeout_at(check_by, self.judge(opener, signed.as_ref()));
+        tokio::pin!(verdict_in, judged);
+        let mut verdict = None;
+        let mut ruling = None;
+        while verdict.is_none() || ruling.is_none() {
+            tokio::select! {
+                biased;
+                v = &mut verdict_in, if verdict.is_none() => verdict = Some(v),
+                r = &mut judged, if ruling.is_none() => {
+                    // Run out of time with its opener known: the referee's
+                    // site is slow, and it goes up unchecked.
+                    let r = r.unwrap_or(Judgment::Ruled(RulingCheck::CannotCheck));
+                    // Thrown out at once: the events behind it on its task
+                    // do not wait for its line's verdict, whose check, already
+                    // started, goes on and sends after the gate.
+                    if r.hidden() {
+                        return Some((verdict.unwrap_or(fallback), r));
+                    }
+                    ruling = Some(r);
+                }
+                _ = &mut deadline => break,
+                // Still being checked when the connection ends: dropped, and
+                // its line's verdict check, already started, goes on.
+                _ = ended.wait_for(|ended| *ended) => return None,
+            }
+        }
+        Some((
+            verdict.unwrap_or(fallback),
+            ruling.unwrap_or(Judgment::Ruled(RulingCheck::CannotCheck)),
+        ))
+    }
+
+    /// A ruling dropped before its check ran (its batch cut, or the
+    /// connection ended), whose line was delivered pending: the line still
+    /// gets its verdict, under its task's venue if that is known.
+    fn check_dropped_line(
+        &self,
+        task: &str,
+        delivered: &Option<crate::verdict::Verdict>,
+        signed: Option<crate::verdict::Signed>,
+        own_did: Option<&str>,
+    ) {
+        if !delivered
+            .as_ref()
+            .is_some_and(|v| v.state == crate::verdict::VerdictState::Pending)
+        {
+            return;
+        }
+        let opener = self.held_opener(task);
+        self.check_line_under(signed, opener.as_ref(), own_did, None);
+    }
+
+    /// A ruling thrown out because its task's opening post was proven
+    /// altered, whose line was delivered pending: the line still gets its
+    /// verdict, under no opener, once `gate` opens.
+    fn check_line_unrefereed(
+        &self,
+        signed: Option<crate::verdict::Signed>,
+        own_did: Option<&str>,
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) {
+        self.check_line_under(signed, None, own_did, gate);
+    }
+
+    /// Check a ruling's line under its task's venue as `opener` gives it,
+    /// and send its verdict once `gate` opens.
+    fn check_line_under(
+        &self,
+        signed: Option<crate::verdict::Signed>,
+        opener: Option<&TaskOpener>,
+        own_did: Option<&str>,
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) {
+        let msgid = signed.as_ref().map(|signed| signed.msgid.clone());
+        match signed.map(|signed| under_task_venue(signed, opener, own_did)) {
+            Some(crate::verdict::FirstLook::Check(signed)) => spawn_verdict_check(
+                self.checker.as_ref(),
+                Some(signed),
+                None,
+                gate.map(|up| ActHooks { settled: None, up }),
+                &self.maps,
+                &self.event_tx,
+            ),
+            Some(look) => {
+                if let (Some(checker), Some(msgid)) = (self.checker.as_ref(), msgid) {
+                    self.send_verdict_after(gate, msgid, checker.at_delivery(&look));
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Whether a ruling counts: only on a task whose opener names its
+    /// referee, and then only signed by that referee, with a key its own
+    /// site lists, before the key stopped counting. The connected server's
+    /// own rulings are checked against its key set, which is its own list.
+    async fn judge(
+        &self,
+        opener: Option<TaskOpener>,
+        signed: Option<&crate::verdict::Signed>,
+    ) -> Judgment {
+        use crate::key_lookup::OwnHostAnswer;
+        use crate::verdict::RulingCheck;
+        let Some(checker) = self.checker.as_ref() else {
+            return Judgment::Ruled(RulingCheck::CannotCheck);
+        };
+        // No opening post it has, could read, and could check: the app
+        // cannot know the referee.
+        let Some(opener) = opener else {
+            return Judgment::RefereeUnknown;
+        };
+        // Its opening post proven altered: nothing the referee signs counts.
+        if opener.altered {
+            return Judgment::Ruled(RulingCheck::Fails);
+        }
+        // A checked opening post naming no referee: as before step 9.
+        let Some(home) = opener.home else {
+            return Judgment::Ruled(RulingCheck::CannotCheck);
+        };
+        // No signature, or one that cannot be read: nothing the referee
+        // signed, as the server holds too.
+        let Some(signed) = signed else {
+            return Judgment::Ruled(RulingCheck::Fails);
+        };
+        if signed.did != home {
+            return Judgment::Ruled(RulingCheck::Fails);
+        }
+        // The connected server's key set is the referee's own list only when
+        // the host the client connected to is the referee's own host: a name
+        // the server merely claims for itself proves nothing.
+        let connected = checker
+            .lookup
+            .origin_base()
+            .and_then(|origin| url::Url::parse(origin).ok())
+            .and_then(|origin| origin.host_str().map(str::to_ascii_lowercase))
+            .zip(home.strip_prefix("did:web:"))
+            .is_some_and(|(host, referee)| host == referee.to_ascii_lowercase());
+        let answer = match connected {
+            true => checker.server_ruling_key(&home, &signed.kid).await,
+            false => None,
+        };
+        let answer = match answer {
+            Some(answer) => answer,
+            None => checker.lookup.own_host_answer(&home, &signed.kid).await,
+        };
+        Judgment::Ruled(match answer {
+            OwnHostAnswer::Listed {
+                public_key,
+                retired_at,
+            } => ruling_against(signed, &public_key, retired_at),
+            OwnHostAnswer::NotListed => RulingCheck::Fails,
+            OwnHostAnswer::CannotAnswer => RulingCheck::CannotCheck,
+        })
+    }
+
+    /// Send a line's verdict once its event has gone up (`gate`), off the
+    /// line, as `spawn_verdict_check` does for a verdict it found.
+    fn send_verdict_after(
+        &self,
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+        msgid: String,
+        verdict: crate::verdict::Verdict,
+    ) {
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            let _ = event_tx.send(Event::Verdict { msgid, verdict }).await;
+        });
+    }
+
+    /// What `task`'s opener says, when it is already known; none for one
+    /// proven altered.
+    fn held_opener(&self, task: &str) -> Option<TaskOpener> {
+        let cell = self.homes.lock().cells.get(task).cloned()?;
+        cell.get().cloned()?.ok().filter(|opener| !opener.altered)
+    }
+
+    /// What `task`'s opener says; `None` when the opener was not seen and
+    /// its history could not be read. Rulings of one task asking at once
+    /// share one read; an opener that checks while it is under way answers
+    /// instead when it fails.
+    async fn home_of(&self, task: &str) -> Option<TaskOpener> {
+        let cell = self.homes.lock().cell(task);
+        let opener = cell.get_or_init(|| self.read_home(task)).await.clone();
+        if opener.as_ref().is_ok_and(|opener| !opener.altered) {
+            return opener.ok();
+        }
+        // An opener that checked while the read was under way replaced it,
+        // a read that failed or a copy found altered: what the map holds now
+        // is awaited once more.
+        let now = {
+            let mut homes = self.homes.lock();
+            if opener.is_err() {
+                homes.forget(task, &cell);
+            }
+            homes.cells.get(task).cloned()
+        };
+        let Some(now) = now.filter(|now| !Arc::ptr_eq(now, &cell)) else {
+            return opener.ok();
+        };
+        let again = now.get_or_init(|| self.read_home(task)).await.clone();
+        if again.is_err() {
+            self.homes.lock().forget(task, &now);
+        }
+        again.ok()
+    }
+
+    /// What `task`'s opener says, read from the task's history on the
+    /// connected server within [`TASK_HISTORY_WAIT`] and checked
+    /// (`checked_opener_in`).
+    async fn read_home(&self, task: &str) -> Result<TaskOpener, ()> {
+        let history = self.read_history(task, Some(TASK_HISTORY_WAIT)).await?;
+        self.checked_opener_in(&history, task).await
+    }
+
+    /// What the opener in a task's history says, once its own signature is
+    /// checked as a live opener's is: the referee it names and the venue it
+    /// was signed for (its canonical's `target`) when it checks; marked
+    /// altered when its signature contradicts its key (invalid, made at or
+    /// after the key stopped counting, or missing or unreadable, as a
+    /// ruling's is); `Err` when the history holds no opener, or its
+    /// signature cannot be checked (its key not found). An `Err` is not
+    /// kept: the next ruling reads and checks again.
+    async fn checked_opener_in(
+        &self,
+        history: &serde_json::Value,
+        task: &str,
+    ) -> Result<TaskOpener, ()> {
+        let checker = self.checker.as_ref().ok_or(())?;
+        let event = history
+            .get("events")
+            .and_then(|events| events.as_array())
+            .into_iter()
+            .flatten()
+            .find(|event| event.get("event_id").and_then(|id| id.as_str()) == Some(task))
+            .ok_or(())?;
+        let altered = TaskOpener {
+            fetched: true,
+            altered: true,
+            ..TaskOpener::default()
+        };
+        let Some(act) = history_act(event) else {
+            return Ok(altered);
+        };
+        let Some(signed) = act.signed.as_ref() else {
+            return Ok(altered);
+        };
+        match opener_standing(&checker.resolve(signed).await) {
+            OpenerStanding::Checks => Ok(TaskOpener {
+                home: act.field("act-home"),
+                venue: act.field("target"),
+                fetched: true,
+                altered: false,
+            }),
+            OpenerStanding::Altered => Ok(altered),
+            OpenerStanding::Unknown => Err(()),
+        }
+    }
+
+    /// `task`'s history as the connected server answers it
+    /// (`GET /api/v1/actions/{id}`), with the session bearer, which a DM's or
+    /// a private channel's history needs; within `wait` when one is given.
+    async fn read_history(
+        &self,
+        task: &str,
+        wait: Option<std::time::Duration>,
+    ) -> Result<serde_json::Value, ()> {
+        use freeq_oauth::ClientProvider;
+        let checker = self.checker.as_ref().ok_or(())?;
+        let base = checker.lookup.origin_base().ok_or(())?;
+        let mut url = url::Url::parse(base).map_err(|_| ())?;
+        url.path_segments_mut()
+            .map_err(|_| ())?
+            .pop_if_empty()
+            .extend(["api", "v1", "actions", task]);
+        let client = checker
+            .lookup
+            .reader
+            .clients
+            .client_for(url.as_str())
+            .await
+            .map_err(|_| ())?;
+        let mut request = client.get(url);
+        let bearer = self.bearer.lock().clone();
+        if let Some(bearer) = bearer {
+            request = request.bearer_auth(bearer);
+        }
+        let read = async {
+            let response = request.send().await.map_err(|_| ())?;
+            if !response.status().is_success() {
+                return Err(());
+            }
+            response.json::<serde_json::Value>().await.map_err(|_| ())
+        };
+        match wait {
+            Some(wait) => tokio::time::timeout(wait, read).await.map_err(|_| ())?,
+            None => read.await,
+        }
+    }
+
+    /// `task`'s history, read within [`TASK_HISTORY_READ_WAIT`], with every
+    /// ruling in it that fails its referee check left out: each is judged as
+    /// a live ruling is, over the document
+    /// rebuilt from its stored canonical and signature, the referee being
+    /// the one the opener in the same answer names. The rulings are judged
+    /// together, so asks of one referee share its read, all within
+    /// [`RULING_CHECK_WAIT`]; one not judged by then stays, as one that
+    /// cannot be checked does. A receipt the server filed and marked
+    /// ignored, its link not the task's home, is left out too.
+    async fn task_history(self: &Arc<Self>, task: &str) -> Result<TaskHistory, ()> {
+        let mut history = self
+            .read_history(task, Some(TASK_HISTORY_READ_WAIT))
+            .await?;
+        let check_by = tokio::time::Instant::now() + RULING_CHECK_WAIT;
+        let opener = tokio::time::timeout_at(check_by, self.checked_opener_in(&history, task))
+            .await
+            .ok()
+            .and_then(Result::ok);
+        let Some(events) = history
+            .get_mut("events")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return Ok(history);
+        };
+        let checks: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(at, event)| {
+                let signed = history_ruling(event)?;
+                let (line, opener) = (self.clone(), opener.clone());
+                let check = tokio::spawn(async move {
+                    tokio::time::timeout_at(check_by, line.judge(opener, signed.as_ref())).await
+                });
+                Some((at, check))
+            })
+            .collect();
+        // Left out: a ruling that fails, or whose referee cannot be known
+        // (its opener missing, uncheckable, or not checked in time). One
+        // whose judgment ran out of time, its opener known, stays.
+        let mut failing = HashSet::new();
+        for (at, check) in checks {
+            if let Ok(Ok(judged)) = check.await
+                && judged.hidden()
+            {
+                failing.insert(at);
+            }
+        }
+        let mut at = 0;
+        events.retain(|event| {
+            at += 1;
+            !failing.contains(&(at - 1)) && event["confirm_state"] != "ignored"
+        });
+        Ok(history)
+    }
+}
+
+/// What a fetched opening post's check says about naming its task's
+/// referee.
+enum OpenerStanding {
+    /// Its signature checks: what it says is used.
+    Checks,
+    /// Its signature contradicts its key: every ruling on the task fails.
+    Altered,
+    /// Its signature cannot be checked: nothing is kept.
+    Unknown,
+}
+
+/// The standing a verdict gives an opening post. Only a device verdict
+/// names a referee: "signed by the server" is a chat verdict. A key that
+/// was found but cannot check the signature, as a ruling's unreadable
+/// signature, contradicts it.
+fn opener_standing(verdict: &crate::verdict::Verdict) -> OpenerStanding {
+    use crate::verdict::VerdictState;
+    match verdict.state {
+        VerdictState::Device => OpenerStanding::Checks,
+        VerdictState::Invalid | VerdictState::Retired | VerdictState::Unsigned => {
+            OpenerStanding::Altered
+        }
+        VerdictState::Unverifiable if verdict.key_source.is_some() => OpenerStanding::Altered,
+        VerdictState::Unverifiable | VerdictState::Server | VerdictState::Pending => {
+            OpenerStanding::Unknown
+        }
+    }
+}
+
+/// A task event in a task's history as its signer signed it, rebuilt from
+/// its stored document and signature the way a server rebuilds the line
+/// (`wire_tags_from_canonical`).
+struct HistoryAct {
+    doc: serde_json::Map<String, serde_json::Value>,
+    /// `None` when it carries no signature that can be read.
+    signed: Option<crate::verdict::Signed>,
+}
+
+impl HistoryAct {
+    fn field(&self, name: &str) -> Option<String> {
+        self.doc
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+}
+
+/// `event` rebuilt as [`HistoryAct`]; `None` when its document cannot be
+/// read.
+fn history_act(event: &serde_json::Value) -> Option<HistoryAct> {
+    let canonical = event.get("canonical")?.as_str()?;
+    let doc: serde_json::Map<String, serde_json::Value> = serde_json::from_str(canonical).ok()?;
+    let field = |name: &str| doc.get(name).and_then(serde_json::Value::as_str);
+    let signed = || {
+        let sig_tag = event.get("signature")?.as_str()?;
+        let (kid, _) = crate::sigtag::parse(sig_tag).ok()?;
+        let id = field("id")?.to_string();
+        let tags = doc
+            .iter()
+            .filter(|(name, _)| *name != "target" && *name != "id")
+            .map(|(name, value)| {
+                let tag = match name.as_str() {
+                    "from" => "+freeq.at/from".to_string(),
+                    _ => format!("+freeq.at/{name}"),
+                };
+                Some((tag, value.as_str()?.to_string()))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(crate::verdict::Signed {
+            did: field("from")?.to_string(),
+            kid: kid.to_string(),
+            sig_tag: sig_tag.to_string(),
+            msgid: id.clone(),
+            origin: None,
+            doc: crate::verdict::SignedDoc::Act {
+                tags,
+                venue: field("target")?.to_string(),
+                id,
+            },
+        })
+    };
+    let signed = signed();
+    Some(HistoryAct { doc, signed })
+}
+
+/// A ruling in a task's history as its referee signed it ([`history_act`]):
+/// `None` when the event is no ruling, or its document cannot be read;
+/// `Some(None)` when it carries no signature that can be read, which fails
+/// on a task that names its referee.
+fn history_ruling(event: &serde_json::Value) -> Option<Option<crate::verdict::Signed>> {
+    let act = history_act(event)?;
+    if !crate::act_transitions::is_ruling(&act.field("act-verb")?) {
+        return None;
+    }
+    Some(act.signed)
+}
+
+/// A ruling as its referee signed it. A server signs its own events about a
+/// DM task for the task's own venue, the pair of the conversation, and sends
+/// them to `*`, so the venue rebuilt from the line (the signer and this
+/// session) is not what was signed. Such a ruling, signed by the task's
+/// referee, is checked under the venue its opener was signed for, when this
+/// session is one of that pair, as a server's `venue_for` does. When that
+/// venue is not known (the opener was not seen and could not be read, or
+/// named no venue), the pair it was signed for is unknown: it is
+/// unverifiable, as a line whose venue cannot be built is in `first_look`.
+/// Otherwise it is checked as rebuilt.
+fn under_task_venue(
+    mut signed: crate::verdict::Signed,
+    opener: Option<&TaskOpener>,
+    own_did: Option<&str>,
+) -> crate::verdict::FirstLook {
+    use crate::verdict::{FirstLook, SignedDoc};
+    let SignedDoc::Act { venue, .. } = &mut signed.doc else {
+        return FirstLook::Check(signed);
+    };
+    if !venue.starts_with("dm:") {
+        return FirstLook::Check(signed);
+    }
+    let task_venue = match opener.filter(|opener| !opener.altered) {
+        None => None,
+        Some(opener) if opener.home.as_deref() == Some(signed.did.as_str()) => {
+            opener.venue.as_deref()
+        }
+        // Not the task's referee: checked as rebuilt.
+        Some(_) => return FirstLook::Check(signed),
+    };
+    let Some(task_venue) = task_venue else {
+        return FirstLook::Unverifiable(Some(signed.kid));
+    };
+    if let Some(own_did) = own_did
+        && task_venue
+            .strip_prefix("dm:")
+            .is_some_and(|pair| pair.split(',').any(|one| one == own_did))
+    {
+        *venue = task_venue.to_string();
+    }
+    FirstLook::Check(signed)
+}
+
+/// Whether an opening post's verdict lets it name its task's referee
+/// ([`opener_standing`]).
+fn checks_out(verdict: &crate::verdict::Verdict) -> bool {
+    matches!(opener_standing(verdict), OpenerStanding::Checks)
+}
+
+/// A ruling checked against its referee's key: it counts when the signature
+/// checks and was made before the key stopped counting.
+fn ruling_against(
+    signed: &crate::verdict::Signed,
+    key: &[u8; 32],
+    retired_at: Option<i64>,
+) -> crate::verdict::RulingCheck {
+    use crate::verdict::RulingCheck;
+    if crate::verdict::check(signed, key) != Ok(true) {
+        return RulingCheck::Fails;
+    }
+    let at_ms = crate::sigtag::msgid_timestamp_ms(&signed.msgid)
+        .and_then(|ms| i64::try_from(ms).ok())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    if retired_at.is_some_and(|retired| retired.saturating_mul(1000) <= at_ms) {
+        RulingCheck::Fails
+    } else {
+        RulingCheck::Counts
+    }
 }
 
 /// How long a task event's id is remembered so the same event is not handed up
@@ -3902,7 +5310,8 @@ async fn dispatch_assembled_multiline(
 /// can put minutes between the two sightings of one event.
 const ACT_EVENT_DEDUPE: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// The task event ids this connection has already handed up, and when.
+/// The task event ids this connection has already handed up, and when: an
+/// id is recorded as its event goes up, not as its line arrives.
 #[derive(Default)]
 struct SeenActEvents {
     seen: HashMap<String, std::time::Instant>,
@@ -3924,6 +5333,13 @@ impl SeenActEvents {
                 .retain(|_, t| now.duration_since(*t) < ACT_EVENT_DEDUPE);
         }
         true
+    }
+
+    /// Whether this id has gone up within the window, without recording it.
+    fn went_up(&self, event_id: &str) -> bool {
+        self.seen
+            .get(event_id)
+            .is_some_and(|seen| seen.elapsed() < ACT_EVENT_DEDUPE)
     }
 }
 
@@ -4805,6 +6221,8 @@ async fn execute_command<W: AsyncWrite + Unpin>(
             writer.write_all(format!("{safe}\r\n").as_bytes()).await?;
             tracing::debug!("[SDK] Raw command sent OK");
         }
+        // Answered by the read loop, never written.
+        Command::TaskHistory { .. } => {}
         Command::Quit(msg) => {
             let quit_line = match msg {
                 Some(m) => format!("QUIT :{m}\r\n"),
@@ -10537,7 +11955,9 @@ mod verdict_tests {
 
     const OWN_NICK: &str = "me";
     const OWN_DID: &str = "did:plc:me";
-    const SERVER_DID: &str = "did:web:server.test";
+    /// The stub server's name: the host the tests connect to, as a server
+    /// is named for the host it is reached at.
+    const SERVER_DID: &str = "did:web:127.0.0.1";
 
     fn spec(name: &str) -> Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -10571,11 +11991,31 @@ mod verdict_tests {
     struct Origin {
         keys: parking_lot::Mutex<HeldKeys>,
         server_keys: Vec<[u8; 32]>,
+        /// When the server's own keys were removed, if they were.
+        server_removed_at: Option<i64>,
+        /// The name the server claims, when not its own host's (SERVER_DID).
+        claims: Option<&'static str>,
+        /// Keys the server rotated to after the test began, listed after
+        /// `server_keys`.
+        rotated_keys: parking_lot::Mutex<Vec<[u8; 32]>>,
+        /// Answer the server's key set with this status instead, while set.
+        set_status: parking_lot::Mutex<Option<u16>>,
+        /// Held back this long before the server's key set is answered.
+        set_delay_ms: u64,
         /// Held back this long before a signer's key is answered.
         delay_ms: u64,
         set_reads: AtomicUsize,
         /// Requests for one signer's key.
         key_reads: AtomicUsize,
+        /// Each task's history, by task id, as `/api/v1/actions/{id}` answers.
+        actions: parking_lot::Mutex<HashMap<String, Value>>,
+        /// The bearer the task history asks for; any request passes without.
+        bearer: Option<&'static str>,
+        /// Answer the task history with this status instead, while set.
+        action_status: parking_lot::Mutex<Option<u16>>,
+        /// Held back this long before a task's history is answered.
+        action_delay_ms: u64,
+        action_reads: AtomicUsize,
     }
 
     impl Origin {
@@ -10597,15 +12037,42 @@ mod verdict_tests {
     }
 
     async fn serve_origin(origin: Arc<Origin>) -> String {
-        let (o1, o2, o3) = (origin.clone(), origin.clone(), origin);
+        let (o1, o2, o3, o4) = (origin.clone(), origin.clone(), origin.clone(), origin);
         let router = axum::Router::new()
+            .route(
+                "/api/v1/actions/{id}",
+                get(
+                    move |Path(id): Path<String>, headers: axum::http::HeaderMap| {
+                        let o = o4.clone();
+                        async move {
+                            o.action_reads.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(o.action_delay_ms))
+                                .await;
+                            if let Some(status) = *o.action_status.lock() {
+                                return Err(StatusCode::from_u16(status).unwrap());
+                            }
+                            if let Some(bearer) = o.bearer {
+                                let sent = headers
+                                    .get("authorization")
+                                    .and_then(|v| v.to_str().ok())
+                                    .and_then(|v| v.strip_prefix("Bearer "));
+                                if sent != Some(bearer) {
+                                    return Err(StatusCode::FORBIDDEN);
+                                }
+                            }
+                            let held = o.actions.lock().get(&id).cloned();
+                            held.map(axum::Json).ok_or(StatusCode::NOT_FOUND)
+                        }
+                    },
+                ),
+            )
             .route(
                 "/api/v1/signing-key",
                 get(move || {
                     let o = o1.clone();
                     async move {
                         axum::Json(json!({
-                            "did": SERVER_DID,
+                            "did": o.claims.unwrap_or(SERVER_DID),
                             "public_key": o.server_keys.first().map(b64),
                         }))
                     }
@@ -10616,16 +12083,29 @@ mod verdict_tests {
                 get(move |Path(did): Path<String>| {
                     let o = o2.clone();
                     async move {
+                        use axum::response::IntoResponse;
                         o.set_reads.fetch_add(1, Ordering::SeqCst);
-                        if did != SERVER_DID {
-                            return axum::Json(json!({ "did": did, "keys": [] }));
+                        tokio::time::sleep(std::time::Duration::from_millis(o.set_delay_ms)).await;
+                        if let Some(status) = *o.set_status.lock() {
+                            return StatusCode::from_u16(status).unwrap().into_response();
                         }
+                        if did != o.claims.unwrap_or(SERVER_DID) {
+                            return axum::Json(json!({ "did": did, "keys": [] })).into_response();
+                        }
+                        let rotated = o.rotated_keys.lock().clone();
                         let keys: Vec<Value> = o
                             .server_keys
                             .iter()
-                            .map(|k| json!({ "kid": crate::sigtag::derive_kid_bytes(k), "public_key": b64(k) }))
+                            .chain(rotated.iter())
+                            .map(|k| {
+                                json!({
+                                    "kid": crate::sigtag::derive_kid_bytes(k),
+                                    "public_key": b64(k),
+                                    "removed_at": o.server_removed_at,
+                                })
+                            })
                             .collect();
-                        axum::Json(json!({ "did": did, "keys": keys }))
+                        axum::Json(json!({ "did": did, "keys": keys })).into_response()
                     }
                 }),
             )
@@ -10693,6 +12173,15 @@ mod verdict_tests {
             lookup: Option<Arc<crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>>>,
             own_did: &str,
         ) -> Session {
+            Self::open_welcomed(lookup, own_did, "127.0.0.1").await
+        }
+
+        /// A session welcomed (001) under `welcome`.
+        async fn open_welcomed(
+            lookup: Option<Arc<crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>>>,
+            own_did: &str,
+            welcome: &str,
+        ) -> Session {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = TcpStream::connect(listener.local_addr().unwrap())
                 .await
@@ -10715,7 +12204,8 @@ mod verdict_tests {
                 ":srv CAP * ACK :sasl message-tags".to_string(),
                 format!(":srv 900 {OWN_NICK} :You are now logged in as {own_did}"),
                 format!(":srv 903 {OWN_NICK} :SASL authentication successful"),
-                format!(":srv 001 {OWN_NICK} :Welcome"),
+                // The name the connected server signs under.
+                format!(":{welcome} 001 {OWN_NICK} :Welcome"),
             ] {
                 session.send(&line).await;
             }
@@ -10781,13 +12271,19 @@ mod verdict_tests {
                     _ => unreachable!(),
                 }
             };
+            // A ruling's Act goes up after its TAGMSG, and before the
+            // verdict that follows a pending one.
             let settled = match &delivered {
-                Some(v) if v.state == VerdictState::Pending => {
-                    match self.wait(|e| matches!(e, Event::Verdict { .. })).await {
-                        Event::Verdict { verdict, .. } => Some(verdict),
+                Some(v) if v.state == VerdictState::Pending => loop {
+                    match self
+                        .wait(|e| matches!(e, Event::Verdict { .. } | Event::Act { .. }))
+                        .await
+                    {
+                        Event::Verdict { verdict, .. } => break Some(verdict),
+                        Event::Act { verdict, .. } => act = Some(verdict),
                         _ => unreachable!(),
                     }
-                }
+                },
                 other => other.clone(),
             };
             Seen {
@@ -11127,12 +12623,21 @@ mod verdict_tests {
                 kid: Some(vector["kid"].as_str().unwrap().to_string()),
                 key_source: Some(crate::key_lookup::KeySource::OriginServer),
             };
-            assert_eq!(seen.settled, Some(expected), "{name}");
-            assert_eq!(
-                seen.act.flatten().map(|v| v.state),
-                seen.delivered.map(|v| v.state),
-                "{name}: the act event and its TAGMSG carry one verdict"
-            );
+            assert_eq!(seen.settled, Some(expected.clone()), "{name}");
+            let verb = vector["tags"]["+freeq.at/act-verb"].as_str().unwrap();
+            match crate::act_transitions::is_ruling(verb) {
+                // No opener seen and none to read: its referee cannot be
+                // known, so it is hidden; its TAGMSG still settles.
+                true => assert_eq!(
+                    seen.act, None,
+                    "{name}: a ruling whose referee cannot be known never goes up"
+                ),
+                false => assert_eq!(
+                    seen.act.flatten().map(|v| v.state),
+                    seen.delivered.map(|v| v.state),
+                    "{name}: the act event and its TAGMSG carry one verdict"
+                ),
+            }
         }
     }
 
@@ -11548,7 +13053,7 @@ mod verdict_tests {
         let checker = checker_for(None);
         let maps = DidMaps::default();
         let mut batches: DeferredBatches = HashMap::new();
-        batches.insert("b1".to_string(), Vec::new());
+        batches.insert("b1".to_string(), HeldBatch::default());
 
         let in_batch = "b1".to_string();
         check_now_or_hold(
@@ -11557,16 +13062,18 @@ mod verdict_tests {
             Some(&checker),
             Some(signed_line("did:plc:alice", "m1")),
             None,
+            None,
             &maps,
             &tx,
         );
-        assert_eq!(batches["b1"].len(), 1, "held on the open batch");
+        assert_eq!(batches["b1"].checks.len(), 1, "held on the open batch");
 
         check_now_or_hold(
             &mut batches,
             None,
             Some(&checker),
             Some(signed_line("did:plc:alice", "m2")),
+            None,
             None,
             &maps,
             &tx,
@@ -11578,11 +13085,12 @@ mod verdict_tests {
             Some(&checker),
             Some(signed_line("did:plc:alice", "m3")),
             None,
+            None,
             &maps,
             &tx,
         );
         assert_eq!(
-            batches["b1"].len(),
+            batches["b1"].checks.len(),
             1,
             "a line outside the batch, and one naming no open batch, are not held"
         );
@@ -11623,9 +13131,12 @@ mod verdict_tests {
             checker: Some(checker.clone()),
             maps: DidMaps::default(),
             event_tx: tx.clone(),
+            acts: None,
         };
         // A line held on a batch that never closes.
-        deferred.batches.insert("b1".to_string(), Vec::new());
+        deferred
+            .batches
+            .insert("b1".to_string(), HeldBatch::default());
         let open = "b1".to_string();
         check_now_or_hold(
             &mut deferred.batches,
@@ -11633,10 +13144,15 @@ mod verdict_tests {
             Some(&checker),
             Some(signed_line("did:plc:alice", "m1")),
             None,
+            None,
             &DidMaps::default(),
             &tx,
         );
-        assert_eq!(deferred.batches["b1"].len(), 1, "held on the open batch");
+        assert_eq!(
+            deferred.batches["b1"].checks.len(),
+            1,
+            "held on the open batch"
+        );
         assert_eq!(
             asked.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -11694,6 +13210,7 @@ mod verdict_tests {
             .map(|(i, did)| HeldCheck {
                 signed: signed_line(did, &format!("m{i}")),
                 taught: None,
+                act: None,
             })
             .collect();
         start_deferred_checks(held, Some(&checker), &DidMaps::default(), &tx);
@@ -11871,6 +13388,7 @@ mod verdict_tests {
             .map(|(i, (did, seed))| HeldCheck {
                 signed: signed_by(did, *seed, &format!("m{i}")),
                 taught: None,
+                act: None,
             })
             .collect();
         start_deferred_checks(held, Some(&checker), &DidMaps::default(), &tx);
@@ -12136,6 +13654,7 @@ mod verdict_tests {
             let held = vec![HeldCheck {
                 signed: signed_by(A, 41, batch),
                 taught: None,
+                act: None,
             }];
             start_deferred_checks(held, Some(&checker), &DidMaps::default(), &tx);
         }
@@ -12163,6 +13682,7 @@ mod verdict_tests {
         let held = vec![HeldCheck {
             signed,
             taught: None,
+            act: None,
         }];
         start_deferred_checks(held, Some(&checker), &DidMaps::default(), &tx);
         assert_eq!(
@@ -12194,7 +13714,14 @@ mod verdict_tests {
         .await;
         let (tx, mut rx) = mpsc::channel(64);
         let checker = checker_for(Some(base));
-        spawn_verdict_check(Some(&checker), Some(signed), None, &DidMaps::default(), &tx);
+        spawn_verdict_check(
+            Some(&checker),
+            Some(signed),
+            None,
+            None,
+            &DidMaps::default(),
+            &tx,
+        );
         assert_eq!(
             next_verdict(&mut rx).await,
             plain_verdict(VerdictState::Server, Some(kid))
@@ -12204,5 +13731,1903 @@ mod verdict_tests {
             "records asked for: {:?}",
             routes.records_of.lock()
         );
+    }
+
+    // ── task events and rulings ──────────────────────────────────────────
+
+    const ALICE: &str = "did:plc:alice";
+    const REFEREE: &str = "did:web:referee.example";
+    const TASK_ROOM: &str = "#tasks";
+
+    /// A task event signed with `seed`'s key under `signer`, on the wire to
+    /// TASK_ROOM: the opener of a handoff when `task` is `None`, else `verb`
+    /// on that task. Returns the line and its event id.
+    fn task_event(
+        seed: u8,
+        signer: &str,
+        verb: &str,
+        task: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> (String, String) {
+        let venue = crate::chatsig::channel_venue(TASK_ROOM);
+        task_event_for(seed, signer, verb, task, extra, &venue, TASK_ROOM)
+    }
+
+    /// [`task_event`], signed for `venue` and on the wire to `target`.
+    fn task_event_for(
+        seed: u8,
+        signer: &str,
+        verb: &str,
+        task: Option<&str>,
+        extra: &[(&str, &str)],
+        venue: &str,
+        target: &str,
+    ) -> (String, String) {
+        let id = crate::chatsig::new_event_id();
+        task_event_as(seed, signer, verb, task, extra, venue, target, &id)
+    }
+
+    /// [`task_event_for`], under the event id `id`.
+    #[allow(clippy::too_many_arguments)]
+    fn task_event_as(
+        seed: u8,
+        signer: &str,
+        verb: &str,
+        task: Option<&str>,
+        extra: &[(&str, &str)],
+        venue: &str,
+        target: &str,
+        id: &str,
+    ) -> (String, String) {
+        let id = id.to_string();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let mut tags = vec![
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", verb),
+            ("+freeq.at/from", signer),
+        ];
+        if let Some(task) = task {
+            tags.push(("+freeq.at/act-id", task));
+        }
+        tags.extend_from_slice(extra);
+        let sig = crate::act::sign_act(tags.clone(), venue, &id, &key).unwrap();
+        let mut wire: HashMap<String, String> = tags
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        wire.insert(crate::sigtag::SIG_TAG.to_string(), sig);
+        wire.insert(crate::chatsig::EVENT_ID_TAG.to_string(), id.clone());
+        (line(wire, "TAGMSG", target, None), id)
+    }
+
+    /// An opener by ALICE naming `home` as its referee.
+    fn refereed_opener(home: &str) -> (String, String) {
+        task_event(90, ALICE, "offer", None, &[("+freeq.at/act-home", home)])
+    }
+
+    /// `line` inside the history batch `batch`.
+    fn in_batch(batch: &str, line: &str) -> String {
+        format!("@batch={batch};{}", &line[1..])
+    }
+
+    /// A referee's own site: its key list on loopback, answering each key in
+    /// `listed` with its removal date, after `delay_ms`, or with `status`
+    /// while set; `reads` counts the reads.
+    struct Site {
+        base: String,
+        status: Arc<parking_lot::Mutex<Option<u16>>>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    async fn serve_site(listed: Vec<([u8; 32], Option<i64>)>, delay_ms: u64) -> Site {
+        use axum::response::IntoResponse;
+        let keys: Vec<Value> = listed
+            .iter()
+            .map(|(key, removed_at)| {
+                json!({
+                    "kid": crate::sigtag::derive_kid_bytes(key),
+                    "public_key": b64(key),
+                    "removed_at": removed_at,
+                })
+            })
+            .collect();
+        let status: Arc<parking_lot::Mutex<Option<u16>>> = Default::default();
+        let reads: Arc<AtomicUsize> = Default::default();
+        let (st, rd) = (status.clone(), reads.clone());
+        let base = serve(axum::Router::new().route(
+            "/api/v1/signing-keys/{did}",
+            get(move |Path(did): Path<String>| {
+                rd.fetch_add(1, Ordering::SeqCst);
+                let (keys, status) = (keys.clone(), *st.lock());
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    match status {
+                        Some(status) => StatusCode::from_u16(status).unwrap().into_response(),
+                        None => axum::Json(json!({ "did": did, "keys": keys })).into_response(),
+                    }
+                }
+            }),
+        ))
+        .await;
+        Site {
+            base,
+            status,
+            reads,
+        }
+    }
+
+    /// A session whose lookup reads a referee's key list at `site`, with
+    /// the miss retries off.
+    async fn session_with_site(origin: Origin, site: &Site) -> (Session, Arc<Origin>) {
+        session_with_site_welcomed(origin, site, "127.0.0.1").await
+    }
+
+    /// [`session_with_site`], welcomed under `welcome`.
+    async fn session_with_site_welcomed(
+        origin: Origin,
+        site: &Site,
+        welcome: &str,
+    ) -> (Session, Arc<Origin>) {
+        // ALICE's openers check: an opener names its referee only then.
+        origin.hold(ALICE, public(90), None);
+        let origin = Arc::new(origin);
+        let base = serve_origin(origin.clone()).await;
+        let reader = crate::identity_records::RecordReader::new(
+            crate::did::DidResolver::static_map(HashMap::new()),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        );
+        let site = site.base.clone();
+        let lookup = crate::key_lookup::KeyLookup::new(
+            reader,
+            Some(base),
+            std::time::Duration::from_secs(3600),
+        )
+        .with_retry_delays(Vec::new())
+        .with_own_host_base(move |_| site.clone());
+        (
+            Session::open_welcomed(Some(Arc::new(lookup)), OWN_DID, welcome).await,
+            origin,
+        )
+    }
+
+    /// One event as it went up, in order.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Up {
+        Act {
+            id: String,
+            verdict: Option<VerdictState>,
+            ruling: Option<crate::verdict::RulingCheck>,
+        },
+        TagMsg {
+            id: String,
+            verdict: Option<VerdictState>,
+        },
+        Verdict {
+            id: String,
+            verdict: VerdictState,
+        },
+    }
+
+    impl Session {
+        /// Every task-event, TAGMSG and verdict event that goes up within
+        /// `ms` of now, in order.
+        async fn ups_within(&mut self, ms: u64) -> Vec<Up> {
+            let mut ups = Vec::new();
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(ms), async {
+                while let Some(event) = self.events.recv().await {
+                    ups.extend(up_of(event));
+                }
+            })
+            .await;
+            ups
+        }
+
+        /// Events as they go up, until the Act for `id` has; panics after
+        /// `secs`.
+        async fn ups_until_act(&mut self, id: &str, secs: u64) -> Vec<Up> {
+            let mut ups = Vec::new();
+            tokio::time::timeout(std::time::Duration::from_secs(secs), async {
+                loop {
+                    let event = self.events.recv().await.expect("the session ended");
+                    let up = up_of(event);
+                    let done = matches!(&up, Some(Up::Act { id: got, .. }) if got == id);
+                    ups.extend(up);
+                    if done {
+                        return;
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("no Act for {id} in {secs} s; went up: {ups:?}"));
+            ups
+        }
+
+        /// The ruling result the Act for `id` went up with.
+        async fn ruling_of(&mut self, id: &str) -> Option<crate::verdict::RulingCheck> {
+            match self.ups_until_act(id, 5).await.pop() {
+                Some(Up::Act { ruling, .. }) => ruling,
+                other => panic!("{other:?}"),
+            }
+        }
+
+        /// What the ruling `id` on `task` went up with, `None` when it never
+        /// went up: a move on the task sent after it waits behind it, so once
+        /// the move is up the ruling has been settled.
+        async fn went_up_as(
+            &mut self,
+            id: &str,
+            task: &str,
+        ) -> Option<Option<crate::verdict::RulingCheck>> {
+            let (claim, claim_id) = task_event(90, ALICE, "claim", Some(task), &[]);
+            self.send(&claim).await;
+            self.ups_until_act(&claim_id, 5)
+                .await
+                .into_iter()
+                .find_map(|up| match up {
+                    Up::Act {
+                        id: got, ruling, ..
+                    } if got == id => Some(ruling),
+                    _ => None,
+                })
+        }
+    }
+
+    fn up_of(event: Event) -> Option<Up> {
+        let id = |tags: &HashMap<String, String>| {
+            tags.get(crate::chatsig::EVENT_ID_TAG)
+                .cloned()
+                .unwrap_or_default()
+        };
+        match event {
+            Event::Act {
+                event_id,
+                verdict,
+                ruling,
+                ..
+            } => Some(Up::Act {
+                id: event_id,
+                verdict: verdict.map(|v| v.state),
+                ruling,
+            }),
+            Event::TagMsg { tags, verdict, .. } => Some(Up::TagMsg {
+                id: id(&tags),
+                verdict: verdict.map(|v| v.state),
+            }),
+            Event::Verdict { msgid, verdict } => Some(Up::Verdict {
+                id: msgid,
+                verdict: verdict.state,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Where `want` sits in `ups`.
+    fn at(ups: &[Up], want: impl Fn(&Up) -> bool) -> usize {
+        ups.iter()
+            .position(want)
+            .unwrap_or_else(|| panic!("not in {ups:?}"))
+    }
+
+    fn act_of(id: &str) -> impl Fn(&Up) -> bool + '_ {
+        move |up| matches!(up, Up::Act { id: got, .. } if got == id)
+    }
+
+    fn tagmsg_of(id: &str) -> impl Fn(&Up) -> bool + '_ {
+        move |up| matches!(up, Up::TagMsg { id: got, .. } if got == id)
+    }
+
+    fn verdict_of(id: &str) -> impl Fn(&Up) -> bool + '_ {
+        move |up| matches!(up, Up::Verdict { id: got, .. } if got == id)
+    }
+
+    #[tokio::test]
+    async fn a_task_event_that_is_no_ruling_goes_up_before_its_tagmsg_and_its_verdict_follows() {
+        let origin = Origin {
+            delay_ms: 200,
+            ..Default::default()
+        };
+        origin.hold(ALICE, public(90), None);
+        let base = serve_origin(Arc::new(origin)).await;
+        let mut session = Session::open(Some(key_lookup(&base, vec![])), OWN_DID).await;
+        let (opener, id) = task_event(90, ALICE, "offer", None, &[]);
+        session.send(&opener).await;
+        let mut ups = session.ups_within(100).await;
+        assert_eq!(
+            ups,
+            vec![
+                Up::Act {
+                    id: id.clone(),
+                    verdict: Some(VerdictState::Pending),
+                    ruling: None,
+                },
+                Up::TagMsg {
+                    id: id.clone(),
+                    verdict: Some(VerdictState::Pending),
+                },
+            ],
+            "at once, pending, before its TAGMSG"
+        );
+        ups.extend(session.ups_within(2_000).await);
+        assert_eq!(
+            ups.last(),
+            Some(&Up::Verdict {
+                id,
+                verdict: VerdictState::Device
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ruling_goes_up_once_checked_when_it_counts_and_never_when_it_fails() {
+        use crate::verdict::RulingCheck;
+        let old = Some(1_600_000_000);
+        // (what the referee lists, who signs, with which key, what it comes to)
+        let cases: Vec<(Vec<([u8; 32], Option<i64>)>, &str, u8, RulingCheck)> = vec![
+            (vec![(public(91), None)], REFEREE, 91, RulingCheck::Counts),
+            (
+                vec![(public(91), None)],
+                "did:web:other.example",
+                91,
+                RulingCheck::Fails,
+            ),
+            (vec![(public(93), None)], REFEREE, 91, RulingCheck::Fails),
+            (vec![(public(91), old)], REFEREE, 91, RulingCheck::Fails),
+        ];
+        for (listed, signer, seed, expected) in cases {
+            let site = serve_site(listed, 300).await;
+            let (mut session, _) = session_with_site(Origin::default(), &site).await;
+            let (opener, task) = refereed_opener(REFEREE);
+            let (ruling, id) = task_event(seed, signer, "expire", Some(&task), &[]);
+            session.send(&opener).await;
+            session.send(&ruling).await;
+            if expected == RulingCheck::Fails {
+                assert_eq!(
+                    session.went_up_as(&id, &task).await,
+                    None,
+                    "{signer} {seed}: never goes up"
+                );
+                continue;
+            }
+            let ups = session.ups_until_act(&id, 5).await;
+            assert!(
+                at(&ups, tagmsg_of(&id)) < at(&ups, act_of(&id)),
+                "waits for its check: {ups:?}"
+            );
+            assert_eq!(
+                ups.last(),
+                Some(&Up::Act {
+                    id: id.clone(),
+                    verdict: Some(VerdictState::Unverifiable),
+                    ruling: Some(expected),
+                }),
+                "{signer} {seed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ruling_cannot_be_checked_when_its_referee_cannot_answer_or_none_is_named() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        *site.status.lock() = Some(503);
+        let (mut session, _) = session_with_site(Origin::default(), &site).await;
+        let (opener, task) = refereed_opener(REFEREE);
+        let (ruling, id) = task_event(91, REFEREE, "confirm", Some(&task), &[]);
+        session.send(&opener).await;
+        session.send(&ruling).await;
+        assert_eq!(
+            session.ruling_of(&id).await,
+            Some(crate::verdict::RulingCheck::CannotCheck)
+        );
+        *site.status.lock() = None;
+        let (opener, task) = task_event(90, ALICE, "offer", None, &[]);
+        let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        session.send(&opener).await;
+        session.send(&ruling).await;
+        assert_eq!(
+            session.ruling_of(&id).await,
+            Some(crate::verdict::RulingCheck::CannotCheck),
+            "a task naming no referee"
+        );
+    }
+
+    /// "Signed by the server" is a chat verdict: a person's task message
+    /// signed with the connected server's key reads invalid, before the
+    /// server's key set is known and after, while the server's own ruling
+    /// under that key keeps the server verdict.
+    #[tokio::test]
+    async fn a_persons_task_message_signed_with_the_servers_key_is_invalid() {
+        use crate::verdict::RulingCheck;
+        let origin = Origin {
+            server_keys: vec![public(94)],
+            ..Default::default()
+        };
+        let site = serve_site(vec![], 0).await;
+        let (mut session, _) = session_with_site(origin, &site).await;
+        let (opener, task) = refereed_opener(SERVER_DID);
+        session.send(&opener).await;
+        for verb in ["claim", "progress"] {
+            let (line, id) = task_event(94, ALICE, verb, Some(&task), &[]);
+            session.send(&line).await;
+            let mut ups = session.ups_until_act(&id, 5).await;
+            ups.extend(session.ups_within(300).await);
+            let settled = ups.iter().rev().find_map(|up| match up {
+                Up::Verdict { id: got, verdict } if got == &id => Some(*verdict),
+                Up::Act {
+                    id: got,
+                    verdict: Some(v),
+                    ..
+                } if got == &id && *v != VerdictState::Pending => Some(*v),
+                _ => None,
+            });
+            assert_eq!(settled, Some(VerdictState::Invalid), "{verb}: {ups:?}");
+        }
+        let (expire, expire_id) = task_event(94, SERVER_DID, "expire", Some(&task), &[]);
+        session.send(&expire).await;
+        let ups = session.ups_until_act(&expire_id, 5).await;
+        assert_eq!(
+            ups.last(),
+            Some(&Up::Act {
+                id: expire_id,
+                verdict: Some(VerdictState::Server),
+                ruling: Some(RulingCheck::Counts),
+            }),
+            "the server's own ruling"
+        );
+    }
+
+    /// A live opening post signed with the connected server's key, delivered
+    /// with a final verdict once the server's set is known, reads invalid
+    /// and names no referee.
+    #[tokio::test]
+    async fn an_opener_signed_with_the_servers_key_names_no_referee() {
+        use crate::verdict::RulingCheck;
+        let origin = Origin {
+            server_keys: vec![public(94)],
+            ..Default::default()
+        };
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let (mut session, _) = session_with_site(origin, &site).await;
+        // A first line reads the server's set, so the opener's verdict is
+        // decided as it is delivered.
+        let (warm, warm_task) = refereed_opener(REFEREE);
+        session.send(&warm).await;
+        session.ups_until_act(&warm_task, 5).await;
+        session.ups_within(300).await;
+        let (opener, task) =
+            task_event(94, ALICE, "offer", None, &[("+freeq.at/act-home", REFEREE)]);
+        session.send(&opener).await;
+        let ups = session.ups_until_act(&task, 5).await;
+        assert_eq!(
+            ups.last(),
+            Some(&Up::Act {
+                id: task.clone(),
+                verdict: Some(VerdictState::Invalid),
+                ruling: None,
+            }),
+            "delivered final"
+        );
+        let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        session.send(&ruling).await;
+        assert_ne!(
+            session.went_up_as(&id, &task).await,
+            Some(Some(RulingCheck::Counts))
+        );
+    }
+
+    /// After the connected server rotates its key, a re-read of its key set
+    /// that fails cannot tell whether the new key is its own: the ruling
+    /// cannot be checked, and the next ruling under that key reads again.
+    #[tokio::test]
+    async fn a_failed_reread_of_the_servers_key_set_cannot_check_and_is_tried_again() {
+        use crate::verdict::RulingCheck;
+        let origin = Origin {
+            server_keys: vec![public(94)],
+            ..Default::default()
+        };
+        let site = serve_site(vec![], 0).await;
+        let (mut session, origin) = session_with_site(origin, &site).await;
+        let (opener, task) = refereed_opener(SERVER_DID);
+        session.send(&opener).await;
+        let (old, old_id) = task_event(94, SERVER_DID, "confirm", Some(&task), &[]);
+        session.send(&old).await;
+        assert_eq!(
+            session.ruling_of(&old_id).await,
+            Some(RulingCheck::Counts),
+            "the old key"
+        );
+        // The server rotates to 95; its key set cannot be read for now.
+        origin.rotated_keys.lock().push(public(95));
+        *origin.set_status.lock() = Some(503);
+        let (new, new_id) = task_event(95, SERVER_DID, "expire", Some(&task), &[]);
+        session.send(&new).await;
+        assert_eq!(
+            session.ruling_of(&new_id).await,
+            Some(RulingCheck::CannotCheck),
+            "the new key, its re-read failing"
+        );
+        *origin.set_status.lock() = None;
+        let (again, again_id) = task_event(95, SERVER_DID, "confirm", Some(&task), &[]);
+        session.send(&again).await;
+        assert_eq!(
+            session.ruling_of(&again_id).await,
+            Some(RulingCheck::Counts),
+            "the new key, the server answering again"
+        );
+    }
+
+    /// Two rulings under one new key, checked at once while the key set is
+    /// read again: the second waits for that read rather than answering
+    /// before it, and the set is read again once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_rulings_under_one_new_server_key_share_its_reread() {
+        let origin = Arc::new(Origin {
+            server_keys: vec![public(94)],
+            set_delay_ms: 300,
+            ..Default::default()
+        });
+        let base = serve_origin(origin.clone()).await;
+        let checker = checker_for(Some(base));
+        checker.fetch_server_keys(false).await;
+        origin.rotated_keys.lock().push(public(95));
+        let kid = crate::sigtag::derive_kid_bytes(&public(95));
+        let asks: Vec<_> = (0..8)
+            .map(|_| {
+                let (checker, kid) = (checker.clone(), kid.clone());
+                tokio::spawn(async move { checker.server_ruling_key(SERVER_DID, &kid).await })
+            })
+            .collect();
+        for ask in asks {
+            assert!(matches!(
+                ask.await.unwrap(),
+                Some(crate::key_lookup::OwnHostAnswer::Listed { .. })
+            ));
+        }
+        assert_eq!(
+            origin.set_reads.load(Ordering::SeqCst),
+            2,
+            "read, then read again once"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_connected_servers_own_ruling_counts_only_before_its_key_was_retired() {
+        for (removed_at, expected) in [
+            (None, Some(Some(crate::verdict::RulingCheck::Counts))),
+            // Failing: never goes up.
+            (Some(1_600_000_000), None),
+        ] {
+            let origin = Origin {
+                server_keys: vec![public(94)],
+                server_removed_at: removed_at,
+                ..Default::default()
+            };
+            let site = serve_site(vec![], 0).await;
+            let (mut session, _) = session_with_site(origin, &site).await;
+            let (opener, task) = refereed_opener(SERVER_DID);
+            let (ruling, id) = task_event(94, SERVER_DID, "confirm", Some(&task), &[]);
+            session.send(&opener).await;
+            session.send(&ruling).await;
+            assert_eq!(
+                session.went_up_as(&id, &task).await,
+                expected,
+                "{removed_at:?}"
+            );
+            assert_eq!(
+                site.reads.load(Ordering::SeqCst),
+                0,
+                "its own set, not a site"
+            );
+        }
+    }
+
+    /// A connected server that claims a name other than the host it was
+    /// reached at is not that name's own site: a ruling under that name is
+    /// checked against the name's own key list, not the connected server's
+    /// keys.
+    #[tokio::test]
+    async fn a_connected_server_claiming_another_name_does_not_vouch_for_its_rulings() {
+        const CLAIMED: &str = "did:web:server.test";
+        let origin = Origin {
+            server_keys: vec![public(94)],
+            claims: Some(CLAIMED),
+            ..Default::default()
+        };
+        // The claimed name's own site lists nothing.
+        let site = serve_site(vec![], 0).await;
+        let (mut session, _) = session_with_site_welcomed(origin, &site, "server.test").await;
+        let (opener, task) = refereed_opener(CLAIMED);
+        let (ruling, id) = task_event(94, CLAIMED, "confirm", Some(&task), &[]);
+        session.send(&opener).await;
+        session.send(&ruling).await;
+        assert_eq!(
+            session.went_up_as(&id, &task).await,
+            None,
+            "its own keys do not count for the name it claims: it never goes up"
+        );
+        assert_eq!(
+            site.reads.load(Ordering::SeqCst),
+            1,
+            "the name's own site was read"
+        );
+    }
+
+    /// The connected host is the referee's own host, but its key set is
+    /// published under another name: the set does not answer for the
+    /// referee, so the referee's own site is asked, as for any referee.
+    #[tokio::test]
+    async fn a_referees_host_whose_key_set_names_another_did_is_asked_as_its_own_site() {
+        let origin = Origin {
+            server_keys: vec![public(94)],
+            claims: Some("did:web:elsewhere.example"),
+            ..Default::default()
+        };
+        let site = serve_site(vec![(public(94), None)], 0).await;
+        let (mut session, _) = session_with_site(origin, &site).await;
+        let (opener, task) = refereed_opener(SERVER_DID);
+        let (ruling, id) = task_event(94, SERVER_DID, "confirm", Some(&task), &[]);
+        session.send(&opener).await;
+        session.send(&ruling).await;
+        assert_eq!(
+            session.ruling_of(&id).await,
+            Some(crate::verdict::RulingCheck::Counts),
+            "the referee's own site lists the key"
+        );
+        assert_eq!(site.reads.load(Ordering::SeqCst), 1, "and was read");
+    }
+
+    #[tokio::test]
+    async fn an_event_behind_a_waiting_ruling_goes_up_after_it_and_another_task_does_not_wait() {
+        let site = serve_site(vec![(public(91), None)], 500).await;
+        let origin = Origin::default();
+        origin.hold(ALICE, public(90), None);
+        let (mut session, _) = session_with_site(origin, &site).await;
+        let (opener_a, task_a) = refereed_opener(REFEREE);
+        let (ruling, ruling_id) = task_event(91, REFEREE, "expire", Some(&task_a), &[]);
+        let (claim, claim_id) = task_event(90, ALICE, "claim", Some(&task_a), &[]);
+        let (opener_b, task_b) = task_event(90, ALICE, "offer", None, &[]);
+        for line in [&opener_a, &ruling, &claim, &opener_b] {
+            session.send(line).await;
+        }
+        let mut ups = session.ups_until_act(&claim_id, 5).await;
+        ups.extend(session.ups_within(500).await);
+        let acts: Vec<&str> = ups
+            .iter()
+            .filter_map(|up| match up {
+                Up::Act { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(acts, vec![&task_a, &task_b, &ruling_id, &claim_id]);
+        assert!(
+            at(&ups, act_of(&claim_id)) < at(&ups, verdict_of(&claim_id)),
+            "the claim's verdict follows its Act: {ups:?}"
+        );
+        assert!(matches!(
+            ups[at(&ups, act_of(&claim_id))],
+            Up::Act { ruling: None, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_ruling_whose_check_outlasts_the_wait_goes_up_with_its_settled_verdict() {
+        RULING_WAIT_FOR_TEST.with(|w| w.set(Some(std::time::Duration::from_millis(400))));
+        let site = serve_site(vec![(public(91), None)], 4_000).await;
+        let origin = Origin::default();
+        origin.hold(REFEREE, public(91), None);
+        let (mut session, _) = session_with_site(origin, &site).await;
+        let (opener, task) = refereed_opener(REFEREE);
+        let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        session.send(&opener).await;
+        session.send(&ruling).await;
+        let ups = session.ups_until_act(&id, 2).await;
+        assert_eq!(
+            ups.last(),
+            Some(&Up::Act {
+                id,
+                verdict: Some(VerdictState::Device),
+                ruling: Some(crate::verdict::RulingCheck::CannotCheck),
+            }),
+            "the settled verdict, not pending"
+        );
+    }
+
+    /// The opener's history as the task route answers it.
+    fn history_of(home: &str, task: &str) -> Value {
+        history_in(home, task, &crate::chatsig::channel_venue(TASK_ROOM))
+    }
+
+    /// The opener's history, its opener ALICE's, signed, posted to `venue`.
+    fn history_in(home: &str, task: &str, venue: &str) -> Value {
+        let (opener, _) = served_as(
+            90,
+            ALICE,
+            "offer",
+            None,
+            &[("+freeq.at/act-home", home)],
+            venue,
+            task,
+        );
+        json!({ "act_id": task, "events": [opener] })
+    }
+
+    #[tokio::test]
+    async fn a_slow_history_read_and_a_slow_referee_read_still_finish_inside_the_wait() {
+        let site = serve_site(vec![(public(91), None)], 4_500).await;
+        let task = crate::chatsig::new_event_id();
+        let origin = Origin {
+            bearer: Some("sekrit"),
+            action_delay_ms: 3_500,
+            ..Default::default()
+        };
+        origin
+            .actions
+            .lock()
+            .insert(task.clone(), history_of(REFEREE, &task));
+        let (mut session, origin) = session_with_site(origin, &site).await;
+        session.send(":srv NOTICE * :API-BEARER sekrit").await;
+        let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        let sent = std::time::Instant::now();
+        session.send(&ruling).await;
+        let ups = session.ups_until_act(&id, 12).await;
+        assert!(matches!(
+            ups.last(),
+            Some(Up::Act {
+                ruling: Some(crate::verdict::RulingCheck::Counts),
+                ..
+            })
+        ));
+        assert!(sent.elapsed() < RULING_CHECK_WAIT, "{:?}", sent.elapsed());
+        assert_eq!(origin.action_reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_history_read_is_read_again_and_concurrent_ones_share_a_read() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let task = crate::chatsig::new_event_id();
+        let origin = Origin {
+            action_delay_ms: 200,
+            ..Default::default()
+        };
+        origin
+            .actions
+            .lock()
+            .insert(task.clone(), history_of(REFEREE, &task));
+        *origin.action_status.lock() = Some(500);
+        let (mut session, origin) = session_with_site(origin, &site).await;
+        // Two rulings at once share the failed read. With no opener the
+        // app cannot know the referee: both are hidden, and the move behind
+        // them goes on.
+        let (first, first_id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        let (second, second_id) = task_event(91, REFEREE, "confirm", Some(&task), &[]);
+        let (claim, claim_id) = task_event(90, ALICE, "claim", Some(&task), &[]);
+        session.send(&first).await;
+        session.send(&second).await;
+        session.send(&claim).await;
+        let ups = session.ups_until_act(&claim_id, 5).await;
+        for id in [&first_id, &second_id] {
+            assert!(
+                !ups.iter()
+                    .any(|up| matches!(up, Up::Act { id: got, .. } if got == id)),
+                "hidden: {ups:?}"
+            );
+        }
+        assert_eq!(origin.action_reads.load(Ordering::SeqCst), 1, "one read");
+        // Not remembered: the next ruling reads again.
+        *origin.action_status.lock() = None;
+        let (third, third_id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        session.send(&third).await;
+        assert_eq!(
+            session.ruling_of(&third_id).await,
+            Some(crate::verdict::RulingCheck::Counts)
+        );
+        assert_eq!(origin.action_reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_ruling_in_a_history_batch_waits_for_the_batch_to_close() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let (mut session, _) = session_with_site(Origin::default(), &site).await;
+        let (opener, task) = refereed_opener(REFEREE);
+        session.send(&opener).await;
+        session
+            .send(&format!(":srv BATCH +h1 chathistory {TASK_ROOM}"))
+            .await;
+        let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        session.send(&in_batch("h1", &ruling)).await;
+        let ups = session.ups_within(400).await;
+        assert!(!ups.iter().any(act_of(&id)), "held for the batch: {ups:?}");
+        session.send(":srv BATCH -h1").await;
+        assert_eq!(
+            session.ruling_of(&id).await,
+            Some(crate::verdict::RulingCheck::Counts)
+        );
+    }
+
+    /// A task event read inside an open history batch that is no ruling and
+    /// waits behind none is held to the batch's close, as the web holds it:
+    /// none goes up before; at the close they go up in wire order, before
+    /// the batch's rulings. Each line's TAGMSG still goes up at once.
+    #[tokio::test]
+    async fn task_events_in_a_history_batch_go_up_at_its_close_in_order_before_its_rulings() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let (mut session, _) = session_with_site(Origin::default(), &site).await;
+        let (opener, task) = refereed_opener(REFEREE);
+        session.send(&opener).await;
+        session.ups_within(300).await;
+        session
+            .send(&format!(":srv BATCH +h1 chathistory {TASK_ROOM}"))
+            .await;
+        let (ruling, ruling_id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        let (first, first_id) = task_event(90, ALICE, "offer", None, &[]);
+        let (second, second_id) = task_event(90, ALICE, "offer", None, &[]);
+        for line in [&ruling, &first, &second] {
+            session.send(&in_batch("h1", line)).await;
+        }
+        let mut ups = session.ups_within(400).await;
+        for id in [&ruling_id, &first_id, &second_id] {
+            assert!(!ups.iter().any(act_of(id)), "held to the close: {ups:?}");
+        }
+        at(&ups, tagmsg_of(&first_id));
+        at(&ups, tagmsg_of(&second_id));
+        session.send(":srv BATCH -h1").await;
+        ups.extend(session.ups_until_act(&ruling_id, 5).await);
+        assert!(
+            at(&ups, act_of(&first_id)) < at(&ups, act_of(&second_id))
+                && at(&ups, act_of(&second_id)) < at(&ups, act_of(&ruling_id)),
+            "in wire order, before the ruling: {ups:?}"
+        );
+    }
+
+    /// A batch the connection cuts drops the task events it holds, and the
+    /// replay on the next connection brings them back; a copy of a held
+    /// event read in a later batch goes up once; a live task event goes up
+    /// at once while a batch holds an older one.
+    #[tokio::test]
+    async fn task_events_held_on_a_batch_are_dropped_with_it_and_a_live_one_is_not_held() {
+        let site = serve_site(vec![], 0).await;
+        let (mut session, _) = session_with_site(Origin::default(), &site).await;
+        let (held, held_id) = task_event(90, ALICE, "offer", None, &[]);
+        let (live, live_id) = task_event(90, ALICE, "offer", None, &[]);
+        session
+            .send(&format!(":srv BATCH +h1 chathistory {TASK_ROOM}"))
+            .await;
+        session.send(&in_batch("h1", &held)).await;
+        session.send(&live).await;
+        let mut ups = session.ups_within(300).await;
+        at(&ups, act_of(&live_id));
+        assert!(!ups.iter().any(act_of(&held_id)), "held: {ups:?}");
+        // The connection ends with the batch still open.
+        let Session {
+            server,
+            mut events,
+            _handle,
+        } = session;
+        drop(server);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while let Some(event) = events.recv().await {
+                ups.extend(up_of(event));
+            }
+        })
+        .await;
+        assert!(!ups.iter().any(act_of(&held_id)), "dropped: {ups:?}");
+
+        // Reconnected: the replay brings it back; a copy of it in a later
+        // batch goes up once.
+        let (mut session, _) = session_with_site(Origin::default(), &site).await;
+        for batch in ["h2", "h3"] {
+            session
+                .send(&format!(":srv BATCH +{batch} chathistory {TASK_ROOM}"))
+                .await;
+            session.send(&in_batch(batch, &held)).await;
+        }
+        session.send(":srv BATCH -h2").await;
+        session.send(":srv BATCH -h3").await;
+        let ups = session.ups_within(500).await;
+        assert_eq!(
+            ups.iter().filter(|up| act_of(&held_id)(up)).count(),
+            1,
+            "{ups:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_drops_a_ruling_still_being_checked_and_the_replay_brings_it_back() {
+        let site = serve_site(vec![(public(91), None)], 1_500).await;
+        let (mut session, _) = session_with_site(Origin::default(), &site).await;
+        let (opener, task) = refereed_opener(REFEREE);
+        let (live, live_id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        let (behind, behind_id) = task_event(90, ALICE, "claim", Some(&task), &[]);
+        let (replayed, replayed_id) = task_event(91, REFEREE, "confirm", Some(&task), &[]);
+        session.send(&opener).await;
+        session.send(&live).await;
+        session.send(&behind).await;
+        session
+            .send(&format!(":srv BATCH +h1 chathistory {TASK_ROOM}"))
+            .await;
+        session.send(&in_batch("h1", &replayed)).await;
+        let mut ups = session.ups_within(200).await;
+        // The connection ends with the batch still open.
+        let Session {
+            server,
+            mut events,
+            _handle,
+        } = session;
+        drop(server);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                ups.extend(up_of(event));
+            }
+        })
+        .await;
+        assert!(
+            !ups.iter().any(act_of(&live_id)),
+            "the ruling still being checked is dropped, not shown: {ups:?}"
+        );
+        assert!(
+            !ups.iter().any(act_of(&behind_id)),
+            "and the move behind it"
+        );
+        assert!(
+            !ups.iter().any(act_of(&replayed_id)),
+            "the cut batch's is dropped"
+        );
+        // Neither ruling's line verdict is held back for good.
+        at(&ups, verdict_of(&live_id));
+        at(&ups, verdict_of(&replayed_id));
+
+        // Reconnected: the replay brings them back, checked and in order.
+        let (mut session, _) = session_with_site(Origin::default(), &site).await;
+        for line in [&opener, &live, &behind] {
+            session.send(line).await;
+        }
+        let ups = session.ups_until_act(&behind_id, 5).await;
+        assert!(matches!(
+            ups[at(&ups, act_of(&live_id))],
+            Up::Act {
+                ruling: Some(crate::verdict::RulingCheck::Counts),
+                ..
+            }
+        ));
+        assert!(at(&ups, act_of(&live_id)) < at(&ups, act_of(&behind_id)));
+    }
+
+    /// A disconnect that cuts a history batch drops the ruling in it and the
+    /// move behind that ruling too, so the replay after reconnecting gives
+    /// them back in order: the ruling, then the move.
+    #[tokio::test]
+    async fn a_move_behind_a_ruling_dropped_with_its_cut_batch_is_dropped_and_replayed_after_it() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let (opener, task) = refereed_opener(REFEREE);
+        let (ruling, ruling_id) = task_event(91, REFEREE, "confirm", Some(&task), &[]);
+        let (progress, progress_id) = task_event(90, ALICE, "progress", Some(&task), &[]);
+        let (mut session, origin) = session_with_site(Origin::default(), &site).await;
+        session.send(&opener).await;
+        session
+            .send(&format!(":srv BATCH +h1 chathistory {TASK_ROOM}"))
+            .await;
+        session.send(&in_batch("h1", &ruling)).await;
+        session.send(&in_batch("h1", &progress)).await;
+        let mut ups = session.ups_within(200).await;
+        // The connection ends with the batch still open.
+        let Session {
+            server,
+            mut events,
+            _handle,
+        } = session;
+        drop(server);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while let Some(event) = events.recv().await {
+                ups.extend(up_of(event));
+            }
+        })
+        .await;
+        assert!(
+            !ups.iter().any(act_of(&ruling_id)),
+            "the ruling is dropped: {ups:?}"
+        );
+        assert!(
+            !ups.iter().any(act_of(&progress_id)),
+            "and the move behind it: {ups:?}"
+        );
+
+        // Reconnected: the replay brings all three again.
+        drop(origin);
+        let (mut session, _) = session_with_site(Origin::default(), &site).await;
+        session
+            .send(&format!(":srv BATCH +h2 chathistory {TASK_ROOM}"))
+            .await;
+        for line in [&opener, &ruling, &progress] {
+            session.send(&in_batch("h2", line)).await;
+        }
+        session.send(":srv BATCH -h2").await;
+        let ups = session.ups_until_act(&progress_id, 5).await;
+        assert!(
+            at(&ups, act_of(&ruling_id)) < at(&ups, act_of(&progress_id)),
+            "the ruling, then the move: {ups:?}"
+        );
+    }
+
+    /// A task opened in a DM: the referee signs its rulings for the task's
+    /// own venue, the DM pair, and sends them to `*`. Each is checked under
+    /// that venue, verdict and judgment alike, when this session is one of
+    /// the pair: whether the opener was seen or its history was read.
+    #[tokio::test]
+    async fn a_ruling_on_a_dm_task_is_checked_under_the_tasks_own_venue() {
+        use crate::verdict::RulingCheck;
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin::default();
+        origin.hold(REFEREE, public(91), None);
+        let ours = crate::chatsig::dm_venue(ALICE, OWN_DID);
+        // Seen: ALICE opens the task in a DM to this session.
+        let (mut session, origin) = session_with_site(origin, &site).await;
+        let (opener, task) = task_event_for(
+            90,
+            ALICE,
+            "offer",
+            None,
+            &[("+freeq.at/act-home", REFEREE)],
+            &ours,
+            OWN_NICK,
+        );
+        session.send(&opener).await;
+        for verb in ["expire", "confirm"] {
+            let (ruling, id) = task_event_for(91, REFEREE, verb, Some(&task), &[], &ours, "*");
+            session.send(&ruling).await;
+            assert_eq!(
+                session.ups_until_act(&id, 5).await.pop(),
+                Some(Up::Act {
+                    id,
+                    verdict: Some(VerdictState::Device),
+                    ruling: Some(RulingCheck::Counts),
+                }),
+                "{verb}"
+            );
+        }
+        // Read from the history: its opener's venue is the pair it names.
+        *origin.actions.lock() = HashMap::new();
+        for (pair, expected) in [
+            (ours.clone(), Some(Some(RulingCheck::Counts))),
+            // Failing: never goes up.
+            (crate::chatsig::dm_venue(ALICE, "did:plc:bob"), None),
+        ] {
+            let task = crate::chatsig::new_event_id();
+            origin
+                .actions
+                .lock()
+                .insert(task.clone(), history_in(REFEREE, &task, &pair));
+            let (ruling, id) = task_event_for(91, REFEREE, "expire", Some(&task), &[], &pair, "*");
+            session.send(&ruling).await;
+            assert_eq!(
+                session.went_up_as(&id, &task).await,
+                expected,
+                "a pair {} this session",
+                if pair == ours { "with" } else { "without" }
+            );
+        }
+    }
+
+    /// A DM ruling that arrives before this session's own DID is known has
+    /// no venue to check its signature under: the app cannot know its
+    /// referee, and it is hidden.
+    #[tokio::test]
+    async fn a_dm_ruling_before_the_session_did_is_known_cannot_be_checked() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin::default();
+        origin.hold(REFEREE, public(91), None);
+        let task = crate::chatsig::new_event_id();
+        let pair = crate::chatsig::dm_venue(ALICE, OWN_DID);
+        origin
+            .actions
+            .lock()
+            .insert(task.clone(), history_in(REFEREE, &task, &pair));
+        let origin = Arc::new(origin);
+        let base = serve_origin(origin.clone()).await;
+        let reader = crate::identity_records::RecordReader::new(
+            crate::did::DidResolver::static_map(HashMap::new()),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        );
+        let site_base = site.base.clone();
+        let lookup = crate::key_lookup::KeyLookup::new(
+            reader,
+            Some(base),
+            std::time::Duration::from_secs(3600),
+        )
+        .with_retry_delays(Vec::new())
+        .with_own_host_base(move |_| site_base.clone());
+        // Signed in with no DID the session learns.
+        let mut session = Session::open_welcomed(Some(Arc::new(lookup)), "", "127.0.0.1").await;
+        let (ruling, id) = task_event_for(91, REFEREE, "expire", Some(&task), &[], &pair, "*");
+        session.send(&ruling).await;
+        let ups = session.ups_within(1_000).await;
+        assert!(
+            !ups.iter()
+                .any(|up| matches!(up, Up::Act { id: got, .. } if got == &id)),
+            "hidden: {ups:?}"
+        );
+    }
+
+    /// A ruling on a DM task whose opener is not on the connection and whose
+    /// history cannot be read: the pair it was signed for is unknown, so its
+    /// signature cannot be checked and its referee cannot be known. It is
+    /// hidden, and its line's verdict is unverifiable, with no key looked
+    /// up.
+    #[tokio::test]
+    async fn a_dm_ruling_whose_pair_is_unknown_cannot_be_checked() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin::default();
+        origin.hold(REFEREE, public(91), None);
+        *origin.action_status.lock() = Some(500);
+        let (mut session, origin) = session_with_site(origin, &site).await;
+        let task = crate::chatsig::new_event_id();
+        let pair = crate::chatsig::dm_venue(ALICE, OWN_DID);
+        let (ruling, id) = task_event_for(91, REFEREE, "expire", Some(&task), &[], &pair, "*");
+        session.send(&ruling).await;
+        let ups = session.ups_within(1_000).await;
+        assert!(
+            !ups.iter()
+                .any(|up| matches!(up, Up::Act { id: got, .. } if got == &id)),
+            "hidden: {ups:?}"
+        );
+        assert!(
+            ups.contains(&Up::Verdict {
+                id,
+                verdict: VerdictState::Unverifiable
+            }),
+            "its line's verdict follows: {ups:?}"
+        );
+        assert_eq!(
+            origin.key_reads.load(Ordering::SeqCst),
+            0,
+            "no key looked up"
+        );
+        assert_eq!(
+            site.reads.load(Ordering::SeqCst),
+            0,
+            "nor the referee's list"
+        );
+    }
+
+    /// A copy of a ruling's id signed with a key its referee does not list
+    /// never goes up; it does not make the genuine ruling under that id a
+    /// repeat.
+    #[tokio::test]
+    async fn a_failing_copy_does_not_hide_the_genuine_ruling_with_its_id() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let (mut session, _) = session_with_site(Origin::default(), &site).await;
+        let (opener, task) = refereed_opener(REFEREE);
+        session.send(&opener).await;
+        let id = crate::chatsig::new_event_id();
+        let venue = crate::chatsig::channel_venue(TASK_ROOM);
+        let (copy, _) = task_event_as(
+            93,
+            REFEREE,
+            "expire",
+            Some(&task),
+            &[],
+            &venue,
+            TASK_ROOM,
+            &id,
+        );
+        session.send(&copy).await;
+        assert_eq!(
+            session.went_up_as(&id, &task).await,
+            None,
+            "the copy never goes up"
+        );
+        let (genuine, _) = task_event_as(
+            91,
+            REFEREE,
+            "expire",
+            Some(&task),
+            &[],
+            &venue,
+            TASK_ROOM,
+            &id,
+        );
+        session.send(&genuine).await;
+        assert_eq!(
+            session.ruling_of(&id).await,
+            Some(crate::verdict::RulingCheck::Counts),
+            "the genuine ruling"
+        );
+    }
+
+    /// The genuine ruling under an id still goes up when it arrives while a
+    /// failing copy with that id is still being checked: an id is taken as
+    /// seen when its event goes up, not when its line arrives. The same
+    /// ruling twice still goes up once.
+    #[tokio::test]
+    async fn a_ruling_arriving_while_a_failing_copy_is_checked_still_goes_up() {
+        let site = serve_site(vec![(public(91), None)], 300).await;
+        let venue = crate::chatsig::channel_venue(TASK_ROOM);
+        let (mut session, _) = session_with_site(Origin::default(), &site).await;
+        let (opener, task) = refereed_opener(REFEREE);
+        session.send(&opener).await;
+        let id = crate::chatsig::new_event_id();
+        let ruling = |seed| {
+            task_event_as(
+                seed,
+                REFEREE,
+                "expire",
+                Some(&task),
+                &[],
+                &venue,
+                TASK_ROOM,
+                &id,
+            )
+            .0
+        };
+        session.send(&ruling(93)).await;
+        session.send(&ruling(91)).await;
+        let ups = session.ups_within(3_000).await;
+        let rulings: Vec<_> = ups
+            .iter()
+            .filter_map(|u| match u {
+                Up::Act { id: i, ruling, .. } if *i == id => Some(*ruling),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rulings,
+            vec![Some(crate::verdict::RulingCheck::Counts)],
+            "the genuine ruling; the copy never goes up"
+        );
+
+        let (opener, task) = refereed_opener(REFEREE);
+        session.send(&opener).await;
+        let id = crate::chatsig::new_event_id();
+        let (twice, _) = task_event_as(
+            91,
+            REFEREE,
+            "expire",
+            Some(&task),
+            &[],
+            &venue,
+            TASK_ROOM,
+            &id,
+        );
+        session.send(&twice).await;
+        session.send(&twice).await;
+        let ups = session.ups_within(2_000).await;
+        let acts = ups
+            .iter()
+            .filter(|u| matches!(u, Up::Act { id: i, .. } if *i == id))
+            .count();
+        assert_eq!(acts, 1, "the same ruling twice goes up once: {ups:?}");
+    }
+
+    /// An opener names its task's referee only once its signature checks: an
+    /// unsigned line under the opener's id naming another referee, before or
+    /// after the real opener, does not change how the genuine ruling is
+    /// judged. Until a signed opener checks, the referee is read from the
+    /// task's history.
+    #[tokio::test]
+    async fn only_an_opener_whose_signature_checks_names_its_referee() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        for fake_first in [false, true] {
+            let origin = Origin::default();
+            origin.hold(ALICE, public(90), None);
+            let (mut session, origin) = session_with_site(origin, &site).await;
+            let (opener, task) = refereed_opener(REFEREE);
+            origin
+                .actions
+                .lock()
+                .insert(task.clone(), history_of(REFEREE, &task));
+            let fake: HashMap<String, String> = [
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", ALICE),
+                ("+freeq.at/act-home", "did:web:evil.example"),
+                (crate::chatsig::EVENT_ID_TAG, task.as_str()),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+            let fake = line(fake, "TAGMSG", TASK_ROOM, None);
+            let lines = match fake_first {
+                true => [&fake, &opener],
+                false => [&opener, &fake],
+            };
+            for l in lines {
+                session.send(l).await;
+            }
+            session.ups_within(300).await;
+            let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+            session.send(&ruling).await;
+            assert_eq!(
+                session.ruling_of(&id).await,
+                Some(crate::verdict::RulingCheck::Counts),
+                "fake first: {fake_first}"
+            );
+        }
+    }
+
+    /// A ruling with no signature, or one that cannot be read (an unknown
+    /// algorithm, a tag not in `alg:kid:sig` form, no `from`), fails on a
+    /// task that names its referee, and never goes up, and cannot be checked
+    /// on one that names none, and goes up at once. Neither has a check to
+    /// wait for: the move behind it does not wait.
+    #[tokio::test]
+    async fn an_unsigned_or_unreadable_ruling_fails_where_its_task_names_a_referee() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        // A well-formed signature over a ruling whose `from` is then left off.
+        let (signed, _) = task_event(91, REFEREE, "expire", Some("01TASK"), &[]);
+        let real_sig = signed
+            .split(' ')
+            .next()
+            .unwrap()
+            .trim_start_matches('@')
+            .split(';')
+            .find_map(|t| t.strip_prefix(&format!("{}=", crate::sigtag::SIG_TAG)))
+            .unwrap()
+            .to_string();
+        let kinds: [(&str, Option<&str>, bool); 4] = [
+            ("unsigned", None, true),
+            ("unknown algorithm", Some("ed99999:somekid:c2ln"), true),
+            ("not alg:kid:sig", Some("garbled"), true),
+            ("no from", Some(real_sig.as_str()), false),
+        ];
+        // Failing where its task names a referee: it never goes up.
+        for (named, expected) in [
+            (true, None),
+            (false, Some(Some(crate::verdict::RulingCheck::CannotCheck))),
+        ] {
+            for (kind, sig, with_from) in kinds {
+                let (mut session, _) = session_with_site(Origin::default(), &site).await;
+                let (opener, task) = if named {
+                    refereed_opener(REFEREE)
+                } else {
+                    task_event(90, ALICE, "offer", None, &[])
+                };
+                session.send(&opener).await;
+                session.ups_within(200).await;
+                let id = crate::chatsig::new_event_id();
+                let mut tags: HashMap<String, String> = [
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "expire"),
+                    ("+freeq.at/act-id", task.as_str()),
+                    (crate::chatsig::EVENT_ID_TAG, id.as_str()),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+                if with_from {
+                    tags.insert("+freeq.at/from".to_string(), REFEREE.to_string());
+                }
+                if let Some(sig) = sig {
+                    tags.insert(crate::sigtag::SIG_TAG.to_string(), sig.to_string());
+                }
+                let (claim, claim_id) = task_event(90, ALICE, "claim", Some(&task), &[]);
+                let sent = std::time::Instant::now();
+                session.send(&line(tags, "TAGMSG", TASK_ROOM, None)).await;
+                session.send(&claim).await;
+                let ups = session.ups_until_act(&claim_id, 3).await;
+                assert!(
+                    sent.elapsed() < std::time::Duration::from_secs(3),
+                    "{kind}, named {named}"
+                );
+                let went_up = ups.iter().find_map(|up| match up {
+                    Up::Act {
+                        id: got, ruling, ..
+                    } if *got == id => Some(*ruling),
+                    _ => None,
+                });
+                assert_eq!(went_up, expected, "{kind}, named {named}: {ups:?}");
+            }
+        }
+    }
+
+    /// A ruling arrives before its task's opener and reads the task's
+    /// history, slowly, and the read fails; the opener arrives and checks
+    /// while the read is in flight. The opener's naming replaces the read:
+    /// the ruling is judged from it, and a second ruling reads nothing.
+    #[tokio::test]
+    async fn an_opener_checked_while_a_history_read_is_in_flight_names_its_referee() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin {
+            action_delay_ms: 800,
+            ..Default::default()
+        };
+        *origin.action_status.lock() = Some(500);
+        let (mut session, origin) = session_with_site(origin, &site).await;
+        let (opener, task) = refereed_opener(REFEREE);
+        let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        session.send(&ruling).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        session.send(&opener).await;
+        assert_eq!(
+            session.ruling_of(&id).await,
+            Some(crate::verdict::RulingCheck::Counts),
+            "judged from the opener's naming"
+        );
+        let (again, again_id) = task_event(91, REFEREE, "confirm", Some(&task), &[]);
+        session.send(&again).await;
+        assert_eq!(
+            session.ruling_of(&again_id).await,
+            Some(crate::verdict::RulingCheck::Counts)
+        );
+        assert_eq!(
+            origin.action_reads.load(Ordering::SeqCst),
+            1,
+            "the second ruling read nothing"
+        );
+    }
+
+    /// A ruling its check finds failing never goes up, and the move behind
+    /// it on its task goes on as soon as the check says so, without waiting
+    /// for the ruling's own line verdict, which still follows.
+    #[tokio::test]
+    async fn a_failing_ruling_never_goes_up_and_the_move_behind_it_does_not_wait_for_its_verdict() {
+        // The referee's list answers at once; every signer's key is read
+        // slowly, so the ruling's line verdict is slow.
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin {
+            delay_ms: 1_500,
+            ..Default::default()
+        };
+        let (mut session, _) = session_with_site(origin, &site).await;
+        let (opener, task) = refereed_opener(REFEREE);
+        session.send(&opener).await;
+        // The opener names its referee once its own check settles.
+        let ups = session.ups_within(2_500).await;
+        assert!(ups.iter().any(verdict_of(&task)), "{ups:?}");
+        let (ruling, id) = task_event(93, REFEREE, "expire", Some(&task), &[]);
+        let (claim, claim_id) = task_event(90, ALICE, "claim", Some(&task), &[]);
+        let sent = std::time::Instant::now();
+        session.send(&ruling).await;
+        session.send(&claim).await;
+        let mut ups = session.ups_until_act(&claim_id, 5).await;
+        assert!(
+            sent.elapsed() < std::time::Duration::from_millis(1_000),
+            "the move did not wait for the ruling's verdict: {ups:?}"
+        );
+        ups.extend(session.ups_within(3_000).await);
+        assert!(!ups.iter().any(act_of(&id)), "never goes up: {ups:?}");
+        assert!(
+            ups.iter().any(verdict_of(&id)),
+            "its line's verdict still follows: {ups:?}"
+        );
+    }
+
+    /// One event as `/api/v1/actions/{id}` serves it: `verb` by `signer`
+    /// with `seed`'s key on `task` (an opener when `None`), posted to
+    /// TASK_ROOM. Returns it and its event id.
+    fn served(
+        seed: u8,
+        signer: &str,
+        verb: &str,
+        task: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> (Value, String) {
+        let id = crate::chatsig::new_event_id();
+        let venue = crate::chatsig::channel_venue(TASK_ROOM);
+        served_as(seed, signer, verb, task, extra, &venue, &id)
+    }
+
+    /// [`served`], posted to `venue` under the event id `id`.
+    fn served_as(
+        seed: u8,
+        signer: &str,
+        verb: &str,
+        task: Option<&str>,
+        extra: &[(&str, &str)],
+        venue: &str,
+        id: &str,
+    ) -> (Value, String) {
+        let (venue, id) = (venue.to_string(), id.to_string());
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let mut tags = vec![
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", verb),
+            ("+freeq.at/from", signer),
+        ];
+        if let Some(task) = task {
+            tags.push(("+freeq.at/act-id", task));
+        }
+        tags.extend_from_slice(extra);
+        let canonical = crate::act::act_canonical(tags.clone(), &venue, &id).unwrap();
+        let signature = crate::act::sign_act(tags, &venue, &id, &key).unwrap();
+        let event = json!({
+            "event_id": id,
+            "canonical": canonical,
+            "signature": signature,
+            "actor_did": signer,
+            "venue": venue,
+            "confirm_state": null,
+            "timestamp": 1_700_000_000,
+        });
+        (event, id)
+    }
+
+    /// A task's history as the route answers it, its events in order.
+    fn served_history(task: &str, events: Vec<Value>) -> Value {
+        json!({
+            "act_id": task,
+            "venue": crate::chatsig::channel_venue(TASK_ROOM),
+            "task": { "state": "open" },
+            "events": events,
+        })
+    }
+
+    fn ids_of(history: &Value) -> Vec<String> {
+        history["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["event_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// A task's history read through the SDK leaves out a ruling signed with
+    /// a key its referee's own site does not list, and keeps one the site
+    /// lists and one on a task naming no referee, with every field the
+    /// server sent.
+    #[tokio::test]
+    async fn the_task_history_leaves_out_a_ruling_that_fails_its_referee_check() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin::default();
+        let (opener, task) = served(90, ALICE, "offer", None, &[("+freeq.at/act-home", REFEREE)]);
+        let (claim, claim_id) = served(90, ALICE, "claim", Some(&task), &[]);
+        let (failing, _) = served(93, REFEREE, "confirm", Some(&task), &[]);
+        let (counting, counting_id) = served(91, REFEREE, "expire", Some(&task), &[]);
+        origin.actions.lock().insert(
+            task.clone(),
+            served_history(&task, vec![opener, claim, failing, counting]),
+        );
+        let (plain, plain_task) = served(90, ALICE, "offer", None, &[]);
+        let (unrefereed, unrefereed_id) = served(93, REFEREE, "expire", Some(&plain_task), &[]);
+        origin.actions.lock().insert(
+            plain_task.clone(),
+            served_history(&plain_task, vec![plain, unrefereed]),
+        );
+        let (session, _) = session_with_site(origin, &site).await;
+
+        let history = session._handle.task_history(&task).await.unwrap();
+        assert_eq!(ids_of(&history), [task.clone(), claim_id, counting_id]);
+        assert_eq!(history["act_id"], json!(task));
+        assert_eq!(history["task"], json!({ "state": "open" }));
+        assert_eq!(history["events"][1]["actor_did"], json!(ALICE));
+        assert_eq!(history["events"][1]["timestamp"], json!(1_700_000_000));
+
+        let history = session._handle.task_history(&plain_task).await.unwrap();
+        assert_eq!(
+            ids_of(&history),
+            [plain_task, unrefereed_id],
+            "no referee named"
+        );
+    }
+
+    /// The rulings in one history are judged together: three asks of a
+    /// referee whose site does not answer share one read, and the history
+    /// comes back within one read's time, every ruling kept.
+    #[tokio::test]
+    async fn the_rulings_in_one_task_history_are_judged_together() {
+        let site = serve_site(vec![(public(91), None)], 800).await;
+        *site.status.lock() = Some(503);
+        let origin = Origin::default();
+        let (opener, task) = served(90, ALICE, "offer", None, &[("+freeq.at/act-home", REFEREE)]);
+        let mut events = vec![opener];
+        for seed in [91, 93, 95] {
+            events.push(served(seed, REFEREE, "expire", Some(&task), &[]).0);
+        }
+        origin
+            .actions
+            .lock()
+            .insert(task.clone(), served_history(&task, events));
+        let (session, _) = session_with_site(origin, &site).await;
+        let asked = std::time::Instant::now();
+        let history = session._handle.task_history(&task).await.unwrap();
+        assert!(
+            asked.elapsed() < std::time::Duration::from_millis(1_500),
+            "{:?}",
+            asked.elapsed()
+        );
+        assert_eq!(ids_of(&history).len(), 4, "none can be checked: all kept");
+        assert_eq!(site.reads.load(Ordering::SeqCst), 1, "one shared read");
+    }
+
+    /// A receipt the server filed and marked ignored is left out of a task's
+    /// history read through the SDK; one with no mark stays.
+    #[tokio::test]
+    async fn the_task_history_leaves_out_an_ignored_receipt() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin::default();
+        let (opener, task) = served(90, ALICE, "offer", None, &[("+freeq.at/act-home", REFEREE)]);
+        let (claim, claim_id) = served(90, ALICE, "claim", Some(&task), &[]);
+        let (mut ignored, _) = served(91, REFEREE, "confirm", Some(&task), &[]);
+        ignored["confirm_state"] = json!("ignored");
+        let (receipt, receipt_id) = served(91, REFEREE, "confirm", Some(&task), &[]);
+        origin.actions.lock().insert(
+            task.clone(),
+            served_history(&task, vec![opener, claim, ignored, receipt]),
+        );
+        let (session, _) = session_with_site(origin, &site).await;
+
+        let history = session._handle.task_history(&task).await.unwrap();
+        assert_eq!(ids_of(&history), [task, claim_id, receipt_id]);
+    }
+
+    /// `event` as a server that took `name` out of its document serves it,
+    /// its signature left as it was.
+    fn stripped(mut event: Value, name: &str) -> Value {
+        let mut doc: serde_json::Map<String, Value> =
+            serde_json::from_str(event["canonical"].as_str().unwrap()).unwrap();
+        doc.remove(name);
+        event["canonical"] = json!(Value::Object(doc).to_string());
+        event
+    }
+
+    /// A task's opening post read from the server counts only once its own
+    /// signature checks: one served with its `act-home` taken out no longer
+    /// matches its signature, so every ruling on its task fails, live and in
+    /// the task's history, and the live ruling's line still gets its verdict.
+    #[tokio::test]
+    async fn a_fetched_opener_whose_signature_no_longer_matches_fails_its_rulings() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin::default();
+        origin.hold(REFEREE, public(91), None);
+        let (opener, task) = served(90, ALICE, "offer", None, &[("+freeq.at/act-home", REFEREE)]);
+        let (claim, claim_id) = served(90, ALICE, "claim", Some(&task), &[]);
+        let (counting, _) = served(91, REFEREE, "expire", Some(&task), &[]);
+        origin.actions.lock().insert(
+            task.clone(),
+            served_history(&task, vec![stripped(opener, "act-home"), claim, counting]),
+        );
+        let (mut session, _) = session_with_site(origin, &site).await;
+        let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        let (move_after, move_id) = task_event(90, ALICE, "claim", Some(&task), &[]);
+        session.send(&ruling).await;
+        session.send(&move_after).await;
+        let mut ups = session.ups_until_act(&move_id, 5).await;
+        ups.extend(session.ups_within(300).await);
+        assert!(
+            !ups.iter()
+                .any(|up| matches!(up, Up::Act { id: got, .. } if got == &id)),
+            "never goes up: {ups:?}"
+        );
+        assert!(
+            ups.contains(&Up::Verdict {
+                id,
+                verdict: VerdictState::Device
+            }),
+            "its line's verdict, under the channel's venue: {ups:?}"
+        );
+        let history = session._handle.task_history(&task).await.unwrap();
+        assert_eq!(ids_of(&history), [task, claim_id]);
+    }
+
+    /// In a direct conversation, a ruling on a task whose fetched opener was
+    /// altered fails at once, before the pair it was signed for is worked
+    /// out, which needs that opener; its line's verdict is unverifiable.
+    #[tokio::test]
+    async fn a_dm_ruling_on_a_task_whose_fetched_opener_was_altered_fails() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin::default();
+        let pair = crate::chatsig::dm_venue(ALICE, OWN_DID);
+        let task = crate::chatsig::new_event_id();
+        let (opener, _) = served_as(
+            90,
+            ALICE,
+            "offer",
+            None,
+            &[("+freeq.at/act-home", REFEREE)],
+            &pair,
+            &task,
+        );
+        origin.actions.lock().insert(
+            task.clone(),
+            json!({ "act_id": task, "events": [stripped(opener, "act-home")] }),
+        );
+        let (mut session, _) = session_with_site(origin, &site).await;
+        let (ruling, id) = task_event_for(91, REFEREE, "expire", Some(&task), &[], &pair, "*");
+        let (move_after, move_id) =
+            task_event_for(90, ALICE, "claim", Some(&task), &[], &pair, OWN_NICK);
+        session.send(&ruling).await;
+        session.send(&move_after).await;
+        let mut ups = session.ups_until_act(&move_id, 5).await;
+        ups.extend(session.ups_within(300).await);
+        assert!(
+            !ups.iter()
+                .any(|up| matches!(up, Up::Act { id: got, .. } if got == &id)),
+            "never goes up: {ups:?}"
+        );
+        assert!(
+            ups.contains(&Up::Verdict {
+                id,
+                verdict: VerdictState::Unverifiable
+            }),
+            "{ups:?}"
+        );
+    }
+
+    /// A fetched opener whose poster's key cannot be found cannot name the
+    /// referee: its rulings are hidden, and nothing is kept, so the next
+    /// ruling reads the history again.
+    #[tokio::test]
+    async fn a_fetched_opener_whose_key_cannot_be_found_is_read_again() {
+        const CAROL: &str = "did:plc:carol";
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin::default();
+        let (opener, task) = served(92, CAROL, "offer", None, &[("+freeq.at/act-home", REFEREE)]);
+        origin
+            .actions
+            .lock()
+            .insert(task.clone(), served_history(&task, vec![opener]));
+        let (mut session, origin) = session_with_site(origin, &site).await;
+        for read in [1, 2] {
+            let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+            session.send(&ruling).await;
+            assert_eq!(session.went_up_as(&id, &task).await, None, "hidden");
+            assert_eq!(origin.action_reads.load(Ordering::SeqCst), read);
+        }
+    }
+
+    /// A fetched opener that checks and names no referee leaves its task's
+    /// rulings as they were before step 9: shown, not checked.
+    #[tokio::test]
+    async fn a_fetched_opener_naming_no_referee_leaves_its_rulings_unchecked() {
+        use crate::verdict::RulingCheck;
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin::default();
+        let (opener, task) = served(90, ALICE, "offer", None, &[]);
+        origin
+            .actions
+            .lock()
+            .insert(task.clone(), served_history(&task, vec![opener]));
+        let (mut session, _) = session_with_site(origin, &site).await;
+        let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        session.send(&ruling).await;
+        assert_eq!(session.ruling_of(&id).await, Some(RulingCheck::CannotCheck));
+    }
+
+    /// A live opener whose signature checks replaces what a fetched copy
+    /// gave, a copy found altered included.
+    #[tokio::test]
+    async fn a_live_opener_that_checks_replaces_a_fetched_copy_found_altered() {
+        use crate::verdict::RulingCheck;
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin::default();
+        let venue = crate::chatsig::channel_venue(TASK_ROOM);
+        let task = crate::chatsig::new_event_id();
+        let home = [("+freeq.at/act-home", REFEREE)];
+        let (opener, _) = served_as(90, ALICE, "offer", None, &home, &venue, &task);
+        origin.actions.lock().insert(
+            task.clone(),
+            served_history(&task, vec![stripped(opener, "act-home")]),
+        );
+        let (mut session, _) = session_with_site(origin, &site).await;
+        let (first, first_id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        session.send(&first).await;
+        assert_eq!(session.went_up_as(&first_id, &task).await, None, "fails");
+        let (live, _) = task_event_as(90, ALICE, "offer", None, &home, &venue, TASK_ROOM, &task);
+        session.send(&live).await;
+        session.ups_within(300).await;
+        let (second, second_id) = task_event(91, REFEREE, "confirm", Some(&task), &[]);
+        session.send(&second).await;
+        assert_eq!(
+            session.ruling_of(&second_id).await,
+            Some(RulingCheck::Counts)
+        );
+    }
+
+    /// A task's history read through the SDK leaves out a ruling whose
+    /// task's referee the app cannot know: the history holds no opener, or
+    /// one under a key nobody can find. A ruling on a task naming no
+    /// referee stays.
+    #[tokio::test]
+    async fn the_task_history_leaves_out_a_ruling_whose_referee_cannot_be_known() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin::default();
+        let task = crate::chatsig::new_event_id();
+        let (claim, claim_id) = served(90, ALICE, "claim", Some(&task), &[]);
+        let (ruling, _) = served(91, REFEREE, "expire", Some(&task), &[]);
+        origin
+            .actions
+            .lock()
+            .insert(task.clone(), served_history(&task, vec![claim, ruling]));
+        let (unknown, unknown_task) = served(
+            92,
+            "did:plc:carol",
+            "offer",
+            None,
+            &[("+freeq.at/act-home", REFEREE)],
+        );
+        let (on_unknown, _) = served(91, REFEREE, "expire", Some(&unknown_task), &[]);
+        origin.actions.lock().insert(
+            unknown_task.clone(),
+            served_history(&unknown_task, vec![unknown, on_unknown]),
+        );
+        let (session, _) = session_with_site(origin, &site).await;
+        let history = session._handle.task_history(&task).await.unwrap();
+        assert_eq!(ids_of(&history), [claim_id], "no opener");
+        let history = session._handle.task_history(&unknown_task).await.unwrap();
+        assert_eq!(ids_of(&history), [unknown_task], "its key not found");
+    }
+
+    /// A task's history read that does not answer fails after its limit,
+    /// as the other Rust reads do.
+    #[tokio::test]
+    async fn a_task_history_whose_server_does_not_answer_fails_after_its_limit() {
+        let site = serve_site(vec![], 0).await;
+        let origin = Origin {
+            action_delay_ms: 60_000,
+            ..Default::default()
+        };
+        let (opener, task) = served(90, ALICE, "offer", None, &[]);
+        origin
+            .actions
+            .lock()
+            .insert(task.clone(), served_history(&task, vec![opener]));
+        let (session, _) = session_with_site(origin, &site).await;
+        let asked = std::time::Instant::now();
+        let read = tokio::time::timeout(
+            TASK_HISTORY_READ_WAIT + std::time::Duration::from_secs(3),
+            session._handle.task_history(&task),
+        )
+        .await;
+        assert!(matches!(read, Ok(Err(_))), "{read:?}");
+        assert!(
+            asked.elapsed() >= TASK_HISTORY_READ_WAIT,
+            "{:?}",
+            asked.elapsed()
+        );
+    }
+
+    /// Two rulings on one task whose history route hangs share one read: it
+    /// gives up after its own limit (`TASK_HISTORY_WAIT`), both are hidden,
+    /// and no second request is made; a ruling after that reads again.
+    #[tokio::test]
+    async fn rulings_sharing_a_hung_history_read_make_one_request() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin {
+            action_delay_ms: 60_000,
+            ..Default::default()
+        };
+        let task = crate::chatsig::new_event_id();
+        let (mut session, origin) = session_with_site(origin, &site).await;
+        let (first, first_id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        let (second, second_id) = task_event(91, REFEREE, "confirm", Some(&task), &[]);
+        session.send(&first).await;
+        session.send(&second).await;
+        let (claim, claim_id) = task_event(90, ALICE, "claim", Some(&task), &[]);
+        session.send(&claim).await;
+        let ups = session.ups_until_act(&claim_id, 8).await;
+        assert!(
+            !ups.iter()
+                .any(|up| matches!(up, Up::Act { id, .. } if *id == first_id || *id == second_id)),
+            "both hidden: {ups:?}"
+        );
+        assert_eq!(origin.action_reads.load(Ordering::SeqCst), 1, "one request");
+        let (third, third_id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        session.send(&third).await;
+        assert_eq!(session.went_up_as(&third_id, &task).await, None);
+        assert_eq!(origin.action_reads.load(Ordering::SeqCst), 2, "read again");
+    }
+
+    /// A task's history that cannot be read is an error, not an empty one.
+    #[tokio::test]
+    async fn a_task_history_that_cannot_be_read_is_an_error() {
+        let site = serve_site(vec![], 0).await;
+        let (session, _) = session_with_site(Origin::default(), &site).await;
+        assert!(session._handle.task_history("01NOSUCHTASK").await.is_err());
+    }
+
+    /// The rulings are exactly the receipt, the expiry and the review window
+    /// closing.
+    #[test]
+    fn the_rulings_are_the_receipt_the_expiry_and_the_review_timeout() {
+        let rules = spec("act-transitions.json");
+        let mut verbs: Vec<&str> = rules["kinds"]
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|k| k["transitions"].as_array().unwrap())
+            .map(|t| t["verb"].as_str().unwrap())
+            .chain(["confirm", "offer", "claim"])
+            .filter(|v| crate::act_transitions::is_ruling(v))
+            .collect();
+        verbs.sort_unstable();
+        verbs.dedup();
+        assert_eq!(verbs, ["auto-accept", "confirm", "expire"]);
     }
 }

@@ -184,6 +184,7 @@ dictionary ActEvent {
     boolean replayed;
     string? dm_key;
     SignatureVerdict? verdict = null;
+    string? ruling = null;
 };
 
 dictionary ReactionTally {

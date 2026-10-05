@@ -645,13 +645,20 @@ pub const OWN_HOST_WAIT: Duration = Duration::from_secs(5);
 /// Most referees whose key lists are kept at once.
 const REFEREES_HELD: usize = 1024;
 
+/// Most kids a referee's list is remembered as read for, oldest out. One
+/// is added per ruling naming a key the list lacks, so only a misbehaving
+/// referee or server comes near it; a kid that falls out is read for once
+/// more if it is named again.
+const READ_FOR_HELD: usize = 256;
+
 /// One referee's key list, as its own site last listed it: the server's key
 /// set (`SignatureChecker`'s `ServerKeySet`) for a server not connected to.
 #[derive(Default)]
 struct RefereeKeys {
     keys: HashMap<String, ListedKey>,
-    /// Kids the list has been read for, once each.
-    read_for: HashSet<String>,
+    /// Kids the list has been read for, once each, oldest first, at most
+    /// [`READ_FOR_HELD`].
+    read_for: std::collections::VecDeque<String>,
     /// The read in flight, shared by every ask meanwhile; `true` once read.
     reading: Option<Arc<tokio::sync::OnceCell<bool>>>,
     /// When a read last failed.
@@ -668,6 +675,20 @@ fn plain_did_web_host(did: &str) -> Option<&str> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
     .then_some(host)
+}
+
+impl RefereeKeys {
+    /// Remember that the list was read for `kid`, dropping the oldest kid
+    /// past [`READ_FOR_HELD`].
+    fn note_read_for(&mut self, kid: String) {
+        if self.read_for.contains(&kid) {
+            return;
+        }
+        self.read_for.push_back(kid);
+        while self.read_for.len() > READ_FOR_HELD {
+            self.read_for.pop_front();
+        }
+    }
 }
 
 /// Drop the referees asked about longest ago until at most `cap` are left;
@@ -826,7 +847,9 @@ impl<P: ClientProvider> KeyLookup<P> {
                                 referee.keys.entry(kid).or_insert((key, retired_at));
                             }
                         }
-                        referee.read_for.extend(kept.read_for);
+                        for kid in kept.read_for {
+                            referee.note_read_for(kid);
+                        }
                     }
                     bound_referees(&mut referees, REFEREES_HELD);
                 }
@@ -2073,7 +2096,7 @@ impl<P: ClientProvider> KeyLookup<P> {
                             // A later list's dates win: a key retired since
                             // is learned at the next read.
                             referee.keys.extend(keys);
-                            referee.read_for.insert(kid.to_string());
+                            referee.note_read_for(kid.to_string());
                             referee.failed_at = None;
                             true
                         }
@@ -2096,7 +2119,7 @@ impl<P: ClientProvider> KeyLookup<P> {
                 match self.held_answer(referee, kid) {
                     Some(answer) => Some(answer),
                     None if started_here => {
-                        referee.read_for.insert(kid.to_string());
+                        referee.note_read_for(kid.to_string());
                         Some(OwnHostAnswer::NotListed)
                     }
                     None => None,
@@ -2129,7 +2152,7 @@ impl<P: ClientProvider> KeyLookup<P> {
                 retired_at: *retired_at,
             });
         }
-        if referee.read_for.contains(kid) {
+        if referee.read_for.iter().any(|read| read == kid) {
             return Some(OwnHostAnswer::NotListed);
         }
         referee
@@ -5297,6 +5320,38 @@ mod tests {
             OwnHostAnswer::NotListed
         );
         assert_eq!(site.hits(), 2);
+    }
+
+    /// The kids a referee's list was read for and lacked are bounded, oldest
+    /// out, as the referees themselves are: each one is a ruling naming a
+    /// key the list does not hold, so only a misbehaving referee or server
+    /// grows them.
+    #[tokio::test]
+    async fn a_referees_kids_not_found_are_bounded_oldest_out() {
+        let site = referee_site().await;
+        site.list(&[(71, None, None)]);
+        let keys = referee_lookup(&site, HOUR);
+        for i in 0..=READ_FOR_HELD {
+            assert_eq!(
+                keys.own_host_answer(REFEREE, &format!("missing-{i}")).await,
+                OwnHostAnswer::NotListed
+            );
+        }
+        assert_eq!(site.hits(), READ_FOR_HELD + 1);
+        assert_eq!(
+            keys.held_own_host_answer(REFEREE, "missing-0"),
+            None,
+            "the oldest went"
+        );
+        assert_eq!(
+            keys.held_own_host_answer(REFEREE, &format!("missing-{READ_FOR_HELD}")),
+            Some(OwnHostAnswer::NotListed)
+        );
+        assert_eq!(
+            keys.held_own_host_answer(REFEREE, &kid_of(71)),
+            Some(listed(71, None)),
+            "a found key is not among them"
+        );
     }
 
     #[tokio::test]

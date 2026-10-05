@@ -10,8 +10,10 @@
 // Node's ESM loader needs the type attribute on a JSON import (see
 // identity-claim.ts).
 import model from './verdict-model.json' with { type: 'json' };
+// Same reason for this copy of `spec/act-transitions.json`, pinned the same way.
+import rules from './act-transitions.json' with { type: 'json' };
 import { verifyEd25519 } from './did-key.js';
-import { type KeyLookup, type KeySource, keyList } from './key-lookup.js';
+import { type KeyLookup, type KeySource, type ListedKey, type OwnHostAnswer, keyList } from './key-lookup.js';
 import * as signing from './signing.js';
 
 /** What checking a message's signature came to. */
@@ -201,6 +203,13 @@ function mutationIn(
   return null;
 }
 
+/** The venue a task event's line was signed for, as its own check rebuilds
+ *  it; null when it cannot be. */
+export function actVenue(line: Line): string | null {
+  const did = line.tags['+freeq.at/from'] ?? line.tags['freeq.at/from'];
+  return did ? venueOf(line.target, did, line) : null;
+}
+
 /** The venue a line was signed for: a channel folded, or a DM's DID pair. */
 function venueOf(target: string, signer: string, line: Line): string | null {
   if (target.startsWith('#') || target.startsWith('&')) return signing.channelVenue(target);
@@ -237,9 +246,13 @@ export async function checkSigned(signed: Signed, key: Uint8Array): Promise<bool
  * the server's. Twin of the Rust client's `SignatureChecker`.
  */
 export class SignatureChecker {
-  private serverKeys = new Map<string, Uint8Array>();
-  private fetched: Promise<void> | null = null;
-  private readonly refetched = new Set<string>();
+  private serverKeys = new Map<string, ListedKey>();
+  /** The DID the connected server's key set is published under. */
+  private serverDid: string | null = null;
+  private fetched: Promise<boolean> | null = null;
+  /** Kids the set has been read again for, once each, and whether that
+   *  read succeeded. */
+  private readonly refetched = new Map<string, Promise<boolean>>();
 
   constructor(private readonly lookup: KeyLookup) {}
 
@@ -247,7 +260,7 @@ export class SignatureChecker {
   async resolve(signed: Signed): Promise<Verdict> {
     await (this.fetched ??= this.fetchServerKeys());
     const serverKey = this.serverKeys.get(signed.kid);
-    if (serverKey !== undefined) return serverVerdict(signed, serverKey);
+    if (serverKey !== undefined) return this.ownKeyVerdict(signed, serverKey.key);
 
     const atMs = signing.msgidTimestampMs(signed.msgid) ?? Date.now();
     const server = originServerDid(signed.origin);
@@ -300,19 +313,35 @@ export class SignatureChecker {
     // A kid no source holds may be a key the server rotated to since its set
     // was read: read it again, once per kid.
     if (!this.refetched.has(signed.kid)) {
-      this.refetched.add(signed.kid);
-      await (this.fetched = this.fetchServerKeys());
+      const read = this.fetchServerKeys();
+      this.refetched.set(signed.kid, read);
+      await (this.fetched = read);
       const again = this.serverKeys.get(signed.kid);
-      if (again !== undefined) return serverVerdict(signed, again);
+      if (again !== undefined) return this.ownKeyVerdict(signed, again.key);
     }
     return { state: 'unverifiable', kid: signed.kid };
   }
 
+  /**
+   * The verdict on a signature made with one of the connected server's own
+   * keys. "Signed by the server" is a chat verdict, for a server signing a
+   * chat line on a sender's behalf: a task message counts only signed by
+   * the author it names with that author's own key, so a task document
+   * naming anyone but the server itself reads invalid under the server's
+   * key, whatever the check says. The server's own task documents keep the
+   * server verdict. Twin of the Rust `own_key_verdict`.
+   */
+  private async ownKeyVerdict(signed: Signed, key: Uint8Array): Promise<Verdict> {
+    if (signed.doc.kind === 'act' && signed.did !== this.serverDid) return { state: 'invalid', kid: signed.kid };
+    return serverVerdict(signed, key);
+  }
+
   /** Read the server's key set: `/api/v1/signing-key` names the DID it is
-   *  published under, `/api/v1/signing-keys/{did}` lists every key. */
-  private async fetchServerKeys(): Promise<void> {
+   *  published under, `/api/v1/signing-keys/{did}` lists every key. Whether
+   *  the set was read. */
+  private async fetchServerKeys(): Promise<boolean> {
     const origin = this.lookup.originBase()?.replace(/\/+$/, '');
-    if (!origin) return;
+    if (!origin) return false;
     const get = async (url: string): Promise<Record<string, unknown> | null> => {
       try {
         const res = await this.lookup.reader.fetch(url);
@@ -322,10 +351,42 @@ export class SignatureChecker {
       }
     };
     const did = (await get(`${origin}/api/v1/signing-key`))?.['did'];
-    if (typeof did !== 'string' || !/^did:web:[A-Za-z0-9.\-_:%]+$/.test(did)) return;
+    if (typeof did !== 'string' || !/^did:web:[A-Za-z0-9.\-_:%]+$/.test(did)) return false;
     const set = await get(`${origin}/api/v1/signing-keys/${did}`);
-    if (set === null) return;
-    for (const [kid, { key }] of (await keyList(set)) ?? []) this.serverKeys.set(kid, key);
+    if (set === null) return false;
+    const keys = await keyList(set);
+    if (keys === null) return false;
+    this.serverDid = did;
+    for (const [kid, key] of keys) this.serverKeys.set(kid, key);
+    return true;
+  }
+
+  /**
+   * What the connected server's own key set says about `kid`, for a ruling
+   * made under the server's own name `home`: as a referee's own site
+   * answers (`KeyLookup.ownHostAnswer`). A kid the set lacks reads it once
+   * more, once per kid, counted only when that read succeeds; a read that
+   * fails cannot answer, and the next ruling under the kid reads again. A
+   * set published under another name is not the referee's list: `null`,
+   * and the referee's own list is asked. Asks at once share one read.
+   * Twin of the Rust `server_ruling_key`.
+   */
+  async serverRulingKey(home: string, kid: string): Promise<OwnHostAnswer | null> {
+    await (this.fetched ??= this.fetchServerKeys());
+    const earlier = this.refetched.get(kid);
+    if (!this.serverKeys.has(kid) && (earlier === undefined || !(await earlier))) {
+      // None yet, or the one before failed: read again for this kid.
+      const read = this.fetchServerKeys();
+      this.refetched.set(kid, read);
+      this.fetched = read;
+      if (!(await read)) return { state: 'cannot-answer' };
+    }
+    // A set published under another name is not the referee's list: no
+    // answer, and the referee's own list is asked, as in the Rust SDK.
+    if (this.serverDid !== home) return null;
+    const found = this.serverKeys.get(kid);
+    if (found === undefined) return { state: 'not-listed' };
+    return { state: 'listed', publicKey: found.key, retiredAt: found.retiredAt };
   }
 }
 
@@ -336,6 +397,41 @@ export class SignatureChecker {
  */
 export function originServerDid(origin: string | undefined): string | null {
   return origin !== undefined && /^[A-Za-z0-9.-]+$/.test(origin) ? `did:web:${origin}` : null;
+}
+
+/**
+ * The ruling verbs: the home's receipt, or a move only the system makes in
+ * some kind (an expiry, a closed review window), the words only a task's
+ * home signs. Read off the rules file the way the Rust
+ * `act_transitions::is_ruling` reads it.
+ */
+export const RULING_VERBS: ReadonlySet<string> = new Set([
+  rules.confirmation.verb,
+  ...Object.values(rules.kinds).flatMap((kind) =>
+    kind.transitions.filter((t) => t.who === 'system').map((t) => t.verb),
+  ),
+]);
+
+/**
+ * Whether a ruling on a task counts: decided only for a ruling on a task
+ * whose opener names its referee in `act-home`. `counts`: signed by that
+ * referee with a key its own site lists, before the key stopped counting.
+ * `fails`: anything else that site answered for, or no signature that can
+ * be read.
+ * `cannot-check`: the site could not answer, the opener names no referee,
+ * or the check ran out of time with the referee known; handled as before.
+ * A ruling whose referee the client cannot know (its task's opening post
+ * missing, uncheckable, or trusted only through the server, or a DM pair
+ * it would have given unknown) is hidden instead, as a failing one is.
+ */
+export type RulingCheck = 'counts' | 'fails' | 'cannot-check';
+
+/** A ruling checked against its referee's key: it counts when the signature
+ *  checks and was made before the key stopped counting. */
+export async function rulingAgainst(signed: Signed, key: Uint8Array, retiredAt: number | null): Promise<RulingCheck> {
+  if ((await checkSigned(signed, key)) !== true) return 'fails';
+  const atMs = signing.msgidTimestampMs(signed.msgid) ?? Date.now();
+  return retiredAt !== null && retiredAt * 1000 <= atMs ? 'fails' : 'counts';
 }
 
 async function serverVerdict(signed: Signed, key: Uint8Array): Promise<Verdict> {

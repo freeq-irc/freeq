@@ -99,6 +99,38 @@ pub fn sentence(state: VerdictState, layer: Option<KeyLayer>) -> &'static str {
 
 // ─── checking a received line ───────────────────────────────────────────
 
+/// Whether a ruling on a task counts: decided only for a ruling (a receipt,
+/// an expiry, a closed review window) on a task whose opener names its
+/// referee in `act-home`, from what the referee's own site lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RulingCheck {
+    /// Signed by the named referee, with a key its own site lists, before
+    /// that key stopped counting.
+    Counts,
+    /// Signed by anyone else, with a key the referee's site does not list,
+    /// at or after the key stopped counting, or with no signature that can
+    /// be read.
+    Fails,
+    /// The referee's site could not answer, the task's opener names no
+    /// referee, or the check ran out of time with the referee known:
+    /// handled as before. A ruling whose referee the client cannot know
+    /// (its task's opening post missing, uncheckable, or trusted only
+    /// through the server, or a DM pair it would have given unknown) is
+    /// hidden instead, as a failing one is.
+    CannotCheck,
+}
+
+impl RulingCheck {
+    /// The name on the wire to the apps.
+    pub fn name(self) -> &'static str {
+        match self {
+            RulingCheck::Counts => "counts",
+            RulingCheck::Fails => "fails",
+            RulingCheck::CannotCheck => "cannot-check",
+        }
+    }
+}
+
 /// What a received line's signature covers, rebuilt from the wire.
 #[derive(Debug, Clone)]
 pub(crate) struct Signed {

@@ -152,6 +152,12 @@ export type OwnHostAnswer =
 /** Most referees whose key lists are kept at once. */
 const REFEREES_HELD = 1024;
 
+/** Most kids a referee's list is remembered as read for, oldest out. One is
+ *  added per ruling naming a key the list lacks, so only a misbehaving
+ *  referee or server comes near it; a kid that falls out is read for once
+ *  more if it is named again. Twin of the Rust `READ_FOR_HELD`. */
+export const READ_FOR_HELD = 256;
+
 /** A key from a server's key list: its bytes, and when it stopped counting. */
 export interface ListedKey {
   key: Uint8Array;
@@ -164,7 +170,8 @@ export interface ListedKey {
  */
 export interface RefereeKeys {
   keys: Map<string, ListedKey>;
-  /** Kids the list has been read for, once each. */
+  /** Kids the list has been read for, once each, oldest first, at most
+   *  `READ_FOR_HELD`. */
   readFor: Set<string>;
   /** The read in flight, shared by every ask meanwhile; true once read. */
   reading: Promise<boolean> | null;
@@ -264,7 +271,7 @@ export class KeyLookup {
               this.referees.set(did, referee);
             }
             for (const [kid, key] of kept.keys) if (!referee.keys.has(kid)) referee.keys.set(kid, key);
-            for (const kid of kept.readFor) referee.readFor.add(kid);
+            for (const kid of kept.readFor) noteReadFor(referee, kid);
           }
           boundReferees(this.referees, REFEREES_HELD);
         },
@@ -1049,7 +1056,7 @@ export class KeyLookup {
           // A later list's dates win: a key retired since is learned at the
           // next read.
           for (const [listedKid, listedKey] of keys) reading.keys.set(listedKid, listedKey);
-          reading.readFor.add(kid);
+          noteReadFor(reading, kid);
           return true;
         })();
       }
@@ -1059,7 +1066,7 @@ export class KeyLookup {
       // the loop reads once more for this one.
       let after = heldAnswer(referee, kid);
       if (after === null && startedHere) {
-        referee.readFor.add(kid);
+        noteReadFor(referee, kid);
         after = { state: 'not-listed' };
       }
       if (after !== null) {
@@ -1112,6 +1119,17 @@ function heldAnswer(referee: RefereeKeys, kid: string): OwnHostAnswer | null {
   const found = referee.keys.get(kid);
   if (found !== undefined) return { state: 'listed', publicKey: found.key, retiredAt: found.retiredAt };
   return referee.readFor.has(kid) ? { state: 'not-listed' } : null;
+}
+
+/** Remember that a referee's list was read for `kid`, dropping the oldest
+ *  kid past `READ_FOR_HELD`. */
+function noteReadFor(referee: RefereeKeys, kid: string): void {
+  if (referee.readFor.has(kid)) return;
+  referee.readFor.add(kid);
+  for (const oldest of referee.readFor) {
+    if (referee.readFor.size <= READ_FOR_HELD) break;
+    referee.readFor.delete(oldest);
+  }
 }
 
 /** Drop the referees asked about longest ago until at most `cap` are left;

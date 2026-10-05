@@ -1584,10 +1584,11 @@ public struct ActEvent {
     public var replayed: Bool
     public var dmKey: String?
     public var verdict: SignatureVerdict?
+    public var ruling: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(from: String, target: String, kind: String, verb: String, did: String?, eventId: String, taskId: String, fields: [TagEntry], sigTag: String?, replayed: Bool, dmKey: String?, verdict: SignatureVerdict? = nil) {
+    public init(from: String, target: String, kind: String, verb: String, did: String?, eventId: String, taskId: String, fields: [TagEntry], sigTag: String?, replayed: Bool, dmKey: String?, verdict: SignatureVerdict? = nil, ruling: String? = nil) {
         self.from = from
         self.target = target
         self.kind = kind
@@ -1600,6 +1601,7 @@ public struct ActEvent {
         self.replayed = replayed
         self.dmKey = dmKey
         self.verdict = verdict
+        self.ruling = ruling
     }
 }
 
@@ -1646,6 +1648,9 @@ extension ActEvent: Equatable, Hashable {
         if lhs.verdict != rhs.verdict {
             return false
         }
+        if lhs.ruling != rhs.ruling {
+            return false
+        }
         return true
     }
 
@@ -1662,6 +1667,7 @@ extension ActEvent: Equatable, Hashable {
         hasher.combine(replayed)
         hasher.combine(dmKey)
         hasher.combine(verdict)
+        hasher.combine(ruling)
     }
 }
 
@@ -1685,7 +1691,8 @@ public struct FfiConverterTypeActEvent: FfiConverterRustBuffer {
                 sigTag: FfiConverterOptionString.read(from: &buf), 
                 replayed: FfiConverterBool.read(from: &buf), 
                 dmKey: FfiConverterOptionString.read(from: &buf), 
-                verdict: FfiConverterOptionTypeSignatureVerdict.read(from: &buf)
+                verdict: FfiConverterOptionTypeSignatureVerdict.read(from: &buf), 
+                ruling: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -1702,6 +1709,7 @@ public struct FfiConverterTypeActEvent: FfiConverterRustBuffer {
         FfiConverterBool.write(value.replayed, into: &buf)
         FfiConverterOptionString.write(value.dmKey, into: &buf)
         FfiConverterOptionTypeSignatureVerdict.write(value.verdict, into: &buf)
+        FfiConverterOptionString.write(value.ruling, into: &buf)
     }
 }
 
