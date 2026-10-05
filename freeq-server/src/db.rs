@@ -326,6 +326,10 @@ pub struct ActEvent<'a> {
     pub from_system: bool,
     /// The peer this arrived from; `None` for local ingress.
     pub origin: Option<&'a str>,
+    /// A ruling signed by the referee its task's opener names (`act-home`),
+    /// with a key that referee's own site lists: the home's word, whichever
+    /// peer carried it.
+    pub by_referee: bool,
     pub timestamp: i64,
 }
 
@@ -3749,6 +3753,7 @@ mod tests {
             venue,
             actor: ELIZA,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: ts,
         })
@@ -3783,6 +3788,7 @@ mod tests {
             venue,
             actor,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: ts,
         })
@@ -3807,6 +3813,7 @@ mod tests {
             venue,
             actor: ELIZA,
             from_system: false,
+            by_referee: false,
             origin: Some(origin),
             timestamp: ts,
         })
@@ -3842,6 +3849,7 @@ mod tests {
             venue,
             actor,
             from_system: false,
+            by_referee: false,
             origin: Some(origin),
             timestamp: ts,
         })
@@ -3882,6 +3890,7 @@ mod tests {
             venue,
             actor,
             from_system: false,
+            by_referee: false,
             origin: Some(origin),
             timestamp: ts,
         })
@@ -4259,6 +4268,7 @@ mod tests {
             venue,
             actor: home_did,
             from_system: true,
+            by_referee: false,
             origin: Some(origin),
             timestamp: ts,
         })
@@ -4296,6 +4306,7 @@ mod tests {
             venue,
             actor: HOME,
             from_system,
+            by_referee: false,
             origin: None,
             timestamp: ts,
         })
@@ -4662,6 +4673,7 @@ mod tests {
                 venue: "#ops",
                 actor: PEER_HOME,
                 from_system: true,
+                by_referee: false,
                 origin: Some("peer-b"),
                 timestamp: 12,
             })
@@ -4711,6 +4723,7 @@ mod tests {
                 venue: "#ops",
                 actor: PEER_HOME,
                 from_system: true,
+                by_referee: false,
                 origin: Some("peer-b"),
                 timestamp: 11,
             })
@@ -4799,6 +4812,7 @@ mod tests {
                 venue,
                 actor: ELIZA,
                 from_system: false,
+                by_referee: false,
                 origin: None,
                 timestamp: 10,
             },
@@ -4838,6 +4852,7 @@ mod tests {
             venue,
             actor: ELIZA,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: ts,
         })
@@ -4867,6 +4882,7 @@ mod tests {
             venue,
             actor: ELIZA,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: ts,
         })
@@ -4904,6 +4920,7 @@ mod tests {
             venue,
             actor,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: ts,
         })
@@ -5180,6 +5197,7 @@ mod tests {
             venue: "#ops",
             actor: ELIZA,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: 10,
         })
@@ -5213,6 +5231,45 @@ mod tests {
             db.act_task("B1").unwrap().unwrap().assignee.as_deref(),
             Some(SCHOLAR)
         );
+    }
+
+    /// The referee a task's opener names in `act-home`, read from the bytes
+    /// it signed: none for an opener that names none, or a task not on file.
+    #[test]
+    fn a_tasks_referee_is_read_from_its_openers_signed_bytes() {
+        let db = Db::open_memory().unwrap();
+        let open = |id: &str, tags: Vec<(&str, &str)>| {
+            let canonical = freeq_sdk::act::act_canonical(tags, "#ops", id).unwrap();
+            db.apply_act_event(&ActEvent {
+                canonical: &canonical,
+                signature: None,
+                event_id: id,
+                act_id: id,
+                opens: true,
+                venue: "#ops",
+                actor: "did:plc:poster",
+                from_system: false,
+                origin: Some("a-peer"),
+                by_referee: false,
+                timestamp: 10,
+            })
+            .unwrap()
+        };
+        let base = vec![
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "offer"),
+            ("+freeq.at/from", "did:plc:poster"),
+        ];
+        let mut named = base.clone();
+        named.push(("+freeq.at/act-home", "did:web:referee.example"));
+        assert!(matches!(open("T1", named), ActWrite::Filed { .. }));
+        assert!(matches!(open("T2", base), ActWrite::Filed { .. }));
+        assert_eq!(
+            db.act_task_home("T1").unwrap().as_deref(),
+            Some("did:web:referee.example")
+        );
+        assert_eq!(db.act_task_home("T2").unwrap(), None);
+        assert_eq!(db.act_task_home("T3").unwrap(), None);
     }
 
     /// A bounty whose offer named no cutoff takes bids for as long as it
@@ -5311,6 +5368,7 @@ mod tests {
             venue,
             actor: ELIZA,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: ts,
         })
@@ -5394,6 +5452,7 @@ mod tests {
                 venue: "#ops",
                 actor: SCHOLAR,
                 from_system: false,
+                by_referee: false,
                 origin: None,
                 timestamp: 12,
             })
@@ -5617,6 +5676,7 @@ mod tests {
                 venue: "#ops",
                 actor: &server,
                 from_system: true,
+                by_referee: false,
                 origin: None,
                 timestamp: 12,
             })
@@ -5708,6 +5768,7 @@ mod tests {
             venue,
             actor: ELIZA,
             from_system: false,
+            by_referee: false,
             origin: Some(home),
             timestamp: ts,
         })
@@ -5862,6 +5923,7 @@ mod tests {
             venue: "#ops",
             actor: SCHOLAR,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: 20,
         })
@@ -9294,10 +9356,11 @@ impl Db {
             let Some(home) = self.act_task_origin(ev.act_id)? else {
                 return Ok(ActWrite::ReceiptBeforeSubject);
             };
-            let from_home = match ev.origin {
-                None => home.is_empty(),
-                Some(peer) => home == peer,
-            };
+            let from_home = ev.by_referee
+                || match ev.origin {
+                    None => home.is_empty(),
+                    Some(peer) => home == peer,
+                };
             let record = EventRecord {
                 shape: EventShape::Document(ev.canonical),
                 signature: ev.signature,
@@ -9413,7 +9476,10 @@ impl Db {
             // referees the task. Our own events carry no origin at all, and a
             // task of ours has no home to hear from — we are it — so an empty
             // origin on either side is never a match.
-            let from_home = !task.origin.is_empty() && ev.origin == Some(task.origin.as_str());
+            // A ruling its referee's own site vouched for is the home's word
+            // whichever link carried it.
+            let from_home = ev.by_referee
+                || (!task.origin.is_empty() && ev.origin == Some(task.origin.as_str()));
             // The one transition on a foreign task that needs no receipt: one
             // the home itself authored — an expiry, a closed review window —
             // which already carries the signature of the server whose word
@@ -9601,6 +9667,7 @@ impl Db {
             venue: &named.venue,
             actor: &actor,
             from_system: crate::server::is_system_actor(&actor),
+            by_referee: false,
             origin: named.origin.as_deref(),
             timestamp: named.timestamp as i64,
         };
@@ -10204,6 +10271,27 @@ impl Db {
                 .and_then(|v| v.as_str())?
                 .parse::<i64>()
                 .ok()
+        }))
+    }
+
+    /// The referee `act_id`'s opener names in `act-home`, read from the bytes
+    /// it signed, as `act_task_bid_deadline` reads its cutoff: `None` for an
+    /// opener that names none, or a task whose opener is not on file.
+    pub fn act_task_home(&self, act_id: &str) -> SqlResult<Option<String>> {
+        let canonical: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT canonical FROM events WHERE kind = 'act' AND event_id = ?1",
+                params![act_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(canonical.and_then(|c| {
+            serde_json::from_str::<serde_json::Value>(&c)
+                .ok()?
+                .get("act-home")?
+                .as_str()
+                .map(str::to_string)
         }))
     }
 

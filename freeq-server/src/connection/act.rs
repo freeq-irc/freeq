@@ -195,6 +195,7 @@ fn file_own_event(
             // actor a `system` transition allows, and the only one that may
             // write a receipt.
             from_system: true,
+            by_referee: false,
             origin: None,
             timestamp: now,
         })
@@ -1168,6 +1169,7 @@ pub(super) fn gate(
             venue: &venue,
             actor: did,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: now,
         })
