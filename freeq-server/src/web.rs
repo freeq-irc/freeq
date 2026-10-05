@@ -1632,7 +1632,9 @@ async fn api_act_task(
                 // file and waiting on the server that owns the task:
                 // "confirmed", "unconfirmed", or "superseded" — the last being
                 // a move a confirmed one outran. Absent for a receipt, which
-                // is the answer itself and has no state of its own.
+                // is the answer itself and has no state of its own, except
+                // "ignored" for one filed and not acted on, its link not the
+                // task's home's.
                 "confirm_state": e.confirm.map(crate::events::ConfirmState::as_str),
                 "timestamp": e.timestamp,
             })
