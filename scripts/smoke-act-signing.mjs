@@ -191,7 +191,7 @@ const tx = await makeBot('actsmoke-tx', `asmk-tx-${STAMP}`);
 const rx = await makeBot('actsmoke-rx', `asmk-rx-${STAMP}`);
 
 const actSeen = [];
-rx.client.on('actEvent', (e) =>
+rx.on('actEvent', (e) =>
   actSeen.push({ eventId: e.eventId, verb: e.verb, taskId: e.taskId }));
 
 

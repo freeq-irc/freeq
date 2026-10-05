@@ -1185,8 +1185,9 @@ await bot.client.sendAct(
   { humanText: 'shipped it' },                           // '' for no line at all
 );
 
-// Hearing them: every task event in a channel we are in, live or replayed
-bot.client.on('actEvent', (e) => {
+// Hearing them: every task event in a channel we are in, live or replayed.
+// A ruling that fails its referee check never reaches a bot.
+bot.on('actEvent', (e) => {
   console.log(e.verb, 'on', e.taskId, 'by', e.did, e.fields['act-note']);
 });
 

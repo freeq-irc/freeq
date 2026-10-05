@@ -258,7 +258,12 @@ interface Seen {
 
 /** An authenticated session as `ownDid`, watching what lines come to,
  *  welcomed by a server named `welcome`. */
-async function session(ownDid = OWN_DID, keyLookup: KeyLookup | null = lookup(), welcome = 'srv') {
+async function session(
+  ownDid = OWN_DID,
+  keyLookup: KeyLookup | null = lookup(),
+  welcome = 'srv',
+  checkLines?: boolean,
+) {
   const { FreeqClient } = await import('./client.js');
   const client = new FreeqClient({
     url: 'wss://test/irc',
@@ -266,6 +271,7 @@ async function session(ownDid = OWN_DID, keyLookup: KeyLookup | null = lookup(),
     skipInitialBrokerRefresh: true,
     autoMsgSig: false,
     ...(keyLookup ? { keyLookup } : {}),
+    ...(checkLines === undefined ? {} : { checkLines }),
   });
   client.setSaslCredentials({ token: 't', did: ownDid, pdsUrl: 'https://pds.example', method: 'oauth' });
   // What each line id was delivered with, and the verdict it settled on.
@@ -1096,10 +1102,10 @@ describe('a task event', () => {
     taskEvent(90, ALICE, 'offer', undefined, home === undefined ? {} : { '+freeq.at/act-home': home });
 
   /** Every task event and verdict as it goes up, in order. */
-  async function watching(keyLookup: KeyLookup = lookup([], []), welcome = 'srv') {
+  async function watching(keyLookup: KeyLookup = lookup([], []), welcome = 'srv', checkLines?: boolean) {
     // ALICE's openers check: an opener names its referee only then.
     await hold(ALICE, (await keyOf(90)).pub);
-    const s = await session(OWN_DID, keyLookup, welcome);
+    const s = await session(OWN_DID, keyLookup, welcome, checkLines);
     const up: { kind: 'act' | 'verdict'; id: string; verdict?: string; ruling?: string }[] = [];
     s.client.on('actEvent', (p) =>
       up.push({ kind: 'act', id: p.eventId, verdict: p.verdict?.state, ruling: p.ruling }),
@@ -1486,6 +1492,44 @@ describe('a task event', () => {
     expect(w.at('act', live.id), 'the ruling, then the move').toBeLessThan(w.at('act', behind.id));
     w.client.disconnect();
   }, 10_000);
+
+  it("with checkLines off, checks no chat line or move but checks a task's opener, so a ruling needs no history read", async () => {
+    const BOB = 'did:plc:bob';
+    await hold(ALICE, (await keyOf(90)).pub);
+    await hold(BOB, (await keyOf(92)).pub);
+    await list(91);
+    const w = await watching(lookup([], []), 'srv', false);
+    const messages: (Verdict | undefined)[] = [];
+    w.client.on('message', (_c, m) => messages.push(m.verdict));
+    // Bob's chat line, and Bob's move on a task this session never saw opened.
+    const chat = line(
+      { [signing.SIG_TAG]: `ed25519:${(await keyOf(92)).kid}:${'A'.repeat(86)}`, msgid: '01CHAT', account: BOB },
+      'PRIVMSG',
+      ROOM,
+      'hello',
+    );
+    const elsewhere = await taskEvent(92, BOB, 'claim', '01ELSEWHERE0000000000000000');
+    await w.send(chat, elsewhere.wire);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(messages, 'no verdict on a chat line').toEqual([undefined]);
+    expect(origin.batchReads + origin.kidReads + origin.setReads, 'no key asked for either').toBe(0);
+
+    const o = await opener(REFEREE);
+    await w.send(o.wire);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(origin.batchReads + origin.kidReads, "the opener's key is asked for").toBeGreaterThan(0);
+    expect(
+      w.up.filter((u) => u.id === o.id).map((u) => [u.kind, u.verdict]),
+      'and no verdict is put on it',
+    ).toEqual([['act', undefined]]);
+
+    const r = await taskEvent(91, REFEREE, 'expire', o.id);
+    await w.send(r.wire);
+    expect((await w.actFor(r.id))?.ruling).toBe('counts');
+    const asked = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => String(c[0]));
+    expect(asked.filter((u) => u.includes('/api/v1/actions/')), 'no history read').toEqual([]);
+    w.client.disconnect();
+  });
 
   it("asks the referee's own list when the connected server's key set names another DID", async () => {
     origin.serverKeys = [(await keyOf(94)).pub];

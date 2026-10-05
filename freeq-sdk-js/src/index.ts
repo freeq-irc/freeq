@@ -192,4 +192,4 @@ export type {
 // Both are byte-identical to the Rust SDK's `act_tags` and `act_line`, and
 // neither knows a verb — which verbs a kind allows is `spec/act-transitions.json`'s
 // business. Send them with `FreeqClient.sendAct`.
-export { actTags, actLine } from './signing.js';
+export { actTags, actLine, msgidTimestampMs } from './signing.js';

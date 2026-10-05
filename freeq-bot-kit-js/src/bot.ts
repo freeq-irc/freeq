@@ -22,8 +22,10 @@
 
 import {
   FreeqClient,
+  KeyLookup,
   MemoryDeviceKeyStore,
   importDidKeyPair,
+  makeDidResolver,
   type FreeqEvents,
   type NickCollisionPolicy,
   type TransportState,
@@ -119,6 +121,16 @@ export interface FreeqBotCreateOptions {
   heartbeatTtlS?: number;
   /** Server origin for REST API calls. Defaults to the URL origin. */
   serverOrigin?: string;
+  /** Check the signature on every received line, and whether a ruling on a
+   *  task counts, with this lookup: passed to the SDK client (its own
+   *  `keyLookup`). Unset: a lookup asking the connected server, checking
+   *  rulings only. Either way a ruling found failing never leaves the SDK,
+   *  so no `actEvent` handler sees it. */
+  keyLookup?: KeyLookup;
+  /** False checks only whether a ruling counts and puts no verdict on
+   *  received lines (the SDK client's own `checkLines`). Unset: the SDK's
+   *  default with `keyLookup`, false without. */
+  checkLines?: boolean;
   /** Policy on 433 ERR_NICKNAMEINUSE. Default `"refuse"`. */
   onNickCollision?: NickCollisionPolicy;
   /** Register a per-session message-signing key after SASL (SDK default:
@@ -266,6 +278,20 @@ export class FreeqBot {
       nick: opts.nick,
       channels: opts.channels,
       serverOrigin: opts.serverOrigin,
+      // Rulings are checked by default, asking the connected server, as the
+      // web does; reading no line's verdict, no other line's key is looked up.
+      keyLookup:
+        opts.keyLookup ??
+        new KeyLookup(
+          { fetch: (target, init) => fetch(target, init), resolveDid: makeDidResolver() },
+          null,
+          60 * 60 * 1000,
+        ),
+      ...(opts.checkLines !== undefined
+        ? { checkLines: opts.checkLines }
+        : opts.keyLookup
+          ? {}
+          : { checkLines: false }),
       onNickCollision: opts.onNickCollision ?? "refuse",
       sasl: {
         did: identity.did,

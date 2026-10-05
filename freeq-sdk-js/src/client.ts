@@ -2484,6 +2484,14 @@ export class FreeqClient extends EventEmitter {
    * check started by `checkLater`.
    */
   private deliveredVerdict(tags: Record<string, string>, isTagmsg: boolean): Verdict | undefined {
+    if (this.opts.checkLines === false) return undefined;
+    return this.startingVerdict(tags, isTagmsg);
+  }
+
+  /** `deliveredVerdict` whatever `checkLines` says: where a line's check
+   *  starts. A task's opener is checked with `checkLines` off too, for the
+   *  referee its signature vouches for. */
+  private startingVerdict(tags: Record<string, string>, isTagmsg: boolean): Verdict | undefined {
     if (!this.checker) return undefined;
     const sigTag = tags[signing.SIG_TAG] ?? tags['freeq.at/sig'];
     if (sigTag === undefined) return { state: 'unsigned' };
@@ -2499,7 +2507,8 @@ export class FreeqClient extends EventEmitter {
    * an open batch other than `draft/multiline` (`batchId`, by default its
    * `batch` tag) is held on the batch and checked when it closes, against the
    * DM venue and the checker read at the time it was held; its verdict goes
-   * out even when a reconnect has replaced the checker since.
+   * out even when a reconnect has replaced the checker since. `announce`
+   * false keeps it to `onSettled`: no `verdict` is emitted.
    */
   private checkLater(
     delivered: Verdict | undefined,
@@ -2507,6 +2516,7 @@ export class FreeqClient extends EventEmitter {
     onSettled?: (verdict: Verdict) => void,
     batchId: string | undefined = line.tags['batch'],
     held?: { ownDid: string | undefined; targetDid: string | undefined; checker: SignatureChecker },
+    announce = true,
   ): void {
     const checker = held ? held.checker : this.checker;
     if (!checker || delivered?.state !== 'pending') return;
@@ -2524,7 +2534,7 @@ export class FreeqClient extends EventEmitter {
         did: line.tags['account'],
         kid: (sigTag && sigTagKid(sigTag)) || undefined,
         server: originServerDid(line.tags['+freeq.at/origin']) ?? undefined,
-        start: () => this.checkLater(delivered, line, onSettled, '', at),
+        start: () => this.checkLater(delivered, line, onSettled, '', at, announce),
       });
       return;
     }
@@ -2551,7 +2561,7 @@ export class FreeqClient extends EventEmitter {
         this.emit('memberDid', line.from, did);
       }
       onSettled?.(verdict);
-      if (held || this.checker === checker) this.emit('verdict', id, verdict);
+      if (announce && (held || this.checker === checker)) this.emit('verdict', id, verdict);
     })();
   }
 
@@ -3784,12 +3794,18 @@ export class FreeqClient extends EventEmitter {
           targetDid: this.didForNick(target),
         };
         // An opener names its task's referee once its signature checks.
+        // With `checkLines` off it is still checked, for that alone: no
+        // verdict goes on the line, and no chat line or move is checked.
         let openerChecked: ((settled: Verdict) => void) | undefined;
         if (act?.opens && this.checker !== null) {
           const checked = new Promise<Verdict>((resolve) => {
             openerChecked = resolve;
           });
-          this.nameOnceChecked(act.taskId, act.home, actVenue(look), verdict, checked);
+          const opening = verdict ?? this.startingVerdict(msg.tags, true);
+          this.nameOnceChecked(act.taskId, act.home, actVenue(look), opening, checked);
+          if (verdict === undefined) {
+            this.checkLater(opening, { tags: msg.tags, target, from: isSelf ? undefined : from }, openerChecked, undefined, undefined, false);
+          }
         }
         if (!isRuling) {
           this.checkLater(verdict, { tags: msg.tags, target, from: isSelf ? undefined : from }, (settled) => {

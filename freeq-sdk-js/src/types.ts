@@ -190,6 +190,10 @@ export interface FreeqClientOptions {
    *  Unset: no verdicts. */
   keyLookup?: KeyLookup;
 
+  /** With a `keyLookup`, false puts no verdict on received lines and checks
+   *  only whether a ruling counts (a task event's `ruling`). Default true. */
+  checkLines?: boolean;
+
   /** Policy on 433 ERR_NICKNAMEINUSE during registration:
    *   - `'refuse'` (default for new code): emit `authError` and disconnect.
    *   - `'auto-suffix'`: append `_` until accepted (legacy SDK behavior).

@@ -8,16 +8,17 @@ import {
   sigTagOf,
   base64urlToBytes,
   fetchServerDid,
+  serverKeyFetcher,
   type KeyFetcher,
 } from "./verify.js";
 
 const SELF = "did:key:zSelf";
 
 /** Build a genuinely signed act event, the way the SDK would. */
-async function signedEvent(over: { channel?: string; tags?: Record<string, string> } = {}) {
+async function signedEvent(over: { channel?: string; tags?: Record<string, string>; eventId?: string } = {}) {
   const key = await generateDidKey();
   const channel = over.channel ?? "#work";
-  const eventId = "01SIGNEDEVENT0000000000000";
+  const eventId = over.eventId ?? "01SIGNEDEVENT0000000000000";
   const tags: Record<string, string> = {
     "+freeq.at/act": "handoff",
     "+freeq.at/act-verb": "offer",
@@ -245,5 +246,61 @@ describe("fetchServerDid", () => {
       close();
     }
     expect(await fetchServerDid("http://127.0.0.1:1")).toBeUndefined();
+  });
+});
+
+describe("a key that stopped counting, read from the server's per-key route", () => {
+  /** An event id minted at `ms`: its first ten characters are the time. */
+  function idAt(ms: number): string {
+    const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let time = "";
+    for (let i = 0, t = ms; i < 10; i++, t = Math.floor(t / 32)) time = crockford[t % 32] + time;
+    return `${time}${"0".repeat(16)}`;
+  }
+
+  /** The server's per-key route, answering every key with `raw` and the
+   *  given stop times (unix seconds). */
+  async function keyRoute(raw: Uint8Array, removedAt: number | null, expiresAt: number | null) {
+    const { createServer } = await import("node:http");
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          algorithm: "ed25519",
+          public_key: Buffer.from(raw).toString("base64url"),
+          removed_at: removedAt,
+          expires_at: expiresAt,
+        }),
+      );
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const { port } = server.address() as { port: number };
+    return { fetchKey: serverKeyFetcher(`http://127.0.0.1:${port}`), close: () => server.close() };
+  }
+
+  it("refuses a signature made at or after the earlier of removal and expiry, and keeps one made before", async () => {
+    const signedAt = 1_700_000_000_000;
+    const at = signedAt / 1000;
+    const cases: [string, number | null, number | null, string][] = [
+      ["removed before", at - 60, null, "invalid"],
+      ["expired before", null, at - 60, "invalid"],
+      ["removed at the moment it was signed", at, null, "invalid"],
+      ["expired before, removed after", at + 60, at - 60, "invalid"],
+      ["removed after", at + 60, null, "valid"],
+      ["never stopped", null, null, "valid"],
+    ];
+    for (const [name, removedAt, expiresAt, expected] of cases) {
+      const { ev, raw } = await signedEvent({
+        eventId: idAt(signedAt),
+        tags: { "+freeq.at/act-verb": "expire", "+freeq.at/act-id": "01TASK" },
+      });
+      const { fetchKey, close } = await keyRoute(raw, removedAt, expiresAt);
+      try {
+        const r = await verifyActEvent(ev, { fetchKey, selfDid: SELF });
+        expect(r.outcome, `${name}: ${r.reason}`).toBe(expected);
+      } finally {
+        close();
+      }
+    }
   });
 });

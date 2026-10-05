@@ -116,6 +116,9 @@ export interface ActEventLike {
   fields: Record<string, string>;
   sigTag?: string;
   replayed: boolean;
+  /** For a ruling on a task that names its referee, whether the SDK found
+   *  it counts (`ActEventPayload.ruling`). */
+  ruling?: "counts" | "fails" | "cannot-check";
 }
 
 /**
@@ -281,12 +284,14 @@ export class HandoffStore {
       deadline: existing.deadline ?? null,
     };
 
-    // A move only the server may make counts as the server's when it is
-    // signed by the server this connection is on, and the signature verified.
-    // That server rules only on its own tasks, and no other signer can use its
-    // name. A linked server's ruling on its own task is not accepted here.
+    // A move only the server may make counts as the server's word when the
+    // SDK found it counts: signed by the referee the task's opener named,
+    // with a key that referee's own site lists, whichever server that is.
+    // Otherwise, as before, only when signed by the server this connection
+    // is on and the signature verified here.
     const isSystem =
-      !!server?.serverDid && server.signatureValid && actor === server.serverDid;
+      ev.ruling === "counts" ||
+      (!!server?.serverDid && server.signatureValid && actor === server.serverDid);
     const verdict = checkTransition(
       task,
       { verb: ev.verb, msgid: ev.eventId, fields: Object.keys(ev.fields) },
