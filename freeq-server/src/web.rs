@@ -1775,6 +1775,7 @@ async fn api_channel_audit(
                             "event_id": e.event_id,
                             "timestamp": e.timestamp,
                             "signature": e.signature,
+                            "canonical": e.canonical,
                         }),
                     );
                 }
@@ -1850,6 +1851,10 @@ async fn api_channel_audit(
                 "actor_did": e.actor_did,
                 "details": details,
                 "signature": e.signature,
+                // The bytes the signature covers, so a reader can check the
+                // step itself; beside the signature, not among the details a
+                // reader draws as the step's facts.
+                "canonical": e.canonical,
                 "event_id": e.event_id,
             }));
         }
@@ -1886,8 +1891,37 @@ async fn api_channel_audit(
         timeline.truncate(limit);
     }
 
+    // A ruling is checked against the referee its task's opener names, so
+    // the opener of every task on the page goes with it, outside the rows,
+    // whoever `actor` asked for: a page filtered to one person rarely holds
+    // the openers of the tasks that person moved.
+    let task_ids: std::collections::BTreeSet<String> = timeline
+        .iter()
+        .filter(|row| row["category"] == "act")
+        .filter_map(|row| row["details"]["act_id"].as_str().map(str::to_string))
+        .collect();
+    let venue = channel.to_lowercase();
+    let openers: Vec<serde_json::Value> = state
+        .with_db(|db| {
+            let mut found = Vec::new();
+            for id in &task_ids {
+                if let Some(e) = db.get_event(id)?
+                    && e.kind == "act"
+                    && e.venue == venue
+                {
+                    found.push(serde_json::json!({
+                        "event_id": e.event_id,
+                        "canonical": e.canonical,
+                        "signature": e.signature,
+                    }));
+                }
+            }
+            Ok(found)
+        })
+        .unwrap_or_default();
+
     Ok(Json(
-        serde_json::json!({ "channel": channel, "timeline": timeline }),
+        serde_json::json!({ "channel": channel, "timeline": timeline, "openers": openers }),
     ))
 }
 

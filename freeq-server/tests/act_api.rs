@@ -849,3 +849,111 @@ async fn the_audit_timeline_carries_the_channel_s_task_events() {
         "{later}"
     );
 }
+
+/// A reader that checks the rulings it is shown needs the bytes each one was
+/// signed over: every task step and every receipt on it carries its stored
+/// document, and the answer lists the opener of every task on the page, the
+/// referee it names being what a ruling is checked against, whoever the
+/// `actor` filter asked for.
+#[tokio::test]
+async fn the_audit_timeline_sends_each_task_event_s_signed_document() {
+    let ka = PrivateKey::generate_ed25519();
+    let kb = PrivateKey::generate_ed25519();
+    let (irc, web, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    let (offer_id, accept_id, bearer, _a, _b) = tokio::task::spawn_blocking(move || {
+        let alice_key = SigningKey::from_bytes(&[23u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[24u8; 32]);
+        let mut a = C::authenticated(irc, "alice", DID_ALICE, ka);
+        a.msgsig(&alice_key);
+        a.join("#work");
+        let mut b = C::authenticated(irc, "bob", DID_BOB, kb);
+        b.msgsig(&bob_key);
+        b.join("#work");
+
+        let venue = channel_venue("#work");
+        let offer = a.offer_to("#work", &venue, DID_BOB, DID_ALICE, &alice_key);
+        let accept = b.step("#work", &venue, &offer, "accept", DID_BOB, &bob_key);
+        let bearer = a.bearer.clone();
+        (offer, accept, bearer, a, b)
+    })
+    .await
+    .unwrap();
+
+    // The documents on file, as the task's own history serves them.
+    let (status, history) = get(web, &format!("/api/v1/actions/{offer_id}"), None).await;
+    assert_eq!(status, 200);
+    let on_file: HashMap<String, (String, serde_json::Value)> = history["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["event_id"].as_str().unwrap().to_string(),
+                (
+                    e["canonical"].as_str().unwrap().to_string(),
+                    e["signature"].clone(),
+                ),
+            )
+        })
+        .collect();
+
+    let (status, body) = get(web, "/api/v1/channels/work/audit", Some(&bearer)).await;
+    assert_eq!(status, 200);
+    let rows: Vec<&serde_json::Value> = body["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["category"] == "act")
+        .collect();
+    assert_eq!(rows.len(), 2, "{body}");
+    for row in &rows {
+        let id = row["event_id"].as_str().unwrap();
+        assert_eq!(row["canonical"], on_file[id].0, "{row}");
+        // Beside the signature, never among the facts the panel draws.
+        assert!(row["details"].get("canonical").is_none(), "{row}");
+    }
+    let receipt = &rows[1]["details"]["receipt"];
+    let receipt_id = receipt["event_id"].as_str().unwrap();
+    assert_eq!(receipt["canonical"], on_file[receipt_id].0, "{receipt}");
+    assert_eq!(receipt["signature"], on_file[receipt_id].1, "{receipt}");
+
+    let opener = serde_json::json!({
+        "event_id": offer_id,
+        "canonical": on_file[&offer_id].0,
+        "signature": on_file[&offer_id].1,
+    });
+    assert_eq!(
+        body["openers"],
+        serde_json::json!([opener.clone()]),
+        "{body}"
+    );
+
+    // Bob did not open the task: his page holds no opener row, and the
+    // answer still lists the opener his step is ruled under.
+    let (status, only_bob) = get(
+        web,
+        &format!("/api/v1/channels/work/audit?actor={DID_BOB}"),
+        Some(&bearer),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let bob_rows: Vec<&serde_json::Value> = only_bob["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["category"] == "act")
+        .collect();
+    assert_eq!(
+        bob_rows
+            .iter()
+            .map(|r| r["event_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![accept_id.as_str()],
+        "{only_bob}"
+    );
+    assert_eq!(
+        only_bob["openers"],
+        serde_json::json!([opener]),
+        "{only_bob}"
+    );
+}
