@@ -8917,6 +8917,39 @@ mod tests {
         );
         assert_eq!(row.removed_at, None);
     }
+
+    /// The audit panel asks for the latest of a room's governance actions:
+    /// past the limit, the oldest are the ones left out, and what comes back
+    /// still reads oldest first, actions of one second in the order they were
+    /// filed.
+    #[test]
+    fn the_governance_log_answers_with_its_newest_rows_oldest_first() {
+        let db = Db::open_memory().unwrap();
+        for (action, channel, ts) in [
+            ("pause", "#room", 10),
+            ("resume", "#room", 20),
+            ("revoke", "#room", 20),
+            ("pause", "#elsewhere", 25),
+            ("resume", "#room", 30),
+            ("revoke", "#room", 30),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO governance_log (channel, target_did, action, issued_by, timestamp)
+                     VALUES (?1, 'did:plc:agent', ?2, 'did:plc:op', ?3)",
+                    params![channel, action, ts],
+                )
+                .unwrap();
+        }
+
+        let rows = db.query_governance_log(Some("#room"), 3);
+        assert_eq!(
+            rows.iter()
+                .map(|e| (e.action.as_str(), e.timestamp))
+                .collect::<Vec<_>>(),
+            vec![("revoke", 20), ("resume", 30), ("revoke", 30)]
+        );
+    }
 }
 
 // ── Agent governance DB methods ────────────────────────────────────
@@ -10861,7 +10894,11 @@ impl Db {
             .optional()
     }
 
-    /// Query coordination events with optional filters.
+    /// Query coordination events with optional filters, oldest first.
+    ///
+    /// `newest` picks which `limit` rows come back: the newest of them, as
+    /// `act_events_for_venue` does, or the oldest.
+    #[allow(clippy::too_many_arguments)]
     pub fn query_coordination_events(
         &self,
         channel: &str,
@@ -10870,6 +10907,7 @@ impl Db {
         actor_did: Option<&str>,
         since: Option<i64>,
         limit: usize,
+        newest: bool,
     ) -> Vec<CoordinationEventRow> {
         let mut sql = String::from(
             "SELECT event_id, event_type, actor_did, channel, ref_id, payload_json, signature, timestamp
@@ -10900,7 +10938,15 @@ impl Db {
             param_idx += 1;
         }
         let _ = param_idx; // suppress unused warning
-        sql.push_str(&format!(" ORDER BY timestamp ASC LIMIT {limit}"));
+        if newest {
+            // The event id is the emitter's, not one of ours, so the order
+            // within a second is the order of filing.
+            sql.push_str(&format!(
+                " ORDER BY timestamp DESC, rowid DESC LIMIT {limit}"
+            ));
+        } else {
+            sql.push_str(&format!(" ORDER BY timestamp ASC LIMIT {limit}"));
+        }
 
         let params_refs: Vec<&dyn rusqlite::types::ToSql> =
             params_vec.iter().map(|b| b.as_ref()).collect();
@@ -10923,14 +10969,20 @@ impl Db {
                 timestamp: row.get(7)?,
             })
         }) {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Ok(rows) => {
+                let mut rows: Vec<CoordinationEventRow> = rows.filter_map(|r| r.ok()).collect();
+                if newest {
+                    rows.reverse();
+                }
+                rows
+            }
             Err(_) => Vec::new(),
         }
     }
 
     /// Get all events referencing a task ID.
     pub fn get_task_events(&self, task_id: &str) -> Vec<CoordinationEventRow> {
-        self.query_coordination_events("", None, Some(task_id), None, None, 1000)
+        self.query_coordination_events("", None, Some(task_id), None, None, 1000, false)
             .into_iter()
             .collect()
     }
@@ -11382,7 +11434,8 @@ impl Db {
         })
     }
 
-    /// Query governance log entries for a channel.
+    /// Query governance log entries for a channel: the newest `limit` of
+    /// them, oldest first.
     pub fn query_governance_log(
         &self,
         channel: Option<&str>,
@@ -11391,13 +11444,14 @@ impl Db {
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match channel {
             Some(ch) => (
                 "SELECT id, channel, target_did, action, issued_by, reason, timestamp
-                 FROM governance_log WHERE channel = ?1 ORDER BY timestamp ASC LIMIT ?2"
+                 FROM governance_log WHERE channel = ?1
+                 ORDER BY timestamp DESC, id DESC LIMIT ?2"
                     .to_string(),
                 vec![Box::new(ch.to_string()), Box::new(limit as i64)],
             ),
             None => (
                 "SELECT id, channel, target_did, action, issued_by, reason, timestamp
-                 FROM governance_log ORDER BY timestamp ASC LIMIT ?1"
+                 FROM governance_log ORDER BY timestamp DESC, id DESC LIMIT ?1"
                     .to_string(),
                 vec![Box::new(limit as i64)],
             ),
@@ -11419,7 +11473,11 @@ impl Db {
                 timestamp: row.get(6)?,
             })
         }) {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Ok(rows) => {
+                let mut rows: Vec<GovernanceLogEntry> = rows.filter_map(|r| r.ok()).collect();
+                rows.reverse();
+                rows
+            }
             Err(_) => Vec::new(),
         }
     }

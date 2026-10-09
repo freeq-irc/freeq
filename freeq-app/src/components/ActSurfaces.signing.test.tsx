@@ -22,6 +22,7 @@ vi.mock('../irc/client', async (importOriginal) => ({
 import { CoordinationEventCard } from './CoordinationCards';
 import { TaskTimeline } from './TaskTimeline';
 import { AuditTimeline } from './AuditTimeline';
+import { formatDateSeparator } from './MessageList';
 import type { Message } from '../store';
 
 afterEach(() => {
@@ -557,5 +558,34 @@ describe('the audit timeline reads task events', () => {
     });
     expect(container.textContent).toContain(expected);
     expect(container.textContent).not.toContain('1970');
+  });
+});
+
+// The route answers oldest first; a reader wants the latest at the top, and a
+// row says only its time of day, so the day is said once above its rows.
+describe('the audit timeline lists newest first, by day', () => {
+  it('reverses the answer and puts a day divider above each day', async () => {
+    // Two fixed past days, built in local time so the split does not move
+    // with the zone the test runs in; "Today" and "Yesterday" never apply.
+    const first = new Date(2025, 8, 2, 10, 0, 0);
+    const second = new Date(2025, 8, 3, 9, 0, 0);
+    const later = new Date(2025, 8, 3, 10, 0, 0);
+    const at = (d: Date) => Math.floor(d.getTime() / 1000);
+    channelAudit.mockResolvedValue({ timeline: [
+      { category: 'coordination', event: 'first_event', actor_did: 'did:plc:a', event_id: '01KZEVT1', timestamp: at(first), details: {} },
+      { category: 'governance', event: 'resume', actor_did: 'did:plc:a', timestamp: at(second), details: { issued_by: 'did:plc:op' } },
+      { category: 'coordination', event: 'third_event', actor_did: 'did:plc:a', event_id: '01KZEVT3', timestamp: at(later), details: {} },
+    ] });
+
+    const { container } = render(<AuditTimeline channel="#naptest" onClose={() => {}} />);
+    await waitFor(() => expect(container.textContent).toContain('third_event'));
+    const text = container.textContent!;
+    const order = [formatDateSeparator(later), 'third_event', 'resumed by', formatDateSeparator(first), 'first_event']
+      .map(part => text.indexOf(part));
+    expect(order.every(i => i >= 0)).toBe(true);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    // One divider per day.
+    expect(text.split(formatDateSeparator(later)).length).toBe(2);
+    expect(text.split(formatDateSeparator(first)).length).toBe(2);
   });
 });

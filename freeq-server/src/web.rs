@@ -1416,7 +1416,7 @@ async fn api_channel_events(
 
     let events: Vec<serde_json::Value> = state
         .with_db(|db| {
-            Ok(db.query_coordination_events(&channel.to_lowercase(), event_type, ref_id, actor, since, limit)
+            Ok(db.query_coordination_events(&channel.to_lowercase(), event_type, ref_id, actor, since, limit, false)
                 .into_iter()
                 .map(|e| serde_json::json!({
                     "event_id": e.event_id,
@@ -1701,7 +1701,15 @@ async fn api_channel_audit(
 
     // 1. Coordination events
     if let Some(events) = state.with_db(|db| {
-        Ok(db.query_coordination_events(&channel.to_lowercase(), None, None, actor, since, limit))
+        Ok(db.query_coordination_events(
+            &channel.to_lowercase(),
+            None,
+            None,
+            actor,
+            since,
+            limit,
+            true,
+        ))
     }) {
         for e in events {
             timeline.push(serde_json::json!({
@@ -1881,14 +1889,16 @@ async fn api_channel_audit(
         }
     }
 
-    // Sort by timestamp
+    // Sort by timestamp, and keep the newest `limit` rows: each source sent
+    // its newest. The sort is stable, so rows of one second keep the order
+    // their source gave them.
     timeline.sort_by(|a, b| {
         let ta = a.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
         let tb = b.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
         ta.cmp(&tb)
     });
     if timeline.len() > limit {
-        timeline.truncate(limit);
+        timeline.drain(..timeline.len() - limit);
     }
 
     // A ruling is checked against the referee its task's opener names, so

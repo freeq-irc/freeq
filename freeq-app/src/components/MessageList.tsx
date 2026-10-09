@@ -47,7 +47,7 @@ export function formatTime(d: Date): string {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
 }
 
-function formatDateSeparator(d: Date): string {
+export function formatDateSeparator(d: Date): string {
   const today = new Date();
   const yesterday = new Date(today);
   yesterday.setDate(yesterday.getDate() - 1);
@@ -862,7 +862,7 @@ function Avatar({ nick, did, size = 40 }: { nick: string; did?: string; size?: n
 
 // ── Components ──
 
-function DateSeparator({ date }: { date: Date }) {
+export function DateSeparator({ date }: { date: Date }) {
   return (
     <div className="flex items-center gap-3 py-3 px-4">
       <div className="flex-1 border-t border-border" />

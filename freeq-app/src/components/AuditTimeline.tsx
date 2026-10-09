@@ -1,5 +1,5 @@
 /**
- * AuditTimeline — shows chronological audit trail for a channel.
+ * AuditTimeline — shows a channel's audit trail, newest first, by day.
  * Reads GET /api/v1/channels/{name}/audit through the SDK, which leaves out
  * what fails its check.
  */
@@ -11,6 +11,7 @@ import { Seal, SealPanel } from './ActCards';
 import { actHeadline, actEmoji } from '../lib/act-verbs';
 import { sealPanelHeader } from '../lib/seal-panel-copy';
 import { actFacts } from '../lib/act-facts';
+import { DateSeparator } from './MessageList';
 
 /** The home's ruling on a step, as the step's row carries it. */
 interface AuditReceipt {
@@ -111,8 +112,9 @@ export function AuditTimeline({ channel, onClose }: AuditTimelineProps) {
   }, [channel, actorFilter]);
 
   // The route filters by actor and by window; the kind of row is filtered
-  // here, over what it answered.
-  const filtered = categoryFilter ? events.filter(e => e.category === categoryFilter) : events;
+  // here, over what it answered. The route answers oldest first, and the
+  // panel reads newest first.
+  const filtered = [...(categoryFilter ? events.filter(e => e.category === categoryFilter) : events)].reverse();
 
   return (
     <div className="@container flex flex-col h-full bg-bg-primary">
@@ -170,13 +172,23 @@ export function AuditTimeline({ channel, onClose }: AuditTimelineProps) {
           <div className="text-fg-dim text-center py-8">No audit events found.</div>
         ) : (
           <div className="space-y-1">
-            {filtered.map((evt, i) => (
-              <AuditEventRow
-                key={i}
-                event={evt}
-                onVerify={(id, signed, pos) => setVerify({ id, signed, pos })}
-              />
-            ))}
+            {filtered.map((evt, i) => {
+              // A row says only its time of day; the day is said once, above
+              // its rows, the way the chat list says it.
+              const day = new Date(evt.timestamp * 1000);
+              const newDay = i === 0
+                || day.toDateString() !== new Date(filtered[i - 1].timestamp * 1000).toDateString();
+              // A governance row carries no id of its own.
+              return (
+                <Fragment key={evt.event_id ?? `${evt.timestamp}:${i}`}>
+                  {newDay && <DateSeparator date={day} />}
+                  <AuditEventRow
+                    event={evt}
+                    onVerify={(id, signed, pos) => setVerify({ id, signed, pos })}
+                  />
+                </Fragment>
+              );
+            })}
           </div>
         )}
       </div>
