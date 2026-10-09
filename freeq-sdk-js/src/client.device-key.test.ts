@@ -331,6 +331,7 @@ describe('publishing the device key through the broker', () => {
     const unpublished = await storedKey();
     const second = await lookupHolding(unpublished, true);
     await login((await makeClient(new MemoryDeviceKeyStore(unpublished), true, second.lookup)).client);
+    await until(() => enrollCalls.length > 0);
     await pause();
     expect(first.refresh).not.toHaveBeenCalled();
     expect(second.refresh).not.toHaveBeenCalled();
@@ -505,6 +506,7 @@ describe('a stored key the account has retired', () => {
     expect(replaced.keyPair).not.toBe(stored.keyPair);
     expect(replaced.refused).toBeUndefined();
     expect(replaced.recordUri).toBeUndefined();
+    await until(() => enrollCalls.length > 0);
     again.client.disconnect();
   });
 
@@ -518,6 +520,7 @@ describe('a stored key the account has retired', () => {
     const ws = await login(client);
     expect(msgsigOf(ws)).not.toBe(await rawPublicB64(keyPair));
     expect((await store.load())!.keyPair).not.toBe(keyPair);
+    await until(() => enrollCalls.length > 0);
     client.disconnect();
   });
 
@@ -534,6 +537,7 @@ describe('a stored key the account has retired', () => {
     const ws = await login(client);
     expect(msgsigOf(ws)).not.toBe(await rawPublicB64(old.keyPair));
     expect((await store.load())!.keyPair).not.toBe(old.keyPair);
+    await until(() => enrollCalls.length > 0);
   });
 
   it('is replaced right after a new sign-in, and the new key is published', async () => {
@@ -587,6 +591,7 @@ describe('a stored key the account has retired', () => {
     const ws2 = await login(second.client);
     expect(msgsigOf(ws2)).not.toBe(await rawPublicB64(genuineKey.keyPair));
     expect((await replaced.load())!.keyPair).not.toBe(genuineKey.keyPair);
+    await until(() => enrollCalls.length > 0);
   });
 
   it('is kept on a connect that does not follow a new sign-in', async () => {
@@ -670,6 +675,7 @@ describe('a stored key the account has retired', () => {
         expect(repo.proofReads(entry)).toBe(1);
       }
       expect(await lookup.provenDeviceRecords(DID)).toHaveLength(51);
+      await until(() => enrollCalls.length > 0);
     });
 
     it('keeps the key when the retirement proof fails', async () => {
