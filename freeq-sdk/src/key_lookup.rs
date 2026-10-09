@@ -4157,6 +4157,16 @@ mod tests {
             .map(|f| f.source)
     }
 
+    /// Date Alice's held listing, and when she was last listed, an hour ago,
+    /// so the listing is past the ttl without waiting it out.
+    fn backdate_alice(keys: &KeyLookup<freeq_oauth::SharedClient>) {
+        let hour_ago = Utc::now() - chrono::TimeDelta::hours(1);
+        if let Some(entry) = keys.records.lock().get_mut(ALICE) {
+            entry.1 = hour_ago;
+        }
+        keys.refreshed.lock().insert(ALICE.to_string(), hour_ago);
+    }
+
     /// Requests to the home server's batch and listing routes together.
     fn home_listings(home: &Home) -> usize {
         let (batch, listing, _) = home.counts();
@@ -4166,7 +4176,8 @@ mod tests {
     /// A key held as the origin vouched for it, published since the
     /// account's listing went past the ttl: taking the records again lists
     /// them once, through the home server and not at the PDS, and the key is
-    /// then held as found in them.
+    /// then held as found in them. The listing is backdated past the ttl
+    /// rather than waited out.
     #[tokio::test]
     async fn relist_vouched_lists_through_the_home_server_and_finds_a_key_published_since() {
         let (home_server, pds, repos, docs) = three_signers().await;
@@ -4174,10 +4185,10 @@ mod tests {
             .keys
             .lock()
             .insert((ALICE.to_string(), kid_of(4)), raw(4));
-        let keys = lookup_at_home_for(docs, &home_server, Duration::from_secs(1));
+        let keys = lookup_at_home(docs, &home_server);
         assert_eq!(source_of(&keys, 4).await, Some(KeySource::OriginServer));
         publish_alice_4(&repos);
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        backdate_alice(&keys);
         let listed = home_listings(&home_server);
         keys.relist_vouched(ALICE, &kid_of(4)).await;
         assert_eq!(home_listings(&home_server), listed + 1, "one listing");
@@ -4188,7 +4199,8 @@ mod tests {
 
     /// A key held as the origin vouched for it and still unpublished stays
     /// held so after the records are taken again, and they are taken again
-    /// at most once per ttl.
+    /// at most once per ttl. The listing is backdated past the ttl rather
+    /// than waited out.
     #[tokio::test]
     async fn relist_vouched_keeps_the_origins_key_while_it_is_unpublished() {
         let (home_server, pds, _repos, docs) = three_signers().await;
@@ -4196,9 +4208,9 @@ mod tests {
             .keys
             .lock()
             .insert((ALICE.to_string(), kid_of(4)), raw(4));
-        let keys = lookup_at_home_for(docs, &home_server, Duration::from_secs(1));
+        let keys = lookup_at_home(docs, &home_server);
         assert_eq!(source_of(&keys, 4).await, Some(KeySource::OriginServer));
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        backdate_alice(&keys);
         let listed = home_listings(&home_server);
         keys.relist_vouched(ALICE, &kid_of(4)).await;
         assert_eq!(home_listings(&home_server), listed + 1, "one listing");
