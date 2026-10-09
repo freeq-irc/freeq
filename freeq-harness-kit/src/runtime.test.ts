@@ -641,3 +641,59 @@ describe("AgentRuntime: messages the harness takes", () => {
     await rt.stop();
   });
 });
+
+describe("AgentRuntime: settled", () => {
+  it("resolves only after a handler's awaited step resolves", async () => {
+    // Hold the server-DID read the task handler awaits, so the handler is in
+    // flight for exactly as long as the test says.
+    const prior = globalThis.fetch;
+    let release!: (r: Response) => void;
+    const held = new Promise<Response>((r) => (release = r));
+    let asked = false;
+    vi.stubGlobal("fetch", async (url: string) => {
+      const u = String(url);
+      if (u.endsWith("/api/v1/signing-key")) {
+        asked = true;
+        return held;
+      }
+      return u.includes("/api/v1/actions")
+        ? new Response(JSON.stringify({ tasks: [] }), { status: 200 })
+        : new Response(null, { status: 404 });
+    });
+    try {
+      const { bot, notices, rt } = await started();
+      bot.emit("actEvent", act("offer", "01JA", {}, { "act-to": "did:key:zSelf", "act-title": "t" }));
+      let done = false;
+      const wait = rt.settled().then(() => (done = true));
+      for (let i = 0; i < 50 && !asked; i++) await tick();
+      expect(asked, "the handler reached the held read").toBe(true);
+      await tick();
+      expect(done, "settled() while the read is held").toBe(false);
+      expect(notices.map((n) => n.text).join("\n")).not.toContain("ignoring handoff");
+      release(new Response(null, { status: 404 }));
+      await wait;
+      expect(done).toBe(true);
+      expect(notices.map((n) => n.text).join("\n")).toContain("ignoring handoff from did:plc:boss");
+    } finally {
+      vi.stubGlobal("fetch", prior);
+    }
+  });
+
+  it("a handler that throws still rejects as before, and settled() still resolves", async () => {
+    const { bot, rt } = await started();
+    let caught: unknown;
+    const onRejection = (reason: unknown) => (caught = reason);
+    process.once("unhandledRejection", onRejection);
+    try {
+      bot.mention = () => {
+        throw new Error("mention check broke");
+      };
+      bot.emit("message", "#work", { from: "peer", text: "hi", isSelf: false, tags: { account: PEER } });
+      await rt.settled();
+      for (let i = 0; i < 50 && caught === undefined; i++) await tick();
+      expect((caught as Error)?.message).toBe("mention check broke");
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+  });
+});

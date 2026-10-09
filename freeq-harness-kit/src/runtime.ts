@@ -271,6 +271,13 @@ export class AgentRuntime {
 
   readonly #botFactory: BotFactory | undefined;
 
+  /**
+   * Inbound handlers still running: a message, a task event, the resume on
+   * connect. Each is fire-and-forget from the wire's point of view; this is
+   * what `settled()` waits on.
+   */
+  readonly #inFlight = new Set<Promise<unknown>>();
+
   constructor(
     readonly harness: Harness,
     options: RuntimeOptions = {},
@@ -286,6 +293,32 @@ export class AgentRuntime {
 
   /** How text and the wire name this harness. */
   readonly names: HarnessNames;
+
+  /**
+   * Remember an inbound handler's promise until it settles.
+   *
+   * Only the removal is attached. The derived promise is left unhandled on
+   * purpose: a handler that throws still surfaces as exactly one unhandled
+   * rejection carrying its own error, as it did before it was tracked.
+   */
+  #track(p: Promise<unknown>): void {
+    this.#inFlight.add(p);
+    void p.finally(() => this.#inFlight.delete(p));
+  }
+
+  /**
+   * Resolves once every inbound handler that has started — a message, a
+   * task event, the resume on connect, and the connection's own coordination
+   * handler — has finished, including any handler one of them started. For
+   * tests and shutdown. Never throws: a failing handler still reports as an
+   * unhandled rejection, not here.
+   */
+  async settled(): Promise<void> {
+    do {
+      while (this.#inFlight.size > 0) await Promise.allSettled([...this.#inFlight]);
+      await this.conn?.settled();
+    } while (this.#inFlight.size > 0);
+  }
 
   // ── presence ────────────────────────────────────────────────────────────
 
@@ -2213,7 +2246,7 @@ export class AgentRuntime {
       },
 
       onMessage: (channel, msg) => {
-        void (async () => {
+        this.#track((async () => {
           const did = await this.conn!.resolveSenderDid(msg);
           try {
             if (this.harness.intercept?.({ channel, from: msg.from, did, text: msg.text })) return;
@@ -2276,11 +2309,11 @@ export class AgentRuntime {
             // Someone addressed us in a room: answer in the room.
             { replyToChannel: mention.addressed },
           );
-        })();
+        })());
       },
 
       onActEvent: (ev) => {
-        void (async () => {
+        this.#track((async () => {
           const store = await this.ensureHandoffs();
 
           // Check the signature BEFORE applying. Three-way outcome per the
@@ -2341,7 +2374,7 @@ export class AgentRuntime {
             );
           }
           await this.#onHandoffEvent(cfg, ev, result.record, result.created);
-        })();
+        })());
       },
 
       // Every connect, including a reconnect after a dropped socket — the gap
@@ -2354,10 +2387,10 @@ export class AgentRuntime {
         } catch {
           /* presentation is best-effort */
         }
-        void (async () => {
+        this.#track((async () => {
           const message = await this.resumeAssigned(cfg);
           if (message !== "freeq: nothing to resume") this.notify(message, "info");
-        })();
+        })());
       },
 
       onAsk: (ask) => {

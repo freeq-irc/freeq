@@ -223,6 +223,8 @@ export class FreeqConnection {
   /** Notices are deduped: a flapping connection must not spam the TUI. */
   #noticed = new Set<string>();
   #asks = new AskRegistry((reason) => this.#opts.onNotice?.(`freeq ask: ${reason}`, "warning"));
+  /** Coordination handlers still running; what `settled()` waits on. */
+  readonly #inFlight = new Set<Promise<unknown>>();
 
   constructor(opts: ConnectionOptions) {
     // The configured list is the initial intent; join()/leave() keep it live.
@@ -369,7 +371,7 @@ export class FreeqConnection {
       // Peer discovery rides coordination events, not presence — the server
       // drops presence status for active agents (see discovery.ts).
       bot.on("coordinationEvent", (e: CoordinationEventPayload) => {
-        void this.#onCoordinationEvent(e);
+        this.#track(this.#onCoordinationEvent(e));
       });
 
       // Announce into each channel once we're actually in it.
@@ -586,6 +588,24 @@ export class FreeqConnection {
   /** Re-announce into every joined channel (after a metadata change). */
   announceAll(): void {
     for (const channel of this.#opts.channels) this.#announce(channel, PI_HELLO);
+  }
+
+  /**
+   * Remember a coordination handler's promise until it settles. Only the
+   * removal is attached: a handler that throws still surfaces as exactly one
+   * unhandled rejection carrying its own error, as it did before.
+   */
+  #track(p: Promise<unknown>): void {
+    this.#inFlight.add(p);
+    void p.finally(() => this.#inFlight.delete(p));
+  }
+
+  /**
+   * Resolves once every coordination handler that has started has finished,
+   * including any one of them started. For tests and shutdown; never throws.
+   */
+  async settled(): Promise<void> {
+    while (this.#inFlight.size > 0) await Promise.allSettled([...this.#inFlight]);
   }
 
   async #onCoordinationEvent(e: CoordinationEventPayload): Promise<void> {

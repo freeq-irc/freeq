@@ -24,6 +24,7 @@ import { vi } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AgentRuntime } from "@freeq/harness-kit/runtime";
 
 // Real timer functions, captured before any test installs fake timers, so
 // `settle()` can let promise chains run while the clock is frozen.
@@ -41,11 +42,14 @@ const defaultFetch: FetchHandler = (url) =>
 const state: {
   agentDir: string;
   bot: FakeBot | undefined;
+  /** The runtime the extension built, so `quiesce()` can await its handlers. */
+  runtime: AgentRuntime | undefined;
   fetch: FetchHandler;
   fetched: string[];
 } = {
   agentDir: "",
   bot: undefined,
+  runtime: undefined,
   fetch: defaultFetch,
   fetched: [],
 };
@@ -86,6 +90,21 @@ vi.mock("@freeq/bot-kit", async (orig) => ({
     },
   },
 }));
+
+// The extension creates its runtime and keeps it to itself; this subclass
+// hands each instance to `state.runtime` so a test can wait on its handlers.
+vi.mock("@freeq/harness-kit/runtime", async (orig) => {
+  const real = await orig<typeof import("@freeq/harness-kit/runtime")>();
+  return {
+    ...real,
+    AgentRuntime: class extends real.AgentRuntime {
+      constructor(...args: ConstructorParameters<typeof real.AgentRuntime>) {
+        super(...args);
+        state.runtime = this;
+      }
+    },
+  };
+});
 
 export interface BotCreateOptions {
   name: string;
@@ -295,6 +314,7 @@ export async function startPi(opts: StartOptions = {}) {
   state.fetched = [];
   const fakeBot = new FakeBot();
   state.bot = fakeBot;
+  state.runtime = undefined;
 
   const handlers = new Map<string, Handler[]>();
   const tools = new Map<string, any>();
@@ -360,8 +380,10 @@ export async function startPi(opts: StartOptions = {}) {
   /**
    * Wait until the extension stops producing output. Its inbound handlers are
    * fire-and-forget and await file writes, so a fixed number of ticks is not
-   * enough; this waits for the wire, notices, deliveries, entries and
-   * confirmations to stay unchanged across several real pauses.
+   * enough; this awaits the runtime's in-flight handlers, then waits for the
+   * wire, notices, deliveries, entries and confirmations to stay unchanged
+   * across several real pauses (a handler can hand work to pi, such as a
+   * confirm or a delivery, that finishes outside the runtime).
    */
   const activity = () =>
     fakeBot.sent.length + notices.length + delivered.length + entries.length + confirms.length +
@@ -370,6 +392,7 @@ export async function startPi(opts: StartOptions = {}) {
     let last = -1;
     let stable = 0;
     for (let i = 0; i < 200 && stable < 3; i++) {
+      await state.runtime?.settled();
       await settle();
       const now = activity();
       stable = now === last ? stable + 1 : 0;
