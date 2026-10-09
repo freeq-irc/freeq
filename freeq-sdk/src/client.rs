@@ -2450,6 +2450,7 @@ impl SignatureChecker {
             };
             let layer = (state == VerdictState::Device).then_some(match found.source {
                 crate::key_lookup::KeySource::IdentityRecord => KeyLayer::Published,
+                crate::key_lookup::KeySource::DidKey => KeyLayer::DidKey,
                 _ => KeyLayer::Vouched,
             });
             return Verdict {
@@ -2842,7 +2843,10 @@ fn start_deferred_checks(
         let mut pairs: Vec<crate::key_lookup::KeyPair> = Vec::new();
         for check in &held {
             let signed = &check.signed;
-            if !crate::address::is_did(&signed.did) {
+            // A did:key signer's key is read from its DID: nothing to ask.
+            if !crate::address::is_did(&signed.did)
+                || crate::key_lookup::did_key_answer(&signed.did, &signed.kid).is_some()
+            {
                 continue;
             }
             if !dids.contains(&signed.did) {

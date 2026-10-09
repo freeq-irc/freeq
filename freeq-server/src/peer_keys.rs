@@ -383,6 +383,7 @@ fn file_found(
         KeySource::IdentityRecord => "identity-record",
         KeySource::DidDocument => "did-document",
         KeySource::OriginServer => "origin-server",
+        KeySource::DidKey => "did-key",
     };
     let now = chrono::Utc::now().timestamp();
     let (dates, retired_at) = match found.source {
@@ -399,8 +400,10 @@ fn file_found(
                 .retired_at
                 .filter(|at| found.expires_at.is_none_or(|exp| *at < exp)),
         ),
-        // Its own document's key: its owner rotates it.
-        KeySource::DidDocument => (
+        // Its own document's key: its owner rotates it. A did:key is its
+        // key, read from the DID by the lookup (`did_key_answer`), and has
+        // no expiry (ruling 20).
+        KeySource::DidDocument | KeySource::DidKey => (
             KeyDates {
                 registered_at: now,
                 expires_at: None,
@@ -1425,6 +1428,38 @@ mod tests {
             source_of(&state, did, &kid).as_deref(),
             Some("identity-record")
         );
+        assert_eq!(peer_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A relayed line signed by a did:key bot with the key its DID names:
+    /// the key is read from the DID, filed under "did-key", and no peer is
+    /// asked for it.
+    #[tokio::test]
+    async fn a_did_key_signers_own_key_is_read_from_the_did_before_any_peer() {
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let pubkey = *key.verifying_key().as_bytes();
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let did = format!(
+            "did:key:{}",
+            freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&key.to_bytes())
+                .unwrap()
+                .public_key_multibase()
+        );
+        let (base, peer_hits) = counting_key_server(Some(pubkey)).await;
+        let state = state_with(
+            &base,
+            freeq_sdk::did::DidResolver::static_map(std::collections::HashMap::new()),
+        );
+
+        fetch_on_miss(
+            &state,
+            PEER,
+            &did,
+            &freeq_sdk::sigtag::sign_canonical("{}", &key),
+        );
+
+        assert_eq!(wait_for_key(&state, &did, &kid).await, Some(pubkey));
+        assert_eq!(source_of(&state, &did, &kid).as_deref(), Some("did-key"));
         assert_eq!(peer_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 

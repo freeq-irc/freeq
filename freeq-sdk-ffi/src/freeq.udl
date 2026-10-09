@@ -78,6 +78,7 @@ enum VerdictState {
 enum KeyLayer {
     "Vouched",
     "Published",
+    "DidKey",
 };
 
 dictionary SignatureVerdict {

@@ -33,6 +33,32 @@ pub enum KeySource {
     DidDocument,
     /// The origin server's `/api/v1/signing-keys/{did}/{kid}`.
     OriginServer,
+    /// The signer's own `did:key` DID, which is the key: read from the DID
+    /// ([`did_key_answer`]), never asked for and never kept.
+    DidKey,
+}
+
+/// A `did:key` signer's key, read from the DID itself when `kid` is that
+/// key's: no request, no retirement date (a did:key has none; ruling 20
+/// exempts it), and nothing kept, since it costs nothing to read again.
+/// `None` for any other DID, one that does not decode to an ed25519 key,
+/// or a kid that is not its key's (a bot on bot-kit before it signed with
+/// its did:key), which a lookup answers as before.
+pub fn did_key_answer(did: &str, kid: &str) -> Option<FoundKey> {
+    let multibase = did.strip_prefix("did:key:")?;
+    let crate::crypto::PublicKey::Ed25519(key) =
+        crate::crypto::PublicKey::from_multibase(multibase).ok()?
+    else {
+        return None;
+    };
+    let public_key = key.to_bytes();
+    (derive_kid_bytes(&public_key) == kid).then_some(FoundKey {
+        public_key,
+        source: KeySource::DidKey,
+        retired_at: None,
+        created_at: None,
+        expires_at: None,
+    })
 }
 
 /// An ed25519 public key that hashes to the kid asked for, and its source.
@@ -430,6 +456,7 @@ impl FoundKeySnapshot {
                 KeySource::IdentityRecord => "IdentityRecord",
                 KeySource::DidDocument => "DidDocument",
                 KeySource::OriginServer => "OriginServer",
+                KeySource::DidKey => "DidKey",
             }
             .to_string(),
             retired_at: found.retired_at,
@@ -448,6 +475,7 @@ impl FoundKeySnapshot {
                 "IdentityRecord" => KeySource::IdentityRecord,
                 "DidDocument" => KeySource::DidDocument,
                 "OriginServer" => KeySource::OriginServer,
+                "DidKey" => KeySource::DidKey,
                 _ => return None,
             },
             retired_at: self.retired_at,
@@ -1008,7 +1036,9 @@ impl<P: ClientProvider> KeyLookup<P> {
     /// fresh line's miss without the retry delays; `server: true` names a
     /// server's DID, which has no device records: none are listed. A line
     /// signed more than [`FRESH_LINE`] before now is never asked about
-    /// again.
+    /// again. A did:key signer's own key is read from its DID
+    /// ([`did_key_answer`]) before anything held is looked at or any source
+    /// asked, and is never kept.
     pub async fn key_for_at_with(
         &self,
         did: &str,
@@ -1016,6 +1046,9 @@ impl<P: ClientProvider> KeyLookup<P> {
         at: DateTime<Utc>,
         ask: KeyAsk,
     ) -> Result<Option<FoundKey>> {
+        if let Some(found) = did_key_answer(did, kid) {
+            return Ok(Some(found));
+        }
         self.load().await;
         let slot = (did.to_string(), kid.to_string());
         loop {

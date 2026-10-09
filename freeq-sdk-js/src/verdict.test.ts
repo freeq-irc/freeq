@@ -22,7 +22,7 @@ describe('the verdict model', () => {
     for (const layer of KEY_LAYERS) {
       expect(sentence('device', layer)).toBe(spec.layers[layer]);
     }
-    expect(spec.states.device.layers).toEqual(['vouched', 'published']);
+    expect(spec.states.device.layers).toEqual(['vouched', 'published', 'did-key']);
     expect(mark()).toBe(spec.mark);
   });
 
@@ -38,6 +38,7 @@ describe('the verdict model', () => {
     expect(sentence('device', 'published')).toBe(
       "Signed on the sender’s device. Key published in their identity record.",
     );
+    expect(sentence('device', 'did-key')).toBe('Signed with the sender’s own key. The key is their identity.');
     expect(sentence('retired')).toBe('Signed after this key was retired.');
     expect(sentence('pending')).toBe('This signature hasn’t been checked yet.');
   });

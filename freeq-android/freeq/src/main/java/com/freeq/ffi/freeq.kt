@@ -5765,7 +5765,8 @@ public object FfiConverterTypeIdentityClaimState: FfiConverterRustBuffer<Identit
 enum class KeyLayer {
     
     VOUCHED,
-    PUBLISHED;
+    PUBLISHED,
+    DID_KEY;
     companion object
 }
 

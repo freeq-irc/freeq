@@ -245,6 +245,8 @@ pub enum VerdictState {
 pub enum KeyLayer {
     Vouched,
     Published,
+    /// The key is the sender's `did:key` DID itself.
+    DidKey,
 }
 
 /// A line's verdict, with the sentence to show for it.
@@ -253,7 +255,7 @@ pub struct SignatureVerdict {
     pub state: VerdictState,
     pub layer: Option<KeyLayer>,
     pub kid: Option<String>,
-    /// `identity-record`, `did-document` or `origin-server`.
+    /// `identity-record`, `did-document`, `origin-server` or `did-key`.
     pub key_source: Option<String>,
     pub sentence: String,
 }
@@ -726,6 +728,7 @@ fn convert_verdict(verdict: &freeq_sdk::verdict::Verdict) -> SignatureVerdict {
         layer: verdict.layer.map(|l| match l {
             sdk::KeyLayer::Vouched => KeyLayer::Vouched,
             sdk::KeyLayer::Published => KeyLayer::Published,
+            sdk::KeyLayer::DidKey => KeyLayer::DidKey,
         }),
         kid: verdict.kid.clone(),
         key_source: verdict.key_source.map(|s| {
@@ -733,6 +736,7 @@ fn convert_verdict(verdict: &freeq_sdk::verdict::Verdict) -> SignatureVerdict {
                 KeySource::IdentityRecord => "identity-record",
                 KeySource::DidDocument => "did-document",
                 KeySource::OriginServer => "origin-server",
+                KeySource::DidKey => "did-key",
             }
             .to_string()
         }),
@@ -3894,6 +3898,18 @@ mod tests {
             });
             assert_eq!(crossed.key_source.as_deref(), Some(name));
         }
+        let own = convert_verdict(&sdk::Verdict {
+            state: sdk::VerdictState::Device,
+            layer: Some(sdk::KeyLayer::DidKey),
+            kid: None,
+            key_source: Some(KeySource::DidKey),
+        });
+        assert_eq!(own.layer, Some(KeyLayer::DidKey));
+        assert_eq!(own.key_source.as_deref(), Some("did-key"));
+        assert_eq!(
+            own.sentence,
+            "Signed with the sender’s own key. The key is their identity."
+        );
     }
 
     /// The two new events reach the app.

@@ -29,8 +29,10 @@ import {
 } from './identity-records.js';
 import { deriveKid } from './signing.js';
 
-/** Where a key was found. */
-export type KeySource = 'IdentityRecord' | 'DidDocument' | 'OriginServer';
+/** Where a key was found. `DidKey`: the signer's own `did:key` DID, which
+ *  is the key, read from the DID (`didKeyAnswer`), never asked for and
+ *  never kept. */
+export type KeySource = 'IdentityRecord' | 'DidDocument' | 'OriginServer' | 'DidKey';
 
 /** An ed25519 public key (32 bytes) that hashes to the kid asked for, and its source. */
 export interface FoundKey {
@@ -44,6 +46,28 @@ export interface FoundKey {
   /** When the key stops counting, unix seconds: its record's expiry, told
    *  whether or not it has passed. Only the records give one. */
   expiresAt: number | null;
+}
+
+/**
+ * A `did:key` signer's key, read from the DID itself when `kid` is that
+ * key's: no request, no retirement date (a did:key has none; ruling 20
+ * exempts it), and nothing kept, since it costs nothing to read again.
+ * Null for any other DID, one that does not decode to an ed25519 key, or a
+ * kid that is not its key's (a bot on bot-kit before it signed with its
+ * did:key), which a lookup answers as before. Twin of the Rust
+ * `did_key_answer`.
+ */
+export async function didKeyAnswer(did: string, kid: string): Promise<FoundKey | null> {
+  if (!did.startsWith('did:key:')) return null;
+  let publicKey: Uint8Array;
+  try {
+    publicKey = decodeMultibaseEd25519(did.slice('did:key:'.length));
+  } catch {
+    return null;
+  }
+  return (await deriveKid(publicKey)) === kid
+    ? { publicKey, source: 'DidKey', retiredAt: null, expiresAt: null }
+    : null;
 }
 
 /** What the identity-record reader needs: an HTTP GET and a DID resolver. */
@@ -374,7 +398,9 @@ export class KeyLookup {
    * Asks for one (did, kid) while a lookup for it runs await that lookup.
    * `retry: false` settles a fresh line's miss without the retry delays.
    * `server: true` names a server's DID, which has no device records: none
-   * are listed.
+   * are listed. A did:key signer's own key is read from its DID
+   * (`didKeyAnswer`) before anything held is looked at or any source asked,
+   * and is never kept.
    */
   async keyForAt(
     did: string,
@@ -382,6 +408,8 @@ export class KeyLookup {
     at: Date,
     options: { retry?: boolean; server?: boolean } = {},
   ): Promise<FoundKey | null> {
+    const fromDid = await didKeyAnswer(did, kid);
+    if (fromDid !== null) return fromDid;
     await this.load();
     const slot = JSON.stringify([did, kid]);
     for (;;) {

@@ -16,7 +16,7 @@ import { dmPeerKey, isDid } from './address.js';
 import { prefetchProfiles } from './profiles.js';
 import { recordKeyOf, type DeviceKeyStore, type StoredDeviceKey } from './device-key.js';
 import { KEY_LIFETIME_MS, buildDeviceRecord, deviceKeyHistory } from './identity-records.js';
-import { KeyLookup, type KeyPair, makeDidResolver } from './key-lookup.js';
+import { KeyLookup, type KeyPair, didKeyAnswer, makeDidResolver } from './key-lookup.js';
 import {
   RULING_VERBS,
   type RulingCheck,
@@ -2279,7 +2279,10 @@ export class FreeqClient extends EventEmitter {
     let prefetched: Promise<void> | undefined;
     const prefetch = (): Promise<void> =>
       (prefetched ??= (async () => {
-        const signers = openers.flatMap((e) => historyAct(e)?.signed ?? []).filter((s) => isDid(s.did));
+        const all = openers.flatMap((e) => historyAct(e)?.signed ?? []).filter((s) => isDid(s.did));
+        // A did:key signer's key is read from its DID: nothing to ask.
+        const fromDid = await Promise.all(all.map((s) => didKeyAnswer(s.did, s.kid)));
+        const signers = all.filter((_, at) => fromDid[at] === null);
         if (!lookup || !checker || signers.length === 0) return;
         await lookup.prefetch([...new Set(signers.map((s) => s.did))]).catch(() => undefined);
         await lookup.prefetchKeys(signers.map((s): KeyPair => [s.did, s.kid])).catch(() => undefined);
@@ -2590,12 +2593,15 @@ export class FreeqClient extends EventEmitter {
   private startDeferredChecks(batch: Batch): void {
     const held = batch.deferredChecks;
     if (!held?.length) return;
-    const dids = [...new Set(held.map((h) => h.did).filter((d): d is string => !!d && isDid(d)))];
-    const pairs: KeyPair[] = held
-      .filter((h) => !!h.did && isDid(h.did) && !!h.kid)
-      .flatMap((h): KeyPair[] => [[h.did!, h.kid!], ...(h.server ? [[h.server, h.kid!, true] as KeyPair] : [])]);
     const lookup = this.opts.keyLookup;
     void (async () => {
+      // A did:key signer's key is read from its DID: nothing to ask.
+      const fromDid = await Promise.all(held.map((h) => (h.did && h.kid ? didKeyAnswer(h.did, h.kid) : null)));
+      const asked = held.filter((_, at) => fromDid[at] === null);
+      const dids = [...new Set(asked.map((h) => h.did).filter((d): d is string => !!d && isDid(d)))];
+      const pairs: KeyPair[] = asked
+        .filter((h) => !!h.did && isDid(h.did) && !!h.kid)
+        .flatMap((h): KeyPair[] => [[h.did!, h.kid!], ...(h.server ? [[h.server, h.kid!, true] as KeyPair] : [])]);
       if (lookup && dids.length > 0) await lookup.prefetch(dids).catch(() => undefined);
       if (lookup && pairs.length > 0) await lookup.prefetchKeys(pairs).catch(() => undefined);
       for (const h of held) h.start();

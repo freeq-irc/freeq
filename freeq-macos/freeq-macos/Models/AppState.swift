@@ -429,6 +429,7 @@ class AppState {
         switch v.layer {
         case .some(.vouched): layer = .vouched
         case .some(.published): layer = .published
+        case .some(.didKey): layer = .didKey
         case .none: layer = nil
         }
         return VerdictInfo(

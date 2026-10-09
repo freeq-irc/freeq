@@ -13,7 +13,7 @@ import model from './verdict-model.json' with { type: 'json' };
 // Same reason for this copy of `spec/act-transitions.json`, pinned the same way.
 import rules from './act-transitions.json' with { type: 'json' };
 import { verifyEd25519 } from './did-key.js';
-import { type KeyLookup, type KeySource, type ListedKey, type OwnHostAnswer, keyList } from './key-lookup.js';
+import { type FoundKey, type KeyLookup, type KeySource, type ListedKey, type OwnHostAnswer, keyList } from './key-lookup.js';
 import * as signing from './signing.js';
 
 /** What checking a message's signature came to. */
@@ -26,8 +26,10 @@ export type VerdictState =
   | 'retired'
   | 'pending';
 
-/** Where a device key's standing comes from. */
-export type KeyLayer = 'vouched' | 'published';
+/** Where a device key's standing comes from: vouched for by the sender's
+ *  server, published in their identity record, or their `did:key` DID
+ *  itself. */
+export type KeyLayer = 'vouched' | 'published' | 'did-key';
 
 export const VERDICT_STATES: readonly VerdictState[] = [
   'device',
@@ -39,7 +41,7 @@ export const VERDICT_STATES: readonly VerdictState[] = [
   'pending',
 ];
 
-export const KEY_LAYERS: readonly KeyLayer[] = ['vouched', 'published'];
+export const KEY_LAYERS: readonly KeyLayer[] = ['vouched', 'published', 'did-key'];
 
 /** A message's verdict: the state, the layer for a device signature, and
  *  the key the check used. */
@@ -272,7 +274,7 @@ export class SignatureChecker {
         return null;
       }
     };
-    let found = null;
+    let found: FoundKey | null;
     if (server === null) {
       found = await lookup(signed.did, true);
     } else {
@@ -306,7 +308,8 @@ export class SignatureChecker {
       if (found.retiredAt !== null && found.retiredAt * 1000 <= atMs) {
         return { state: 'retired', kid: signed.kid, keySource };
       }
-      const layer: KeyLayer = found.source === 'IdentityRecord' ? 'published' : 'vouched';
+      const layer: KeyLayer =
+        found.source === 'IdentityRecord' ? 'published' : found.source === 'DidKey' ? 'did-key' : 'vouched';
       return { state: 'device', layer, kid: signed.kid, keySource };
     }
 
