@@ -64,6 +64,11 @@ export type {
   PresencePayload,
   CoordinationEventPayload,
   ActEventPayload,
+  TaskHistory,
+  TaskHistoryEvent,
+  ChannelAudit,
+  ChannelAuditRow,
+  ChannelAuditDocument,
   SpendPayload,
   BudgetSnapshot,
   AgentSpawnedPayload,
@@ -155,7 +160,7 @@ export type { DeviceKeyStore, StoredDeviceKey } from './device-key.js';
 
 // What a client shows for a message's signature; words from spec/verdict-model.json
 export { mark, sentence, VERDICT_STATES, KEY_LAYERS } from './verdict.js';
-export type { Verdict, VerdictState, KeyLayer } from './verdict.js';
+export type { Verdict, VerdictState, KeyLayer, RulingCheck } from './verdict.js';
 
 // VC-bootstrapped E2E group channels (EG1/EGK1) — passphrase-free, server-blind
 // channel encryption with per-epoch revocation. Interop-compatible with the
@@ -187,4 +192,4 @@ export type {
 // Both are byte-identical to the Rust SDK's `act_tags` and `act_line`, and
 // neither knows a verb — which verbs a kind allows is `spec/act-transitions.json`'s
 // business. Send them with `FreeqClient.sendAct`.
-export { actTags, actLine } from './signing.js';
+export { actTags, actLine, msgidTimestampMs } from './signing.js';

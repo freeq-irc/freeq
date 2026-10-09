@@ -33,6 +33,32 @@ pub enum KeySource {
     DidDocument,
     /// The origin server's `/api/v1/signing-keys/{did}/{kid}`.
     OriginServer,
+    /// The signer's own `did:key` DID, which is the key: read from the DID
+    /// ([`did_key_answer`]), never asked for and never kept.
+    DidKey,
+}
+
+/// A `did:key` signer's key, read from the DID itself when `kid` is that
+/// key's: no request, no retirement date (a did:key has none; ruling 20
+/// exempts it), and nothing kept, since it costs nothing to read again.
+/// `None` for any other DID, one that does not decode to an ed25519 key,
+/// or a kid that is not its key's (a bot on bot-kit before it signed with
+/// its did:key), which a lookup answers as before.
+pub fn did_key_answer(did: &str, kid: &str) -> Option<FoundKey> {
+    let multibase = did.strip_prefix("did:key:")?;
+    let crate::crypto::PublicKey::Ed25519(key) =
+        crate::crypto::PublicKey::from_multibase(multibase).ok()?
+    else {
+        return None;
+    };
+    let public_key = key.to_bytes();
+    (derive_kid_bytes(&public_key) == kid).then_some(FoundKey {
+        public_key,
+        source: KeySource::DidKey,
+        retired_at: None,
+        created_at: None,
+        expires_at: None,
+    })
 }
 
 /// An ed25519 public key that hashes to the kid asked for, and its source.
@@ -107,6 +133,15 @@ pub struct KeyLookup<P: ClientProvider> {
     /// The origin answered its batch key route with a 404: a server from
     /// before it, asked key by key for the rest of this lookup's life.
     batch_route_missing: std::sync::atomic::AtomicBool,
+    /// Each ruling referee's key list as its own site last listed it, by
+    /// `did:web:` name; see [`Self::own_host_answer`].
+    referees: Arc<Mutex<HashMap<String, RefereeKeys>>>,
+    /// How long a referee's site that could not answer is answered for
+    /// without asking; zero unless set (`with_cannot_answer_for`).
+    cannot_answer_for: Duration,
+    own_host_wait: Duration,
+    #[cfg(any(test, feature = "test-support"))]
+    own_host_base: Option<OwnHostBase>,
     /// Where the cache is kept between launches, and whether it has been
     /// taken in yet. The snapshot is read once, before the first lookup,
     /// once `after` (another lookup's flush) has settled.
@@ -166,6 +201,7 @@ impl Writer {
 /// What a snapshot is taken from, shared with a write held for later.
 struct Held {
     cache: Arc<Mutex<HashMap<(String, String), Cached>>>,
+    referees: Arc<Mutex<HashMap<String, RefereeKeys>>>,
     records: Arc<Mutex<HashMap<String, ListedRecords>>>,
     refreshed: Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
     proven: Arc<Mutex<HashSet<crate::identity_records::Cid>>>,
@@ -219,6 +255,26 @@ impl Held {
                 .lock()
                 .iter()
                 .map(|cid| cid.to_string())
+                .collect(),
+            referees: self
+                .referees
+                .lock()
+                .iter()
+                .map(|(did, referee)| {
+                    (
+                        did.clone(),
+                        RefereeSnapshot {
+                            keys: referee
+                                .keys
+                                .iter()
+                                .map(|(kid, (key, retired_at))| {
+                                    (kid.clone(), URL_SAFE_NO_PAD.encode(key), *retired_at)
+                                })
+                                .collect(),
+                            read_for: referee.read_for.iter().cloned().collect(),
+                        },
+                    )
+                })
                 .collect(),
         }
     }
@@ -339,6 +395,19 @@ pub struct KeyLookupSnapshot {
     pub records: Vec<(String, i64)>,
     pub refreshed: Vec<(String, i64)>,
     pub proven: Vec<String>,
+    /// Each ruling referee's key list as its own site listed it. Absent from
+    /// a snapshot written before lists were kept.
+    #[serde(default)]
+    pub referees: Vec<(String, RefereeSnapshot)>,
+}
+
+/// One referee's key list as a snapshot carries it: each key by kid,
+/// base64url, with when it stopped counting, and the kids the list was read
+/// for.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct RefereeSnapshot {
+    pub keys: Vec<(String, String, Option<i64>)>,
+    pub read_for: Vec<String>,
 }
 
 /// The snapshot shape this code reads and writes.
@@ -387,6 +456,7 @@ impl FoundKeySnapshot {
                 KeySource::IdentityRecord => "IdentityRecord",
                 KeySource::DidDocument => "DidDocument",
                 KeySource::OriginServer => "OriginServer",
+                KeySource::DidKey => "DidKey",
             }
             .to_string(),
             retired_at: found.retired_at,
@@ -405,6 +475,7 @@ impl FoundKeySnapshot {
                 "IdentityRecord" => KeySource::IdentityRecord,
                 "DidDocument" => KeySource::DidDocument,
                 "OriginServer" => KeySource::OriginServer,
+                "DidKey" => KeySource::DidKey,
                 _ => return None,
             },
             retired_at: self.retired_at,
@@ -550,6 +621,122 @@ impl OriginKey {
     }
 }
 
+/// A key from a server's key list: its bytes, and when it stopped counting.
+pub(crate) type ListedKey = ([u8; 32], Option<i64>);
+
+/// The keys a server's key list (`/api/v1/signing-keys/{did}`) holds, by
+/// kid, each with when it stopped counting: every `keys[]` entry, and the
+/// top-level `public_key`, the only key a server from before the list sends.
+/// A key is filed under the kid its bytes hash to. `None` for a body that is
+/// not a key list.
+pub(crate) fn key_list(body: &serde_json::Value) -> Option<HashMap<String, ListedKey>> {
+    let entries = body.get("keys").and_then(|keys| keys.as_array());
+    let current = body.get("public_key").and_then(|key| key.as_str());
+    if entries.is_none() && current.is_none() {
+        return None;
+    }
+    let mut keys: HashMap<String, ListedKey> = entries
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| serde_json::from_value::<OriginKey>(entry.clone()).ok())
+        .filter_map(|entry| Some((decode_key(&entry.public_key)?, entry.retired_at())))
+        .map(|(key, retired_at)| (derive_kid_bytes(&key), (key, retired_at)))
+        .collect();
+    if let Some(key) = current.and_then(decode_key) {
+        keys.entry(derive_kid_bytes(&key)).or_insert((key, None));
+    }
+    Some(keys)
+}
+
+/// What a ruling referee's own site says about one of its keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnHostAnswer {
+    /// Its key list holds the key. `retired_at`: when it stopped counting,
+    /// unix seconds.
+    Listed {
+        public_key: [u8; 32],
+        retired_at: Option<i64>,
+    },
+    /// Its key list, read since the key was first asked about, lacks it.
+    NotListed,
+    /// The name is not a plain public host, or the list could not be read.
+    CannotAnswer,
+}
+
+/// Where a `did:web:` host's key list is read, given the host.
+#[cfg(any(test, feature = "test-support"))]
+type OwnHostBase = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+/// The longest one read of a referee's key list may take.
+pub const OWN_HOST_WAIT: Duration = Duration::from_secs(5);
+
+/// Most referees whose key lists are kept at once.
+const REFEREES_HELD: usize = 1024;
+
+/// Most kids a referee's list is remembered as read for, oldest out. One
+/// is added per ruling naming a key the list lacks, so only a misbehaving
+/// referee or server comes near it; a kid that falls out is read for once
+/// more if it is named again.
+const READ_FOR_HELD: usize = 256;
+
+/// One referee's key list, as its own site last listed it: the server's key
+/// set (`SignatureChecker`'s `ServerKeySet`) for a server not connected to.
+#[derive(Default)]
+struct RefereeKeys {
+    keys: HashMap<String, ListedKey>,
+    /// Kids the list has been read for, once each, oldest first, at most
+    /// [`READ_FOR_HELD`].
+    read_for: std::collections::VecDeque<String>,
+    /// The read in flight, shared by every ask meanwhile; `true` once read.
+    reading: Option<Arc<tokio::sync::OnceCell<bool>>>,
+    /// When a read last failed.
+    failed_at: Option<tokio::time::Instant>,
+    /// When last asked about, for the bound.
+    used: Option<tokio::time::Instant>,
+}
+
+/// The host of a `did:web:` name that is a plain host: no port, no path.
+fn plain_did_web_host(did: &str) -> Option<&str> {
+    let host = did.strip_prefix("did:web:")?;
+    (!host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+    .then_some(host)
+}
+
+impl RefereeKeys {
+    /// Remember that the list was read for `kid`, dropping the oldest kid
+    /// past [`READ_FOR_HELD`].
+    fn note_read_for(&mut self, kid: String) {
+        if self.read_for.contains(&kid) {
+            return;
+        }
+        self.read_for.push_back(kid);
+        while self.read_for.len() > READ_FOR_HELD {
+            self.read_for.pop_front();
+        }
+    }
+}
+
+/// Drop the referees asked about longest ago until at most `cap` are left;
+/// one being read is never dropped.
+fn bound_referees(held: &mut HashMap<String, RefereeKeys>, cap: usize) {
+    if held.len() <= cap {
+        return;
+    }
+    let mut aged: Vec<(Option<tokio::time::Instant>, String)> = held
+        .iter()
+        .filter(|(_, referee)| referee.reading.is_none())
+        .map(|(did, referee)| (referee.used, did.clone()))
+        .collect();
+    aged.sort();
+    let over = held.len() - cap;
+    for (_, did) in aged.into_iter().take(over) {
+        held.remove(&did);
+    }
+}
+
 impl<P: ClientProvider> KeyLookup<P> {
     /// `origin_base` is the origin server's base URL; the same client
     /// provider as the reader's serves its requests.
@@ -578,6 +765,11 @@ impl<P: ClientProvider> KeyLookup<P> {
             before_remember: Mutex::new(None),
             retry_after: MISS_RETRY_AFTER.to_vec(),
             batch_route_missing: Default::default(),
+            referees: Default::default(),
+            cannot_answer_for: Duration::ZERO,
+            own_host_wait: OWN_HOST_WAIT,
+            #[cfg(any(test, feature = "test-support"))]
+            own_host_base: None,
             writer: Writer::new(Arc::new(MemoryKeyLookupStore::default())),
             loaded: tokio::sync::OnceCell::new(),
             after: Mutex::new(None),
@@ -673,6 +865,22 @@ impl<P: ClientProvider> KeyLookup<P> {
                         }
                     }
                 }
+                {
+                    let mut referees = self.referees.lock();
+                    for (did, kept) in snapshot.referees {
+                        let referee = referees.entry(did).or_default();
+                        for (kid, key, retired_at) in kept.keys {
+                            // A key that does not decode is not a key.
+                            if let Some(key) = decode_key(&key) {
+                                referee.keys.entry(kid).or_insert((key, retired_at));
+                            }
+                        }
+                        for kid in kept.read_for {
+                            referee.note_read_for(kid);
+                        }
+                    }
+                    bound_referees(&mut referees, REFEREES_HELD);
+                }
             })
             .await;
     }
@@ -681,6 +889,7 @@ impl<P: ClientProvider> KeyLookup<P> {
     fn held(&self) -> Held {
         Held {
             cache: self.cache.clone(),
+            referees: self.referees.clone(),
             records: self.records.clone(),
             refreshed: self.refreshed.clone(),
             proven: self.proven.clone(),
@@ -755,6 +964,31 @@ impl<P: ClientProvider> KeyLookup<P> {
         self
     }
 
+    /// Answer a referee whose site could not be read as unable to answer for
+    /// `window` after the failed read, without reading again.
+    pub fn with_cannot_answer_for(mut self, window: Duration) -> Self {
+        self.cannot_answer_for = window;
+        self
+    }
+
+    /// Read a `did:web:` host's key list at the base `base` gives for the
+    /// host, not at `https://<host>`, without the private-address check: for
+    /// tests, whose stubs serve on loopback.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_own_host_base(
+        mut self,
+        base: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.own_host_base = Some(Arc::new(base));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_own_host_wait(mut self, wait: Duration) -> Self {
+        self.own_host_wait = wait;
+        self
+    }
+
     /// The record reader this lookup lists and proves through, with whatever
     /// callbacks it was built with.
     pub fn reader(&self) -> &RecordReader<P> {
@@ -802,7 +1036,9 @@ impl<P: ClientProvider> KeyLookup<P> {
     /// fresh line's miss without the retry delays; `server: true` names a
     /// server's DID, which has no device records: none are listed. A line
     /// signed more than [`FRESH_LINE`] before now is never asked about
-    /// again.
+    /// again. A did:key signer's own key is read from its DID
+    /// ([`did_key_answer`]) before anything held is looked at or any source
+    /// asked, and is never kept.
     pub async fn key_for_at_with(
         &self,
         did: &str,
@@ -810,6 +1046,9 @@ impl<P: ClientProvider> KeyLookup<P> {
         at: DateTime<Utc>,
         ask: KeyAsk,
     ) -> Result<Option<FoundKey>> {
+        if let Some(found) = did_key_answer(did, kid) {
+            return Ok(Some(found));
+        }
         self.load().await;
         let slot = (did.to_string(), kid.to_string());
         loop {
@@ -1708,6 +1947,28 @@ impl<P: ClientProvider> KeyLookup<P> {
         self.save().await;
     }
 
+    /// When the answer held for `(did, kid)` is a key the origin server
+    /// vouched for, take `did`'s records again as any lookup does past the
+    /// ttl (`device_records`: through the home server, at most once per DID
+    /// per ttl), so a key published since is answered from them; one still
+    /// unpublished keeps the server's answer. For a task's opening post,
+    /// which only a published key lets name its referee. Never fails.
+    pub async fn relist_vouched(&self, did: &str, kid: &str) {
+        if !self.holds_origin_answer(did, kid).await {
+            return;
+        }
+        let slot = (did.to_string(), kid.to_string());
+        let Some(hit) = self.cache.lock().get(&slot).cloned() else {
+            return;
+        };
+        self.relisted(&slot, did, kid, hit).await;
+    }
+
+    /// How long a miss and a listing are held.
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
     /// How many times `refresh_account` has dropped `did`'s answers.
     fn refresh_count(&self, did: &str) -> u64 {
         self.refreshes.lock().get(did).copied().unwrap_or(0)
@@ -1762,13 +2023,21 @@ impl<P: ClientProvider> KeyLookup<P> {
     }
 
     /// A found key's cached answer with the DID's current proven records: the
-    /// last listing while inside the ttl, else a new one. A listing that
-    /// fails leaves `hit` as it was.
+    /// last listing while inside the ttl, else a new one. The answer held
+    /// beside the records (the origin's) stands unless the records now hold
+    /// the key. A listing that fails leaves `hit` as it was.
     async fn relisted(&self, slot: &(String, String), did: &str, kid: &str, hit: Cached) -> Cached {
         let Ok(records) = self.device_records(did, kid).await else {
             return hit;
         };
-        self.remember(slot.clone(), records, None);
+        let other = match device_key_history(did, &records)
+            .iter()
+            .any(|k| k.kid == kid)
+        {
+            true => None,
+            false => hit.other,
+        };
+        self.remember(slot.clone(), records, other);
         self.save().await;
         self.cache.lock().get(slot).cloned().unwrap_or(hit)
     }
@@ -1839,6 +2108,155 @@ impl<P: ClientProvider> KeyLookup<P> {
             .await
             .context("the origin key store answer is not a key")?;
         Ok(decode_key(&answer.public_key).map(|key| (key, answer.retired_at())))
+    }
+
+    /// What a ruling referee's own site says about its key `kid`: its key
+    /// list at `https://<host>/api/v1/signing-keys/<did>`, read whole and
+    /// kept for the life of the lookup, as the connected server's key set
+    /// is kept for a connection. A kid on the list is answered from it; a
+    /// kid not on it reads the list once more, once per kid, and is not
+    /// listed if still missing. A read that fails is not kept, unless
+    /// `with_cannot_answer_for` says otherwise. One read per referee at a
+    /// time; asks meanwhile share it. Never fails.
+    pub async fn own_host_answer(&self, did: &str, kid: &str) -> OwnHostAnswer {
+        let Some(host) = plain_did_web_host(did) else {
+            return OwnHostAnswer::CannotAnswer;
+        };
+        self.load().await;
+        let asked_at = tokio::time::Instant::now();
+        loop {
+            let (read, started_here) = {
+                let mut referees = self.referees.lock();
+                if !referees.contains_key(did) {
+                    bound_referees(&mut referees, REFEREES_HELD - 1);
+                }
+                let referee = referees.entry(did.to_string()).or_default();
+                referee.used = Some(asked_at);
+                if let Some(answer) = self.held_answer(referee, kid) {
+                    return answer;
+                }
+                match &referee.reading {
+                    Some(read) => (read.clone(), false),
+                    None => {
+                        let read = Arc::new(tokio::sync::OnceCell::new());
+                        referee.reading = Some(read.clone());
+                        (read, true)
+                    }
+                }
+            };
+            let read_ok = *read
+                .get_or_init(|| async {
+                    let keys =
+                        tokio::time::timeout(self.own_host_wait, self.read_referee_list(host, did))
+                            .await
+                            .ok()
+                            .flatten();
+                    let mut referees = self.referees.lock();
+                    let referee = referees.entry(did.to_string()).or_default();
+                    referee.reading = None;
+                    match keys {
+                        Some(keys) => {
+                            // A later list's dates win: a key retired since
+                            // is learned at the next read.
+                            referee.keys.extend(keys);
+                            referee.note_read_for(kid.to_string());
+                            referee.failed_at = None;
+                            true
+                        }
+                        None => {
+                            referee.failed_at = Some(tokio::time::Instant::now());
+                            false
+                        }
+                    }
+                })
+                .await;
+            if !read_ok {
+                return OwnHostAnswer::CannotAnswer;
+            }
+            // A read this ask started, or one for the same kid, has answered
+            // it. One that was already under way for another kid may predate
+            // the key: the loop reads once more for this one.
+            let answer = {
+                let mut referees = self.referees.lock();
+                let referee = referees.entry(did.to_string()).or_default();
+                match self.held_answer(referee, kid) {
+                    Some(answer) => Some(answer),
+                    None if started_here => {
+                        referee.note_read_for(kid.to_string());
+                        Some(OwnHostAnswer::NotListed)
+                    }
+                    None => None,
+                }
+            };
+            if let Some(answer) = answer {
+                // Kept with the found keys, under the same write rule.
+                self.save().await;
+                return answer;
+            }
+        }
+    }
+
+    /// What is held about a referee's key `kid`, without asking: listed or
+    /// not listed as its key list last said, cannot answer inside the
+    /// `with_cannot_answer_for` window after a failed read and at once for a
+    /// name that is not a plain host, else `None`.
+    pub fn held_own_host_answer(&self, did: &str, kid: &str) -> Option<OwnHostAnswer> {
+        if plain_did_web_host(did).is_none() {
+            return Some(OwnHostAnswer::CannotAnswer);
+        }
+        let referees = self.referees.lock();
+        self.held_answer(referees.get(did)?, kid)
+    }
+
+    fn held_answer(&self, referee: &RefereeKeys, kid: &str) -> Option<OwnHostAnswer> {
+        if let Some((public_key, retired_at)) = referee.keys.get(kid) {
+            return Some(OwnHostAnswer::Listed {
+                public_key: *public_key,
+                retired_at: *retired_at,
+            });
+        }
+        if referee.read_for.iter().any(|read| read == kid) {
+            return Some(OwnHostAnswer::NotListed);
+        }
+        referee
+            .failed_at
+            .is_some_and(|at| at.elapsed() < self.cannot_answer_for)
+            .then_some(OwnHostAnswer::CannotAnswer)
+    }
+
+    /// One read of a referee's key list. `None` when the host is, or
+    /// resolves to, a private address, the request fails or is refused, or
+    /// the body is not a key list.
+    async fn read_referee_list(&self, host: &str, did: &str) -> Option<HashMap<String, ListedKey>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let base = self.own_host_base.as_ref().map(|base| base(host));
+        #[cfg(not(any(test, feature = "test-support")))]
+        let base: Option<String> = None;
+        // The name comes off a line anyone can send: a host that is, or
+        // resolves to, a private address is not asked, and the read goes to
+        // the addresses checked, following no redirect, as the did:web
+        // document read does (`did.rs`).
+        let (base, client) = match base {
+            Some(base) => (
+                base,
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(self.own_host_wait)
+                    .build()
+                    .ok()?,
+            ),
+            None => {
+                let addrs = crate::ssrf::resolve_and_check(host, 443).await.ok()?;
+                let client = crate::ssrf::pinned_client(host, &addrs, self.own_host_wait).ok()?;
+                (format!("https://{host}"), client)
+            }
+        };
+        let url = format!("{}/api/v1/signing-keys/{did}", base.trim_end_matches('/'));
+        let response = client.get(&url).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        key_list(&response.json::<serde_json::Value>().await.ok()?)
     }
 }
 
@@ -3684,6 +4102,15 @@ mod tests {
         documents: Vec<DidDocument>,
         home: &Home,
     ) -> KeyLookup<freeq_oauth::SharedClient> {
+        lookup_at_home_for(documents, home, HOUR)
+    }
+
+    /// [`lookup_at_home`] with a ttl of `ttl`.
+    fn lookup_at_home_for(
+        documents: Vec<DidDocument>,
+        home: &Home,
+        ttl: Duration,
+    ) -> KeyLookup<freeq_oauth::SharedClient> {
         let resolver = DidResolver::static_map(
             documents
                 .into_iter()
@@ -3691,7 +4118,7 @@ mod tests {
                 .collect(),
         );
         let reader = RecordReader::new(resolver, freeq_oauth::SharedClient(reqwest::Client::new()));
-        KeyLookup::new(reader, Some(home.base.clone()), HOUR).with_retry_delays(Vec::new())
+        KeyLookup::new(reader, Some(home.base.clone()), ttl).with_retry_delays(Vec::new())
     }
 
     #[tokio::test]
@@ -3728,6 +4155,62 @@ mod tests {
             .await
             .unwrap()
             .map(|f| f.source)
+    }
+
+    /// Requests to the home server's batch and listing routes together.
+    fn home_listings(home: &Home) -> usize {
+        let (batch, listing, _) = home.counts();
+        batch + listing
+    }
+
+    /// A key held as the origin vouched for it, published since the
+    /// account's listing went past the ttl: taking the records again lists
+    /// them once, through the home server and not at the PDS, and the key is
+    /// then held as found in them.
+    #[tokio::test]
+    async fn relist_vouched_lists_through_the_home_server_and_finds_a_key_published_since() {
+        let (home_server, pds, repos, docs) = three_signers().await;
+        home_server
+            .keys
+            .lock()
+            .insert((ALICE.to_string(), kid_of(4)), raw(4));
+        let keys = lookup_at_home_for(docs, &home_server, Duration::from_secs(1));
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::OriginServer));
+        publish_alice_4(&repos);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let listed = home_listings(&home_server);
+        keys.relist_vouched(ALICE, &kid_of(4)).await;
+        assert_eq!(home_listings(&home_server), listed + 1, "one listing");
+        assert_eq!(pds.hits(), 0, "the PDS was not asked");
+        assert!(!keys.holds_origin_answer(ALICE, &kid_of(4)).await);
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::IdentityRecord));
+    }
+
+    /// A key held as the origin vouched for it and still unpublished stays
+    /// held so after the records are taken again, and they are taken again
+    /// at most once per ttl.
+    #[tokio::test]
+    async fn relist_vouched_keeps_the_origins_key_while_it_is_unpublished() {
+        let (home_server, pds, _repos, docs) = three_signers().await;
+        home_server
+            .keys
+            .lock()
+            .insert((ALICE.to_string(), kid_of(4)), raw(4));
+        let keys = lookup_at_home_for(docs, &home_server, Duration::from_secs(1));
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::OriginServer));
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let listed = home_listings(&home_server);
+        keys.relist_vouched(ALICE, &kid_of(4)).await;
+        assert_eq!(home_listings(&home_server), listed + 1, "one listing");
+        assert!(keys.holds_origin_answer(ALICE, &kid_of(4)).await);
+        keys.relist_vouched(ALICE, &kid_of(4)).await;
+        assert_eq!(
+            home_listings(&home_server),
+            listed + 1,
+            "none again inside the ttl"
+        );
+        assert!(keys.holds_origin_answer(ALICE, &kid_of(4)).await);
+        assert_eq!(pds.hits(), 0, "the PDS was not asked");
     }
 
     #[tokio::test]
@@ -4003,6 +4486,30 @@ mod tests {
             "no batch, listing or proof request"
         );
         assert_eq!(pds.hits(), 0, "the PDS was not asked");
+    }
+
+    /// A did:key signer's own key is read from its DID: the lookup answers it
+    /// with no request and keeps nothing, though the origin holds a copy.
+    /// Under any other kid it is asked for as before.
+    #[tokio::test]
+    async fn a_did_key_signers_own_key_is_read_from_the_did_and_another_kid_asked_for() {
+        let bot = format!("did:key:{}", key(7).public_key_multibase());
+        let origin = origin(vec![
+            (bot.as_str(), kid_of(7), raw(7)),
+            (bot.as_str(), kid_of(8), raw(8)),
+        ])
+        .await;
+        let keys = lookup(vec![], Some(&origin), HOUR);
+        let own = keys.key_for(&bot, &kid_of(7)).await.unwrap();
+        assert_eq!(
+            own.map(|f| (f.source, f.public_key)),
+            Some((KeySource::DidKey, raw(7)))
+        );
+        assert_eq!(origin.hits(), 0, "no request");
+        assert!(keys.cache.lock().is_empty(), "nothing kept");
+        let other = keys.key_for(&bot, &kid_of(8)).await.unwrap();
+        assert_eq!(other.map(|f| f.source), Some(KeySource::OriginServer));
+        assert_eq!(origin.hits(), 1, "asked as before");
     }
 
     #[tokio::test]
@@ -4425,6 +4932,7 @@ mod tests {
             records: vec![(ALICE.to_string(), 1_000)],
             refreshed: vec![(ALICE.to_string(), 1_000)],
             proven: vec!["bafyreiproven".to_string()],
+            referees: Vec::new(),
         };
         let store = FileKeyLookupStore::new(snapshot_path("round-trip"));
         let text = serde_json::to_string(&snapshot).unwrap();
@@ -4785,5 +5293,527 @@ mod tests {
             .map(|l| (l.link.agent_did, l.uri))
             .collect();
         assert_eq!(named, vec![(bot, proven_uri)]);
+    }
+
+    // ── a ruling referee's own key list ───────────────────────────────────
+    //
+    // A ruling's key counts only when its referee's own site lists it. The
+    // list is read whole, kept, and read again only for a kid not on it.
+
+    const REFEREE: &str = "did:web:referee.example";
+
+    /// A referee's site serving its key list at `/api/v1/signing-keys/{did}`
+    /// with `body`, or `status` when set, after `delay`; `hits` counts reads.
+    struct RefereeSite {
+        base: String,
+        body: Arc<parking_lot::Mutex<serde_json::Value>>,
+        status: Arc<parking_lot::Mutex<Option<u16>>>,
+        delay: Arc<parking_lot::Mutex<Duration>>,
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl RefereeSite {
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+
+        /// List these keys, each `(seed, removed_at, expires_at)`.
+        fn list(&self, keys: &[(u8, Option<i64>, Option<i64>)]) {
+            let keys: Vec<serde_json::Value> = keys
+                .iter()
+                .map(|(seed, removed_at, expires_at)| {
+                    json!({
+                        "kid": kid_of(*seed),
+                        "public_key": URL_SAFE_NO_PAD.encode(raw(*seed)),
+                        "removed_at": removed_at,
+                        "expires_at": expires_at,
+                    })
+                })
+                .collect();
+            *self.body.lock() = json!({ "did": REFEREE, "public_key": null, "keys": keys });
+        }
+    }
+
+    async fn referee_site() -> RefereeSite {
+        use axum::response::IntoResponse;
+        let body: Arc<parking_lot::Mutex<serde_json::Value>> =
+            Arc::new(parking_lot::Mutex::new(json!({ "keys": [] })));
+        let status: Arc<parking_lot::Mutex<Option<u16>>> = Default::default();
+        let delay: Arc<parking_lot::Mutex<Duration>> = Default::default();
+        let hits: Arc<AtomicUsize> = Default::default();
+        let router = axum::Router::new().route(
+            "/api/v1/signing-keys/{did}",
+            get({
+                let (body, status, delay, hits) =
+                    (body.clone(), status.clone(), delay.clone(), hits.clone());
+                move |Path(did): Path<String>| {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(did, REFEREE, "asked for another DID's list");
+                    let (body, status, delay) =
+                        (body.lock().clone(), *status.lock(), *delay.lock());
+                    async move {
+                        tokio::time::sleep(delay).await;
+                        match status {
+                            Some(status) => StatusCode::from_u16(status).unwrap().into_response(),
+                            None => axum::Json(body).into_response(),
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        RefereeSite {
+            base,
+            body,
+            status,
+            delay,
+            hits,
+        }
+    }
+
+    /// A lookup whose referee.example key list is `site`'s, with `ttl` for
+    /// the general cache.
+    fn referee_lookup(site: &RefereeSite, ttl: Duration) -> KeyLookup<freeq_oauth::SharedClient> {
+        let reader = RecordReader::new(
+            DidResolver::static_map(HashMap::new()),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        );
+        let base = site.base.clone();
+        KeyLookup::new(reader, None, ttl).with_own_host_base(move |host| {
+            assert_eq!(host, "referee.example", "asked another host");
+            base.clone()
+        })
+    }
+
+    fn listed(seed: u8, retired_at: Option<i64>) -> OwnHostAnswer {
+        OwnHostAnswer::Listed {
+            public_key: raw(seed),
+            retired_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listed_referee_key_is_kept_and_never_asked_again() {
+        let site = referee_site().await;
+        site.list(&[(70, None, None)]);
+        // The general cache's ttl has no say over a referee's keys.
+        let keys = referee_lookup(&site, Duration::from_millis(1));
+        assert_eq!(
+            keys.own_host_answer(REFEREE, &kid_of(70)).await,
+            listed(70, None)
+        );
+        assert_eq!(site.hits(), 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            keys.own_host_answer(REFEREE, &kid_of(70)).await,
+            listed(70, None)
+        );
+        assert_eq!(
+            keys.held_own_host_answer(REFEREE, &kid_of(70)),
+            Some(listed(70, None))
+        );
+        assert_eq!(site.hits(), 1, "a listed key is never asked again");
+    }
+
+    #[tokio::test]
+    async fn a_kid_not_on_file_reads_the_whole_list_once_with_its_retired_keys() {
+        let site = referee_site().await;
+        site.list(&[
+            (71, None, None),
+            (72, Some(1_700_000_000), None),
+            (73, Some(1_700_000_000), Some(1_650_000_000)),
+        ]);
+        let keys = referee_lookup(&site, HOUR);
+        assert_eq!(keys.held_own_host_answer(REFEREE, &kid_of(71)), None);
+        assert_eq!(
+            keys.own_host_answer(REFEREE, &kid_of(71)).await,
+            listed(71, None)
+        );
+        assert_eq!(site.hits(), 1);
+        // The rest of the list came with it, each key with when it stopped
+        // counting: the earlier of its removal and its expiry.
+        assert_eq!(
+            keys.own_host_answer(REFEREE, &kid_of(72)).await,
+            listed(72, Some(1_700_000_000))
+        );
+        assert_eq!(
+            keys.held_own_host_answer(REFEREE, &kid_of(73)),
+            Some(listed(73, Some(1_650_000_000)))
+        );
+        assert_eq!(site.hits(), 1, "one read of the whole list");
+    }
+
+    #[tokio::test]
+    async fn a_kid_still_missing_after_its_read_is_not_listed_and_not_asked_again() {
+        let site = referee_site().await;
+        site.list(&[(71, None, None)]);
+        let keys = referee_lookup(&site, HOUR);
+        assert_eq!(
+            keys.own_host_answer(REFEREE, &kid_of(74)).await,
+            OwnHostAnswer::NotListed
+        );
+        assert_eq!(site.hits(), 1);
+        assert_eq!(
+            keys.own_host_answer(REFEREE, &kid_of(74)).await,
+            OwnHostAnswer::NotListed
+        );
+        assert_eq!(
+            keys.held_own_host_answer(REFEREE, &kid_of(74)),
+            Some(OwnHostAnswer::NotListed)
+        );
+        assert_eq!(site.hits(), 1, "read once for that kid");
+        // Another kid not on file reads the list once more.
+        assert_eq!(
+            keys.own_host_answer(REFEREE, &kid_of(75)).await,
+            OwnHostAnswer::NotListed
+        );
+        assert_eq!(site.hits(), 2);
+    }
+
+    /// The kids a referee's list was read for and lacked are bounded, oldest
+    /// out, as the referees themselves are: each one is a ruling naming a
+    /// key the list does not hold, so only a misbehaving referee or server
+    /// grows them.
+    #[tokio::test]
+    async fn a_referees_kids_not_found_are_bounded_oldest_out() {
+        let site = referee_site().await;
+        site.list(&[(71, None, None)]);
+        let keys = referee_lookup(&site, HOUR);
+        for i in 0..=READ_FOR_HELD {
+            assert_eq!(
+                keys.own_host_answer(REFEREE, &format!("missing-{i}")).await,
+                OwnHostAnswer::NotListed
+            );
+        }
+        assert_eq!(site.hits(), READ_FOR_HELD + 1);
+        assert_eq!(
+            keys.held_own_host_answer(REFEREE, "missing-0"),
+            None,
+            "the oldest went"
+        );
+        assert_eq!(
+            keys.held_own_host_answer(REFEREE, &format!("missing-{READ_FOR_HELD}")),
+            Some(OwnHostAnswer::NotListed)
+        );
+        assert_eq!(
+            keys.held_own_host_answer(REFEREE, &kid_of(71)),
+            Some(listed(71, None)),
+            "a found key is not among them"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_for_a_new_kid_learns_a_held_keys_retirement() {
+        let site = referee_site().await;
+        site.list(&[(71, None, None)]);
+        let keys = referee_lookup(&site, HOUR);
+        assert_eq!(
+            keys.own_host_answer(REFEREE, &kid_of(71)).await,
+            listed(71, None)
+        );
+        // The referee retires 71 and rules under 76.
+        site.list(&[(71, Some(1_700_000_000), None), (76, None, None)]);
+        assert_eq!(
+            keys.own_host_answer(REFEREE, &kid_of(76)).await,
+            listed(76, None)
+        );
+        assert_eq!(
+            keys.held_own_host_answer(REFEREE, &kid_of(71)),
+            Some(listed(71, Some(1_700_000_000)))
+        );
+        assert_eq!(site.hits(), 2);
+    }
+
+    /// A referee's list is kept with the found keys: a lookup built on the
+    /// same store answers a listed key, and a kid already read for, with no
+    /// read; a snapshot written before lists were kept still loads.
+    #[tokio::test]
+    async fn a_referees_list_is_kept_in_the_snapshot() {
+        let site = referee_site().await;
+        site.list(&[(71, Some(1_700_000_000), None)]);
+        let store: Arc<dyn KeyLookupStore> = Arc::new(MemoryKeyLookupStore::default());
+        let first = referee_lookup(&site, HOUR).with_store(store.clone());
+        assert_eq!(
+            first.own_host_answer(REFEREE, &kid_of(71)).await,
+            listed(71, Some(1_700_000_000))
+        );
+        assert_eq!(
+            first.own_host_answer(REFEREE, &kid_of(74)).await,
+            OwnHostAnswer::NotListed
+        );
+        first.flush().await;
+        assert_eq!(site.hits(), 2);
+
+        let second = referee_lookup(&site, HOUR).with_store(store.clone());
+        assert_eq!(
+            second.own_host_answer(REFEREE, &kid_of(71)).await,
+            listed(71, Some(1_700_000_000))
+        );
+        assert_eq!(
+            second.own_host_answer(REFEREE, &kid_of(74)).await,
+            OwnHostAnswer::NotListed
+        );
+        assert_eq!(site.hits(), 2, "answered from the snapshot, with no read");
+
+        // Written before lists were kept: no `referees` field.
+        let mut old: serde_json::Value =
+            serde_json::from_str(&store.load().unwrap().unwrap()).unwrap();
+        old.as_object_mut().unwrap().remove("referees");
+        let older: Arc<dyn KeyLookupStore> = Arc::new(MemoryKeyLookupStore::default());
+        older.save(&old.to_string()).unwrap();
+        let third = referee_lookup(&site, HOUR).with_store(older);
+        assert_eq!(
+            third.own_host_answer(REFEREE, &kid_of(71)).await,
+            listed(71, Some(1_700_000_000))
+        );
+        assert_eq!(site.hits(), 3, "read again, the old snapshot loading");
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_cannot_answer_and_the_next_ask_reads_again() {
+        let site = referee_site().await;
+        let keys = referee_lookup(&site, HOUR);
+        for (status, body) in [
+            (Some(503), json!({})),
+            (Some(404), json!({})),
+            (None, json!({ "error": "not a key list" })),
+        ] {
+            *site.status.lock() = status;
+            *site.body.lock() = body;
+            let before = site.hits();
+            assert_eq!(
+                keys.own_host_answer(REFEREE, &kid_of(71)).await,
+                OwnHostAnswer::CannotAnswer,
+                "{status:?}"
+            );
+            assert_eq!(
+                keys.held_own_host_answer(REFEREE, &kid_of(71)),
+                None,
+                "not kept"
+            );
+            assert_eq!(site.hits(), before + 1);
+        }
+        *site.status.lock() = None;
+        site.list(&[(71, None, None)]);
+        assert_eq!(
+            keys.own_host_answer(REFEREE, &kid_of(71)).await,
+            listed(71, None)
+        );
+        assert_eq!(site.hits(), 4, "each ask after a failure read again");
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_is_not_repeated_inside_the_cannot_answer_window() {
+        let site = referee_site().await;
+        *site.status.lock() = Some(503);
+        let keys = referee_lookup(&site, HOUR).with_cannot_answer_for(Duration::from_millis(300));
+        assert_eq!(
+            keys.own_host_answer(REFEREE, &kid_of(71)).await,
+            OwnHostAnswer::CannotAnswer
+        );
+        assert_eq!(
+            keys.own_host_answer(REFEREE, &kid_of(71)).await,
+            OwnHostAnswer::CannotAnswer
+        );
+        // The window is the referee's, whichever kid is asked.
+        assert_eq!(
+            keys.own_host_answer(REFEREE, &kid_of(72)).await,
+            OwnHostAnswer::CannotAnswer
+        );
+        assert_eq!(
+            keys.held_own_host_answer(REFEREE, &kid_of(72)),
+            Some(OwnHostAnswer::CannotAnswer)
+        );
+        assert_eq!(site.hits(), 1, "not read again inside the window");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(keys.held_own_host_answer(REFEREE, &kid_of(71)), None);
+        *site.status.lock() = None;
+        site.list(&[(71, None, None)]);
+        assert_eq!(
+            keys.own_host_answer(REFEREE, &kid_of(71)).await,
+            listed(71, None)
+        );
+        assert_eq!(site.hits(), 2, "read again after it");
+    }
+
+    #[tokio::test]
+    async fn ten_concurrent_asks_make_one_read() {
+        let site = referee_site().await;
+        site.list(&[(71, None, None)]);
+        *site.delay.lock() = Duration::from_millis(100);
+        let keys = Arc::new(referee_lookup(&site, HOUR));
+        for (kid, answer) in [
+            (kid_of(71), listed(71, None)),
+            (kid_of(77), OwnHostAnswer::NotListed),
+        ] {
+            let before = site.hits();
+            let asks: Vec<_> = (0..10)
+                .map(|_| {
+                    let (keys, kid) = (keys.clone(), kid.clone());
+                    tokio::spawn(async move { keys.own_host_answer(REFEREE, &kid).await })
+                })
+                .collect();
+            for ask in asks {
+                assert_eq!(ask.await.unwrap(), answer);
+            }
+            assert_eq!(site.hits(), before + 1, "one read for ten asks");
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_asks_share_a_failed_read() {
+        let site = referee_site().await;
+        *site.status.lock() = Some(503);
+        *site.delay.lock() = Duration::from_millis(100);
+        let keys = Arc::new(referee_lookup(&site, HOUR));
+        let asks: Vec<_> = (0..10)
+            .map(|_| {
+                let keys = keys.clone();
+                tokio::spawn(async move { keys.own_host_answer(REFEREE, &kid_of(71)).await })
+            })
+            .collect();
+        for ask in asks {
+            assert_eq!(ask.await.unwrap(), OwnHostAnswer::CannotAnswer);
+        }
+        assert_eq!(site.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_old_servers_single_key_answer_lists_that_key() {
+        let site = referee_site().await;
+        *site.body.lock() = json!({
+            "did": REFEREE,
+            "algorithm": "ed25519",
+            "public_key": URL_SAFE_NO_PAD.encode(raw(78)),
+            "encoding": "base64url",
+            "source": "key-store",
+        });
+        let keys = referee_lookup(&site, HOUR);
+        assert_eq!(
+            keys.own_host_answer(REFEREE, &kid_of(78)).await,
+            listed(78, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_that_never_answers_cannot_answer_within_the_wait() {
+        let site = referee_site().await;
+        *site.delay.lock() = Duration::from_secs(30);
+        let keys = referee_lookup(&site, HOUR).with_own_host_wait(Duration::from_millis(200));
+        let asked = tokio::time::timeout(
+            Duration::from_secs(5),
+            keys.own_host_answer(REFEREE, &kid_of(71)),
+        )
+        .await
+        .expect("the read is bounded");
+        assert_eq!(asked, OwnHostAnswer::CannotAnswer);
+    }
+
+    /// A referee's site answering with a redirect is not followed: the
+    /// read is of the site checked, and no other.
+    #[tokio::test]
+    async fn a_redirect_from_the_referees_site_is_not_followed() {
+        let elsewhere = referee_site().await;
+        elsewhere.list(&[(71, None, None)]);
+        let target = format!("{}/api/v1/signing-keys/{REFEREE}", elsewhere.base);
+        let router = axum::Router::new().route(
+            "/api/v1/signing-keys/{did}",
+            get(move || {
+                let target = target.clone();
+                async move { axum::response::Redirect::temporary(&target) }
+            }),
+        );
+        let hits: Arc<AtomicUsize> = Default::default();
+        let site = serve(router, hits).await;
+        let reader = RecordReader::new(
+            DidResolver::static_map(HashMap::new()),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        );
+        let base = site.base.clone();
+        let keys = KeyLookup::new(reader, None, HOUR).with_own_host_base(move |_| base.clone());
+        assert_eq!(
+            keys.own_host_answer(REFEREE, &kid_of(71)).await,
+            OwnHostAnswer::CannotAnswer
+        );
+        assert_eq!(elsewhere.hits(), 0, "the redirect was not followed");
+    }
+
+    /// Hands out a plain client and counts every request it is asked for.
+    struct CountingClients(Arc<AtomicUsize>);
+
+    impl freeq_oauth::ClientProvider for CountingClients {
+        async fn client_for(&self, _url: &str) -> anyhow::Result<reqwest::Client> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(reqwest::Client::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_that_is_not_a_plain_public_host_asks_nothing() {
+        let site = referee_site().await;
+        let keys = referee_lookup(&site, HOUR);
+        for did in [
+            "did:web:referee.example%3A8443",
+            "did:web:referee.example:people:bot",
+            "did:web:",
+            "did:plc:k2n3e2vsihf3farequ44t5j7",
+        ] {
+            assert_eq!(
+                keys.own_host_answer(did, &kid_of(71)).await,
+                OwnHostAnswer::CannotAnswer,
+                "{did}"
+            );
+            assert_eq!(
+                keys.held_own_host_answer(did, &kid_of(71)),
+                Some(OwnHostAnswer::CannotAnswer),
+                "{did}"
+            );
+        }
+        assert_eq!(site.hits(), 0);
+        // Without the test base, the host is checked before any request.
+        let requests: Arc<AtomicUsize> = Default::default();
+        let reader = RecordReader::new(
+            DidResolver::static_map(HashMap::new()),
+            CountingClients(requests.clone()),
+        );
+        let keys = KeyLookup::new(reader, None, HOUR);
+        for did in ["did:web:localhost", "did:web:127.0.0.1", "did:web:10.0.0.1"] {
+            assert_eq!(
+                keys.own_host_answer(did, &kid_of(71)).await,
+                OwnHostAnswer::CannotAnswer,
+                "{did}"
+            );
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 0, "nothing was asked");
+    }
+
+    #[test]
+    fn the_referees_held_are_bounded_and_one_being_read_stays() {
+        let now = tokio::time::Instant::now();
+        let mut held: HashMap<String, RefereeKeys> = HashMap::new();
+        for n in 0..10u64 {
+            held.insert(
+                format!("did:web:r{n}.example"),
+                RefereeKeys {
+                    used: Some(now - Duration::from_secs(100 - n)),
+                    ..Default::default()
+                },
+            );
+        }
+        held.get_mut("did:web:r0.example").unwrap().reading =
+            Some(Arc::new(tokio::sync::OnceCell::new()));
+        bound_referees(&mut held, 5);
+        assert_eq!(held.len(), 5);
+        assert!(
+            held.contains_key("did:web:r0.example"),
+            "a read in flight stays"
+        );
+        for n in 6..10u64 {
+            assert!(held.contains_key(&format!("did:web:r{n}.example")));
+        }
     }
 }

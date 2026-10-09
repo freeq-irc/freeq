@@ -150,11 +150,27 @@ impl From<crate::sigtag::SigError> for ActSigError {
 }
 
 /// Strip the client-tag vendor prefix from a tag name, if present.
-fn stripped_name(tag_name: &str) -> &str {
+pub(crate) fn stripped_name(tag_name: &str) -> &str {
     tag_name
         .strip_prefix(CLIENT_TAG_PREFIX)
         .or_else(|| tag_name.strip_prefix(TAG_PREFIX))
         .unwrap_or(tag_name)
+}
+
+/// An act field a line carries under more than one spelling (`+freeq.at/x`,
+/// `freeq.at/x`, `x`): the canonical keeps only one of them, and which one
+/// depends on the order the tags are read in, so such a line has no single
+/// document. `None` when every act field is spelled once.
+pub fn repeated_field<'a, I>(tags: I) -> Option<String>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let mut seen = std::collections::BTreeSet::new();
+    tags.into_iter()
+        .filter(|(name, _)| is_act_tag(name))
+        .map(|(name, _)| stripped_name(name))
+        .find(|field| !seen.insert(*field))
+        .map(str::to_string)
 }
 
 /// Whether a (possibly prefixed) tag name is covered by the act canonical.
@@ -454,6 +470,26 @@ mod tests {
 
     fn test_key(byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[byte; 32])
+    }
+
+    /// A field under two of its three spellings is named; spelled once
+    /// each, nothing is.
+    #[test]
+    fn a_field_under_two_spellings_is_found() {
+        let once = [
+            ("+freeq.at/act", "handoff"),
+            ("act-home", "did:web:a"),
+            ("+freeq.at/from", "x"),
+        ];
+        assert_eq!(repeated_field(once), None);
+        for other in ["+freeq.at/act-home", "freeq.at/act-home"] {
+            let twice = [("act-home", "did:web:a"), (other, "did:web:b")];
+            assert_eq!(
+                repeated_field(twice).as_deref(),
+                Some("act-home"),
+                "{other}"
+            );
+        }
     }
 
     /// The venue and the signer-minted event id of the directed-offer vector.
@@ -1204,6 +1240,63 @@ mod tests {
                 ],
                 target: "#swarm",
                 id: "01JFORFEITEVENTID000000000",
+            },
+            Case {
+                // An opener naming its referee: the server it was posted on,
+                // by the `did:web:` name that server signs its rulings under.
+                name: "offer-naming-its-home",
+                seed: 19,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "offer"),
+                    ("+freeq.at/from", "did:plc:eliza"),
+                    ("+freeq.at/act-title", "Triage the overnight alerts"),
+                    ("+freeq.at/act-home", "did:web:irc.example"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JHOMEOFFEREVENTID0000000",
+            },
+            Case {
+                // The home's rulings on one task are numbered in one sequence:
+                // a receipt, an expiry and a closed review window alike.
+                name: "receipt-numbered",
+                seed: 5,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "confirm"),
+                    ("+freeq.at/from", "did:web:irc.example"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                    ("+freeq.at/act-subject", "01JACCEPTEVENTID0000000000"),
+                    ("+freeq.at/act-seq", "1"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JCONFIRMSEQEVENTID000000",
+            },
+            Case {
+                name: "expire-numbered",
+                seed: 5,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "expire"),
+                    ("+freeq.at/from", "did:web:irc.example"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                    ("+freeq.at/act-seq", "2"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JEXPIRESEQEVENTID0000000",
+            },
+            Case {
+                name: "review-timeout-accept-numbered",
+                seed: 5,
+                tags: vec![
+                    ("+freeq.at/act", "bounty"),
+                    ("+freeq.at/act-verb", "auto-accept"),
+                    ("+freeq.at/from", "did:web:irc.example"),
+                    ("+freeq.at/act-id", BOUNTY_ID),
+                    ("+freeq.at/act-seq", "3"),
+                ],
+                target: "#swarm",
+                id: "01JAUTOACCEPTSEQEVENTID000",
             },
         ]
     }

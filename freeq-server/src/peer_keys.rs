@@ -54,6 +54,20 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 static LOOKUPS: LazyLock<Mutex<HashMap<(String, String), Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// `did:web:` host names pointed at a loopback stub, for tests. Any other
+/// host is pointed at a closed port, so no test asks the network.
+#[cfg(test)]
+static OWN_HOST_BASES: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Point `host`'s own key routes at `base`, for tests.
+#[cfg(test)]
+pub(crate) fn point_own_host_at(host: &str, base: &str) {
+    OWN_HOST_BASES
+        .lock()
+        .insert(host.to_string(), base.to_string());
+}
+
 /// How many times the batch key route asked `key_for` about a DID (tests).
 #[cfg(test)]
 static DOCUMENT_FETCHES: LazyLock<Mutex<HashMap<String, usize>>> =
@@ -100,7 +114,19 @@ pub(crate) fn key_lookup(
         .on_checked_proof(move |did, collection, rkey, cid, repo_key, car| {
             cache.keep_proof(did, collection, rkey, cid, repo_key, car)
         });
-    KeyLookup::new(reader, None, Duration::from_secs(ttl_secs))
+    // A ruling's referee whose site could not answer is asked again after
+    // the same while a missed key is.
+    let lookup = KeyLookup::new(reader, None, Duration::from_secs(ttl_secs))
+        .with_cannot_answer_for(Duration::from_secs(ttl_secs));
+    #[cfg(test)]
+    let lookup = lookup.with_own_host_base(|host| {
+        OWN_HOST_BASES
+            .lock()
+            .get(host)
+            .cloned()
+            .unwrap_or_else(|| "http://127.0.0.1:9".to_string())
+    });
+    lookup
 }
 
 /// The client provider for the running server's record lookups.
@@ -181,7 +207,15 @@ pub fn fetch_on_miss(state: &Arc<SharedState>, origin: &str, did: &str, sig_tag:
             "No key server configured for this peer (--s2s-peer-api); only the signer's records are asked"
         );
     }
-    start_lookup(state, bases, did, kid);
+    start_lookup(state, bases, did, kid, false);
+}
+
+/// Ask a ruling's referee's own site about `kid` (`KeyLookup::own_host_answer`),
+/// for the ruling check only, and once it has answered — whatever it said —
+/// judge again what is parked on the pair. One ask per pair at a time,
+/// through the same gate as every key lookup. Returns immediately.
+pub(crate) fn ask_own_host(state: &Arc<SharedState>, did: &str, kid: &str) {
+    start_lookup(state, Vec::new(), did, kid, true);
 }
 
 /// Ask a peer's key server again for a key that task events are parked on.
@@ -203,7 +237,7 @@ pub fn fetch_again(state: &Arc<SharedState>, origin: &str, did: &str, kid: &str)
     // The record lookup's remembered miss goes too, so the signer's records
     // are read again rather than answered from the cache.
     state.key_lookup.forget(did, kid);
-    start_lookup(state, bases, did, kid);
+    start_lookup(state, bases, did, kid, false);
 }
 
 /// Look up a key without knowing which peer the signer belongs to.
@@ -221,13 +255,25 @@ pub fn fetch_from_any_peer(state: &Arc<SharedState>, did: &str, sig_tag: &str) {
     let bases: Vec<(String, String)> = parse_peer_api_config(&state.config.s2s_peer_api)
         .into_iter()
         .collect();
-    start_lookup(state, bases, did, kid);
+    start_lookup(state, bases, did, kid, false);
 }
 
 /// One lookup for `kid`: the signer's own records first, then `bases`, each
-/// a peer's endpoint id and its key server, in turn.
-fn start_lookup(state: &Arc<SharedState>, bases: Vec<(String, String)>, did: &str, kid: &str) {
-    let entry = (did.to_string(), kid.to_string());
+/// a peer's endpoint id and its key server, in turn. With `own_host`, the
+/// question a ruling's check asks instead: what the signer's own site lists
+/// ([`ask_own_host`]); it shares the gate under its own entry, so a key
+/// lookup for the same pair neither blocks it nor is blocked by it.
+fn start_lookup(
+    state: &Arc<SharedState>,
+    bases: Vec<(String, String)>,
+    did: &str,
+    kid: &str,
+    own_host: bool,
+) {
+    let entry = match own_host {
+        true => (format!("{did} own-host"), kid.to_string()),
+        false => (did.to_string(), kid.to_string()),
+    };
     {
         // How long a fruitless lookup is remembered: an unreachable key server
         // is asked once a window rather than once per message.
@@ -241,8 +287,18 @@ fn start_lookup(state: &Arc<SharedState>, bases: Vec<(String, String)>, did: &st
     }
 
     let state = state.clone();
+    let (did, kid) = (did.to_string(), kid.to_string());
     tokio::spawn(async move {
-        let (did, kid) = entry;
+        if own_host {
+            let answer = state.key_lookup.own_host_answer(&did, &kid).await;
+            tracing::info!(
+                did = %did, kid = %kid, answer = ?answer,
+                "Asked a ruling's referee what its own site lists for this key"
+            );
+            // Whatever it said, what waits on it can be judged now.
+            lookup_settled(&state, &entry, &did, &kid, Some(answer));
+            return;
+        }
         match state.key_lookup.key_for(&did, &kid).await {
             Ok(Some(found)) => {
                 file_found(&state, &did, &kid, &found);
@@ -327,6 +383,7 @@ fn file_found(
         KeySource::IdentityRecord => "identity-record",
         KeySource::DidDocument => "did-document",
         KeySource::OriginServer => "origin-server",
+        KeySource::DidKey => "did-key",
     };
     let now = chrono::Utc::now().timestamp();
     let (dates, retired_at) = match found.source {
@@ -343,8 +400,10 @@ fn file_found(
                 .retired_at
                 .filter(|at| found.expires_at.is_none_or(|exp| *at < exp)),
         ),
-        // Its own document's key: its owner rotates it.
-        KeySource::DidDocument => (
+        // Its own document's key: its owner rotates it. A did:key is its
+        // key, read from the DID by the lookup (`did_key_answer`), and has
+        // no expiry (ruling 20).
+        KeySource::DidDocument | KeySource::DidKey => (
             KeyDates {
                 registered_at: now,
                 expires_at: None,
@@ -456,12 +515,24 @@ pub(crate) fn key_landed(
     if let Some(retired_at) = retired_at {
         state.with_db(|db| db.retire_signing_key(did, kid, retired_at));
     }
-    LOOKUPS.lock().remove(&(did.to_string(), kid.to_string()));
     tracing::info!(did = %did, kid = %kid, source = %source, "Fetched a signing key");
-    // This lookup was started because something could not be checked without
-    // the key. Whatever is parked on it can be judged now, which is what makes
-    // deferring a delay rather than a loss.
-    crate::server::retry_deferred_task_events(state, did, kid);
+    lookup_settled(state, &(did.to_string(), kid.to_string()), did, kid, None);
+}
+
+/// A lookup has its answer: its gate entry goes, and whatever is parked on the
+/// pair is judged again, with the referee's own-site answer when that is
+/// what was asked. The lookup was started because something could not be
+/// checked without it, and this is what makes deferring a delay rather than
+/// a loss.
+fn lookup_settled(
+    state: &Arc<SharedState>,
+    entry: &(String, String),
+    did: &str,
+    kid: &str,
+    referee_answer: Option<freeq_sdk::key_lookup::OwnHostAnswer>,
+) {
+    LOOKUPS.lock().remove(entry);
+    crate::server::retry_deferred_task_events_with(state, did, kid, referee_answer);
 }
 
 /// The dates a peer's copy of a key is filed with. A key its own did:web host
@@ -1357,6 +1428,38 @@ mod tests {
             source_of(&state, did, &kid).as_deref(),
             Some("identity-record")
         );
+        assert_eq!(peer_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A relayed line signed by a did:key bot with the key its DID names:
+    /// the key is read from the DID, filed under "did-key", and no peer is
+    /// asked for it.
+    #[tokio::test]
+    async fn a_did_key_signers_own_key_is_read_from_the_did_before_any_peer() {
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let pubkey = *key.verifying_key().as_bytes();
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let did = format!(
+            "did:key:{}",
+            freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&key.to_bytes())
+                .unwrap()
+                .public_key_multibase()
+        );
+        let (base, peer_hits) = counting_key_server(Some(pubkey)).await;
+        let state = state_with(
+            &base,
+            freeq_sdk::did::DidResolver::static_map(std::collections::HashMap::new()),
+        );
+
+        fetch_on_miss(
+            &state,
+            PEER,
+            &did,
+            &freeq_sdk::sigtag::sign_canonical("{}", &key),
+        );
+
+        assert_eq!(wait_for_key(&state, &did, &kid).await, Some(pubkey));
+        assert_eq!(source_of(&state, &did, &kid).as_deref(), Some("did-key"));
         assert_eq!(peer_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 

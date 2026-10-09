@@ -291,6 +291,91 @@ describe("AgentRuntime: handoffs", () => {
     expect(rt.workTask).toBe("01JB");
   });
 
+  it("checks a ruling the SDK could not check itself, as before", async () => {
+    const { bot } = await started({ trust: { "did:plc:boss": "handoff" } });
+    bot.emit("actEvent", act("offer", "01JR", {}, { "act-to": "did:key:zSelf", "act-title": "t", "act-home": "did:web:irc.test" }));
+    await tick();
+    fetched.length = 0;
+    // A failing one never reaches the kit: bot-kit drops it.
+    bot.emit("actEvent", act("expire", "01JR", { did: "did:web:irc.test", from: "irc.test", eventId: "01JR-expire-2", ruling: "cannot-check" }));
+    await tick();
+    expect(fetched.some((u) => u.includes("/api/v1/signing-key"))).toBe(true);
+  });
+
+  it("does not apply a ruling it checks itself whose key stopped counting before it was signed", async () => {
+    const { generateDidKey } = await import("@freeq/sdk");
+    const { signActTags, deriveKid, publicKeyFromMultibase } = await import("@freeq/bot-kit");
+    const SERVER = "did:web:irc.test";
+    // An id minted at `ms`: its first ten characters are the time.
+    const idAt = (ms: number, tail: string) => {
+      const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+      let time = "";
+      for (let i = 0, t = ms; i < 10; i++, t = Math.floor(t / 32)) time = crockford[t % 32] + time;
+      return `${time}${tail.padStart(16, "0")}`;
+    };
+    const signedAt = 1_700_000_000_000;
+    // Each key's removal date, by kid, in unix seconds.
+    const removedAt = new Map<string, number>();
+    const keys = new Map<string, Uint8Array>();
+    const prior = globalThis.fetch;
+    vi.stubGlobal("fetch", async (url: string) => {
+      const u = new URL(String(url));
+      if (u.pathname === "/api/v1/signing-key") return Response.json({ did: SERVER });
+      const kid = decodeURIComponent(u.pathname.split("/").pop() ?? "");
+      const key = keys.get(kid);
+      if (!u.pathname.startsWith(`/api/v1/signing-keys/${encodeURIComponent(SERVER)}/`) || !key) {
+        return new Response(null, { status: 404 });
+      }
+      return Response.json({
+        algorithm: "ed25519",
+        public_key: Buffer.from(key).toString("base64url"),
+        removed_at: removedAt.get(kid) ?? null,
+        expires_at: null,
+      });
+    });
+    try {
+      const { bot, rt } = await started({ trust: { "did:plc:boss": "handoff" } });
+      const outcome = async (task: string, removed: number) => {
+        bot.emit("actEvent", act("offer", task, {}, { "act-to": "did:plc:other", "act-title": "t", "act-home": SERVER }));
+        await tick();
+        const key = await generateDidKey();
+        const raw = publicKeyFromMultibase(key.publicKeyMultibase);
+        const kid = await deriveKid(raw);
+        keys.set(kid, raw);
+        removedAt.set(kid, removed);
+        const eventId = idAt(signedAt, String(removed));
+        const tags = {
+          "+freeq.at/act": "handoff",
+          "+freeq.at/act-verb": "expire",
+          "+freeq.at/from": SERVER,
+          "+freeq.at/act-id": task,
+        };
+        const sigTag = (await signActTags(tags, "#work", eventId, key))!;
+        bot.emit(
+          "actEvent",
+          act("expire", task, { did: SERVER, from: "irc.test", eventId, tags, sigTag, ruling: "cannot-check" }),
+        );
+        for (let i = 0; i < 50 && rt.handoffs?.get(task)?.state !== "expired"; i++) await tick();
+        return rt.handoffs?.get(task)?.state;
+      };
+      expect(await outcome("01JRBEFORE", signedAt / 1000 + 60), "removed after it was signed").toBe("expired");
+      expect(await outcome("01JRAFTER", signedAt / 1000 - 60), "removed before it was signed").toBe("offered");
+    } finally {
+      vi.stubGlobal("fetch", prior);
+    }
+  });
+
+  it("applies a ruling the SDK found counts from the task's referee on another server, with no check of its own", async () => {
+    const { bot, rt } = await started({ trust: { "did:plc:boss": "handoff" } });
+    bot.emit("actEvent", act("offer", "01JC", {}, { "act-to": "did:plc:other", "act-title": "t", "act-home": "did:web:referee.test" }));
+    await tick();
+    fetched.length = 0;
+    bot.emit("actEvent", act("expire", "01JC", { did: "did:web:referee.test", from: "referee.test", eventId: "01JC-expire", ruling: "counts" }));
+    for (let i = 0; i < 50 && rt.handoffs?.get("01JC")?.state !== "expired"; i++) await tick();
+    expect(rt.handoffs?.get("01JC")?.state).toBe("expired");
+    expect(fetched.filter((u) => u.includes("/api/v1/signing-keys/")), "no key fetched by the kit").toEqual([]);
+  });
+
   it("queues a trusted offer while busy", async () => {
     const { bot, delivered, rt, setIdle } = await started({ trust: { "did:plc:boss": "handoff" } });
     setIdle(false);

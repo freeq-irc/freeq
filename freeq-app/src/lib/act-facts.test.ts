@@ -105,6 +105,9 @@ describe('the unlabelled fields', () => {
       'act-pay-to': 'p2', 'act-tx': 'tx', 'act-replaces': 'r', 'act-scope': 'sc',
     })).toEqual([]);
   });
+  it('the referee an opener names and a ruling\'s number are never drawn', () => {
+    expect(unknownFields({ 'act-home': 'did:web:irc.example', 'act-seq': '3' })).toEqual([]);
+  });
   it('non-act tags are not its business', () => {
     expect(unknownFields({ msgid: 'X', 'act-mystery': 'y' })).toEqual([['mystery', 'y']]);
   });

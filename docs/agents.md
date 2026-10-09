@@ -168,6 +168,8 @@ The server files coordination events without interpreting them — the type and 
 
 **A task's history contains an event nobody sent.** The server that owns a task appends a `confirm` of its own — signed under its `did:web:` name, naming the event it confirms, and carrying nothing else. It is the record of an ordering decision, not a step in the lifecycle: no kind's table lists it, sending one draws `FAIL TAGMSG WRONG_SENDER :Only the action's home confirms it`, and a client rendering a task should read it as "this is the move that stood" rather than as another transition on the card.
 
+An opener naming another server in `act-home` draws `FAIL TAGMSG WRONG_HOME :A task opened here must name this server as its home`; the SDKs fill `act-home` in for you. A task message carrying one task tag under two of its prefixes (for example both `+freeq.at/act-home` and `act-home`) draws `FAIL TAGMSG REPEATED_TAG :A task message must carry each task tag only once`.
+
 **A direct message with a guest cannot carry tasks.** A task message must be signed, and a DM's signature names the conversation by its two DIDs. A guest has no DID, so there is no conversation name to sign — no task message can ever be valid there. Sending one draws `FAIL TAGMSG INVALID_TARGET :A task in a direct conversation needs both people to have accounts`. Tasks in a DM need both people logged in; in a channel, guests see the human-readable companion lines like anyone else.
 
 **A task from another server is a task here too.** Task messages relay across servers intact — signature and all — and the receiving server checks the signature itself, stores the event, and serves the task. A task is decided only on the server it was created on. A move you make on a task created elsewhere — a claim, an accept, a completion — is filed here as `unconfirmed`, carried to that server, and confirmed when its `confirm` comes back; until then the task's history shows the move as unconfirmed and its state does not change. Expiry and `confirm` events reach every server that speaks task events. An event whose signer's key this server cannot fetch yet waits rather than being refused; if it is dropped before the key arrives, the task's `dropped_unchecked` count says so. Acting on a task whose opener never reached this server still draws `FAIL TAGMSG UNKNOWN_TASK :That task is not on file`.
@@ -1183,8 +1185,9 @@ await bot.client.sendAct(
   { humanText: 'shipped it' },                           // '' for no line at all
 );
 
-// Hearing them: every task event in a channel we are in, live or replayed
-bot.client.on('actEvent', (e) => {
+// Hearing them: every task event in a channel we are in, live or replayed.
+// A ruling that fails its referee check never reaches a bot.
+bot.on('actEvent', (e) => {
   console.log(e.verb, 'on', e.taskId, 'by', e.did, e.fields['act-note']);
 });
 

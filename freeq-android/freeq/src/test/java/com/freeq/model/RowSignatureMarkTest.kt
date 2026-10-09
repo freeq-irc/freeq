@@ -24,6 +24,17 @@ class RowSignatureMarkTest {
         )
     }
 
+    @Test fun a_did_key_device_key_wears_the_lock_at_full_strength_and_groups_with_a_published_one() {
+        val didKey = verdict(VerdictState.DEVICE, KeyLayer.DID_KEY)
+        assertEquals(RowSignatureMark.Lock(1f), RowSignatureMark.of(didKey))
+        assertFalse(
+            RowSignatureMark.startsHeader(
+                RowSignatureMark.settled(verdict(VerdictState.DEVICE, KeyLayer.PUBLISHED)),
+                RowSignatureMark.settled(didKey),
+            ),
+        )
+    }
+
     @Test fun a_vouched_device_key_wears_the_lock_at_30_percent() {
         assertEquals(
             RowSignatureMark.Lock(0.3f),

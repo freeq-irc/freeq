@@ -190,6 +190,10 @@ export interface FreeqClientOptions {
    *  Unset: no verdicts. */
   keyLookup?: KeyLookup;
 
+  /** With a `keyLookup`, false puts no verdict on received lines and checks
+   *  only whether a ruling counts (a task event's `ruling`). Default true. */
+  checkLines?: boolean;
+
   /** Policy on 433 ERR_NICKNAMEINUSE during registration:
    *   - `'refuse'` (default for new code): emit `authError` and disconnect.
    *   - `'auto-suffix'`: append `_` until accepted (legacy SDK behavior).
@@ -250,6 +254,12 @@ export interface Batch {
     tags: Record<string, string>;
     verdict?: import('./verdict.js').Verdict;
   }>;
+  /**
+   * Settled when this batch closes, or cut when the connection ends with it
+   * open: a ruling read inside it, and the task events behind one, wait on
+   * it; a cut batch's are dropped, for the replay to bring back.
+   */
+  actsSettled?: { promise: Promise<'closed' | 'cut'>; settle: (state: 'closed' | 'cut') => void };
 }
 
 // ── Agent-native types ─────────────────────────────────────────────────────
@@ -358,8 +368,86 @@ export interface ActEventPayload {
   /** True when this arrived from history rather than live — a replayed line
    *  carries the server's `time` tag. */
   replayed: boolean;
-  /** Same as `Message.verdict`. */
+  /** Same as `Message.verdict`. A ruling goes up once its check has settled,
+   *  or its wait ran out, with the verdict settled by then; any other task
+   *  event goes up with the verdict it was delivered with, and a pending
+   *  one's `verdict` event follows it. */
   verdict?: Verdict;
+  /** For a ruling, when the client checks signatures, whether it counts:
+   *  `counts`, or `cannot-check` when its referee is known but its site did
+   *  not answer in time; never `fails`, since a ruling that fails its check
+   *  never fires `actEvent`, nor does one whose referee the client cannot
+   *  know (its task's opening post missing, uncheckable, or trusted only
+   *  through the server); absent for any other event. */
+  ruling?: import('./verdict.js').RulingCheck;
+}
+
+/** One event of a task's history as `/api/v1/actions/{id}` serves it. */
+export interface TaskHistoryEvent {
+  event_id: string;
+  /** The document its signature covers. */
+  canonical: string;
+  signature?: string | null;
+  actor_did?: string;
+  venue?: string;
+  confirm_state?: string | null;
+  timestamp: number;
+  [field: string]: unknown;
+}
+
+/** A task's history as the connected server answers
+ *  `GET /api/v1/actions/{id}`, every field it sent, with each ruling that
+ *  fails its referee check left out of `events` (`FreeqClient.taskHistory`). */
+export interface TaskHistory {
+  act_id: string;
+  venue?: string;
+  task?: unknown;
+  events: TaskHistoryEvent[];
+  [field: string]: unknown;
+}
+
+/** A signed document a channel's audit sends beside its rows: the receipt
+ *  riding on a task step, or a task's opener. */
+export interface ChannelAuditDocument {
+  event_id: string;
+  /** The document its signature covers; absent from an older server. */
+  canonical?: string;
+  signature?: string | null;
+  timestamp?: number;
+  [field: string]: unknown;
+}
+
+/** One row of a channel's audit as `/api/v1/channels/{name}/audit` serves
+ *  it: a coordination event, a governance entry, or a task step. */
+export interface ChannelAuditRow {
+  timestamp: number;
+  category: string;
+  event: string;
+  actor_did?: string;
+  actor_name?: string;
+  details?: Record<string, unknown> & {
+    act_id?: string;
+    confirm_state?: string;
+    receipt?: ChannelAuditDocument;
+  };
+  signature?: string | null;
+  /** On a task step, the document its signature covers; absent from an
+   *  older server. */
+  canonical?: string;
+  event_id?: string;
+  [field: string]: unknown;
+}
+
+/** A channel's audit as the server answers it, every field it sent, with
+ *  the task steps marked ignored and the rulings failing their referee
+ *  check left out (`FreeqClient.channelAudit`). */
+export interface ChannelAudit {
+  channel: string;
+  timeline: ChannelAuditRow[];
+  /** The opener of every task with a row in `timeline`; absent from an
+   *  older server. */
+  openers?: ChannelAuditDocument[];
+  [field: string]: unknown;
 }
 
 /** Payload of the `spend` event — SPEND wire command relayed by the server. */

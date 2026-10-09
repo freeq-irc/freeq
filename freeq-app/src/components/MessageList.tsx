@@ -775,13 +775,19 @@ function ReplyBadge({ msgId }: { msgId: string }) {
 
 // ── Message grouping ──
 
+/** Whether a device verdict's key has the full lock: published in the
+ *  sender's account, or their did:key DID itself. */
+function fullLock(verdict: Verdict): boolean {
+  return verdict.layer === 'published' || verdict.layer === 'did-key';
+}
+
 /** A row's signature mark, for grouping; null while its check is still out. */
 type RowMarkKind = 'lock' | 'dim-lock' | 'warning' | 'none';
 
 function rowMarkKind(verdict: Verdict | undefined): RowMarkKind | null {
   if (!verdict || verdict.state === 'pending') return null;
   if (verdict.state === 'invalid' || verdict.state === 'retired') return 'warning';
-  if (verdict.state === 'device') return verdict.layer === 'published' ? 'lock' : 'dim-lock';
+  if (verdict.state === 'device') return fullLock(verdict) ? 'lock' : 'dim-lock';
   return 'none';
 }
 
@@ -1189,11 +1195,12 @@ function InvalidSigMark({ verdict, onOpen }: { verdict?: Verdict; onOpen: OpenPr
 
 /**
  * The lock, when the sender's own device signed: at full strength once their
- * account publishes the key, at 30% while only their server vouches for it.
- * The title sits on the faded element itself, so the hover text is not faded.
+ * account publishes the key, or when the key is their did:key DID itself; at
+ * 30% while only their server vouches for it. The title sits on the faded
+ * element itself, so the hover text is not faded.
  */
 function SignedMark({ verdict, onOpen }: { verdict: Verdict; onOpen: OpenProof }) {
-  const published = verdict.layer === 'published';
+  const published = fullLock(verdict);
   return (
     <button
       type="button"

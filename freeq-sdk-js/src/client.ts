@@ -16,13 +16,27 @@ import { dmPeerKey, isDid } from './address.js';
 import { prefetchProfiles } from './profiles.js';
 import { recordKeyOf, type DeviceKeyStore, type StoredDeviceKey } from './device-key.js';
 import { KEY_LIFETIME_MS, buildDeviceRecord, deviceKeyHistory } from './identity-records.js';
-import { KeyLookup, type KeyPair, makeDidResolver } from './key-lookup.js';
-import { SignatureChecker, firstLook, originServerDid, sigTagKid, type Verdict } from './verdict.js';
+import { KeyLookup, type KeyPair, didKeyAnswer, makeDidResolver } from './key-lookup.js';
+import {
+  RULING_VERBS,
+  type RulingCheck,
+  SignatureChecker,
+  actVenue,
+  type FirstLook,
+  firstLook,
+  originServerDid,
+  rulingAgainst,
+  sigTagKid,
+  type Line,
+  type Signed,
+  type Verdict,
+} from './verdict.js';
 import type {
   IRCMessage, Message, Member, AvSession, AvParticipant,
   FreeqClientOptions, SaslCredentials, Batch, TransportState,
   PinnedMessage, WhoisInfo, HistoryOptions, HistoryBatchInfo, EmitEventOptions,
   HeartbeatHandle, GovernanceSignal, CoordinationEventPayload, ActEventPayload,
+  TaskHistory, ChannelAudit, ChannelAuditRow,
 } from './types.js';
 import { log } from "./log.js";
 
@@ -125,6 +139,241 @@ function warnDeprecated(helper: string): void {
 
 const ACT_EVENT_DEDUPE_MS = 10 * 60_000;
 
+/** How long a ruling waits for its verdict and its check before it goes up
+ *  with what it has, once its history batch, if it came in one, has closed. */
+export const RULING_WAIT_MS = 15_000;
+
+/**
+ * The longest a ruling's check takes as a whole: its task's history when its
+ * opener was not seen, then the connected server's key set for its own
+ * rulings, or the referee's key list; none of those reads has a time limit
+ * of its own. Shorter than `RULING_WAIT_MS`, so a check that runs out does
+ * so before the ruling's wait does.
+ */
+const RULING_CHECK_WAIT_MS = 10_000;
+
+/** Most tasks whose referee a connection keeps. */
+const TASK_HOMES_HELD = 4096;
+
+/** A task event's task, verb and, for an opener, the referee it names; null
+ *  for a line that is not a task event. An opener carries no `act-id`: its
+ *  own event id is the task's. */
+function actTask(
+  tags: Record<string, string>,
+): { taskId: string; verb: string; opens: boolean; home: string | null } | null {
+  const fields: Record<string, string> = {};
+  for (const [name, value] of Object.entries(tags)) {
+    if (signing.isActTag(name)) fields[signing.strippedTagName(name)] = value;
+  }
+  const eventId = tags[signing.EVENT_ID_TAG] || tags['msgid'] || '';
+  if (Object.keys(fields).length === 0 || !eventId) return null;
+  const taskId = fields['act-id'] || eventId;
+  return {
+    taskId,
+    verb: fields['act-verb'] || '',
+    opens: taskId === eventId,
+    home: fields['act-home'] ?? null,
+  };
+}
+
+/** What a task's opener says about the task's rulings: the referee it names
+ *  (`act-home`), and the venue it was posted to, which a server signs its own
+ *  events about the task for. A fetched copy that does not name the referee
+ *  is kept too, so later rulings on the task read no history: one altered or
+ *  untrusted with what its signature covers and when it was checked, to be
+ *  checked again from those bytes; one missing from the history for the
+ *  connection. Each is its own object, changed in place when checked again.
+ *  Twin of the Rust `TaskOpener`. */
+interface TaskOpener {
+  home: string | null;
+  venue: string | null;
+  /** A fetched copy whose signature contradicts its key: every ruling on the
+   *  task fails, and nothing else it says is read. */
+  altered?: boolean;
+  /** A fetched copy whose key is one only the connected server vouched for,
+   *  the server's own, or found nowhere: the referee cannot be known, and
+   *  every ruling on the task is hidden. */
+  untrusted?: boolean;
+  /** Of an untrusted copy: its key was found nowhere. It waits for the
+   *  lookup's ttl only while the lookup remembers that miss. */
+  keyNotFound?: boolean;
+  /** The task's history the server answered holds no opener: the referee
+   *  cannot be known, and the same server asked again gains nothing. */
+  missing?: boolean;
+  /** When an altered or untrusted copy was last checked, `Date.now()`. */
+  since?: number;
+  /** What an altered or untrusted copy's signature covers, checked again
+   *  once the lookup's ttl has passed since `since`; none for a copy with no
+   *  document or signature that can be read, never checked again. */
+  signed?: Signed;
+}
+
+/** Whether `opener` says who referees its task: a live opener, or a fetched
+ *  copy whose signature checked. */
+function openerChecked(opener: TaskOpener): boolean {
+  return !opener.altered && !opener.untrusted && !opener.missing;
+}
+
+/** What judging a ruling comes to inside the SDK: a `RulingCheck`, or
+ *  `referee-unknown` when the app cannot know the task's referee, because
+ *  its opening post is missing from what it has and could read, is signed
+ *  under a key nobody can find or trusted only through the server, or, in
+ *  a DM, the pair it would have given is unknown. Such a ruling is hidden
+ *  where a failing one is, so only `counts` and `cannot-check` (the referee
+ *  known, its site not answering in time) go up. Twin of the Rust
+ *  `Judgment`. */
+type Judgment = RulingCheck | 'referee-unknown';
+
+/** Whether a ruling is hidden: it fails, or its referee cannot be known. */
+function hiddenRuling(judged: Judgment | undefined): boolean {
+  return judged === 'fails' || judged === 'referee-unknown';
+}
+
+/** What a connection holds about one task's opener: what it says, which
+ *  rejects when it could not be learned; `read`, whether that comes from a
+ *  copy read from the server (true) or a live opener whose signature
+ *  checked (false); `settled`, once `home` has; and, for a read, what gives
+ *  up its request. */
+interface TaskHome {
+  home: Promise<TaskOpener>;
+  read: boolean;
+  settled: boolean;
+  abort?: AbortController;
+}
+
+/**
+ * The standing a verdict gives an opening post: only a device verdict under
+ * a key the connected server cannot fake names a referee, published in the
+ * poster's account or the poster's did:key itself; tasks are not chat, so
+ * one the server only vouched for, and "signed by the server", which is a
+ * chat verdict, leave it untrusted. An invalid, retired or missing
+ * signature, or one whose found key cannot check it (as a ruling's
+ * unreadable signature), contradicts it; one whose key is not found leaves
+ * it untrusted until the key turns up; one still pending is unknown. Twin
+ * of the Rust `opener_standing`.
+ */
+function openerStanding(verdict: Verdict): 'checks' | 'altered' | 'untrusted' | 'key-not-found' | 'unknown' {
+  switch (verdict.state) {
+    case 'device':
+      return verdict.layer === 'published' || verdict.layer === 'did-key' ? 'checks' : 'untrusted';
+    case 'server':
+      return 'untrusted';
+    case 'invalid':
+    case 'retired':
+    case 'unsigned':
+      return 'altered';
+    case 'unverifiable':
+      return verdict.keySource !== undefined ? 'altered' : 'key-not-found';
+    default:
+      return 'unknown';
+  }
+}
+
+/**
+ * A task event in a task's history as its signer signed it, rebuilt from
+ * its stored document and signature the way a server rebuilds the line
+ * (`wire_tags_from_canonical`): its document's fields, and what its
+ * signature covers, null when it carries no signature that can be read.
+ * Undefined when its document cannot be read. Twin of the Rust
+ * `history_act`.
+ */
+function historyAct(event: {
+  canonical?: string | null;
+  signature?: string | null;
+}): { fields: Record<string, unknown>; signed: Signed | null } | undefined {
+  let doc: unknown;
+  try {
+    doc = JSON.parse(event.canonical ?? '');
+  } catch {
+    return undefined;
+  }
+  if (typeof doc !== 'object' || doc === null || Array.isArray(doc)) return undefined;
+  const fields = doc as Record<string, unknown>;
+  return { fields, signed: signedIn(event, fields) };
+}
+
+/**
+ * A ruling in a task's history as its referee signed it (`historyAct`):
+ * undefined when the event is no ruling, or its document cannot be read;
+ * null when it carries no signature that can be read, which fails on a
+ * task that names its referee. Twin of the Rust `history_ruling`.
+ */
+function historyRuling(event: { canonical?: string; signature?: string | null }): Signed | null | undefined {
+  const act = historyAct(event);
+  const verb = act?.fields['act-verb'];
+  if (act === undefined || typeof verb !== 'string' || !RULING_VERBS.has(verb)) return undefined;
+  return act.signed;
+}
+
+/** What a stored task event's signature covers, from its document's
+ *  `fields`; null when it carries no signature that can be read. */
+function signedIn(event: { signature?: string | null }, fields: Record<string, unknown>): Signed | null {
+  const field = (name: string) => (typeof fields[name] === 'string' ? (fields[name] as string) : undefined);
+  const sigTag = typeof event.signature === 'string' ? event.signature : undefined;
+  const kid = sigTag === undefined ? null : sigTagKid(sigTag);
+  const [did, venue, id] = [field('from'), field('target'), field('id')];
+  if (sigTag === undefined || kid === null || !did || !venue || !id) return null;
+  const tags: Record<string, string> = {};
+  for (const [name, value] of Object.entries(fields)) {
+    if (name === 'target' || name === 'id') continue;
+    if (typeof value !== 'string') return null;
+    tags[name === 'from' ? '+freeq.at/from' : `+freeq.at/${name}`] = value;
+  }
+  return { did, kid, sigTag, msgid: id, doc: { kind: 'act', tags, venue, id } };
+}
+
+/**
+ * A ruling as its referee signed it. A server signs its own events about a
+ * DM task for the task's own venue, the pair of the conversation, and sends
+ * them to `*`, so the venue rebuilt from the line (the signer and this
+ * session) is not what was signed. Such a ruling, signed by the task's
+ * referee, is checked under the venue its opener was signed for, when this
+ * session is one of that pair, as a server's `venue_for` does. When that
+ * venue is not known (the opener was not seen and could not be read, does
+ * not say who referees the task, or named no venue), the pair it was signed
+ * for is unknown: it is unverifiable, as a line whose venue cannot be built
+ * is in `firstLook`. Otherwise it is checked as rebuilt. Twin of the Rust
+ * `under_task_venue`.
+ */
+function underTaskVenue(signed: Signed, opener: TaskOpener | undefined, ownDid: string | undefined): FirstLook {
+  if (opener !== undefined && !openerChecked(opener)) opener = undefined;
+  const doc = signed.doc;
+  if (doc.kind !== 'act' || !doc.venue.startsWith('dm:')) return { kind: 'check', signed };
+  // Not the task's referee: checked as rebuilt.
+  if (opener !== undefined && opener.home !== signed.did) return { kind: 'check', signed };
+  const venue = opener?.venue;
+  if (!venue) return { kind: 'unverifiable', kid: signed.kid };
+  if (venue.startsWith('dm:') && ownDid !== undefined && venue.slice('dm:'.length).split(',').includes(ownDid)) {
+    return { kind: 'check', signed: { ...signed, doc: { ...doc, venue } } };
+  }
+  return { kind: 'check', signed };
+}
+
+/** Whether `origin`'s host is the host in the `did:web:` name `did`. */
+function isOwnHostOf(origin: string | null, did: string): boolean {
+  if (origin === null || !did.startsWith('did:web:')) return false;
+  try {
+    return new URL(origin).hostname.toLowerCase() === did.slice('did:web:'.length).toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+/** Whether an opening post's verdict lets it name its task's referee
+ *  (`openerStanding`). */
+function checksOut(verdict: Verdict): boolean {
+  return openerStanding(verdict) === 'checks';
+}
+
+/** A promise and what settles it. */
+function settler<T>(): { promise: Promise<T>; settle: (value: T) => void } {
+  let settle!: (value: T) => void;
+  const promise = new Promise<T>((resolve) => {
+    settle = resolve;
+  });
+  return { promise, settle };
+}
+
 /**
  * How long a task event waits for the server's word before its companion
  * line is sent anyway.
@@ -169,6 +418,14 @@ export class FreeqClient extends EventEmitter {
   private _apiBearer: string | null = null;
   private _connectionState: TransportState = 'disconnected';
   private _registered = false;
+  /** The name the server put in the source of this connection's welcome
+   *  (001): the name it signs under as `did:web:<name>`. Null until the
+   *  welcome, and again once the connection ends. */
+  private _serverName: string | null = null;
+  /** Whether this connection has been welcomed (001), with a server name or
+   *  without one; cleared where `_serverName` is. A task event waits for it,
+   *  not for the name, as the Rust SDK queues it until registration. */
+  private _welcomed = false;
   private opts: FreeqClientOptions;
 
   private ackedCaps = new Set<string>();
@@ -281,6 +538,21 @@ export class FreeqClient extends EventEmitter {
    *  twice — once in JOIN replay and once in the CHATHISTORY it asks for
    *  next. */
   private _seenActEvents = new Map<string, number>();
+  /** Per task, the last task event waiting in line, settled once it has
+   *  gone up (`true`) or been dropped (`false`) (`waitInLine`). Per
+   *  connection. */
+  private actTails = new Map<string, Promise<boolean>>();
+  /** Settled when this connection ends: every ruling still waiting is
+   *  dropped, for the replay to bring back. */
+  private actsEnded = settler<void>();
+  /** What each task's opener named as its referee (`act-home`, null when it
+   *  names none), and its venue, learned from the opener as it arrives or
+   *  read from the task's history, least recently learned first. Per connection, bounded:
+   *  a ruling can arrive any time after its opener, and reading the history
+   *  for every ruling would be a request per ruling. A read that fails is
+   *  not kept. `read` marks a history read, which an opener whose signature
+   *  checks replaces. */
+  private taskHomes = new Map<string, TaskHome>();
 
   constructor(opts: FreeqClientOptions) {
     super();
@@ -310,6 +582,8 @@ export class FreeqClient extends EventEmitter {
 
   /** Whether IRC registration is complete (001 received). */
   get registered(): boolean { return this._registered; }
+  /** The server's own name, from this connection's welcome; null before it. */
+  get serverName(): string | null { return this._serverName; }
 
   /** Set of channels we're currently in (lowercase). */
   get joinedChannels(): ReadonlySet<string> { return this._joinedChannels; }
@@ -384,6 +658,8 @@ export class FreeqClient extends EventEmitter {
     this._authDid = null;
     this._apiBearer = null;
     this._registered = false;
+    this._serverName = null;
+    this._welcomed = false;
     this._saslFailed = false;
     this.ackedCaps.clear();
     this.sasl = null;
@@ -1146,7 +1422,18 @@ export class FreeqClient extends EventEmitter {
 
     // A batch left open when the socket drops never gets its `BATCH -id`.
     // Every report, the second and late ones too; the second finds nothing.
-    if (state === 'disconnected') this.endOpenBatches();
+    // A send waiting behind the key-registration gate is freed too, so a
+    // task event among them fails now, at its turn's connection check,
+    // rather than after the next connection's sign-in.
+    if (state === 'disconnected') {
+      this.endOpenBatches();
+      this.msgSigRegistered();
+    }
+    // A new socket has not been welcomed yet; a dropped one never will be.
+    if (state !== 'connected' || prev !== 'connected') {
+      this._serverName = null;
+      this._welcomed = false;
+    }
 
     if (state === 'connected') {
       this.ackedCaps.clear();
@@ -1156,6 +1443,10 @@ export class FreeqClient extends EventEmitter {
       const lookup = this.opts.keyLookup;
       if (lookup && lookup.originBase() === null) lookup.setDefaultOriginBase(this.serverOrigin);
       this.checker = lookup ? new SignatureChecker(lookup) : null;
+      // Nothing waits into the next connection.
+      this.actTails = new Map();
+      this.actsEnded = settler<void>();
+      this.taskHomes = new Map();
       let registrationSent = false;
 
       const sendRegistration = (token?: string) => {
@@ -1479,6 +1770,7 @@ export class FreeqClient extends EventEmitter {
     tags: Record<string, string>,
     replayed: boolean,
     verdict?: Verdict,
+    ruling?: RulingCheck,
   ): ActEventPayload | undefined {
     const fields: Record<string, string> = {};
     for (const [name, value] of Object.entries(tags)) {
@@ -1519,9 +1811,664 @@ export class FreeqClient extends EventEmitter {
       // on every live line too.
       replayed,
       ...(verdict ? { verdict } : {}),
+      ...(ruling ? { ruling } : {}),
     };
     this.emit('actEvent', payload);
     return payload;
+  }
+
+  /**
+   * Put a task event in line behind the one before it on its task, and emit
+   * it as `ActLine` (Rust) does: a ruling waits for its history batch, if
+   * one is open, to close, then, at most `RULING_WAIT_MS`, for its verdict
+   * and whether it counts; an event behind a ruling waits for it. A ruling
+   * of a batch the connection's end cut off is dropped, as every held event
+   * of such a batch is, and so is every event behind it on its task, for
+   * the replay to bring back in order; none of them was emitted, so none
+   * holds a sighting. One still being checked when the connection ends is
+   * dropped the same way. `item.verdict` is a
+   * carrier, set when the line's verdict settles, so the event goes up with
+   * the settled verdict if one has come, else the delivered one, and the
+   * `verdict` event follows it.
+   */
+  private waitInLine(
+    taskId: string,
+    item: { buffer: string; from: string; tags: Record<string, string>; verdict?: Verdict },
+    replayed: boolean,
+    batch: Batch | undefined,
+    ahead: Promise<boolean> | undefined,
+    ruling: { look: Line } | null,
+  ): void {
+    const ended = this.actsEnded.promise;
+    const checker = this.checker;
+    const closed = batch ? (batch.actsSettled ??= settler()).promise : null;
+    // Open once the event has gone up, or is known never to: a ruling's
+    // `verdict` waits on it, so it follows the event, as in the Rust SDK.
+    const up = settler<void>();
+    const tail = (async () => {
+      const state = closed ? await closed : 'closed';
+      let result: Judgment | undefined;
+      let dropped = state === 'cut';
+      if (ruling && !dropped) {
+        // Null: still being checked when the connection ended, so dropped,
+        // as a cut batch's ruling is, for the replay to bring back.
+        const settled = await this.settleRuling(taskId, item, ruling.look, checker, ended, up.promise);
+        if (settled === null) dropped = true;
+        else result = settled;
+      }
+      const aheadWentUp = ahead ? await ahead : true;
+      if (dropped || !aheadWentUp) return false;
+      // A ruling that fails its check, or whose referee cannot be known, is
+      // thrown out here, before any app or bot sees it, and is not taken as
+      // seen (`emitActEvent` takes it), so a copy of its id cannot hide the
+      // genuine ruling and a replay or history read checks it again. What
+      // waits behind it goes on as if it had gone up, and its `verdict`
+      // follows (`up` opens).
+      if (result === 'fails' || result === 'referee-unknown') return true;
+      this.emitActEvent(item.buffer, item.from, item.tags, replayed, item.verdict, result);
+      return true;
+    })();
+    this.actTails.set(taskId, tail);
+    void tail.finally(() => {
+      up.settle();
+      if (this.actTails.get(taskId) === tail) this.actTails.delete(taskId);
+    });
+  }
+
+  /**
+   * Whether a ruling counts, once its verdict and its check have settled, or
+   * cannot check when the wait runs out first; null when the connection
+   * ends first, and the ruling is dropped. The
+   * ruling's own verdict check starts here, once its task's opener is known,
+   * so its verdict and its judgment check one document: for a DM task, the
+   * task's own venue. The verdict goes on `item` at once, and out as
+   * `verdict` once `up` opens: after the event, whatever the ruling's result.
+   */
+  private async settleRuling(
+    taskId: string,
+    item: { verdict?: Verdict },
+    look: Line,
+    checker: SignatureChecker | null,
+    ended: Promise<void>,
+    up: Promise<void>,
+  ): Promise<Judgment | null> {
+    let result: Judgment = 'cannot-check';
+    let waitTimer: ReturnType<typeof setTimeout> | undefined;
+    let checkTimer: ReturnType<typeof setTimeout> | undefined;
+    const checkBy = new Promise<undefined>((resolve) => {
+      checkTimer = setTimeout(() => resolve(undefined), RULING_CHECK_WAIT_MS);
+    });
+    // Whether the opener was learned, or found not learnable, before the
+    // check's time ran out: if not, the time running out means the app
+    // could not learn the referee, not that the referee's site is slow.
+    let openerSettled = false;
+    const learned = this.homeOf(taskId).then((o) => {
+      openerSettled = true;
+      return o;
+    });
+    const opener = Promise.race([learned, checkBy]);
+    // A read of the opener still under way when the check's time runs out
+    // is dropped, so the next ruling on the task asks again, as the Rust
+    // SDK's cell is left empty when its read is given up.
+    void checkBy.then(() => this.dropHungRead(taskId));
+    // A signature that cannot be read is no signature: `judgeRuling` fails
+    // it on a task that names its referee, as the server drops it.
+    // A DM line signed in a readable form, its signer named, whose venue
+    // cannot be built only because this session's own DID is not known yet,
+    // cannot be checked, which is not a failure.
+    const corrected = opener.then(async (o) => {
+      const first = await firstLook(look).catch(() => null);
+      const noSessionVenue =
+        first?.kind === 'unverifiable' &&
+        first.kid !== undefined &&
+        !(look.target.startsWith('#') || look.target.startsWith('&')) &&
+        !look.ownDid &&
+        (look.tags['+freeq.at/from'] ?? look.tags['freeq.at/from']) !== undefined;
+      if (noSessionVenue) return 'no-session' as const;
+      // Its opening post proven altered: checked under no opener, as the
+      // venue its target gives in a channel, unverifiable in a DM.
+      return first?.kind === 'check'
+        ? { msgid: first.signed.msgid, look: underTaskVenue(first.signed, o, look.ownDid) }
+        : null;
+    });
+    const signed = corrected.then((c) =>
+      c !== null && c !== 'no-session' && c.look.kind === 'check' ? c.look.signed : null,
+    );
+    // Started whatever happens below, so the line gets a final verdict. A
+    // ruling whose DM pair is unknown gets the verdict an unbuildable venue
+    // gets (`checkLater`), with no key looked up; so does one whose first
+    // look is no check (its pair needs this session's DID, or it names no
+    // signer), as the Rust SDK settles such a line at delivery.
+    const verdict = corrected.then(async (c) => {
+      if (!checker || item.verdict?.state !== 'pending') return;
+      let settled: Verdict;
+      let msgid: string;
+      if (c === null || c === 'no-session') {
+        settled = { state: 'unverifiable', kid: item.verdict.kid };
+        // The line's own id, read as `firstLook` reads it.
+        msgid = (look.tags[signing.EVENT_ID_TAG] ?? look.tags['freeq.at/eventid']) || look.tags['msgid'] || '';
+      } else if (c.look.kind === 'check') {
+        msgid = c.msgid;
+        try {
+          settled = await checker.resolve(c.look.signed);
+        } catch {
+          settled = { state: 'unverifiable', kid: c.look.signed.kid };
+        }
+      } else {
+        msgid = c.msgid;
+        settled = { state: 'unverifiable', kid: c.look.kind === 'unverifiable' ? c.look.kid : undefined };
+      }
+      item.verdict = settled;
+      // Not once a reconnect has replaced the checker: the ruling was
+      // dropped with its connection, as the line checker drops a verdict.
+      void up.then(() => {
+        if (this.checker === checker) this.emit('verdict', msgid, settled);
+      });
+    });
+    const judged = Promise.race([
+      // Its opening post proven altered: it fails at once, before the venue
+      // step, which in a DM needs that post.
+      // Its DM pair unknown (no session DID yet, or no opener to give it):
+      // its referee cannot be known.
+      Promise.all([opener, corrected, signed]).then(([o, c, s]) =>
+        c === 'no-session'
+          ? ('referee-unknown' as const)
+          : o?.altered
+            ? ('fails' as const)
+            : c?.look.kind === 'unverifiable'
+              ? ('referee-unknown' as const)
+              : this.judgeRuling(o, s, checker),
+      ),
+      // Run out of time: with the opener known, the referee's site is slow
+      // and it goes up unchecked; else its referee could not be learned.
+      checkBy.then((): Judgment => (openerSettled ? 'cannot-check' : 'referee-unknown')),
+    ]).then((r) => {
+      result = r;
+    });
+    void Promise.allSettled([opener, judged]).then(() => clearTimeout(checkTimer));
+    let outcome: 'settled' | 'wait' | 'ended';
+    try {
+      outcome = await Promise.race([
+        Promise.all([verdict, judged]).then(() => 'settled' as const),
+        // Thrown out at once: the events behind it on its task do not wait
+        // for its line's verdict, which still goes out after `up`.
+        judged.then(() => (hiddenRuling(result) ? ('settled' as const) : new Promise<never>(() => {}))),
+        new Promise<'wait'>((resolve) => {
+          waitTimer = setTimeout(() => resolve('wait'), RULING_WAIT_MS);
+        }),
+        ended.then(() => 'ended' as const),
+      ]);
+    } finally {
+      clearTimeout(waitTimer);
+    }
+    return outcome === 'ended' ? null : result;
+  }
+
+  /**
+   * Whether a ruling counts: only on a task whose opener names its referee,
+   * and then only signed by that referee, with a key its own site lists,
+   * before the key stopped counting. A ruling under the connected server's
+   * own host is checked against its key set, which is its own list. Never
+   * rejects. Twin of the Rust `ActLine::judge`.
+   */
+  private async judgeRuling(
+    opener: TaskOpener | undefined,
+    signed: Signed | null,
+    checker: SignatureChecker | null,
+  ): Promise<Judgment> {
+    const lookup = this.opts.keyLookup;
+    try {
+      if (!checker || !lookup) return 'cannot-check';
+      // No opening post it has, could read, and could check: the app
+      // cannot know the referee.
+      if (opener === undefined) return 'referee-unknown';
+      // Its opening post proven altered: nothing the referee signs counts.
+      if (opener.altered) return 'fails';
+      // Its opening post under a key the app cannot trust or find, or
+      // missing from the history: the app cannot know the referee.
+      if (opener.untrusted || opener.missing) return 'referee-unknown';
+      const home = opener.home;
+      if (!home) return 'cannot-check';
+      if (signed === null) return 'fails';
+      if (signed.did !== home) return 'fails';
+      // The connected server's key set is the referee's own list only when
+      // the host the lookup reads is the referee's own host: a name the
+      // server merely claims for itself proves nothing.
+      const fromSet = isOwnHostOf(lookup.originBase(), home)
+        ? await checker.serverRulingKey(home, signed.kid)
+        : null;
+      const answer = fromSet ?? (await lookup.ownHostAnswer(home, signed.kid));
+      if (answer.state === 'listed') return await rulingAgainst(signed, answer.publicKey, answer.retiredAt);
+      return answer.state === 'not-listed' ? 'fails' : 'cannot-check';
+    } catch {
+      return 'cannot-check';
+    }
+  }
+
+  /**
+   * Name `taskId`'s referee from its opener once the opener's signature
+   * checks: at once when its delivered verdict is final and checks; when its
+   * check (`checked`) settles and checks, the history read instead when it
+   * does not; never from an opener that does not check. The first opener's
+   * answer is kept: a ruling asking meanwhile waits for this one. What a
+   * fetched copy gave, a copy found altered included, is replaced once this
+   * opener checks, never while its check is pending. Its venue is the one
+   * its own check rebuilt. Twin of the Rust `name_once_checked`.
+   */
+  private nameOnceChecked(
+    taskId: string,
+    home: string | null,
+    venue: string | null,
+    delivered: Verdict | undefined,
+    checked: Promise<Verdict>,
+    signed: Promise<Signed | null>,
+  ): void {
+    // Its check, asked once more when it rests on a key only the server
+    // vouched for (`openerVerdict`).
+    const settledOf = (settled: Verdict): Promise<Verdict> =>
+      signed.then((s) => (s && this.checker ? this.openerVerdict(s, settled, this.checker) : settled));
+    // Named unless a checked live opener's answer is already held: what a
+    // fetched copy gave, under way, failed, answered or found altered, gives
+    // way.
+    const name = (): void => {
+      if (this.taskHomes.get(taskId)?.read !== false) this.keepHome(taskId, Promise.resolve({ home, venue }), false);
+    };
+    if (delivered?.state !== 'pending') {
+      if (delivered !== undefined && checksOut(delivered)) name();
+      return;
+    }
+    if (this.taskHomes.has(taskId)) {
+      void checked.then(settledOf).then((settled) => {
+        if (checksOut(settled)) name();
+      });
+      return;
+    }
+    const abort = new AbortController();
+    const naming = checked.then(settledOf).then((settled) => {
+      if (checksOut(settled)) return { home, venue };
+      // Read instead: from here on, what it gives is a fetched copy's.
+      const held = this.taskHomes.get(taskId);
+      if (held?.home === naming) held.read = true;
+      return this.readHome(taskId, abort.signal);
+    });
+    this.keepHome(taskId, naming, false, abort);
+    // A history that could not be read is read again for the next ruling.
+    naming.catch(() => {
+      if (this.taskHomes.get(taskId)?.home === naming) this.taskHomes.delete(taskId);
+    });
+  }
+
+  /** What `taskId`'s opener says; undefined when the opener was not seen
+   *  and its history could not be read and checked. Rulings of one task
+   *  asking at once share one read; an opener that checks while it is under
+   *  way answers instead when it fails or finds a copy that does not name
+   *  the referee. Such a kept copy is checked again from its bytes when it
+   *  is due (`recheckDue`), with no history read, and changed in place. */
+  private async homeOf(taskId: string): Promise<TaskOpener | undefined> {
+    const entry = this.taskHomes.get(taskId);
+    // Held before this ruling asked: only such a copy can be due.
+    let held = entry?.settled === true;
+    let known = entry?.home;
+    if (known === undefined) {
+      const abort = new AbortController();
+      const reading = this.readHome(taskId, abort.signal);
+      known = reading;
+      this.keepHome(taskId, reading, true, abort);
+      // A history that could not be read, or whose opener could not be
+      // checked, is read again for the next ruling.
+      reading.catch(() => {
+        if (this.taskHomes.get(taskId)?.home === reading) this.taskHomes.delete(taskId);
+      });
+    }
+    let answer: TaskOpener | undefined;
+    try {
+      answer = await known;
+      if (openerChecked(answer)) return answer;
+    } catch {
+      answer = undefined;
+    }
+    // An opener that checked while the read was under way replaced it:
+    // what the map holds now is awaited once more.
+    const now = this.taskHomes.get(taskId);
+    if (now !== undefined && now.home !== known) {
+      held = now.settled;
+      try {
+        answer = await now.home;
+      } catch {
+        return undefined;
+      }
+      if (openerChecked(answer)) return answer;
+    }
+    if (!held || answer === undefined || !(await this.recheckDue(answer))) return answer;
+    let checked: TaskOpener;
+    try {
+      checked = await this.checkedSigned(answer.signed!, this.checker!);
+    } catch {
+      // Still pending is no answer: the kept copy and its time stand.
+      return answer;
+    }
+    Object.assign(
+      answer,
+      { altered: undefined, untrusted: undefined, keyNotFound: undefined, since: undefined, signed: undefined },
+      checked,
+    );
+    return answer;
+  }
+
+  /**
+   * Whether a kept copy that does not name the referee is checked again now:
+   * one altered or untrusted once the lookup's ttl has passed since it was
+   * checked; one whose key was found nowhere as soon as the lookup remembers
+   * no miss for it, which it does not when a source failed. A copy missing
+   * from the history, or with nothing to check, never is. Twin of the Rust
+   * `recheck_due`.
+   */
+  private async recheckDue(kept: TaskOpener): Promise<boolean> {
+    const lookup = this.opts.keyLookup;
+    if (!lookup || !this.checker || kept.signed === undefined || kept.since === undefined) return false;
+    if (kept.keyNotFound) return !(await lookup.holdsMiss(kept.signed.did, kept.signed.kid));
+    return Date.now() - kept.since >= lookup.ttl();
+  }
+
+  private keepHome(taskId: string, home: Promise<TaskOpener>, read: boolean, abort?: AbortController): void {
+    this.taskHomes.delete(taskId);
+    const entry: TaskHome = { home, read, settled: false, ...(abort ? { abort } : {}) };
+    this.taskHomes.set(taskId, entry);
+    const settle = (): void => {
+      entry.settled = true;
+    };
+    home.then(settle, settle);
+    while (this.taskHomes.size > TASK_HOMES_HELD) {
+      const oldest = this.taskHomes.keys().next().value;
+      if (oldest === undefined) break;
+      this.taskHomes.delete(oldest);
+    }
+  }
+
+  /** Drop `taskId`'s opener read when it is a fetched copy's still under
+   *  way, and give up its request: a ruling's check ran out of time waiting
+   *  on it. A live opener's pending check is kept: it holds that opener's
+   *  answer. */
+  private dropHungRead(taskId: string): void {
+    const held = this.taskHomes.get(taskId);
+    if (held === undefined || !held.read || held.settled) return;
+    this.taskHomes.delete(taskId);
+    held.abort?.abort();
+  }
+
+  /**
+   * An opening post's verdict, once more when it rests on a key only the
+   * connected server vouched for: its poster's records are taken again
+   * through the connected server (`relistVouched`, at most once per poster
+   * per the lookup's ttl, the server's key kept when nothing is published),
+   * and the post is checked once more, so a key published since names the
+   * referee. A chat line keeps the vouched layer: only an opening post asks.
+   * Twin of the Rust `opener_verdict`.
+   */
+  private async openerVerdict(signed: Signed, verdict: Verdict, checker: SignatureChecker): Promise<Verdict> {
+    const lookup = this.opts.keyLookup;
+    if (!lookup || verdict.state !== 'device' || verdict.layer !== 'vouched') return verdict;
+    await lookup.relistVouched(signed.did, signed.kid);
+    return checker.resolve(signed);
+  }
+
+  /**
+   * What `taskId`'s opener says, read from the task's history on the
+   * connected server and checked (`checkedOpener`); given up when `signal`
+   * aborts.
+   */
+  private async readHome(taskId: string, signal?: AbortSignal): Promise<TaskOpener> {
+    const history = await this.readTaskHistory(taskId, this.serverOrigin, signal);
+    return this.checkedOpener(history.events, taskId, this.checker);
+  }
+
+  /**
+   * What `taskId`'s opener among `events` (a task's history, or the openers
+   * a channel's audit sends) says, once its own signature is checked as a
+   * live opener's is (`checkedSigned`); marked missing when it is not among
+   * them, and altered when it carries no document or signature that can be
+   * read, as a ruling's is. Rejects when this client checks no signatures.
+   * Twin of the Rust `checked_opener_in`.
+   */
+  private async checkedOpener(
+    events: readonly { event_id?: string; canonical?: string | null; signature?: string | null }[],
+    taskId: string,
+    checker: SignatureChecker | null,
+  ): Promise<TaskOpener> {
+    if (!checker) throw new Error('this client checks no signatures');
+    const event = events.find((e) => e.event_id === taskId);
+    if (!event) return { home: null, venue: null, missing: true };
+    const act = historyAct(event);
+    if (act === undefined || act.signed === null) return { home: null, venue: null, altered: true };
+    return this.checkedSigned(act.signed, checker);
+  }
+
+  /**
+   * What a fetched opener says once its signature is checked: the referee
+   * it names and the venue it was signed for (its document's `act-home` and
+   * `target`) when it checks; marked altered when its signature contradicts
+   * its key (invalid, made at or after the key stopped counting, or a found
+   * key that cannot check it); marked untrusted when its key is one only the
+   * connected server vouched for or the server's own, or was found nowhere.
+   * Each but a copy that checks keeps `signed` and the time, so a later
+   * ruling can check it again with no history read. Rejects when it is still
+   * pending, which a finished check never is. Twin of the Rust
+   * `checked_opener`.
+   */
+  private async checkedSigned(signed: Signed, checker: SignatureChecker): Promise<TaskOpener> {
+    let verdict: Verdict;
+    try {
+      verdict = await this.openerVerdict(signed, await checker.resolve(signed), checker);
+    } catch {
+      verdict = { state: 'unverifiable', kid: signed.kid };
+    }
+    const standing = openerStanding(verdict);
+    if (standing === 'checks') {
+      const doc = signed.doc;
+      if (doc.kind !== 'act') throw new Error('the opener is no task event');
+      return { home: doc.tags['+freeq.at/act-home'] ?? null, venue: doc.venue };
+    }
+    const kept = { home: null, venue: null, since: Date.now(), signed };
+    switch (standing) {
+      case 'altered':
+        return { ...kept, altered: true };
+      case 'untrusted':
+        return { ...kept, untrusted: true };
+      case 'key-not-found':
+        return { ...kept, untrusted: true, keyNotFound: true };
+      default:
+        throw new Error("the opener's check has not finished");
+    }
+  }
+
+  /**
+   * `taskId`'s history as the server answers it (`GET /api/v1/actions/{id}`)
+   * under `origin`, the connected server's by default, with the session
+   * bearer, which a DM's or a private channel's history needs; given up
+   * when `signal` aborts.
+   */
+  private async readTaskHistory(taskId: string, origin = this.serverOrigin, signal?: AbortSignal): Promise<TaskHistory> {
+    const path = `/api/v1/actions/${encodeURIComponent(taskId)}`;
+    const body = (await this.readApi(path, origin, signal)) as TaskHistory;
+    if (!Array.isArray(body?.events)) throw new Error('the task history holds no events');
+    return body;
+  }
+
+  /**
+   * The JSON the server answers at `path` under `origin`, the connected
+   * server's by default, with the session bearer, and no time limit of its
+   * own, as the SDK's other reads have none; given up when `signal`
+   * aborts. A status other than OK rejects with an error whose `status` is
+   * that status.
+   */
+  private async readApi(path: string, origin = this.serverOrigin, signal?: AbortSignal): Promise<unknown> {
+    const bearer = this._apiBearer;
+    const res = await fetch(`${origin}${path}`, {
+      headers: bearer ? { Authorization: `Bearer ${bearer}` } : {},
+      ...(signal ? { signal } : {}),
+    });
+    if (!res.ok) throw Object.assign(new Error(`${path} answered ${res.status}`), { status: res.status });
+    return await res.json();
+  }
+
+  /**
+   * A task's history as the server holds it, with every ruling in it that
+   * fails its referee check left out, as a failing ruling never fires
+   * `actEvent`, and every receipt the server marked ignored (filed, not
+   * acted on, its link not the task's home); a ruling that counts or
+   * cannot be checked stays, and every field the server sent is kept. Each ruling is judged as a live one is,
+   * over the document rebuilt from its stored canonical and signature, the
+   * referee being the one the opener in the same answer names, once that
+   * opener's own signature checks (`checkedOpener`); they are judged
+   * together, so asks of one referee share its read, all within
+   * `RULING_CHECK_WAIT_MS` with the opener's check, and one not judged by
+   * then stays. Read with the
+   * session bearer and no time limit of its own, under `opts.origin` when
+   * given (a web page reads under its own), else the connected server's.
+   * Rejects when the history cannot be read. Twin of the Rust
+   * `ClientHandle::task_history`.
+   */
+  async taskHistory(actId: string, opts: { origin?: string } = {}): Promise<TaskHistory> {
+    const history = await this.readTaskHistory(actId, opts.origin);
+    const checker = this.checker;
+    // Run out of time before the opener was checked: its referee could not
+    // be learned; after, the referee's site is slow and the ruling stays.
+    let openerSettled = false;
+    let checkTimer: ReturnType<typeof setTimeout> | undefined;
+    const checkBy = new Promise<Judgment>((resolve) => {
+      checkTimer = setTimeout(
+        () => resolve(openerSettled ? 'cannot-check' : 'referee-unknown'),
+        RULING_CHECK_WAIT_MS,
+      );
+    });
+    const opener = this.checkedOpener(history.events, actId, checker)
+      .catch(() => undefined)
+      .then((o) => {
+        openerSettled = true;
+        return o;
+      });
+    try {
+      const results = await Promise.all(
+        history.events.map((event) => {
+          const signed = historyRuling(event);
+          return signed === undefined
+            ? null
+            : Promise.race([opener.then((o) => this.judgeRuling(o, signed, checker)), checkBy]);
+        }),
+      );
+      return {
+        ...history,
+        events: history.events.filter((event, at) => !hiddenRuling(results[at] ?? undefined) && event.confirm_state !== 'ignored'),
+      };
+    } finally {
+      clearTimeout(checkTimer);
+    }
+  }
+
+  /**
+   * A channel's audit as the server answers it
+   * (`GET /api/v1/channels/{name}/audit`), with every task step the server
+   * marked ignored left out, every task step that is a ruling failing its
+   * referee check left out, and every receipt riding on a step that fails
+   * its check taken off that step, the step staying; a ruling that counts
+   * or cannot be checked stays, and every other row and field is kept as
+   * sent. Each ruling is judged as `taskHistory` judges one, the referee
+   * being the one its task's opener names, from the openers the answer
+   * sends once each one's own signature checks, their signers' keys looked
+   * up together; a task whose opener the answer lacks (an older server)
+   * has its history read once. Each ruling's opener and its judgment run within
+   * one `RULING_CHECK_WAIT_MS` for the call; one not judged by then stays.
+   * A row with no stored document, as an older server sends, is not
+   * judged. Read with the session bearer and no time limit of its own,
+   * under `opts.origin` when given, else the connected server's. Rejects
+   * when the audit cannot be read, with the HTTP status as the error's
+   * `status` when the server refused it.
+   */
+  async channelAudit(
+    channel: string,
+    opts: { actor?: string; limit?: number; origin?: string } = {},
+  ): Promise<ChannelAudit> {
+    const query = new URLSearchParams();
+    if (opts.limit !== undefined) query.set('limit', String(opts.limit));
+    if (opts.actor) query.set('actor', opts.actor);
+    const path = `/api/v1/channels/${encodeURIComponent(channel.replace(/^#/, ''))}/audit`;
+    const asked = query.toString();
+    const audit = (await this.readApi(asked ? `${path}?${asked}` : path, opts.origin)) as ChannelAudit;
+    if (!Array.isArray(audit?.timeline)) throw new Error('the channel audit holds no timeline');
+    const checker = this.checker;
+    const openers = Array.isArray(audit.openers) ? audit.openers : [];
+    // The openers' signers' records and keys in one request each, as a
+    // closed batch's held checks are (`startDeferredChecks`), before the
+    // first opener is checked.
+    const lookup = this.opts.keyLookup;
+    let prefetched: Promise<void> | undefined;
+    const prefetch = (): Promise<void> =>
+      (prefetched ??= (async () => {
+        const all = openers.flatMap((e) => historyAct(e)?.signed ?? []).filter((s) => isDid(s.did));
+        // A did:key signer's key is read from its DID: nothing to ask.
+        const fromDid = await Promise.all(all.map((s) => didKeyAnswer(s.did, s.kid)));
+        const signers = all.filter((_, at) => fromDid[at] === null);
+        if (!lookup || !checker || signers.length === 0) return;
+        await lookup.prefetch([...new Set(signers.map((s) => s.did))]).catch(() => undefined);
+        await lookup.prefetchKeys(signers.map((s): KeyPair => [s.did, s.kid])).catch(() => undefined);
+      })());
+    // Each task's opener once for the call: from the answer, checked, else
+    // its history, whose rulings asking at once share one read.
+    const homes = new Map<string, Promise<TaskOpener | undefined>>();
+    // The tasks whose opener was learned, or found not learnable, so far.
+    const settled = new Set<string>();
+    const openerOf = (taskId: string): Promise<TaskOpener | undefined> => {
+      let home = homes.get(taskId);
+      if (home === undefined) {
+        home = (
+          openers.some((e) => e.event_id === taskId)
+            ? prefetch()
+                .then(() => this.checkedOpener(openers, taskId, checker))
+                .catch(() => undefined)
+            : this.homeOf(taskId)
+        ).then((o) => {
+          settled.add(taskId);
+          return o;
+        });
+        homes.set(taskId, home);
+      }
+      return home;
+    };
+    let checkTimer: ReturnType<typeof setTimeout> | undefined;
+    const checkBy = new Promise<void>((resolve) => {
+      checkTimer = setTimeout(resolve, RULING_CHECK_WAIT_MS);
+    });
+    // Run out of time as `taskHistory`'s check does: before the task's
+    // opener was learned, its referee could not be; after, it stays.
+    const judge = (taskId: unknown, event: unknown): Promise<Judgment> | null => {
+      if (typeof taskId !== 'string' || typeof event !== 'object' || event === null) return null;
+      const signed = historyRuling(event as { canonical?: string; signature?: string | null });
+      if (signed === undefined) return null;
+      return Promise.race([
+        openerOf(taskId).then((opener) => this.judgeRuling(opener, signed, checker)),
+        checkBy.then((): Judgment => (settled.has(taskId) ? 'cannot-check' : 'referee-unknown')),
+      ]);
+    };
+    try {
+      const rows = await Promise.all(
+        audit.timeline.map(async (row): Promise<ChannelAuditRow | null> => {
+          if (row.category !== 'act') return row;
+          const details = row.details ?? {};
+          if (details.confirm_state === 'ignored') return null;
+          const [own, ofReceipt] = await Promise.all([
+            judge(details.act_id, row),
+            judge(details.act_id, details.receipt),
+          ]);
+          if (hiddenRuling(own ?? undefined)) return null;
+          if (!hiddenRuling(ofReceipt ?? undefined)) return row;
+          const { receipt: _receipt, ...kept } = details;
+          return { ...row, details: kept };
+        }),
+      );
+      return { ...audit, timeline: rows.filter((row): row is ChannelAuditRow => row !== null) };
+    } finally {
+      clearTimeout(checkTimer);
+    }
   }
 
   /**
@@ -1628,12 +2575,6 @@ export class FreeqClient extends EventEmitter {
   private actAnswerChain: Promise<unknown> = Promise.resolve();
 
   /**
-   * Task events' signatures, one at a time in call order, so each event
-   * reaches the wire (or `actAnswerChain`) in the order `sendAct` was called.
-   */
-  private actSignChain: Promise<unknown> = Promise.resolve();
-
-  /**
    * Resolves once this session's key registration has reached the wire.
    *
    * `null` whenever no registration is coming — a guest, a server that never
@@ -1671,6 +2612,14 @@ export class FreeqClient extends EventEmitter {
    * check started by `checkLater`.
    */
   private deliveredVerdict(tags: Record<string, string>, isTagmsg: boolean): Verdict | undefined {
+    if (this.opts.checkLines === false) return undefined;
+    return this.startingVerdict(tags, isTagmsg);
+  }
+
+  /** `deliveredVerdict` whatever `checkLines` says: where a line's check
+   *  starts. A task's opener is checked with `checkLines` off too, for the
+   *  referee its signature vouches for. */
+  private startingVerdict(tags: Record<string, string>, isTagmsg: boolean): Verdict | undefined {
     if (!this.checker) return undefined;
     const sigTag = tags[signing.SIG_TAG] ?? tags['freeq.at/sig'];
     if (sigTag === undefined) return { state: 'unsigned' };
@@ -1686,7 +2635,8 @@ export class FreeqClient extends EventEmitter {
    * an open batch other than `draft/multiline` (`batchId`, by default its
    * `batch` tag) is held on the batch and checked when it closes, against the
    * DM venue and the checker read at the time it was held; its verdict goes
-   * out even when a reconnect has replaced the checker since.
+   * out even when a reconnect has replaced the checker since. `announce`
+   * false keeps it to `onSettled`: no `verdict` is emitted.
    */
   private checkLater(
     delivered: Verdict | undefined,
@@ -1694,6 +2644,7 @@ export class FreeqClient extends EventEmitter {
     onSettled?: (verdict: Verdict) => void,
     batchId: string | undefined = line.tags['batch'],
     held?: { ownDid: string | undefined; targetDid: string | undefined; checker: SignatureChecker },
+    announce = true,
   ): void {
     const checker = held ? held.checker : this.checker;
     if (!checker || delivered?.state !== 'pending') return;
@@ -1711,7 +2662,7 @@ export class FreeqClient extends EventEmitter {
         did: line.tags['account'],
         kid: (sigTag && sigTagKid(sigTag)) || undefined,
         server: originServerDid(line.tags['+freeq.at/origin']) ?? undefined,
-        start: () => this.checkLater(delivered, line, onSettled, '', at),
+        start: () => this.checkLater(delivered, line, onSettled, '', at, announce),
       });
       return;
     }
@@ -1738,7 +2689,7 @@ export class FreeqClient extends EventEmitter {
         this.emit('memberDid', line.from, did);
       }
       onSettled?.(verdict);
-      if (held || this.checker === checker) this.emit('verdict', id, verdict);
+      if (announce && (held || this.checker === checker)) this.emit('verdict', id, verdict);
     })();
   }
 
@@ -1750,7 +2701,11 @@ export class FreeqClient extends EventEmitter {
   private endOpenBatches(): void {
     const open = [...this.batches.values()];
     this.batches.clear();
-    for (const batch of open) this.startDeferredChecks(batch);
+    for (const batch of open) {
+      batch.actsSettled?.settle('cut');
+      this.startDeferredChecks(batch);
+    }
+    this.actsEnded.settle();
   }
 
   /**
@@ -1763,12 +2718,15 @@ export class FreeqClient extends EventEmitter {
   private startDeferredChecks(batch: Batch): void {
     const held = batch.deferredChecks;
     if (!held?.length) return;
-    const dids = [...new Set(held.map((h) => h.did).filter((d): d is string => !!d && isDid(d)))];
-    const pairs: KeyPair[] = held
-      .filter((h) => !!h.did && isDid(h.did) && !!h.kid)
-      .flatMap((h): KeyPair[] => [[h.did!, h.kid!], ...(h.server ? [[h.server, h.kid!, true] as KeyPair] : [])]);
     const lookup = this.opts.keyLookup;
     void (async () => {
+      // A did:key signer's key is read from its DID: nothing to ask.
+      const fromDid = await Promise.all(held.map((h) => (h.did && h.kid ? didKeyAnswer(h.did, h.kid) : null)));
+      const asked = held.filter((_, at) => fromDid[at] === null);
+      const dids = [...new Set(asked.map((h) => h.did).filter((d): d is string => !!d && isDid(d)))];
+      const pairs: KeyPair[] = asked
+        .filter((h) => !!h.did && isDid(h.did) && !!h.kid)
+        .flatMap((h): KeyPair[] => [[h.did!, h.kid!], ...(h.server ? [[h.server, h.kid!, true] as KeyPair] : [])]);
       if (lookup && dids.length > 0) await lookup.prefetch(dids).catch(() => undefined);
       if (lookup && pairs.length > 0) await lookup.prefetchKeys(pairs).catch(() => undefined);
       for (const h of held) h.start();
@@ -1884,7 +2842,7 @@ export class FreeqClient extends EventEmitter {
     // key lookup's cache.
     const lookup =
       this.opts.keyLookup ??
-      new KeyLookup({ fetch: (target: string) => fetch(target), resolveDid: makeDidResolver() }, null, 0);
+      new KeyLookup({ fetch: (target, init) => fetch(target, init), resolveDid: makeDidResolver() }, null, 0);
     const check = async (): Promise<StoredDeviceKey> => {
       const raw = new Uint8Array(await crypto.subtle.exportKey('raw', stored.keyPair.publicKey));
       const kid = await signing.deriveKid(raw);
@@ -2499,6 +3457,8 @@ export class FreeqClient extends EventEmitter {
         this.guestFallbackCount = 0;
         this._nick = serverNick;
         this._registered = true;
+        this._serverName = msg.prefix || null;
+        this._welcomed = true;
         this._hadSession = true;
         this._awaitingWelcome = false;
         this.clearNickResume();
@@ -2953,9 +3913,40 @@ export class FreeqClient extends EventEmitter {
         const bufName = isChannel ? target : this.dmKey(isSelf ? target : from);
         // Payloads this line produced, given the verdict when it settles.
         const carriers: { verdict?: Verdict }[] = [];
-        this.checkLater(verdict, { tags: msg.tags, target, from: isSelf ? undefined : from }, (settled) => {
-          for (const carrier of carriers) carrier.verdict = settled;
-        });
+        // A task event: a ruling's verdict is the line's to find, once its
+        // task's opener is known (`waitInLine`), under the same document its
+        // judgment checks.
+        const act = actTask(msg.tags);
+        const isRuling = act !== null && this.checker !== null && RULING_VERBS.has(act.verb);
+        const look: Line = {
+          tags: msg.tags,
+          target,
+          ownDid: this.sasl?.did ?? this._authDid ?? undefined,
+          targetDid: this.didForNick(target),
+        };
+        // An opener names its task's referee once its signature checks.
+        // With `checkLines` off it is still checked, for that alone: no
+        // verdict goes on the line, and no chat line or move is checked.
+        let openerChecked: ((settled: Verdict) => void) | undefined;
+        if (act?.opens && this.checker !== null) {
+          const checked = new Promise<Verdict>((resolve) => {
+            openerChecked = resolve;
+          });
+          const opening = verdict ?? this.startingVerdict(msg.tags, true);
+          const openerSigned = firstLook(look)
+            .then((first) => (first.kind === 'check' ? first.signed : null))
+            .catch(() => null);
+          this.nameOnceChecked(act.taskId, act.home, actVenue(look), opening, checked, openerSigned);
+          if (verdict === undefined) {
+            this.checkLater(opening, { tags: msg.tags, target, from: isSelf ? undefined : from }, openerChecked, undefined, undefined, false);
+          }
+        }
+        if (!isRuling) {
+          this.checkLater(verdict, { tags: msg.tags, target, from: isSelf ? undefined : from }, (settled) => {
+            for (const carrier of carriers) carrier.verdict = settled;
+            openerChecked?.(settled);
+          });
+        }
 
         const deleteOf = msg.tags['+draft/delete'];
         if (deleteOf) { this.emit('messageDeleted', bufName, deleteOf, from, msg.tags['account']); break; }
@@ -3007,10 +3998,25 @@ export class FreeqClient extends EventEmitter {
         // Task event (`act-` tags). Same rule as the coordination branch: the
         // TAGMSG is the event, so this is the one place `actEvent` fires.
         // Inside a history batch the event is held and fired at batch end,
-        // the way a replayed edit collapses into its batch above.
+        // the way a replayed edit collapses into its batch above. A ruling,
+        // and an event on a task with one still waiting ahead of it, waits
+        // in line instead (`waitInLine`).
         const actBatchId = msg.tags['batch'];
         const actBatch = actBatchId ? this.batches.get(actBatchId) : undefined;
-        if (
+        const ahead = act ? this.actTails.get(act.taskId) : undefined;
+        const heldIn = actBatch && actBatch.type !== 'draft/multiline' ? actBatch : undefined;
+        if (act && (isRuling || ahead)) {
+          const item = { buffer: bufName, from, tags: msg.tags, verdict };
+          carriers.push(item);
+          this.waitInLine(
+            act.taskId,
+            item,
+            heldIn !== undefined || (actBatchId !== undefined && !actBatch),
+            heldIn,
+            ahead,
+            isRuling ? { look } : null,
+          );
+        } else if (
           actBatch &&
           actBatch.type !== 'draft/multiline' &&
           Object.keys(msg.tags).some((n) => signing.isActTag(n))
@@ -3334,6 +4340,8 @@ export class FreeqClient extends EventEmitter {
             for (const held of batch.actEvents ?? []) {
               this.emitActEvent(held.buffer, held.from, held.tags, true, held.verdict);
             }
+            // A ruling read inside it, and what waits behind one, go on now.
+            batch.actsSettled?.settle('closed');
             this.startDeferredChecks(batch);
           }
         }
@@ -4142,6 +5150,28 @@ export class FreeqClient extends EventEmitter {
     await this.writeSignedMessage('PRIVMSG', channel, humanText, { ...tags });
   }
 
+  /** Resolves at this connection's welcome (001); rejects if the connection
+   *  ends first. */
+  private welcomeOfThisConnection(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const done = (): void => {
+        this.off('registered', onWelcome);
+        this.off('connectionStateChanged', onState);
+      };
+      const onWelcome = (): void => {
+        done();
+        resolve();
+      };
+      const onState = (state: TransportState): void => {
+        if (state !== 'disconnected') return;
+        done();
+        reject(new Error('the connection ended before the task event was sent'));
+      };
+      this.on('registered', onWelcome);
+      this.on('connectionStateChanged', onState);
+    });
+  }
+
   /**
    * Put a task event on the wire: the signed TAGMSG that *is* the event, then
    * the plain-text companion that renders it for people.
@@ -4160,11 +5190,46 @@ export class FreeqClient extends EventEmitter {
     opts: { humanText?: string; taskId?: string } = {},
   ): Promise<string> {
     const eventId = signing.newEventId();
-    // Signed in call order: a signature takes as long as the platform takes,
-    // and an event signed sooner must not go out ahead of one sent before it.
-    const signing_ = this.actSignChain.then(() => this.signing.signAct(target, actTags, eventId));
-    this.actSignChain = signing_.catch(() => undefined);
-    const signed = await signing_;
+    // A task event sent before the welcome belongs to the connection it was
+    // made on: it waits for that connection's welcome, and fails if the
+    // connection ends first, as the Rust SDK queues it per connection.
+    if (!this._welcomed) {
+      // With no connection at all there is none for it to belong to.
+      if (this._connectionState === 'disconnected') {
+        throw new Error('the connection ended before the task event was sent');
+      }
+      await this.welcomeOfThisConnection();
+    }
+    // The connection it belongs to, checked again at its turn and before its
+    // line is written: it fails as the Rust SDK's does if that connection has
+    // ended. `_welcomed` alone would pass on a later connection's welcome;
+    // each connection steps the epoch.
+    const epoch = this.enrollmentEpoch;
+    const onItsConnection = (): void => {
+      if (!this._welcomed || this.enrollmentEpoch !== epoch) {
+        throw new Error('the connection ended before the task event was sent');
+      }
+    };
+    // Signed in call order, on the chain every signed send takes its turn on:
+    // a signature takes as long as the platform takes, and an event signed
+    // sooner must not go out ahead of one sent before it. A send made before
+    // the welcome waits there until the session key is registered, after
+    // 001, as the Rust SDK queues commands until registration.
+    let signed = null as Awaited<ReturnType<typeof this.signing.signAct>>;
+    await this.enqueueSend(async () => {
+      onItsConnection();
+      // An event naming no task opens one, and names the server it is opened
+      // on as the task's referee: the name this connection was welcomed
+      // under, signed with the rest. A caller's own `act-home` stands.
+      // Read as the signature reads them, under any of their spellings.
+      const fields = new Set(Object.keys(actTags).map((name) => signing.strippedTagName(name)));
+      const opens = !fields.has('act-id');
+      const named = fields.has('act-home');
+      if (opens && !named && this._serverName) {
+        actTags = { ...actTags, '+freeq.at/act-home': `did:web:${this._serverName}` };
+      }
+      signed = await this.signing.signAct(target, actTags, eventId);
+    });
     if (!signed) {
       throw new Error(
         'a task event must be signed: authenticate, register a signing key, ' +
@@ -4202,14 +5267,15 @@ export class FreeqClient extends EventEmitter {
     // own event was taken, and a caller who asked for no line has none to
     // hold back. Both halves go out as they always did.
     if (!humanText || !this.ackedCaps.has('echo-message')) {
+      onItsConnection();
       this.raw(format('TAGMSG', [target], wireTags));
       if (humanText) await this.writeActCompanion(target, humanText, ref);
       return eventId;
     }
 
     const settled = this.actAnswerChain.then(
-      () => this.writeActAwaitingAnswer(target, wireTags, humanText, ref, eventId),
-      () => this.writeActAwaitingAnswer(target, wireTags, humanText, ref, eventId),
+      () => this.writeActAwaitingAnswer(target, wireTags, humanText, ref, eventId, onItsConnection),
+      () => this.writeActAwaitingAnswer(target, wireTags, humanText, ref, eventId, onItsConnection),
     );
     // A refused send must not wedge every act send after it.
     this.actAnswerChain = settled.catch(() => undefined);
@@ -4229,7 +5295,8 @@ export class FreeqClient extends EventEmitter {
    * The server gates the event and not the line, so a line sent beside a
    * refused step is prose about something that never happened — and no card
    * can ever attach to it. Throws the refusal, so the caller of `sendAct`
-   * hears what the server said.
+   * hears what the server said, and throws before writing anything when the
+   * send's connection has ended (`onItsConnection`).
    */
   private async writeActAwaitingAnswer(
     target: string,
@@ -4237,7 +5304,9 @@ export class FreeqClient extends EventEmitter {
     humanText: string,
     ref: string,
     eventId: string,
+    onItsConnection: () => void,
   ): Promise<void> {
+    onItsConnection();
     // Armed before the event goes out: the answer is a line off the same
     // socket, and the listener has to be there when it lands.
     const answer = this.actAnswer(eventId);

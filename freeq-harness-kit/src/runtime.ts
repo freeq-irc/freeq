@@ -2286,17 +2286,22 @@ export class AgentRuntime {
           // Check the signature BEFORE applying. Three-way outcome per the
           // RFC: a forgery is rejected, but an unreachable key store is an
           // outage — deferring beats destroying someone's completed work.
+          // A ruling the SDK found counts was checked there, against its
+          // referee's own key list: the kit does no check of its own.
           this.keyFetcher ??= serverKeyFetcher(httpOriginFor(cfg.server));
-          const verdict = await verifyActEvent(
-            {
-              channel: ev.channel,
-              did: ev.did,
-              eventId: ev.eventId,
-              tags: ev.tags,
-              sigTag: ev.sigTag,
-            },
-            { fetchKey: this.keyFetcher, selfDid: this.conn?.did ?? "" },
-          );
+          const verdict =
+            ev.ruling === "counts"
+              ? { outcome: "valid" as const, reason: "the SDK found the ruling counts" }
+              : await verifyActEvent(
+                  {
+                    channel: ev.channel,
+                    did: ev.did,
+                    eventId: ev.eventId,
+                    tags: ev.tags,
+                    sigTag: ev.sigTag,
+                  },
+                  { fetchKey: this.keyFetcher, selfDid: this.conn?.did ?? "" },
+                );
 
           if (verdict.outcome === "invalid") {
             // Do not apply, and say so loudly: this is tampering or forgery,

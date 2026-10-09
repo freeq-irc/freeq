@@ -27,6 +27,8 @@ const KIND_TAG: &str = "+freeq.at/act";
 const KIND_TAG_BARE: &str = "freeq.at/act";
 const VERB_TAG: &str = "+freeq.at/act-verb";
 const VERB_TAG_BARE: &str = "act-verb";
+/// The number this server gives each of its rulings on one task, 1, 2, 3.
+const SEQ_TAG: &str = "+freeq.at/act-seq";
 
 /// What the gate concluded about a message.
 pub(super) enum Gate {
@@ -168,42 +170,61 @@ fn file_own_event(
 ) -> Option<(HashMap<String, String>, crate::db::ActWrite)> {
     let did = crate::server::server_did(&state.server_name);
     let event_id = freeq_sdk::chatsig::new_event_id();
-    let mut pairs: Vec<(&str, &str)> = vec![
-        (KIND_TAG, kind),
-        (VERB_TAG, verb),
-        ("+freeq.at/from", did.as_str()),
-        ("+freeq.at/act-id", act_id),
-    ];
-    pairs.extend_from_slice(extra);
-    let canonical = freeq_sdk::act::act_canonical(pairs.clone(), venue, &event_id).ok()?;
-    let signature = freeq_sdk::sigtag::sign_canonical(&canonical, &state.msg_signing_key);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let written = state.with_db(|db| {
-        db.apply_act_event(&crate::db::ActEvent {
-            canonical: &canonical,
-            signature: Some(&signature),
-            event_id: &event_id,
-            act_id,
-            opens: false,
-            venue,
-            actor: &did,
-            // This is the server, signing under its own identity — the only
-            // actor a `system` transition allows, and the only one that may
-            // write a receipt.
-            from_system: true,
-            origin: None,
-            timestamp: now,
+    // Numbered, signed and filed under one hold of the database lock: the
+    // number is one past the rulings this server has already signed on this
+    // task, the higher of their count (unnumbered ones included) and their
+    // highest number, so two rulings made at once cannot be given the same
+    // one, nor a new one a number already on file.
+    let (pairs, signature, written) = state
+        .with_db(|db| {
+            let mut pairs: Vec<(String, String)> = [
+                (KIND_TAG, kind),
+                (VERB_TAG, verb),
+                ("+freeq.at/from", did.as_str()),
+                ("+freeq.at/act-id", act_id),
+            ]
+            .iter()
+            .chain(extra)
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+            if freeq_sdk::act_transitions::is_ruling(verb) {
+                let seq = db.own_rulings_on(act_id, &did)? + 1;
+                pairs.push((SEQ_TAG.to_string(), seq.to_string()));
+            }
+            let Ok(canonical) = freeq_sdk::act::act_canonical(
+                pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+                venue,
+                &event_id,
+            ) else {
+                return Ok(None);
+            };
+            let signature = freeq_sdk::sigtag::sign_canonical(&canonical, &state.msg_signing_key);
+            let written = db.apply_act_event(&crate::db::ActEvent {
+                canonical: &canonical,
+                signature: Some(&signature),
+                event_id: &event_id,
+                act_id,
+                opens: false,
+                venue,
+                actor: &did,
+                // This is the server, signing under its own identity — the
+                // only actor a `system` transition allows, and the only one
+                // that may write a receipt.
+                from_system: true,
+                by_referee: false,
+                origin: None,
+                timestamp: now,
+            })?;
+            Ok(Some((pairs, signature, written)))
         })
-    })?;
+        .flatten()?;
 
-    let mut tags: HashMap<String, String> = pairs
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-        .collect();
+    let mut tags: HashMap<String, String> = pairs.into_iter().collect();
     tags.insert(
         freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
         event_id.clone(),
@@ -783,6 +804,24 @@ pub(super) fn gate(
         );
         return Gate::Refused;
     }
+    // The document keeps one value per field, so a field sent under two of
+    // its prefixes has no single document to check or file.
+    if let Some(field) =
+        freeq_sdk::act::repeated_field(tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+    {
+        tracing::debug!(
+            session = %conn.id, target = %target, field = %field,
+            "Refused a task message that carries a task tag twice"
+        );
+        refuse(
+            conn,
+            "TAGMSG",
+            "REPEATED_TAG",
+            "A task message must carry each task tag only once",
+            state,
+        );
+        return Gate::Refused;
+    }
 
     // ── Who sent it ──
     //
@@ -1073,6 +1112,29 @@ pub(super) fn gate(
             refuse(conn, "TAGMSG", code, sentence, state);
             return Gate::Refused;
         }
+        // The server an opener names as its home referees the task, and
+        // this server referees only what is posted here. Refused at the door,
+        // so a task's named home is fixed when it is created. An opener that
+        // names none is accepted as it always was.
+        // Read as the signature reads it, under any of its spellings.
+        let home = freeq_sdk::act::parse_event(tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .and_then(|event| event.fields.get("act-home").cloned());
+        if let Some(home) = home
+            && home != crate::server::server_did(&state.server_name)
+        {
+            tracing::debug!(
+                session = %conn.id, did = %did, kind = %kind, home = %home,
+                "Refused an opener naming another server as its home"
+            );
+            refuse(
+                conn,
+                "TAGMSG",
+                "WRONG_HOME",
+                "A task opened here must name this server as its home",
+                state,
+            );
+            return Gate::Refused;
+        }
     } else if !freeq_sdk::act_transitions::knows_verb(kind, verb) {
         tracing::debug!(
             session = %conn.id, did = %did, kind = %kind, verb = %verb,
@@ -1127,6 +1189,7 @@ pub(super) fn gate(
             venue: &venue,
             actor: did,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: now,
         })
@@ -1160,7 +1223,8 @@ pub(super) fn gate(
             | crate::db::ActWrite::Confirmed { .. }
             | crate::db::ActWrite::ReceiptIgnored
             | crate::db::ActWrite::ReceiptBeforeSubject
-            | crate::db::ActWrite::ReceiptRefused(_),
+            | crate::db::ActWrite::ReceiptRefused(_)
+            | crate::db::ActWrite::Conflict { .. },
         ) => {}
         // A local sender's move on a task another server owns. Filed, carried
         // to the room, and not decided here — the owning server referees it,

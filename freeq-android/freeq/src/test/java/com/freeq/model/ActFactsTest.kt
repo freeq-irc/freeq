@@ -153,4 +153,10 @@ class ActFactsTest {
             "act-pay-to" to "p2", "act-tx" to "tx", "act-replaces" to "r", "act-scope" to "sc",
         )))
     }
+
+    @Test fun the_referee_an_opener_names_and_a_rulings_number_are_never_drawn() {
+        assertEquals(emptyList<Pair<String, String>>(), ActFacts.unknownFields(mapOf(
+            "act-home" to "did:web:irc.example", "act-seq" to "3",
+        )))
+    }
 }

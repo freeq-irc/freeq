@@ -326,6 +326,10 @@ pub struct ActEvent<'a> {
     pub from_system: bool,
     /// The peer this arrived from; `None` for local ingress.
     pub origin: Option<&'a str>,
+    /// A ruling signed by the referee its task's opener names (`act-home`),
+    /// with a key that referee's own site lists: the home's word, whichever
+    /// peer carried it.
+    pub by_referee: bool,
     pub timestamp: i64,
 }
 
@@ -358,6 +362,11 @@ pub enum ActWrite {
     /// applied to nothing: a home's receipt that disagrees with the shared
     /// rules is kept as the signed, comparable evidence it is.
     ReceiptRefused(freeq_sdk::act_transitions::Refusal),
+    /// A ruling numbered the same as another its signer already made on this
+    /// task under a different event id, whatever either says, among the
+    /// rulings this server acted on: an honest referee never puts one number
+    /// on two rulings. Not filed and not applied; `with` is the ruling on file.
+    Conflict { with: String },
     /// The rules refused the move.
     Refused(freeq_sdk::act_transitions::Refusal),
     /// The event names a task this server has never filed. A task another
@@ -435,6 +444,19 @@ pub struct StoredEvent {
     /// Fingerprint of a dropped second claim on this id, if there was one.
     pub conflict: Option<String>,
     pub timestamp: u64,
+}
+
+/// The confirm state a logged task event is read back with. A receipt has
+/// none — it is the ruling, not something awaiting one — unless it was filed
+/// and ignored, which it says.
+fn receipt_aware_confirm(
+    canonical: &str,
+    column: Option<&str>,
+) -> Option<crate::events::ConfirmState> {
+    match is_receipt_document(canonical) {
+        true => (column == Some("ignored")).then_some(crate::events::ConfirmState::Ignored),
+        false => Some(crate::events::ConfirmState::from_column(column)),
+    }
 }
 
 /// Whether a stored task event's bytes are a receipt — the home's word about
@@ -3749,6 +3771,7 @@ mod tests {
             venue,
             actor: ELIZA,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: ts,
         })
@@ -3783,6 +3806,7 @@ mod tests {
             venue,
             actor,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: ts,
         })
@@ -3807,6 +3831,7 @@ mod tests {
             venue,
             actor: ELIZA,
             from_system: false,
+            by_referee: false,
             origin: Some(origin),
             timestamp: ts,
         })
@@ -3842,6 +3867,7 @@ mod tests {
             venue,
             actor,
             from_system: false,
+            by_referee: false,
             origin: Some(origin),
             timestamp: ts,
         })
@@ -3882,6 +3908,7 @@ mod tests {
             venue,
             actor,
             from_system: false,
+            by_referee: false,
             origin: Some(origin),
             timestamp: ts,
         })
@@ -4259,6 +4286,7 @@ mod tests {
             venue,
             actor: home_did,
             from_system: true,
+            by_referee: false,
             origin: Some(origin),
             timestamp: ts,
         })
@@ -4296,6 +4324,7 @@ mod tests {
             venue,
             actor: HOME,
             from_system,
+            by_referee: false,
             origin: None,
             timestamp: ts,
         })
@@ -4662,6 +4691,7 @@ mod tests {
                 venue: "#ops",
                 actor: PEER_HOME,
                 from_system: true,
+                by_referee: false,
                 origin: Some("peer-b"),
                 timestamp: 12,
             })
@@ -4711,6 +4741,7 @@ mod tests {
                 venue: "#ops",
                 actor: PEER_HOME,
                 from_system: true,
+                by_referee: false,
                 origin: Some("peer-b"),
                 timestamp: 11,
             })
@@ -4799,6 +4830,7 @@ mod tests {
                 venue,
                 actor: ELIZA,
                 from_system: false,
+                by_referee: false,
                 origin: None,
                 timestamp: 10,
             },
@@ -4838,6 +4870,7 @@ mod tests {
             venue,
             actor: ELIZA,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: ts,
         })
@@ -4867,6 +4900,7 @@ mod tests {
             venue,
             actor: ELIZA,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: ts,
         })
@@ -4904,6 +4938,7 @@ mod tests {
             venue,
             actor,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: ts,
         })
@@ -5180,6 +5215,7 @@ mod tests {
             venue: "#ops",
             actor: ELIZA,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: 10,
         })
@@ -5213,6 +5249,168 @@ mod tests {
             db.act_task("B1").unwrap().unwrap().assignee.as_deref(),
             Some(SCHOLAR)
         );
+    }
+
+    /// A ruling from `REFEREE` on task `task`, numbered `seq`, signed under
+    /// the key id `kid`, offered as one its referee vouched for or not.
+    #[allow(clippy::too_many_arguments)]
+    fn numbered_ruling(
+        db: &Db,
+        id: &str,
+        task: &str,
+        subject: &str,
+        seq: &str,
+        kid: &str,
+        by_referee: bool,
+    ) -> ActWrite {
+        const REFEREE: &str = "did:web:referee.example";
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "confirm"),
+                ("+freeq.at/from", REFEREE),
+                ("+freeq.at/act-id", task),
+                ("+freeq.at/act-subject", subject),
+                ("+freeq.at/act-seq", seq),
+            ],
+            "#ops",
+            id,
+        );
+        let signature = format!("ed25519:{kid}:sig");
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some(&signature),
+            event_id: id,
+            act_id: task,
+            opens: false,
+            venue: "#ops",
+            actor: REFEREE,
+            from_system: true,
+            by_referee,
+            origin: Some("a-bystander"),
+            timestamp: 20,
+        })
+        .unwrap()
+    }
+
+    /// Two rulings from one referee under one number that say different
+    /// things, both vouched for by its own site: the second is a conflict,
+    /// filed nowhere and applied to nothing. The same words again under a new
+    /// id are not a conflict.
+    #[test]
+    fn a_referees_second_ruling_under_one_number_is_a_conflict() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "Q1", "#ops", "peer-b", 10);
+        relayed_follow_up(&db, "claim", SCHOLAR, "Q1", "Q2", "#ops", "peer-c", 11);
+        relayed_follow_up(&db, "claim", MALLORY, "Q1", "Q3", "#ops", "peer-d", 12);
+        assert_eq!(
+            numbered_ruling(&db, "R1", "Q1", "Q2", "4", "k1", true),
+            ActWrite::Confirmed {
+                state: "assigned".into()
+            }
+        );
+        assert_eq!(
+            numbered_ruling(&db, "R2", "Q1", "Q3", "4", "k1", true),
+            ActWrite::Conflict { with: "R1".into() }
+        );
+        assert!(!db.is_act_event("R2").unwrap(), "nothing is filed for it");
+        assert_eq!(
+            db.act_task("Q1").unwrap().unwrap().assignee.as_deref(),
+            Some(SCHOLAR)
+        );
+        // The same words under a new id are a second ruling under one number
+        // (nap, 2026-10-06 15:50 UTC); the same ruling again is a repeat.
+        assert_eq!(
+            numbered_ruling(&db, "R3", "Q1", "Q2", "4", "k1", true),
+            ActWrite::Conflict { with: "R1".into() },
+            "same words, new id"
+        );
+        assert!(!db.is_act_event("R3").unwrap());
+        assert_ne!(
+            numbered_ruling(&db, "R1", "Q1", "Q2", "4", "k1", true),
+            ActWrite::Conflict { with: "R1".into() },
+            "the same ruling again"
+        );
+        // Under another key, still the referee's.
+        assert_eq!(
+            numbered_ruling(&db, "R4", "Q1", "Q3", "4", "k2", true),
+            ActWrite::Conflict { with: "R1".into() }
+        );
+    }
+
+    /// Only rulings this server acted on are compared (nap, 2026-10-07 01:17
+    /// UTC): one filed and ignored, a claim to a home's authority the link
+    /// did not give, is marked so and cannot make the genuine ruling under
+    /// its number a conflict. Two applied rulings under one number still are.
+    #[test]
+    fn only_a_ruling_this_server_acted_on_is_compared() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "F1", "#ops", "peer-b", 10);
+        relayed_follow_up(&db, "claim", SCHOLAR, "F1", "F2", "#ops", "peer-c", 11);
+        relayed_follow_up(&db, "claim", MALLORY, "F1", "F3", "#ops", "peer-d", 12);
+        assert_eq!(
+            numbered_ruling(&db, "S1", "F1", "F3", "4", "k1", false),
+            ActWrite::ReceiptIgnored
+        );
+        let confirm = db
+            .act_task_events("F1")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_id == "S1")
+            .expect("filed")
+            .confirm;
+        assert_eq!(confirm, Some(crate::events::ConfirmState::Ignored));
+        assert_eq!(
+            numbered_ruling(&db, "S2", "F1", "F2", "4", "k2", true),
+            ActWrite::Confirmed {
+                state: "assigned".into()
+            },
+            "the genuine ruling is applied"
+        );
+        assert_eq!(
+            numbered_ruling(&db, "S3", "F1", "F3", "4", "k2", true),
+            ActWrite::Conflict { with: "S2".into() },
+            "a second applied ruling under the number is still a conflict"
+        );
+    }
+
+    /// The referee a task's opener names in `act-home`, read from the bytes
+    /// it signed: none for an opener that names none, or a task not on file.
+    #[test]
+    fn a_tasks_referee_is_read_from_its_openers_signed_bytes() {
+        let db = Db::open_memory().unwrap();
+        let open = |id: &str, tags: Vec<(&str, &str)>| {
+            let canonical = freeq_sdk::act::act_canonical(tags, "#ops", id).unwrap();
+            db.apply_act_event(&ActEvent {
+                canonical: &canonical,
+                signature: None,
+                event_id: id,
+                act_id: id,
+                opens: true,
+                venue: "#ops",
+                actor: "did:plc:poster",
+                from_system: false,
+                origin: Some("a-peer"),
+                by_referee: false,
+                timestamp: 10,
+            })
+            .unwrap()
+        };
+        let base = vec![
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "offer"),
+            ("+freeq.at/from", "did:plc:poster"),
+        ];
+        let mut named = base.clone();
+        named.push(("+freeq.at/act-home", "did:web:referee.example"));
+        assert!(matches!(open("T1", named), ActWrite::Filed { .. }));
+        assert!(matches!(open("T2", base), ActWrite::Filed { .. }));
+        assert_eq!(
+            db.act_task_home("T1").unwrap().as_deref(),
+            Some("did:web:referee.example")
+        );
+        assert_eq!(db.act_task_home("T2").unwrap(), None);
+        assert_eq!(db.act_task_home("T3").unwrap(), None);
     }
 
     /// A bounty whose offer named no cutoff takes bids for as long as it
@@ -5311,6 +5509,7 @@ mod tests {
             venue,
             actor: ELIZA,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: ts,
         })
@@ -5394,6 +5593,7 @@ mod tests {
                 venue: "#ops",
                 actor: SCHOLAR,
                 from_system: false,
+                by_referee: false,
                 origin: None,
                 timestamp: 12,
             })
@@ -5617,6 +5817,7 @@ mod tests {
                 venue: "#ops",
                 actor: &server,
                 from_system: true,
+                by_referee: false,
                 origin: None,
                 timestamp: 12,
             })
@@ -5708,6 +5909,7 @@ mod tests {
             venue,
             actor: ELIZA,
             from_system: false,
+            by_referee: false,
             origin: Some(home),
             timestamp: ts,
         })
@@ -5862,6 +6064,7 @@ mod tests {
             venue: "#ops",
             actor: SCHOLAR,
             from_system: false,
+            by_referee: false,
             origin: None,
             timestamp: 20,
         })
@@ -9258,6 +9461,19 @@ impl Db {
             return Ok(ActWrite::NotATaskEvent);
         };
 
+        // ── a ruling under a number its signer has already used ──
+        //
+        // Every numbered ruling, whatever its task names and however it was
+        // checked (plan 9.5): the same `act-seq` from the same signer on the
+        // same task under another event id, among the rulings this server
+        // acted on, is a conflict, and nothing is filed for it.
+        if rules::is_ruling(&view.verb)
+            && let Some(seq) = view.fields.get("act-seq")
+            && let Some(with) = self.conflicting_ruling(ev, seq)?
+        {
+            return Ok(ActWrite::Conflict { with });
+        }
+
         // ── A receipt ──
         //
         // Answered before the task's own state machine, because a receipt is
@@ -9294,10 +9510,11 @@ impl Db {
             let Some(home) = self.act_task_origin(ev.act_id)? else {
                 return Ok(ActWrite::ReceiptBeforeSubject);
             };
-            let from_home = match ev.origin {
-                None => home.is_empty(),
-                Some(peer) => home == peer,
-            };
+            let from_home = ev.by_referee
+                || match ev.origin {
+                    None => home.is_empty(),
+                    Some(peer) => home == peer,
+                };
             let record = EventRecord {
                 shape: EventShape::Document(ev.canonical),
                 signature: ev.signature,
@@ -9305,7 +9522,13 @@ impl Db {
                 timestamp: ev.timestamp as u64,
             };
             if !from_home {
-                if !self.insert_event(&record)? {
+                // Marked, so a later ruling's number is never checked against
+                // a claim this server did not act on.
+                let ignored = EventRecord {
+                    ctx: self.act_context(ev, Some(crate::events::ConfirmState::Ignored)),
+                    ..record
+                };
+                if !self.insert_event(&ignored)? {
                     return Ok(ActWrite::Duplicate);
                 }
                 tx.commit()?;
@@ -9413,7 +9636,10 @@ impl Db {
             // referees the task. Our own events carry no origin at all, and a
             // task of ours has no home to hear from — we are it — so an empty
             // origin on either side is never a match.
-            let from_home = !task.origin.is_empty() && ev.origin == Some(task.origin.as_str());
+            // A ruling its referee's own site vouched for is the home's word
+            // whichever link carried it.
+            let from_home = ev.by_referee
+                || (!task.origin.is_empty() && ev.origin == Some(task.origin.as_str()));
             // The one transition on a foreign task that needs no receipt: one
             // the home itself authored — an expiry, a closed review window —
             // which already carries the signature of the server whose word
@@ -9601,6 +9827,7 @@ impl Db {
             venue: &named.venue,
             actor: &actor,
             from_system: crate::server::is_system_actor(&actor),
+            by_referee: false,
             origin: named.origin.as_deref(),
             timestamp: named.timestamp as i64,
         };
@@ -10207,6 +10434,84 @@ impl Db {
         }))
     }
 
+    /// The number `did`'s next ruling on `act_id` follows: the higher of how
+    /// many of its rulings are on file, whatever link brought each, and the
+    /// highest `act-seq` among them. Receipts, expiries and closed review
+    /// windows count, numbered or not. Its own rulings replayed back to it by
+    /// a peer, as after a database restore, count, and one replayed without
+    /// an earlier one still puts the next number past it. A ruling anyone
+    /// else signed is not counted.
+    pub fn own_rulings_on(&self, act_id: &str, did: &str) -> SqlResult<u64> {
+        let mut stmt = self.conn.prepare(
+            "SELECT canonical FROM events
+              WHERE kind = 'act' AND subject = ?1 AND actor_did = ?2",
+        )?;
+        let rows: Vec<String> = stmt
+            .query_map(params![act_id, did], |r| r.get(0))?
+            .collect::<SqlResult<_>>()?;
+        let rulings: Vec<_> = rows
+            .iter()
+            .filter_map(|c| crate::events::derive_act_view(c))
+            .filter(|v| freeq_sdk::act_transitions::is_ruling(&v.verb))
+            .collect();
+        let highest = rulings
+            .iter()
+            .filter_map(|v| v.fields.get("act-seq")?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        Ok(highest.max(rulings.len() as u64))
+    }
+
+    /// A ruling on file that `ev` contradicts: the same signer and task, the
+    /// same `act-seq`, a different event id (the same id again is a repeat).
+    /// Only rulings this server acted on are compared: one filed and not
+    /// acted on (`ignored`, `unconfirmed`, `superseded`) cannot make the
+    /// genuine ruling a conflict.
+    fn conflicting_ruling(&self, ev: &ActEvent<'_>, seq: &str) -> SqlResult<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, canonical FROM events
+              WHERE kind = 'act' AND subject = ?1 AND actor_did = ?2 AND event_id <> ?3
+                AND (confirm_state IS NULL
+                     OR confirm_state NOT IN ('ignored', 'unconfirmed', 'superseded'))",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![ev.act_id, ev.actor, ev.event_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<SqlResult<_>>()?;
+        for (event_id, canonical) in rows {
+            let Some(other) = crate::events::derive_act_view(&canonical) else {
+                continue;
+            };
+            if other.fields.get("act-seq").map(String::as_str) != Some(seq) {
+                continue;
+            }
+            return Ok(Some(event_id));
+        }
+        Ok(None)
+    }
+
+    /// The referee `act_id`'s opener names in `act-home`, read from the bytes
+    /// it signed, as `act_task_bid_deadline` reads its cutoff: `None` for an
+    /// opener that names none, or a task whose opener is not on file.
+    pub fn act_task_home(&self, act_id: &str) -> SqlResult<Option<String>> {
+        let canonical: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT canonical FROM events WHERE kind = 'act' AND event_id = ?1",
+                params![act_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(canonical.and_then(|c| {
+            serde_json::from_str::<serde_json::Value>(&c)
+                .ok()?
+                .get("act-home")?
+                .as_str()
+                .map(str::to_string)
+        }))
+    }
+
     /// Every venue that currently holds a live task.
     ///
     /// The listing endpoint runs each of these through the same authorization
@@ -10250,12 +10555,10 @@ impl Db {
             let canonical: String = row.get(1)?;
             Ok(ActLoggedEvent {
                 event_id: row.get(0)?,
-                confirm: match is_receipt_document(&canonical) {
-                    true => None,
-                    false => Some(crate::events::ConfirmState::from_column(
-                        row.get::<_, Option<String>>(5)?.as_deref(),
-                    )),
-                },
+                confirm: receipt_aware_confirm(
+                    &canonical,
+                    row.get::<_, Option<String>>(5)?.as_deref(),
+                ),
                 canonical,
                 signature: row.get(2)?,
                 actor_did: row.get(3)?,
@@ -10306,12 +10609,10 @@ impl Db {
             let canonical: String = row.get(1)?;
             Ok(ActLoggedEvent {
                 event_id: row.get(0)?,
-                confirm: match is_receipt_document(&canonical) {
-                    true => None,
-                    false => Some(crate::events::ConfirmState::from_column(
-                        row.get::<_, Option<String>>(5)?.as_deref(),
-                    )),
-                },
+                confirm: receipt_aware_confirm(
+                    &canonical,
+                    row.get::<_, Option<String>>(5)?.as_deref(),
+                ),
                 canonical,
                 signature: row.get(2)?,
                 actor_did: row.get(3)?,

@@ -114,10 +114,20 @@ export class Transport {
       // call `flush()` first. We still emit a defensive QUIT here for callers
       // that haven't sent one, but it may be lost if the buffer is non-empty.
       try { this.send('QUIT :Leaving'); } catch { /* ignore */ }
+      // Unhooked first: the drop is reported below, and the socket's own
+      // close can arrive after a later connect() is up.
+      Transport.unhook(this.ws);
       this.ws.close();
       this.ws = null;
     }
     this.opts.onStateChange('disconnected');
+  }
+
+  private static unhook(ws: WebSocket) {
+    ws.onopen = null;
+    ws.onmessage = null;
+    ws.onclose = null;
+    ws.onerror = null;
   }
 
   private startHeartbeat() {
@@ -130,8 +140,14 @@ export class Transport {
         );
         this.stopHeartbeat();
         if (this.ws) {
+          // Its close handler's two jobs are done here, so that a dead
+          // socket's late close cannot follow a later reconnect() or
+          // connect().
+          Transport.unhook(this.ws);
           this.ws.close();
           this.ws = null;
+          this.opts.onStateChange('disconnected');
+          this.scheduleReconnect();
         }
       } else if (elapsed > Transport.PING_INTERVAL) {
         this.send('PING :heartbeat');

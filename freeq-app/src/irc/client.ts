@@ -285,7 +285,7 @@ export async function deviceRowsFrom(
  *  `after` settles. */
 function newKeyLookup(after?: Promise<void>): KeyLookup {
   return new KeyLookup(
-    { fetch: (target: string) => fetch(target), resolveDid: makeDidResolver() },
+    { fetch: (target, init) => fetch(target, init), resolveDid: makeDidResolver() },
     window.location.origin,
     60 * 60 * 1000,
     undefined,

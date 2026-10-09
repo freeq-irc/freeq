@@ -78,6 +78,7 @@ enum VerdictState {
 enum KeyLayer {
     "Vouched",
     "Published",
+    "DidKey",
 };
 
 dictionary SignatureVerdict {
@@ -184,6 +185,7 @@ dictionary ActEvent {
     boolean replayed;
     string? dm_key;
     SignatureVerdict? verdict = null;
+    string? ruling = null;
 };
 
 dictionary ReactionTally {

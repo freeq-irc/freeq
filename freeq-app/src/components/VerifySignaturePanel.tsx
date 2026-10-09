@@ -23,6 +23,7 @@ const KEY_SOURCES: Record<string, string> = {
   IdentityRecord: 'identity-record',
   DidDocument: 'did-document',
   OriginServer: 'origin-server',
+  DidKey: 'did-key',
 };
 
 const PANEL_W = 288;
