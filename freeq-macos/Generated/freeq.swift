@@ -4176,6 +4176,7 @@ public enum KeyLayer {
     
     case vouched
     case published
+    case didKey
 }
 
 
@@ -4197,6 +4198,8 @@ public struct FfiConverterTypeKeyLayer: FfiConverterRustBuffer {
         
         case 2: return .published
         
+        case 3: return .didKey
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -4211,6 +4214,10 @@ public struct FfiConverterTypeKeyLayer: FfiConverterRustBuffer {
         
         case .published:
             writeInt(&buf, Int32(2))
+        
+        
+        case .didKey:
+            writeInt(&buf, Int32(3))
         
         }
     }
