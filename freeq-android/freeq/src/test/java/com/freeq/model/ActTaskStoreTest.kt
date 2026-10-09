@@ -3,6 +3,7 @@ package com.freeq.model
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
+import java.util.Date
 
 /**
  * What a channel remembers about the work done in it: one task per opener,
@@ -350,5 +351,129 @@ class ActTaskStoreTest {
         store.record(ev())
         assertNull(store.record(move("claim", "e2")))
         assertNull(store.record(move("complete", "e3")))
+    }
+
+    // ── Where a confirmation line is drawn ──
+
+    private val second = 1_760_011_200_000L
+
+    private fun row(id: String, at: Long, from: String = "worker", deleted: Boolean = false) =
+        ChatMessage(id = id, from = from, text = id, isAction = false, timestamp = Date(at), isDeleted = deleted)
+
+    /** The line the home's confirmation draws, stamped by the home's clock. */
+    private fun systemRow(id: String, at: Long) = row(id, at, from = "")
+
+    private fun confirmOf(id: String, subject: String) =
+        ActTaskEvent(eventId = id, verb = "confirm", from = "home", fields = mapOf("act-subject" to subject))
+
+    /** The card a claim draws on row `card`, in a task holding `rest` too. */
+    private fun cardFor(card: String, claim: String, rest: List<ActTaskEvent>): Pair<String, ActCard> {
+        val step = ActTaskEvent(eventId = claim, verb = "claim", from = "worker", msgId = card)
+        val task = ActTask(taskId = "t-$claim", kind = "handoff", title = "ship it", verb = "claim", events = listOf(step) + rest)
+        return card to ActCard(task, step)
+    }
+
+    private val claimed = mapOf(cardFor("card", "claim", listOf(confirmOf("line", "claim"))))
+
+    private fun ids(rows: List<ChatMessage>) = rows.map { it.id }
+
+    @Test fun a_line_stored_above_its_card_is_drawn_under_it_in_either_stamping() {
+        for (cardAt in listOf(second, second + 1000)) {
+            val stored = listOf(row("before", second - 5000), systemRow("line", second + 400), row("card", cardAt), row("after", second + 9000))
+            assertEquals(listOf("before", "card", "line", "after"), ids(actConfirmLinesUnderCards(stored, claimed)))
+        }
+    }
+
+    @Test fun a_line_already_under_its_card_stays() {
+        for (cardAt in listOf(second, second + 1000)) {
+            val stored = listOf(row("card", cardAt), systemRow("line", cardAt + 400), row("after", second + 9000))
+            assertEquals(listOf("card", "line", "after"), ids(actConfirmLinesUnderCards(stored, claimed)))
+        }
+    }
+
+    @Test fun a_line_whose_card_is_not_drawn_or_was_deleted_stays_by_its_time() {
+        val missing = listOf(systemRow("line", second + 400), row("after", second + 9000))
+        assertEquals(listOf("line", "after"), ids(actConfirmLinesUnderCards(missing, claimed)))
+
+        val deleted = listOf(systemRow("line", second + 400), row("card", second, deleted = true))
+        assertEquals(listOf("line", "card"), ids(actConfirmLinesUnderCards(deleted, claimed)))
+    }
+
+    @Test fun an_expiry_line_stays_by_its_time() {
+        val cards = mapOf(cardFor("card", "claim", listOf(ActTaskEvent(eventId = "gone", verb = "expire", from = "home"))))
+        val stored = listOf(systemRow("gone", second + 400), row("card", second))
+        assertEquals(listOf("gone", "card"), ids(actConfirmLinesUnderCards(stored, cards)))
+    }
+
+    @Test fun each_of_two_tasks_lines_goes_under_its_own_card() {
+        val cards = mapOf(
+            cardFor("cardA", "a", listOf(confirmOf("lineA", "a"))),
+            cardFor("cardB", "b", listOf(confirmOf("lineB", "b"))),
+        )
+        val stored = listOf(
+            systemRow("lineA", second + 100), systemRow("lineB", second + 200),
+            row("cardA", second), row("between", second), row("cardB", second + 1000),
+        )
+        assertEquals(listOf("cardA", "lineA", "between", "cardB", "lineB"), ids(actConfirmLinesUnderCards(stored, cards)))
+    }
+
+    @Test fun two_lines_under_one_card_keep_their_order() {
+        val cards = mapOf(cardFor("card", "claim", listOf(confirmOf("first", "claim"), confirmOf("second", "claim"))))
+        val stored = listOf(systemRow("first", second + 100), systemRow("second", second + 200), row("card", second + 1000))
+        assertEquals(listOf("card", "first", "second"), ids(actConfirmLinesUnderCards(stored, cards)))
+    }
+
+    /** Live order into a channel: the step, the home's confirmation and its
+     *  line, then the card's line stamped `cardAt` by the server. */
+    private fun liveChannel(cardAt: Long): Triple<ChannelState, String, String> {
+        val claim = idAt(second + 400)
+        val receipt = idAt(second + 450)
+        val ch = ChannelState("#work")
+        ch.recordActEvent(ev())
+        ch.recordActEvent(move("claim", claim))
+        val text = ch.recordActEvent(move("confirm", receipt, mapOf("act-subject" to claim), who = "acceptance", did = null))!!
+        ch.appendIfNew(ChatMessage(id = receipt, from = "", text = text, isAction = false, timestamp = Date(second + 450)))
+        ch.appendIfNew(
+            ChatMessage(
+                id = "m-card", from = "worker", text = "on it", isAction = false,
+                timestamp = Date(cardAt), account = worker, actRef = opener,
+            )
+        )
+        return Triple(ch, receipt, "m-card")
+    }
+
+    @Test fun a_live_confirmation_is_drawn_under_its_card_whatever_order_it_was_stored_in() {
+        // Stamped in the step's second, the card sorts before the line's
+        // millisecond; stamped in the next, after it.
+        val (same, receipt, card) = liveChannel(second)
+        assertEquals(listOf(card, receipt), ids(same.messages))
+        assertEquals(listOf(card, receipt), ids(actConfirmLinesUnderCards(same.messages, same.actCards)))
+
+        val (next, _, _) = liveChannel(second + 1000)
+        assertEquals(listOf(receipt, card), ids(next.messages))
+        assertEquals(listOf(card, receipt), ids(actConfirmLinesUnderCards(next.messages, next.actCards)))
+    }
+
+    @Test fun no_new_divider_falls_between_a_read_card_and_its_line() {
+        val (ch, _, card) = liveChannel(second + 1000)
+        ch.appendIfNew(row("later", second + 60_000, from = "alice"))
+        val timeOrdered = ch.messages.toList()
+        val drawn = actConfirmLinesUnderCards(timeOrdered, ch.actCards)
+
+        // The card was the last row read; the divider goes before what came
+        // after it in time, which is drawn after the line.
+        val divider = UnreadBoundary.find(timeOrdered, lastReadId = card, lastReadTimestamp = 0, nick = "me")
+        assertEquals("later", divider)
+        assertEquals(drawn.lastIndex, drawn.indexOfFirst { it.id == divider })
+    }
+
+    @Test fun the_new_divider_sits_above_a_card_that_arrived_after_its_line_was_read() {
+        val (ch, receipt, card) = liveChannel(second + 1000)
+        val timeOrdered = ch.messages.toList()
+        val drawn = actConfirmLinesUnderCards(timeOrdered, ch.actCards)
+
+        val divider = UnreadBoundary.find(timeOrdered, lastReadId = receipt, lastReadTimestamp = 0, nick = "me")
+        assertEquals(card, divider)
+        assertEquals(listOf(card, receipt), ids(drawn))
     }
 }

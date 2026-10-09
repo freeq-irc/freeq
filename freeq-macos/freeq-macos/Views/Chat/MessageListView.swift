@@ -44,8 +44,10 @@ struct MessageListView: View {
             // separators + sender-header decisions baked in). Cheap array work
             // — the expensive part (view layout) is what the AppKit list now
             // controls per-row instead of re-diffing the whole world.
+            // Each "confirmed" line drawn under its card. Reading `actCards`
+            // here registers it, so a pairing redraws the list.
             let rows = MessageListTimeline.build(
-                from: messages,
+                from: actConfirmLinesUnderCards(messages, cards: channel?.actCards ?? [:]),
                 presence: JoinPartDisplay(rawValue: joinPartDisplayRaw) ?? .hidden
             ) {
                 appState.checkedVerdicts[$0.id] ?? $0.verdict

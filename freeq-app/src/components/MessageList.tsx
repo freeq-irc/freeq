@@ -17,7 +17,7 @@ import { MessageContextMenu } from './MessageContextMenu';
 import { MarkdownMessage } from './MarkdownRenderer';
 import { MENTION_RE, CHANNEL_RE, MentionSpan, ChannelSpan, type RenderCtx } from './messageEntities';
 import { CoordinationEventCard } from './CoordinationCards';
-import { ActEventCard, useActCompanion } from './ActCards';
+import { ActEventCard, useActCompanion, confirmLinesUnderCards } from './ActCards';
 import { jumbomojiSize } from '../lib/jumbomoji';
 import { buildTranscript, rowsInSelection } from '../lib/transcript';
 import { useCachedVerdict, useVerdictLookup, copyForVerdict, verdictCopy, type Verdict } from '../lib/verify-signature';
@@ -1573,12 +1573,17 @@ export function MessageList() {
   const blockedDids = useStore((s) => s.blockedDids);
   const blockedNicks = useStore((s) => s.blockedNicks);
   const activeMembers = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.members);
+  const actTasks = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.actTasks);
+  const lastReadMsgId = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.lastReadMsgId);
   /** A DM buffer: not the server tab, and not a channel name. */
   const isDM = activeChannel !== 'server' && !activeChannel.startsWith('#') && !activeChannel.startsWith('&');
 
   // Join/part/quit notices are hidden unless the reader opted in.
   // Moderation actions (kicks, bans, mode changes) are always visible.
-  const messages = useMemo(() => {
+  // The "New" divider goes before the row after the last read one in time
+  // order, worked out before a confirmation line moves under its card: in the
+  // drawn order a card would be its own line's predecessor.
+  const { messages, firstUnreadId } = useMemo(() => {
     let msgs = rawMessages;
     // Hide messages from blocked users (DID first, nick fallback for guests).
     if (blockedDids.length > 0 || blockedNicks.length > 0) {
@@ -1589,9 +1594,13 @@ export function MessageList() {
         return !blockedNicks.includes(m.from.toLowerCase());
       });
     }
-    if (joinPartDisplay !== 'hidden') return msgs;
-    return msgs.filter((m) => !isPresenceLine(m));
-  }, [rawMessages, joinPartDisplay, blockedDids, blockedNicks, activeMembers]);
+    if (joinPartDisplay === 'hidden') msgs = msgs.filter((m) => !isPresenceLine(m));
+    const readAt = lastReadMsgId ? msgs.findIndex((m) => m.id === lastReadMsgId) : -1;
+    return {
+      messages: confirmLinesUnderCards(msgs, actTasks),
+      firstUnreadId: readAt >= 0 ? msgs[readAt + 1]?.id : undefined,
+    };
+  }, [rawMessages, joinPartDisplay, blockedDids, blockedNicks, activeMembers, actTasks, lastReadMsgId]);
 
   /** Whether anything on screen came from a sender, as opposed to join and
    *  part notices. A channel with none has nothing for the boundary row to
@@ -1635,7 +1644,6 @@ export function MessageList() {
     isPeerBlocked(allChannels, activeChannel, blockedNicks, blockedDids,
       (did) => getClient()?.getNickForDid(did));
 
-  const lastReadMsgId = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.lastReadMsgId);
   const pins = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.pins ?? EMPTY_PINS);
   const density = useStore((s) => s.messageDensity);
   const ref = useRef<HTMLDivElement>(null);
@@ -2185,7 +2193,7 @@ export function MessageList() {
               </div>
             ) : (
             <div key={row.key} id={`msg-${row.key}`} className={highlightId === row.key ? 'bg-accent/10 transition-colors duration-1000' : ''}>
-              {lastReadMsgId && row.at > 0 && messages[row.at - 1].id === lastReadMsgId && !row.msg.isSelf && (
+              {firstUnreadId !== undefined && row.msg.id === firstUnreadId && !row.msg.isSelf && (
                 <div className="flex items-center gap-3 px-4 my-3" id="unread-marker">
                   <div className="flex-1 h-px bg-danger/40" />
                   <span className="text-xs font-bold text-danger/70 uppercase tracking-wider">New</span>

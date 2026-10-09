@@ -583,10 +583,15 @@ struct MessageListView: View {
     /// Every row's header flag, worked out once per render: checking row by
     /// row re-walked the sender's run for every row (`RowSignatureMark.headers`).
     /// The buffer as the transcript draws it: presence lines hidden, folded,
-    /// or all shown per the setting. Everything that indexes rendered rows
-    /// indexes this, not `channel.messages`.
+    /// or all shown per the setting, and each "confirmed" line under its card.
+    /// Everything that indexes rendered rows indexes this, not
+    /// `channel.messages`.
     private var displayRows: [ChatMessage] {
-        PresenceLines.apply(channel.messages, mode: joinPartDisplay)
+        actConfirmLinesUnderCards(
+            PresenceLines.apply(channel.messages, mode: joinPartDisplay),
+            cards: channel.actCards,
+            // A blocked sender's row stays in the list but is drawn empty.
+            hidden: { appState.isBlocked(nick: $0.from, did: channel.memberInfo(for: $0.from)?.did) })
     }
 
     /// The row the "New" separator sits above: the first one past the last

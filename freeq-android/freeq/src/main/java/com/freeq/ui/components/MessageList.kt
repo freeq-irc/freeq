@@ -58,6 +58,7 @@ import com.freeq.model.RowSignatureMark
 import com.freeq.model.SignatureVerdict
 import com.freeq.model.ChatMessage
 import com.freeq.model.PresenceLines
+import com.freeq.model.actConfirmLinesUnderCards
 import com.freeq.model.MemberInfo
 import com.freeq.ui.theme.FreeqColors
 import com.freeq.ui.theme.Theme
@@ -80,12 +81,15 @@ fun MessageList(
     // Join/part/quit lines then follow the user's display choice (hidden by
     // default), so header runs and scroll indices see only what is drawn.
     val joinPartDisplay by appState.joinPartDisplay
-    val messages = PresenceLines.apply(
+    val timeOrdered = PresenceLines.apply(
         channelState.messages.filter { msg ->
             msg.from.isEmpty() || !appState.isBlocked(msg.from, appState.didForNick(msg.from))
         },
         joinPartDisplay
     )
+    // Each "confirmed" line drawn under its card. Read here, not under a
+    // `remember`, so a pairing that changes only `actCards` redraws the list.
+    val messages = actConfirmLinesUnderCards(timeOrdered, channelState.actCards)
 
     // Show header if sender changes, >5 min gap, or after date/system/deleted boundary.
     // Also break across a provenance boundary: a federated message (msg.origin
@@ -266,8 +270,10 @@ fun MessageList(
                 }
             }
 
+            // Worked out in time order: in the drawn order a card would be its
+            // own line's predecessor, and the divider would fall between them.
             val unreadSeparatorMsgId = UnreadBoundary.find(
-                messages, lastReadId, lastReadTimestamp, appState.nick.value
+                timeOrdered, lastReadId, lastReadTimestamp, appState.nick.value
             )
 
             itemsIndexed(messages, key = { _, msg -> msg.id }) { index, msg ->

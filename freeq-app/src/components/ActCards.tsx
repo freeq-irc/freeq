@@ -148,6 +148,51 @@ export function cardNeighbours(task: ActTask, event: ActEvent): { prev?: string;
   return { prev: cards[i - 1]?.msgId, next: cards[i + 1]?.msgId };
 }
 
+/**
+ * The rows as the list draws them: each "confirmed" line directly under the
+ * card of the step it confirms.
+ *
+ * The stored list stays in time order, and a confirmation is stamped by the
+ * home's clock while its card is stamped by the server's whole second, so by
+ * time the line can land above its card. A line moves only when its card's
+ * row is here and not deleted; otherwise it stays where its time put it. Two
+ * lines under one card keep their order. Nothing else moves.
+ */
+export function confirmLinesUnderCards(
+  messages: Message[],
+  actTasks: Map<string, ActTask> | undefined,
+): Message[] {
+  // The card row each confirmation belongs under, by the confirmation's id.
+  const cardOf = new Map<string, string>();
+  for (const task of actTasks?.values() ?? []) {
+    for (const ev of task.events) {
+      if (ev.verb !== 'confirm') continue;
+      const step = task.events.find(e => e.eventId === ev.fields['act-subject']);
+      if (step?.msgId) cardOf.set(ev.eventId, step.msgId);
+    }
+  }
+  if (cardOf.size === 0) return messages;
+  const drawnCards = new Set(messages.filter(m => !m.isSystem && !m.deleted).map(m => m.id));
+  const under = new Map<string, Message[]>();
+  for (const m of messages) {
+    const card = m.isSystem ? cardOf.get(m.id) : undefined;
+    if (card === undefined || !drawnCards.has(card)) continue;
+    const lines = under.get(card);
+    if (lines) lines.push(m);
+    else under.set(card, [m]);
+  }
+  if (under.size === 0) return messages;
+  const out: Message[] = [];
+  for (const m of messages) {
+    const card = m.isSystem ? cardOf.get(m.id) : undefined;
+    if (card !== undefined && under.has(card)) continue;
+    out.push(m);
+    const lines = under.get(m.id);
+    if (lines) out.push(...lines);
+  }
+  return out;
+}
+
 export function ActEventCard({ msg, task, event }: {
   msg: Message;
   task: ActTask;

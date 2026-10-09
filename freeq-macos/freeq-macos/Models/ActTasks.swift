@@ -74,6 +74,45 @@ func actCardNeighbours(task: ActTask, event: ActTaskEvent) -> ActNeighbours {
         next: i + 1 < cards.count ? cards[i + 1].msgId : nil)
 }
 
+/// The rows as the list draws them: each "confirmed" line directly under the
+/// card of the step it confirms.
+///
+/// The stored list stays in time order, and a confirmation is stamped by the
+/// home's clock while its card is stamped by the server's whole second, so by
+/// time the line can land above its card. A line moves only when its card's
+/// row is here, not deleted and not `hidden` (a row the list keeps but draws
+/// empty); otherwise it stays where its time put it. Two lines under one card
+/// keep their order. Nothing else moves.
+func actConfirmLinesUnderCards(
+    _ rows: [ChatMessage],
+    cards: [String: ActCard],
+    hidden: (ChatMessage) -> Bool = { _ in false }
+) -> [ChatMessage] {
+    // The card row each confirmation belongs under, by the confirmation's id.
+    var cardOf: [String: String] = [:]
+    for (rowId, card) in cards {
+        for ev in card.task.events
+        where ev.verb == "confirm" && ev.fields["act-subject"] == card.event.eventId {
+            cardOf[ev.eventId] = rowId
+        }
+    }
+    if cardOf.isEmpty { return rows }
+    let drawnCards = Set(rows.filter { !$0.from.isEmpty && !$0.isDeleted && !hidden($0) }.map(\.id))
+    var under: [String: [ChatMessage]] = [:]
+    for m in rows where m.from.isEmpty {
+        if let card = cardOf[m.id], drawnCards.contains(card) { under[card, default: []].append(m) }
+    }
+    if under.isEmpty { return rows }
+    var out: [ChatMessage] = []
+    out.reserveCapacity(rows.count)
+    for m in rows {
+        if m.from.isEmpty, let card = cardOf[m.id], under[card] != nil { continue }
+        out.append(m)
+        if let lines = under[m.id] { out.append(contentsOf: lines) }
+    }
+    return out
+}
+
 /// A task event and the task it belongs to, as one card draws them.
 struct ActCard: Equatable {
     var task: ActTask
