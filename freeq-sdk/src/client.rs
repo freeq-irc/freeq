@@ -4016,7 +4016,7 @@ where
                                         home,
                                         venue,
                                         verdict.as_ref(),
-                                        follow_up.is_some(),
+                                        follow_up.clone(),
                                         act_hooks,
                                     );
                                 }
@@ -4263,7 +4263,11 @@ const TASK_HOMES_HELD: usize = 4096;
 
 /// What a task's opener says about the task's rulings: the referee it names
 /// (`act-home`, `None` when it names none), and the venue it was posted to,
-/// which a server signs its own events about the task for.
+/// which a server signs its own events about the task for. A fetched copy
+/// that does not name the referee is kept too, so later rulings on the task
+/// read no history: one altered or untrusted with what its signature covers
+/// and when it was checked, to be checked again from those bytes; one
+/// missing from the history for the connection.
 #[derive(Debug, Clone, Default)]
 struct TaskOpener {
     home: Option<String>,
@@ -4274,6 +4278,31 @@ struct TaskOpener {
     /// The fetched copy's signature contradicts its key: every ruling on the
     /// task fails, and nothing else it says is read.
     altered: bool,
+    /// The fetched copy's key is one only the connected server vouched for,
+    /// the server's own, or found nowhere: the referee cannot be known, and
+    /// every ruling on the task is hidden.
+    untrusted: bool,
+    /// Of an untrusted copy: its key was found nowhere. It waits for the
+    /// lookup's ttl only while the lookup remembers that miss.
+    key_not_found: bool,
+    /// The task's history the server answered holds no opener: the referee
+    /// cannot be known, and the same server asked again gains nothing.
+    missing: bool,
+    /// When an altered or untrusted copy was last checked, on the wall
+    /// clock the key lookup's ttl runs on, so the two pass together.
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    /// What an altered or untrusted copy's signature covers, checked again
+    /// once the lookup's ttl has passed since `since`; none for a copy with
+    /// no document or signature that can be read, never checked again.
+    signed: Option<crate::verdict::Signed>,
+}
+
+impl TaskOpener {
+    /// Whether it says who referees the task: a live opener, or a fetched
+    /// copy whose signature checked.
+    fn checked(&self) -> bool {
+        !self.altered && !self.untrusted && !self.missing
+    }
 }
 
 /// What judging a ruling comes to inside the SDK: a [`RulingCheck`], or
@@ -4337,7 +4366,8 @@ impl TaskHomes {
     /// Name `task`'s opener from a live opener whose signature checked. An
     /// answer from such an opener already held stands; anything else, a
     /// cell with none yet, a history read still in flight or one that
-    /// failed, or an answer from a fetched copy (one found altered too), is
+    /// failed, or an answer from a fetched copy (one found altered,
+    /// untrusted or missing too), is
     /// replaced by one holding `opener`, and a ruling waiting on that read
     /// looks again (`home_of`). A replace keeps the task's place in `order`.
     fn name(&mut self, task: &str, opener: TaskOpener) {
@@ -4367,6 +4397,21 @@ impl TaskHomes {
         {
             self.cells.remove(task);
             self.order.retain(|t| t != task);
+        }
+    }
+
+    /// Put `opener`, a kept copy checked again, in place of `cell`, unless
+    /// something replaced `cell` meanwhile (a live opener that checked).
+    fn replace(&mut self, task: &str, cell: &HomeCell, opener: TaskOpener) {
+        if self
+            .cells
+            .get(task)
+            .is_some_and(|held| Arc::ptr_eq(held, cell))
+        {
+            self.cells.insert(
+                task.to_string(),
+                Arc::new(tokio::sync::OnceCell::new_with(Some(Ok(opener)))),
+            );
         }
     }
 }
@@ -4495,22 +4540,23 @@ impl ActLine {
     /// `settled` hook, which this returns with `hooks`, the history read
     /// instead when it does not; never from an opener that does not check.
     /// The first opener's answer is kept; a history read under way or failed
-    /// is replaced by it.
+    /// is replaced by it. `signed`, what the opener's pending check checks;
+    /// none when its verdict was final at delivery.
     fn name_once_checked(
         self: &Arc<Self>,
         task: String,
         home: Option<String>,
         venue: Option<String>,
         delivered: Option<&crate::verdict::Verdict>,
-        pending: bool,
+        signed: Option<crate::verdict::Signed>,
         hooks: Option<ActHooks>,
     ) -> Option<ActHooks> {
-        if !pending {
+        let Some(signed) = signed else {
             if delivered.is_some_and(checks_out) {
                 self.name_home(&task, home, venue);
             }
             return hooks;
-        }
+        };
         let (settled, checked) = tokio::sync::oneshot::channel();
         let hooks = match hooks {
             Some(hooks) => ActHooks {
@@ -4534,7 +4580,10 @@ impl ActLine {
         // if it checks, replacing a read that has not answered.
         if read_under_way {
             tokio::spawn(async move {
-                if checked.await.is_ok_and(|verdict| checks_out(&verdict)) {
+                let Ok(verdict) = checked.await else {
+                    return;
+                };
+                if checks_out(&line.opener_verdict(&signed, verdict).await) {
                     line.name_home(&task, home, venue);
                 }
             });
@@ -4546,8 +4595,12 @@ impl ActLine {
         tokio::spawn(async move {
             let named = cell
                 .get_or_init(|| async {
-                    match checked.await {
-                        Ok(verdict) if checks_out(&verdict) => Ok(TaskOpener {
+                    let verdict = match checked.await {
+                        Ok(verdict) => Some(line.opener_verdict(&signed, verdict).await),
+                        Err(_) => None,
+                    };
+                    match verdict {
+                        Some(verdict) if checks_out(&verdict) => Ok(TaskOpener {
                             home,
                             venue,
                             ..TaskOpener::default()
@@ -4896,6 +4949,11 @@ impl ActLine {
         if opener.altered {
             return Judgment::Ruled(RulingCheck::Fails);
         }
+        // Its opening post under a key the app cannot trust or find, or
+        // missing from the history: the app cannot know the referee.
+        if opener.untrusted || opener.missing {
+            return Judgment::RefereeUnknown;
+        }
         // A checked opening post naming no referee: as before step 9.
         let Some(home) = opener.home else {
             return Judgment::Ruled(RulingCheck::CannotCheck);
@@ -4953,26 +5011,30 @@ impl ActLine {
         });
     }
 
-    /// What `task`'s opener says, when it is already known; none for one
-    /// proven altered.
+    /// What `task`'s opener says, when it is already known; none for a
+    /// fetched copy that does not say (`TaskOpener::checked`).
     fn held_opener(&self, task: &str) -> Option<TaskOpener> {
         let cell = self.homes.lock().cells.get(task).cloned()?;
-        cell.get().cloned()?.ok().filter(|opener| !opener.altered)
+        cell.get().cloned()?.ok().filter(TaskOpener::checked)
     }
 
     /// What `task`'s opener says; `None` when the opener was not seen and
     /// its history could not be read. Rulings of one task asking at once
     /// share one read; an opener that checks while it is under way answers
-    /// instead when it fails.
+    /// instead when it fails. A kept copy that does not name the referee is
+    /// checked again from its bytes when it is due (`recheck_due`), with no
+    /// history read.
     async fn home_of(&self, task: &str) -> Option<TaskOpener> {
-        let cell = self.homes.lock().cell(task);
-        let opener = cell.get_or_init(|| self.read_home(task)).await.clone();
-        if opener.as_ref().is_ok_and(|opener| !opener.altered) {
+        let mut cell = self.homes.lock().cell(task);
+        // Held before this ruling asked: only such a copy can be due.
+        let held = cell.initialized();
+        let mut opener = cell.get_or_init(|| self.read_home(task)).await.clone();
+        if opener.as_ref().is_ok_and(TaskOpener::checked) {
             return opener.ok();
         }
         // An opener that checked while the read was under way replaced it,
-        // a read that failed or a copy found altered: what the map holds now
-        // is awaited once more.
+        // a read that failed or a copy that does not name the referee: what
+        // the map holds now is awaited once more.
         let now = {
             let mut homes = self.homes.lock();
             if opener.is_err() {
@@ -4980,14 +5042,80 @@ impl ActLine {
             }
             homes.cells.get(task).cloned()
         };
-        let Some(now) = now.filter(|now| !Arc::ptr_eq(now, &cell)) else {
+        if let Some(now) = now.filter(|now| !Arc::ptr_eq(now, &cell)) {
+            let held = now.initialized();
+            opener = now.get_or_init(|| self.read_home(task)).await.clone();
+            if opener.is_err() {
+                self.homes.lock().forget(task, &now);
+            }
+            if !held {
+                return opener.ok();
+            }
+            cell = now;
+        } else if !held {
             return opener.ok();
-        };
-        let again = now.get_or_init(|| self.read_home(task)).await.clone();
-        if again.is_err() {
-            self.homes.lock().forget(task, &now);
         }
-        again.ok()
+        let kept = opener.ok()?;
+        if !self.recheck_due(&kept).await {
+            return Some(kept);
+        }
+        let Some(signed) = kept.signed.clone() else {
+            return Some(kept);
+        };
+        // Still pending is no answer: the kept copy and its time stand.
+        let Ok(checked) = self.checked_opener(signed).await else {
+            return Some(kept);
+        };
+        self.homes.lock().replace(task, &cell, checked.clone());
+        Some(checked)
+    }
+
+    /// Whether a kept copy that does not name the referee is checked again
+    /// now: one altered or untrusted once the lookup's ttl has passed since
+    /// it was checked; one whose key was found nowhere as soon as the
+    /// lookup remembers no miss for it, which it does not when a source
+    /// failed. A copy missing from the history, or with nothing to check,
+    /// never is.
+    async fn recheck_due(&self, kept: &TaskOpener) -> bool {
+        let (Some(checker), Some(signed), Some(since)) =
+            (self.checker.as_ref(), kept.signed.as_ref(), kept.since)
+        else {
+            return false;
+        };
+        if kept.key_not_found {
+            return !checker.lookup.holds_miss(&signed.did, &signed.kid).await;
+        }
+        // As the lookup's `inside_ttl`: a time in the future counts as now.
+        match (chrono::Utc::now() - since).to_std() {
+            Ok(elapsed) => elapsed >= checker.lookup.ttl(),
+            Err(_) => false,
+        }
+    }
+
+    /// An opening post's verdict, once more when it rests on a key only the
+    /// connected server vouched for: its poster's records are taken again
+    /// through the connected server (`relist_vouched`, at most once per
+    /// poster per the lookup's ttl, the server's key kept when nothing is
+    /// published), and the post is checked once more, so a key published
+    /// since names the referee. A chat line keeps the vouched layer: only an
+    /// opening post asks.
+    async fn opener_verdict(
+        &self,
+        signed: &crate::verdict::Signed,
+        verdict: crate::verdict::Verdict,
+    ) -> crate::verdict::Verdict {
+        use crate::verdict::{KeyLayer, VerdictState};
+        let Some(checker) = self.checker.as_ref() else {
+            return verdict;
+        };
+        if verdict.state != VerdictState::Device || verdict.layer != Some(KeyLayer::Vouched) {
+            return verdict;
+        }
+        checker
+            .lookup
+            .relist_vouched(&signed.did, &signed.kid)
+            .await;
+        checker.resolve(signed).await
     }
 
     /// What `task`'s opener says, read from the task's history on the
@@ -4999,26 +5127,30 @@ impl ActLine {
     }
 
     /// What the opener in a task's history says, once its own signature is
-    /// checked as a live opener's is: the referee it names and the venue it
-    /// was signed for (its canonical's `target`) when it checks; marked
-    /// altered when its signature contradicts its key (invalid, made at or
-    /// after the key stopped counting, or missing or unreadable, as a
-    /// ruling's is); `Err` when the history holds no opener, or its
-    /// signature cannot be checked (its key not found). An `Err` is not
-    /// kept: the next ruling reads and checks again.
+    /// checked as a live opener's is (`checked_opener`); marked missing when
+    /// the history holds no opener, and altered when it carries no document
+    /// or signature that can be read, as a ruling's is. `Err` when this
+    /// client checks no signatures or the answer holds no events.
     async fn checked_opener_in(
         &self,
         history: &serde_json::Value,
         task: &str,
     ) -> Result<TaskOpener, ()> {
-        let checker = self.checker.as_ref().ok_or(())?;
-        let event = history
+        self.checker.as_ref().ok_or(())?;
+        let events = history
             .get("events")
             .and_then(|events| events.as_array())
-            .into_iter()
-            .flatten()
-            .find(|event| event.get("event_id").and_then(|id| id.as_str()) == Some(task))
             .ok_or(())?;
+        let Some(event) = events
+            .iter()
+            .find(|event| event.get("event_id").and_then(|id| id.as_str()) == Some(task))
+        else {
+            return Ok(TaskOpener {
+                fetched: true,
+                missing: true,
+                ..TaskOpener::default()
+            });
+        };
         let altered = TaskOpener {
             fetched: true,
             altered: true,
@@ -5027,18 +5159,63 @@ impl ActLine {
         let Some(act) = history_act(event) else {
             return Ok(altered);
         };
-        let Some(signed) = act.signed.as_ref() else {
+        let Some(signed) = act.signed else {
             return Ok(altered);
         };
-        match opener_standing(&checker.resolve(signed).await) {
-            OpenerStanding::Checks => Ok(TaskOpener {
-                home: act.field("act-home"),
-                venue: act.field("target"),
+        self.checked_opener(signed).await
+    }
+
+    /// What a fetched opener says once its signature is checked: the
+    /// referee it names and the venue it was signed for (its document's
+    /// `act-home` and `target`) when it checks; marked altered when its
+    /// signature contradicts its key (invalid, made at or after the key
+    /// stopped counting, or a found key that cannot check it); marked
+    /// untrusted when its key is one only the connected server vouched for
+    /// or the server's own, or was found nowhere. Each but a copy that
+    /// checks keeps `signed` and the time, so a later ruling can check it
+    /// again with no history read. `Err` when it is still pending, which a
+    /// finished check never is.
+    async fn checked_opener(&self, signed: crate::verdict::Signed) -> Result<TaskOpener, ()> {
+        let checker = self.checker.as_ref().ok_or(())?;
+        let verdict = self
+            .opener_verdict(&signed, checker.resolve(&signed).await)
+            .await;
+        let standing = opener_standing(&verdict);
+        if let OpenerStanding::Checks = standing {
+            let crate::verdict::SignedDoc::Act { tags, venue, .. } = &signed.doc else {
+                return Err(());
+            };
+            return Ok(TaskOpener {
+                home: tags
+                    .iter()
+                    .find(|(tag, _)| tag == "+freeq.at/act-home")
+                    .map(|(_, home)| home.clone()),
+                venue: Some(venue.clone()),
                 fetched: true,
-                altered: false,
+                ..TaskOpener::default()
+            });
+        }
+        let kept = TaskOpener {
+            fetched: true,
+            since: Some(chrono::Utc::now()),
+            signed: Some(signed),
+            ..TaskOpener::default()
+        };
+        match standing {
+            OpenerStanding::Altered => Ok(TaskOpener {
+                altered: true,
+                ..kept
             }),
-            OpenerStanding::Altered => Ok(altered),
-            OpenerStanding::Unknown => Err(()),
+            OpenerStanding::Untrusted => Ok(TaskOpener {
+                untrusted: true,
+                ..kept
+            }),
+            OpenerStanding::KeyNotFound => Ok(TaskOpener {
+                untrusted: true,
+                key_not_found: true,
+                ..kept
+            }),
+            OpenerStanding::Checks | OpenerStanding::Unknown => Err(()),
         }
     }
 
@@ -5144,27 +5321,41 @@ impl ActLine {
 enum OpenerStanding {
     /// Its signature checks: what it says is used.
     Checks,
-    /// Its signature contradicts its key: every ruling on the task fails.
+    /// Its signature contradicts its key: every ruling on the task fails;
+    /// kept, and checked again after the lookup's ttl.
     Altered,
-    /// Its signature cannot be checked: nothing is kept.
+    /// Its key is one the connected server could fake: the referee cannot
+    /// be known; kept, and checked again after the lookup's ttl.
+    Untrusted,
+    /// Its key was found nowhere: the referee cannot be known; kept, and
+    /// checked again once the lookup remembers no miss for it.
+    KeyNotFound,
+    /// Its check has not finished: nothing is kept.
     Unknown,
 }
 
 /// The standing a verdict gives an opening post. Only a device verdict
-/// names a referee: "signed by the server" is a chat verdict. A key that
-/// was found but cannot check the signature, as a ruling's unreadable
+/// under a key the connected server cannot fake names a referee: published
+/// in the poster's account, or the poster's did:key itself. Tasks are not
+/// chat: one the server only vouched for, and "signed by the server",
+/// which is a chat verdict, leave the referee unknown. A key that was
+/// found but cannot check the signature, as a ruling's unreadable
 /// signature, contradicts it.
 fn opener_standing(verdict: &crate::verdict::Verdict) -> OpenerStanding {
-    use crate::verdict::VerdictState;
+    use crate::verdict::{KeyLayer, VerdictState};
     match verdict.state {
-        VerdictState::Device => OpenerStanding::Checks,
+        VerdictState::Device
+            if matches!(verdict.layer, Some(KeyLayer::Published | KeyLayer::DidKey)) =>
+        {
+            OpenerStanding::Checks
+        }
+        VerdictState::Device | VerdictState::Server => OpenerStanding::Untrusted,
         VerdictState::Invalid | VerdictState::Retired | VerdictState::Unsigned => {
             OpenerStanding::Altered
         }
         VerdictState::Unverifiable if verdict.key_source.is_some() => OpenerStanding::Altered,
-        VerdictState::Unverifiable | VerdictState::Server | VerdictState::Pending => {
-            OpenerStanding::Unknown
-        }
+        VerdictState::Unverifiable => OpenerStanding::KeyNotFound,
+        VerdictState::Pending => OpenerStanding::Unknown,
     }
 }
 
@@ -5242,10 +5433,10 @@ fn history_ruling(event: &serde_json::Value) -> Option<Option<crate::verdict::Si
 /// session) is not what was signed. Such a ruling, signed by the task's
 /// referee, is checked under the venue its opener was signed for, when this
 /// session is one of that pair, as a server's `venue_for` does. When that
-/// venue is not known (the opener was not seen and could not be read, or
-/// named no venue), the pair it was signed for is unknown: it is
-/// unverifiable, as a line whose venue cannot be built is in `first_look`.
-/// Otherwise it is checked as rebuilt.
+/// venue is not known (the opener was not seen and could not be read, does
+/// not say who referees the task, or named no venue), the pair it was
+/// signed for is unknown: it is unverifiable, as a line whose venue cannot
+/// be built is in `first_look`. Otherwise it is checked as rebuilt.
 fn under_task_venue(
     mut signed: crate::verdict::Signed,
     opener: Option<&TaskOpener>,
@@ -5258,7 +5449,7 @@ fn under_task_venue(
     if !venue.starts_with("dm:") {
         return FirstLook::Check(signed);
     }
-    let task_venue = match opener.filter(|opener| !opener.altered) {
+    let task_venue = match opener.filter(|opener| opener.checked()) {
         None => None,
         Some(opener) if opener.home.as_deref() == Some(signed.did.as_str()) => {
             opener.venue.as_deref()
@@ -12011,6 +12202,11 @@ mod verdict_tests {
         set_reads: AtomicUsize,
         /// Requests for one signer's key.
         key_reads: AtomicUsize,
+        /// The DID each of those requests named, in order.
+        keys_asked: parking_lot::Mutex<Vec<String>>,
+        /// Requests to any path the origin does not serve, the batch key
+        /// route among them.
+        other_reads: Arc<AtomicUsize>,
         /// Each task's history, by task id, as `/api/v1/actions/{id}` answers.
         actions: parking_lot::Mutex<HashMap<String, Value>>,
         /// The bearer the task history asks for; any request passes without.
@@ -12020,9 +12216,22 @@ mod verdict_tests {
         /// Held back this long before a task's history is answered.
         action_delay_ms: u64,
         action_reads: AtomicUsize,
+        /// The accounts whose records the server's record cache serves, as
+        /// the PDS holds them: the listing route and each record's proof.
+        /// Any other account's routes are not served.
+        repos: parking_lot::Mutex<HashMap<String, SharedRepo>>,
+        /// Requests to the listing route.
+        record_reads: AtomicUsize,
     }
 
+    type SharedRepo = Arc<parking_lot::Mutex<crate::test_support::StubRepo>>;
+
     impl Origin {
+        /// How many requests for one of `did`'s keys came.
+        fn asked_for(&self, did: &str) -> usize {
+            self.keys_asked.lock().iter().filter(|d| *d == did).count()
+        }
+
         fn hold(&self, did: &str, key: [u8; 32], removed_at: Option<i64>) {
             let kid = crate::sigtag::derive_kid_bytes(&key);
             self.keys
@@ -12041,8 +12250,75 @@ mod verdict_tests {
     }
 
     async fn serve_origin(origin: Arc<Origin>) -> String {
-        let (o1, o2, o3, o4) = (origin.clone(), origin.clone(), origin.clone(), origin);
+        use axum::response::IntoResponse;
+        let other = origin.other_reads.clone();
+        let (o1, o2, o3, o4) = (
+            origin.clone(),
+            origin.clone(),
+            origin.clone(),
+            origin.clone(),
+        );
+        let (o5, o6) = (origin.clone(), origin);
         let router = axum::Router::new()
+            .route(
+                "/api/v1/records/{did}/{collection}",
+                get(move |Path((did, collection)): Path<(String, String)>| {
+                    let o = o5.clone();
+                    async move {
+                        let Some(repo) = o.repos.lock().get(&did).cloned() else {
+                            o.other_reads.fetch_add(1, Ordering::SeqCst);
+                            return StatusCode::NOT_FOUND.into_response();
+                        };
+                        o.record_reads.fetch_add(1, Ordering::SeqCst);
+                        let query = HashMap::from([
+                            ("repo".to_string(), did.clone()),
+                            ("collection".to_string(), collection.clone()),
+                        ]);
+                        let listed = repo
+                            .lock()
+                            .respond("/xrpc/com.atproto.repo.listRecords", &query)
+                            .and_then(|(_, _, body)| serde_json::from_slice::<Value>(&body).ok())
+                            .unwrap_or_default();
+                        axum::Json(json!({
+                            "did": did,
+                            "collection": collection,
+                            "fetched_at": chrono::Utc::now().timestamp(),
+                            "stale": false,
+                            "records": listed["records"],
+                        }))
+                        .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/records/{did}/{collection}/{rkey}/proof",
+                get(
+                    move |Path((did, collection, rkey)): Path<(String, String, String)>| {
+                        let o = o6.clone();
+                        async move {
+                            let Some(repo) = o.repos.lock().get(&did).cloned() else {
+                                o.other_reads.fetch_add(1, Ordering::SeqCst);
+                                return StatusCode::NOT_FOUND.into_response();
+                            };
+                            let query = HashMap::from([
+                                ("did".to_string(), did),
+                                ("collection".to_string(), collection),
+                                ("rkey".to_string(), rkey),
+                            ]);
+                            let answer = repo
+                                .lock()
+                                .respond("/xrpc/com.atproto.sync.getRecord", &query);
+                            match answer {
+                                Some((200, _, car)) => {
+                                    ([("content-type", "application/vnd.ipld.car")], car)
+                                        .into_response()
+                                }
+                                _ => StatusCode::NOT_FOUND.into_response(),
+                            }
+                        }
+                    },
+                ),
+            )
             .route(
                 "/api/v1/actions/{id}",
                 get(
@@ -12119,6 +12395,7 @@ mod verdict_tests {
                     let o = o3.clone();
                     async move {
                         o.key_reads.fetch_add(1, Ordering::SeqCst);
+                        o.keys_asked.lock().push(did.clone());
                         if o.delay_ms > 0 {
                             tokio::time::sleep(std::time::Duration::from_millis(o.delay_ms)).await;
                         }
@@ -12133,7 +12410,11 @@ mod verdict_tests {
                         })))
                     }
                 }),
-            );
+            )
+            .fallback(move || {
+                other.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::NOT_FOUND }
+            });
         serve(router).await
     }
 
@@ -12811,13 +13092,26 @@ mod verdict_tests {
     /// A PDS for SIGNER listing `records` with repository proofs, and SIGNER's
     /// DID document naming the key that signs them.
     async fn signer_pds(records: &[Value]) -> crate::did::DidDocument {
+        signer_repo(records).await.0
+    }
+
+    /// [`signer_pds`], with its repository, to list more records in later,
+    /// and a count of the listings it answered.
+    async fn signer_repo(
+        records: &[Value],
+    ) -> (
+        crate::did::DidDocument,
+        Arc<parking_lot::Mutex<crate::test_support::StubRepo>>,
+        Arc<AtomicUsize>,
+    ) {
         use axum::response::IntoResponse;
         let mut repo = crate::test_support::StubRepo::new(SIGNER);
         for record in records {
             repo.add(crate::identity_records::DEVICE_KEY_TYPE, record);
         }
         let repo = Arc::new(parking_lot::Mutex::new(repo));
-        let answering = repo.clone();
+        let listings: Arc<AtomicUsize> = Default::default();
+        let (answering, counting) = (repo.clone(), listings.clone());
         let base =
             serve(
                 axum::Router::new().fallback(
@@ -12825,6 +13119,9 @@ mod verdict_tests {
                           axum::extract::Query(q): axum::extract::Query<
                         HashMap<String, String>,
                     >| {
+                        if uri.path() == "/xrpc/com.atproto.repo.listRecords" {
+                            counting.fetch_add(1, Ordering::SeqCst);
+                        }
                         let answer = answering.lock().respond(uri.path(), &q);
                         async move {
                             match answer {
@@ -12841,7 +13138,166 @@ mod verdict_tests {
                 ),
             )
             .await;
-        repo.lock().document(&base)
+        let document = repo.lock().document(&base);
+        (document, repo, listings)
+    }
+
+    /// SIGNER's device key record for `seed`'s key, made a day ago.
+    fn device_record(seed: u8) -> Value {
+        serde_json::to_value(
+            crate::identity_records::build_device_record(
+                &crate::crypto::PrivateKey::ed25519_from_bytes(&[seed; 32]).unwrap(),
+                SIGNER,
+                &(chrono::Utc::now() - chrono::TimeDelta::days(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A chat line `signer` signed with `seed`'s key in #room.
+    fn signed_message_as(seed: u8, signer: &str, body: &str) -> (String, String) {
+        let msgid = crate::chatsig::new_event_id();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let sig = crate::chatsig::ChatDoc::message(signer, &msgid, "#room", body).sign(&key);
+        let tags = HashMap::from([
+            ("account".to_string(), signer.to_string()),
+            ("msgid".to_string(), msgid.clone()),
+            (crate::sigtag::SIG_TAG.to_string(), sig),
+        ]);
+        (line(tags, "PRIVMSG", "#room", Some(body)), msgid)
+    }
+
+    /// The did:key DID of `seed`'s ed25519 key.
+    fn did_key_of(seed: u8) -> String {
+        let key = crate::crypto::PrivateKey::ed25519_from_bytes(&[seed; 32]).unwrap();
+        format!("did:key:{}", key.public_key_multibase())
+    }
+
+    /// A lookup store holding `seed`'s key for `did` as the origin vouched
+    /// for it.
+    fn held_as_vouched(did: &str, seed: u8) -> Arc<crate::key_lookup::MemoryKeyLookupStore> {
+        use crate::key_lookup::{CachedKey, FoundKeySnapshot, KeyLookupSnapshot, KeyLookupStore};
+        let snapshot = KeyLookupSnapshot {
+            version: crate::key_lookup::SNAPSHOT_VERSION,
+            keys: vec![(
+                (
+                    did.to_string(),
+                    crate::sigtag::derive_kid_bytes(&public(seed)),
+                ),
+                CachedKey {
+                    other: Some(Some(FoundKeySnapshot {
+                        public_key: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .encode(public(seed)),
+                        source: "OriginServer".to_string(),
+                        retired_at: None,
+                    })),
+                    at: chrono::Utc::now().timestamp_millis(),
+                },
+            )],
+            ..Default::default()
+        };
+        let store = Arc::new(crate::key_lookup::MemoryKeyLookupStore::default());
+        store
+            .save(&serde_json::to_string(&snapshot).unwrap())
+            .unwrap();
+        store
+    }
+
+    /// A did:key signer's key is read from its DID: no request, nothing
+    /// kept, the full lock with its own sentence, even where the origin's
+    /// answer for it is already held. A did:key signing with any other key
+    /// is looked up as before.
+    #[tokio::test]
+    async fn a_did_key_signers_key_is_read_from_its_did() {
+        use crate::key_lookup::KeySource;
+        let bot = did_key_of(27);
+        let (own, other) = (
+            crate::sigtag::derive_kid_bytes(&public(27)),
+            crate::sigtag::derive_kid_bytes(&public(28)),
+        );
+        let origin = Arc::new(Origin::default());
+        origin.hold(&bot, public(27), None);
+        origin.hold(&bot, public(28), None);
+        let base = serve_origin(origin.clone()).await;
+        // Held as the origin vouched for it, as an app that met the bot
+        // before the lookup read a did:key from its DID holds it.
+        let lookup = Arc::new(
+            crate::key_lookup::KeyLookup::new(
+                crate::identity_records::RecordReader::new(
+                    crate::did::DidResolver::static_map(HashMap::new()),
+                    freeq_oauth::SharedClient(reqwest::Client::new()),
+                ),
+                Some(base),
+                std::time::Duration::from_secs(3600),
+            )
+            .with_store(held_as_vouched(&bot, 27)),
+        );
+        assert!(lookup.holds_origin_answer(&bot, &own).await);
+        let reads = origin.key_reads.load(Ordering::SeqCst);
+        let mut session = Session::open(Some(lookup.clone()), OWN_DID).await;
+        let (wire, _) = signed_message_as(27, &bot, "from the bot");
+        session.send(&wire).await;
+        assert_eq!(
+            session.next_line().await.settled,
+            Some(Verdict {
+                state: VerdictState::Device,
+                layer: Some(KeyLayer::DidKey),
+                kid: Some(own.clone()),
+                key_source: Some(KeySource::DidKey),
+            })
+        );
+        assert_eq!(
+            origin.key_reads.load(Ordering::SeqCst),
+            reads,
+            "no key request"
+        );
+        assert!(
+            lookup.holds_origin_answer(&bot, &own).await,
+            "nothing kept for it"
+        );
+        assert_eq!(
+            crate::verdict::sentence(VerdictState::Device, Some(KeyLayer::DidKey)),
+            "Signed with the sender’s own key. The key is their identity."
+        );
+        let (wire, _) = signed_message_as(28, &bot, "with another key");
+        session.send(&wire).await;
+        assert_eq!(
+            session.next_line().await.settled,
+            Some(Verdict {
+                state: VerdictState::Device,
+                layer: Some(KeyLayer::Vouched),
+                kid: Some(other),
+                key_source: Some(KeySource::OriginServer),
+            }),
+            "not the DID's key: looked up as before"
+        );
+    }
+
+    /// The signers of a history batch whose key is their did:key are not
+    /// asked for in its prefetch.
+    #[tokio::test]
+    async fn a_history_batch_asks_no_key_for_a_did_key_signer() {
+        let bot = did_key_of(27);
+        let origin = Arc::new(Origin::default());
+        let base = serve_origin(origin.clone()).await;
+        let mut session = Session::open(Some(key_lookup(&base, vec![])), OWN_DID).await;
+        session.send(":srv BATCH +h chathistory #room").await;
+        let (wire, _) = signed_message_as(27, &bot, "in a replay");
+        session.send(&format!("@batch=h;{}", &wire[1..])).await;
+        session.send(":srv BATCH -h").await;
+        assert_eq!(
+            session.next_line().await.settled.map(|v| v.layer),
+            Some(Some(KeyLayer::DidKey))
+        );
+        assert_eq!(origin.key_reads.load(Ordering::SeqCst), 0, "no key request");
+        assert_eq!(
+            origin.other_reads.load(Ordering::SeqCst),
+            0,
+            "no batch request"
+        );
     }
 
     #[tokio::test]
@@ -13739,7 +14195,8 @@ mod verdict_tests {
 
     // ── task events and rulings ──────────────────────────────────────────
 
-    const ALICE: &str = "did:plc:alice";
+    /// Seed 90's did:key: her openers check under the key her DID is.
+    const ALICE: &str = "did:key:z6MkfMo6gxqdBhaHMNnmfhgZFBjpCDTkmJMJLoypsBZS9PwD";
     const REFEREE: &str = "did:web:referee.example";
     const TASK_ROOM: &str = "#tasks";
 
@@ -13872,6 +14329,26 @@ mod verdict_tests {
         site: &Site,
         welcome: &str,
     ) -> (Session, Arc<Origin>) {
+        session_with_site_as(origin, site, welcome, 3600).await
+    }
+
+    /// [`session_with_site`], its key lookup's ttl `ttl_secs` seconds.
+    async fn session_with_site_ttl(
+        origin: Origin,
+        site: &Site,
+        ttl_secs: u64,
+    ) -> (Session, Arc<Origin>) {
+        session_with_site_as(origin, site, "127.0.0.1", ttl_secs).await
+    }
+
+    /// [`session_with_site_welcomed`], its key lookup's ttl `ttl_secs`
+    /// seconds.
+    async fn session_with_site_as(
+        origin: Origin,
+        site: &Site,
+        welcome: &str,
+        ttl_secs: u64,
+    ) -> (Session, Arc<Origin>) {
         // ALICE's openers check: an opener names its referee only then.
         origin.hold(ALICE, public(90), None);
         let origin = Arc::new(origin);
@@ -13884,7 +14361,7 @@ mod verdict_tests {
         let lookup = crate::key_lookup::KeyLookup::new(
             reader,
             Some(base),
-            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(ttl_secs),
         )
         .with_retry_delays(Vec::new())
         .with_own_host_base(move |_| site.clone());
@@ -14026,14 +14503,17 @@ mod verdict_tests {
 
     #[tokio::test]
     async fn a_task_event_that_is_no_ruling_goes_up_before_its_tagmsg_and_its_verdict_follows() {
+        // A poster whose key the origin answers, slowly, so the verdict
+        // follows the event.
+        const POSTER: &str = "did:plc:poster";
         let origin = Origin {
             delay_ms: 200,
             ..Default::default()
         };
-        origin.hold(ALICE, public(90), None);
+        origin.hold(POSTER, public(90), None);
         let base = serve_origin(Arc::new(origin)).await;
         let mut session = Session::open(Some(key_lookup(&base, vec![])), OWN_DID).await;
-        let (opener, id) = task_event(90, ALICE, "offer", None, &[]);
+        let (opener, id) = task_event(90, POSTER, "offer", None, &[]);
         session.send(&opener).await;
         let mut ups = session.ups_within(100).await;
         assert_eq!(
@@ -15444,26 +15924,65 @@ mod verdict_tests {
         );
     }
 
-    /// A fetched opener whose poster's key cannot be found cannot name the
-    /// referee: its rulings are hidden, and nothing is kept, so the next
-    /// ruling reads the history again.
+    /// A fetched opener whose poster's key is found nowhere cannot name the
+    /// referee: its rulings are hidden, and it is kept with its signed
+    /// document. While the key lookup remembers the miss, the next ruling
+    /// reads no history and asks for no key.
     #[tokio::test]
-    async fn a_fetched_opener_whose_key_cannot_be_found_is_read_again() {
+    async fn a_fetched_opener_whose_key_is_found_nowhere_is_kept_while_the_miss_stands() {
         const CAROL: &str = "did:plc:carol";
         let site = serve_site(vec![(public(91), None)], 0).await;
         let origin = Origin::default();
+        // The server lists CAROL's account and finds no record: a settled
+        // miss.
+        origin.repos.lock().insert(
+            CAROL.to_string(),
+            Arc::new(parking_lot::Mutex::new(crate::test_support::StubRepo::new(
+                CAROL,
+            ))),
+        );
         let (opener, task) = served(92, CAROL, "offer", None, &[("+freeq.at/act-home", REFEREE)]);
         origin
             .actions
             .lock()
             .insert(task.clone(), served_history(&task, vec![opener]));
         let (mut session, origin) = session_with_site(origin, &site).await;
-        for read in [1, 2] {
+        let mut asked = None;
+        for _ in 0..2 {
             let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
             session.send(&ruling).await;
             assert_eq!(session.went_up_as(&id, &task).await, None, "hidden");
-            assert_eq!(origin.action_reads.load(Ordering::SeqCst), read);
+            assert_eq!(origin.action_reads.load(Ordering::SeqCst), 1);
+            let now = origin.asked_for(CAROL);
+            assert_eq!(*asked.get_or_insert(now), now, "no key asked again");
         }
+    }
+
+    /// When a source failed at the fetched opener's check, the lookup
+    /// remembers no miss, and the next ruling checks the kept document again
+    /// at once: one key request, no history read.
+    #[tokio::test]
+    async fn a_fetched_opener_whose_key_lookup_failed_is_checked_again_at_the_next_ruling() {
+        const CAROL: &str = "did:plc:carol";
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin::default();
+        // CAROL's records cannot be read: the server has no copy and her
+        // DID does not resolve.
+        let (opener, task) = served(92, CAROL, "offer", None, &[("+freeq.at/act-home", REFEREE)]);
+        origin
+            .actions
+            .lock()
+            .insert(task.clone(), served_history(&task, vec![opener]));
+        let (mut session, origin) = session_with_site(origin, &site).await;
+        let mut asked = Vec::new();
+        for _ in 0..2 {
+            let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+            session.send(&ruling).await;
+            assert_eq!(session.went_up_as(&id, &task).await, None, "hidden");
+            assert_eq!(origin.action_reads.load(Ordering::SeqCst), 1);
+            asked.push(origin.asked_for(CAROL));
+        }
+        assert_eq!(asked[1] - asked[0], 1, "one key request");
     }
 
     /// A fetched opener that checks and names no referee leaves its task's
@@ -15512,6 +16031,334 @@ mod verdict_tests {
             session.ruling_of(&second_id).await,
             Some(RulingCheck::Counts)
         );
+    }
+
+    /// Tasks are not chat: an opening post signed with a key only the
+    /// connected server lists under its poster's DID names no referee, live
+    /// or read from the history, and its task's rulings are hidden.
+    #[tokio::test]
+    async fn an_opener_under_a_key_only_the_server_vouches_for_names_no_referee() {
+        const CAROL: &str = "did:plc:carol";
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin::default();
+        origin.hold(CAROL, public(92), None);
+        let home = [("+freeq.at/act-home", REFEREE)];
+        let (fetched, fetched_task) = served(92, CAROL, "offer", None, &home);
+        let (on_fetched, _) = served(91, REFEREE, "expire", Some(&fetched_task), &[]);
+        origin.actions.lock().insert(
+            fetched_task.clone(),
+            served_history(&fetched_task, vec![fetched, on_fetched]),
+        );
+        let (mut session, _) = session_with_site(origin, &site).await;
+        let (live, task) = task_event(92, CAROL, "offer", None, &home);
+        session.send(&live).await;
+        session.ups_within(300).await;
+        let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        session.send(&ruling).await;
+        assert_eq!(session.went_up_as(&id, &task).await, None, "live: hidden");
+        let (ruling, id) = task_event(91, REFEREE, "expire", Some(&fetched_task), &[]);
+        session.send(&ruling).await;
+        assert_eq!(
+            session.went_up_as(&id, &fetched_task).await,
+            None,
+            "fetched: hidden"
+        );
+        let history = session._handle.task_history(&fetched_task).await.unwrap();
+        assert_eq!(ids_of(&history), [fetched_task]);
+    }
+
+    /// A session whose connected server vouches for SIGNER's key 26 and
+    /// serves SIGNER's records from the repository SIGNER's PDS lists, its
+    /// key lookup's ttl one second; SIGNER's key is met through the server
+    /// on a chat line first, before it is published. With the origin, the
+    /// repository, the PDS's listing count and the lookup.
+    async fn vouched_poster() -> (
+        Session,
+        Arc<Origin>,
+        SharedRepo,
+        Arc<AtomicUsize>,
+        Arc<crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>>,
+    ) {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let (document, repo, pds_listings) = signer_repo(&[]).await;
+        let origin = Arc::new(Origin::default());
+        origin.hold(SIGNER, public(26), None);
+        origin.repos.lock().insert(SIGNER.to_string(), repo.clone());
+        let base = serve_origin(origin.clone()).await;
+        let reader = crate::identity_records::RecordReader::new(
+            crate::did::DidResolver::static_map(HashMap::from([(SIGNER.to_string(), document)])),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        );
+        let site_base = site.base.clone();
+        let lookup = Arc::new(
+            crate::key_lookup::KeyLookup::new(
+                reader,
+                Some(base),
+                std::time::Duration::from_secs(1),
+            )
+            .with_retry_delays(Vec::new())
+            .with_own_host_base(move |_| site_base.clone()),
+        );
+        let mut session = Session::open_welcomed(Some(lookup.clone()), OWN_DID, "127.0.0.1").await;
+        let (chat, _) = signed_message(26, "before publishing");
+        session.send(&chat).await;
+        assert_eq!(
+            session.next_line().await.settled.map(|v| v.layer),
+            Some(Some(KeyLayer::Vouched))
+        );
+        (session, origin, repo, pds_listings, lookup)
+    }
+
+    /// Past the one-second ttl of [`vouched_poster`]'s lookup.
+    async fn past_the_ttl() {
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    }
+
+    /// SIGNER's opener of a task naming REFEREE, with key 26.
+    fn signers_opener() -> (String, String) {
+        task_event(
+            26,
+            SIGNER,
+            "offer",
+            None,
+            &[("+freeq.at/act-home", REFEREE)],
+        )
+    }
+
+    /// An opening post whose key the app holds only as the server vouched
+    /// for it lists its poster's records once, through the connected
+    /// server's records route and not at the PDS, and, finding the key
+    /// published since, names the referee; the key is then held as found
+    /// in the records, not as the server's.
+    #[tokio::test]
+    async fn an_opener_under_a_vouched_key_lists_its_posters_records_through_the_server_once() {
+        use crate::verdict::RulingCheck;
+        let (mut session, origin, repo, pds_listings, lookup) = vouched_poster().await;
+        repo.lock()
+            .add(crate::identity_records::DEVICE_KEY_TYPE, &device_record(26));
+        past_the_ttl().await;
+        let listed = origin.record_reads.load(Ordering::SeqCst);
+        let at_pds = pds_listings.load(Ordering::SeqCst);
+        let (opener, task) = signers_opener();
+        session.send(&opener).await;
+        session.ups_within(500).await;
+        let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        session.send(&ruling).await;
+        assert_eq!(session.ruling_of(&id).await, Some(RulingCheck::Counts));
+        assert_eq!(
+            origin.record_reads.load(Ordering::SeqCst) - listed,
+            1,
+            "its records listed once, through the server"
+        );
+        assert_eq!(
+            pds_listings.load(Ordering::SeqCst),
+            at_pds,
+            "the PDS is not asked"
+        );
+        let kid = crate::sigtag::derive_kid_bytes(&public(26));
+        assert!(!lookup.holds_origin_answer(SIGNER, &kid).await);
+    }
+
+    /// The same with the key still unpublished: the listing finds nothing,
+    /// the server's key stays held, so the poster's next chat line asks for
+    /// no key, and the ruling is hidden.
+    #[tokio::test]
+    async fn an_opener_under_a_key_still_unpublished_keeps_the_servers_key() {
+        let (mut session, origin, _repo, pds_listings, _lookup) = vouched_poster().await;
+        past_the_ttl().await;
+        let listed = origin.record_reads.load(Ordering::SeqCst);
+        let at_pds = pds_listings.load(Ordering::SeqCst);
+        let (opener, task) = signers_opener();
+        session.send(&opener).await;
+        session.ups_within(500).await;
+        let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        session.send(&ruling).await;
+        assert_eq!(session.went_up_as(&id, &task).await, None, "hidden");
+        assert_eq!(origin.record_reads.load(Ordering::SeqCst) - listed, 1);
+        assert_eq!(pds_listings.load(Ordering::SeqCst), at_pds);
+        session.ups_within(300).await;
+        let asked = origin.asked_for(SIGNER);
+        let (chat, _) = signed_message(26, "still unpublished");
+        session.send(&chat).await;
+        assert_eq!(
+            session.next_line().await.settled.map(|v| v.layer),
+            Some(Some(KeyLayer::Vouched))
+        );
+        assert_eq!(origin.asked_for(SIGNER), asked, "no key request");
+    }
+
+    /// A fetched opening post under a key only the server vouches for is
+    /// kept as untrusted with its signed document: a second ruling inside
+    /// the lookup's ttl reads no history and lists nothing; one after the
+    /// ttl lists the poster once and reads no history; and once the key is
+    /// published, the next ruling after the ttl lists the poster, the kept
+    /// document checks, and the ruling shows.
+    #[tokio::test]
+    async fn a_fetched_opener_under_a_vouched_key_is_kept_and_checked_again_after_the_ttl() {
+        use crate::verdict::RulingCheck;
+        let (mut session, origin, repo, _pds_listings, _lookup) = vouched_poster().await;
+        let (opener, task) = served(
+            26,
+            SIGNER,
+            "offer",
+            None,
+            &[("+freeq.at/act-home", REFEREE)],
+        );
+        origin
+            .actions
+            .lock()
+            .insert(task.clone(), served_history(&task, vec![opener]));
+        past_the_ttl().await;
+        let listed = origin.record_reads.load(Ordering::SeqCst);
+        let (first, first_id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        session.send(&first).await;
+        assert_eq!(session.went_up_as(&first_id, &task).await, None, "hidden");
+        assert_eq!(origin.action_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(origin.record_reads.load(Ordering::SeqCst) - listed, 1);
+        let (second, second_id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        session.send(&second).await;
+        assert_eq!(session.went_up_as(&second_id, &task).await, None);
+        assert_eq!(
+            origin.action_reads.load(Ordering::SeqCst),
+            1,
+            "inside the ttl: no history read"
+        );
+        assert_eq!(
+            origin.record_reads.load(Ordering::SeqCst) - listed,
+            1,
+            "inside the ttl: no listing"
+        );
+        past_the_ttl().await;
+        let (third, third_id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+        session.send(&third).await;
+        assert_eq!(session.went_up_as(&third_id, &task).await, None);
+        assert_eq!(
+            origin.action_reads.load(Ordering::SeqCst),
+            1,
+            "after the ttl: no history read"
+        );
+        assert_eq!(
+            origin.record_reads.load(Ordering::SeqCst) - listed,
+            2,
+            "after the ttl: one listing"
+        );
+        repo.lock()
+            .add(crate::identity_records::DEVICE_KEY_TYPE, &device_record(26));
+        past_the_ttl().await;
+        let (fourth, fourth_id) = task_event(91, REFEREE, "confirm", Some(&task), &[]);
+        session.send(&fourth).await;
+        assert_eq!(
+            session.ruling_of(&fourth_id).await,
+            Some(RulingCheck::Counts)
+        );
+        assert_eq!(origin.action_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(origin.record_reads.load(Ordering::SeqCst) - listed, 3);
+    }
+
+    /// A kept untrusted opening post is checked again once the lookup's ttl
+    /// has passed since its `since` on the wall clock, the clock the lookup's
+    /// own ttl runs on; not before.
+    #[tokio::test]
+    async fn a_kept_opener_checked_more_than_the_ttl_ago_on_the_wall_clock_is_checked_again() {
+        let (document, repo, _pds_listings) = signer_repo(&[]).await;
+        let origin = Arc::new(Origin::default());
+        origin.hold(SIGNER, public(26), None);
+        origin.repos.lock().insert(SIGNER.to_string(), repo);
+        let base = serve_origin(origin.clone()).await;
+        let lookup = Arc::new(
+            crate::key_lookup::KeyLookup::new(
+                crate::identity_records::RecordReader::new(
+                    crate::did::DidResolver::static_map(HashMap::from([(
+                        SIGNER.to_string(),
+                        document,
+                    )])),
+                    freeq_oauth::SharedClient(reqwest::Client::new()),
+                ),
+                Some(base),
+                std::time::Duration::from_secs(3600),
+            )
+            .with_retry_delays(Vec::new()),
+        );
+        let acts = ActLine::new(
+            mpsc::channel(16).0,
+            Some(Arc::new(SignatureChecker::new(lookup))),
+            Arc::new(parking_lot::Mutex::new(DidMapsState::default())),
+            Default::default(),
+        );
+        let (opener, task) = served(
+            26,
+            SIGNER,
+            "offer",
+            None,
+            &[("+freeq.at/act-home", REFEREE)],
+        );
+        let signed = history_act(&opener).and_then(|act| act.signed);
+        let kept = |since| TaskOpener {
+            fetched: true,
+            untrusted: true,
+            since: Some(since),
+            signed: signed.clone(),
+            ..TaskOpener::default()
+        };
+        // Checked a minute ago: not checked again.
+        let recent = chrono::Utc::now() - chrono::TimeDelta::minutes(1);
+        let _ = acts.homes.lock().cell(&task).set(Ok(kept(recent)));
+        let held = acts.home_of(&task).await.unwrap();
+        assert_eq!(held.since, Some(recent));
+        assert_eq!(origin.asked_for(SIGNER), 0);
+        // Checked two hours ago: checked again, from its bytes.
+        let old = chrono::Utc::now() - chrono::TimeDelta::hours(2);
+        acts.homes.lock().cells.remove(&task);
+        let _ = acts.homes.lock().cell(&task).set(Ok(kept(old)));
+        let again = acts.home_of(&task).await.unwrap();
+        assert!(again.untrusted, "still only the server's key");
+        assert!(again.since.is_some_and(|since| since > old), "{again:?}");
+        assert_eq!(origin.asked_for(SIGNER), 1, "its key looked up");
+    }
+
+    /// A fetched opening post found altered is kept with its signed
+    /// document: no ruling on its task reads the history again, inside the
+    /// lookup's ttl or after it, and each fails.
+    #[tokio::test]
+    async fn a_fetched_opener_found_altered_is_kept_and_its_history_read_once() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin::default();
+        let (opener, task) = served(90, ALICE, "offer", None, &[("+freeq.at/act-home", REFEREE)]);
+        origin.actions.lock().insert(
+            task.clone(),
+            served_history(&task, vec![stripped(opener, "act-home")]),
+        );
+        let (mut session, origin) = session_with_site_ttl(origin, &site, 1).await;
+        for wait in [false, false, true] {
+            if wait {
+                past_the_ttl().await;
+            }
+            let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+            session.send(&ruling).await;
+            assert_eq!(session.went_up_as(&id, &task).await, None, "fails");
+            assert_eq!(origin.action_reads.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// A history the server answers without the task's opening post is
+    /// remembered for the connection: the next ruling reads nothing.
+    #[tokio::test]
+    async fn a_history_without_its_opener_is_read_once() {
+        let site = serve_site(vec![(public(91), None)], 0).await;
+        let origin = Origin::default();
+        let task = crate::chatsig::new_event_id();
+        let (claim, _) = served(90, ALICE, "claim", Some(&task), &[]);
+        origin
+            .actions
+            .lock()
+            .insert(task.clone(), served_history(&task, vec![claim]));
+        let (mut session, origin) = session_with_site(origin, &site).await;
+        for _ in 0..2 {
+            let (ruling, id) = task_event(91, REFEREE, "expire", Some(&task), &[]);
+            session.send(&ruling).await;
+            assert_eq!(session.went_up_as(&id, &task).await, None, "hidden");
+            assert_eq!(origin.action_reads.load(Ordering::SeqCst), 1);
+        }
     }
 
     /// A task's history read through the SDK leaves out a ruling whose

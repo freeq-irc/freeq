@@ -1947,6 +1947,28 @@ impl<P: ClientProvider> KeyLookup<P> {
         self.save().await;
     }
 
+    /// When the answer held for `(did, kid)` is a key the origin server
+    /// vouched for, take `did`'s records again as any lookup does past the
+    /// ttl (`device_records`: through the home server, at most once per DID
+    /// per ttl), so a key published since is answered from them; one still
+    /// unpublished keeps the server's answer. For a task's opening post,
+    /// which only a published key lets name its referee. Never fails.
+    pub async fn relist_vouched(&self, did: &str, kid: &str) {
+        if !self.holds_origin_answer(did, kid).await {
+            return;
+        }
+        let slot = (did.to_string(), kid.to_string());
+        let Some(hit) = self.cache.lock().get(&slot).cloned() else {
+            return;
+        };
+        self.relisted(&slot, did, kid, hit).await;
+    }
+
+    /// How long a miss and a listing are held.
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
     /// How many times `refresh_account` has dropped `did`'s answers.
     fn refresh_count(&self, did: &str) -> u64 {
         self.refreshes.lock().get(did).copied().unwrap_or(0)
@@ -2001,13 +2023,21 @@ impl<P: ClientProvider> KeyLookup<P> {
     }
 
     /// A found key's cached answer with the DID's current proven records: the
-    /// last listing while inside the ttl, else a new one. A listing that
-    /// fails leaves `hit` as it was.
+    /// last listing while inside the ttl, else a new one. The answer held
+    /// beside the records (the origin's) stands unless the records now hold
+    /// the key. A listing that fails leaves `hit` as it was.
     async fn relisted(&self, slot: &(String, String), did: &str, kid: &str, hit: Cached) -> Cached {
         let Ok(records) = self.device_records(did, kid).await else {
             return hit;
         };
-        self.remember(slot.clone(), records, None);
+        let other = match device_key_history(did, &records)
+            .iter()
+            .any(|k| k.kid == kid)
+        {
+            true => None,
+            false => hit.other,
+        };
+        self.remember(slot.clone(), records, other);
         self.save().await;
         self.cache.lock().get(slot).cloned().unwrap_or(hit)
     }
@@ -4072,6 +4102,15 @@ mod tests {
         documents: Vec<DidDocument>,
         home: &Home,
     ) -> KeyLookup<freeq_oauth::SharedClient> {
+        lookup_at_home_for(documents, home, HOUR)
+    }
+
+    /// [`lookup_at_home`] with a ttl of `ttl`.
+    fn lookup_at_home_for(
+        documents: Vec<DidDocument>,
+        home: &Home,
+        ttl: Duration,
+    ) -> KeyLookup<freeq_oauth::SharedClient> {
         let resolver = DidResolver::static_map(
             documents
                 .into_iter()
@@ -4079,7 +4118,7 @@ mod tests {
                 .collect(),
         );
         let reader = RecordReader::new(resolver, freeq_oauth::SharedClient(reqwest::Client::new()));
-        KeyLookup::new(reader, Some(home.base.clone()), HOUR).with_retry_delays(Vec::new())
+        KeyLookup::new(reader, Some(home.base.clone()), ttl).with_retry_delays(Vec::new())
     }
 
     #[tokio::test]
@@ -4116,6 +4155,62 @@ mod tests {
             .await
             .unwrap()
             .map(|f| f.source)
+    }
+
+    /// Requests to the home server's batch and listing routes together.
+    fn home_listings(home: &Home) -> usize {
+        let (batch, listing, _) = home.counts();
+        batch + listing
+    }
+
+    /// A key held as the origin vouched for it, published since the
+    /// account's listing went past the ttl: taking the records again lists
+    /// them once, through the home server and not at the PDS, and the key is
+    /// then held as found in them.
+    #[tokio::test]
+    async fn relist_vouched_lists_through_the_home_server_and_finds_a_key_published_since() {
+        let (home_server, pds, repos, docs) = three_signers().await;
+        home_server
+            .keys
+            .lock()
+            .insert((ALICE.to_string(), kid_of(4)), raw(4));
+        let keys = lookup_at_home_for(docs, &home_server, Duration::from_secs(1));
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::OriginServer));
+        publish_alice_4(&repos);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let listed = home_listings(&home_server);
+        keys.relist_vouched(ALICE, &kid_of(4)).await;
+        assert_eq!(home_listings(&home_server), listed + 1, "one listing");
+        assert_eq!(pds.hits(), 0, "the PDS was not asked");
+        assert!(!keys.holds_origin_answer(ALICE, &kid_of(4)).await);
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::IdentityRecord));
+    }
+
+    /// A key held as the origin vouched for it and still unpublished stays
+    /// held so after the records are taken again, and they are taken again
+    /// at most once per ttl.
+    #[tokio::test]
+    async fn relist_vouched_keeps_the_origins_key_while_it_is_unpublished() {
+        let (home_server, pds, _repos, docs) = three_signers().await;
+        home_server
+            .keys
+            .lock()
+            .insert((ALICE.to_string(), kid_of(4)), raw(4));
+        let keys = lookup_at_home_for(docs, &home_server, Duration::from_secs(1));
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::OriginServer));
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let listed = home_listings(&home_server);
+        keys.relist_vouched(ALICE, &kid_of(4)).await;
+        assert_eq!(home_listings(&home_server), listed + 1, "one listing");
+        assert!(keys.holds_origin_answer(ALICE, &kid_of(4)).await);
+        keys.relist_vouched(ALICE, &kid_of(4)).await;
+        assert_eq!(
+            home_listings(&home_server),
+            listed + 1,
+            "none again inside the ttl"
+        );
+        assert!(keys.holds_origin_answer(ALICE, &kid_of(4)).await);
+        assert_eq!(pds.hits(), 0, "the PDS was not asked");
     }
 
     #[tokio::test]
@@ -4391,6 +4486,30 @@ mod tests {
             "no batch, listing or proof request"
         );
         assert_eq!(pds.hits(), 0, "the PDS was not asked");
+    }
+
+    /// A did:key signer's own key is read from its DID: the lookup answers it
+    /// with no request and keeps nothing, though the origin holds a copy.
+    /// Under any other kid it is asked for as before.
+    #[tokio::test]
+    async fn a_did_key_signers_own_key_is_read_from_the_did_and_another_kid_asked_for() {
+        let bot = format!("did:key:{}", key(7).public_key_multibase());
+        let origin = origin(vec![
+            (bot.as_str(), kid_of(7), raw(7)),
+            (bot.as_str(), kid_of(8), raw(8)),
+        ])
+        .await;
+        let keys = lookup(vec![], Some(&origin), HOUR);
+        let own = keys.key_for(&bot, &kid_of(7)).await.unwrap();
+        assert_eq!(
+            own.map(|f| (f.source, f.public_key)),
+            Some((KeySource::DidKey, raw(7)))
+        );
+        assert_eq!(origin.hits(), 0, "no request");
+        assert!(keys.cache.lock().is_empty(), "nothing kept");
+        let other = keys.key_for(&bot, &kid_of(8)).await.unwrap();
+        assert_eq!(other.map(|f| f.source), Some(KeySource::OriginServer));
+        assert_eq!(origin.hits(), 1, "asked as before");
     }
 
     #[tokio::test]

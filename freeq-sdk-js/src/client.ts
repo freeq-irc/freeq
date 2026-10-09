@@ -178,17 +178,41 @@ function actTask(
 
 /** What a task's opener says about the task's rulings: the referee it names
  *  (`act-home`), and the venue it was posted to, which a server signs its own
- *  events about the task for. `altered`: a fetched copy whose signature
- *  contradicts its key, under which every ruling on the task fails and
- *  nothing else it says is read. */
+ *  events about the task for. A fetched copy that does not name the referee
+ *  is kept too, so later rulings on the task read no history: one altered or
+ *  untrusted with what its signature covers and when it was checked, to be
+ *  checked again from those bytes; one missing from the history for the
+ *  connection. Each is its own object, changed in place when checked again.
+ *  Twin of the Rust `TaskOpener`. */
 interface TaskOpener {
   home: string | null;
   venue: string | null;
+  /** A fetched copy whose signature contradicts its key: every ruling on the
+   *  task fails, and nothing else it says is read. */
   altered?: boolean;
+  /** A fetched copy whose key is one only the connected server vouched for,
+   *  the server's own, or found nowhere: the referee cannot be known, and
+   *  every ruling on the task is hidden. */
+  untrusted?: boolean;
+  /** Of an untrusted copy: its key was found nowhere. It waits for the
+   *  lookup's ttl only while the lookup remembers that miss. */
+  keyNotFound?: boolean;
+  /** The task's history the server answered holds no opener: the referee
+   *  cannot be known, and the same server asked again gains nothing. */
+  missing?: boolean;
+  /** When an altered or untrusted copy was last checked, `Date.now()`. */
+  since?: number;
+  /** What an altered or untrusted copy's signature covers, checked again
+   *  once the lookup's ttl has passed since `since`; none for a copy with no
+   *  document or signature that can be read, never checked again. */
+  signed?: Signed;
 }
 
-/** A fetched opener whose signature contradicts its key. */
-const ALTERED_OPENER: TaskOpener = { home: null, venue: null, altered: true };
+/** Whether `opener` says who referees its task: a live opener, or a fetched
+ *  copy whose signature checked. */
+function openerChecked(opener: TaskOpener): boolean {
+  return !opener.altered && !opener.untrusted && !opener.missing;
+}
 
 /** What judging a ruling comes to inside the SDK: a `RulingCheck`, or
  *  `referee-unknown` when the app cannot know the task's referee, because
@@ -218,22 +242,28 @@ interface TaskHome {
 }
 
 /**
- * The standing a verdict gives an opening post: only a device verdict
- * names a referee, since "signed by the server" is a chat verdict; an
- * invalid, retired or missing signature, or one whose found key cannot
- * check it (as a ruling's unreadable signature), contradicts it; one whose
- * key is not found cannot be checked. Twin of the Rust `opener_standing`.
+ * The standing a verdict gives an opening post: only a device verdict under
+ * a key the connected server cannot fake names a referee, published in the
+ * poster's account or the poster's did:key itself; tasks are not chat, so
+ * one the server only vouched for, and "signed by the server", which is a
+ * chat verdict, leave it untrusted. An invalid, retired or missing
+ * signature, or one whose found key cannot check it (as a ruling's
+ * unreadable signature), contradicts it; one whose key is not found leaves
+ * it untrusted until the key turns up; one still pending is unknown. Twin
+ * of the Rust `opener_standing`.
  */
-function openerStanding(verdict: Verdict): 'checks' | 'altered' | 'unknown' {
+function openerStanding(verdict: Verdict): 'checks' | 'altered' | 'untrusted' | 'key-not-found' | 'unknown' {
   switch (verdict.state) {
     case 'device':
-      return 'checks';
+      return verdict.layer === 'published' || verdict.layer === 'did-key' ? 'checks' : 'untrusted';
+    case 'server':
+      return 'untrusted';
     case 'invalid':
     case 'retired':
     case 'unsigned':
       return 'altered';
     case 'unverifiable':
-      return verdict.keySource !== undefined ? 'altered' : 'unknown';
+      return verdict.keySource !== undefined ? 'altered' : 'key-not-found';
     default:
       return 'unknown';
   }
@@ -299,13 +329,14 @@ function signedIn(event: { signature?: string | null }, fields: Record<string, u
  * session) is not what was signed. Such a ruling, signed by the task's
  * referee, is checked under the venue its opener was signed for, when this
  * session is one of that pair, as a server's `venue_for` does. When that
- * venue is not known (the opener was not seen and could not be read, or
- * named no venue), the pair it was signed for is unknown: it is
- * unverifiable, as a line whose venue cannot be built is in `firstLook`.
- * Otherwise it is checked as rebuilt. Twin of the Rust `under_task_venue`.
+ * venue is not known (the opener was not seen and could not be read, does
+ * not say who referees the task, or named no venue), the pair it was signed
+ * for is unknown: it is unverifiable, as a line whose venue cannot be built
+ * is in `firstLook`. Otherwise it is checked as rebuilt. Twin of the Rust
+ * `under_task_venue`.
  */
 function underTaskVenue(signed: Signed, opener: TaskOpener | undefined, ownDid: string | undefined): FirstLook {
-  if (opener?.altered) opener = undefined;
+  if (opener !== undefined && !openerChecked(opener)) opener = undefined;
   const doc = signed.doc;
   if (doc.kind !== 'act' || !doc.venue.startsWith('dm:')) return { kind: 'check', signed };
   // Not the task's referee: checked as rebuilt.
@@ -1982,6 +2013,9 @@ export class FreeqClient extends EventEmitter {
       if (opener === undefined) return 'referee-unknown';
       // Its opening post proven altered: nothing the referee signs counts.
       if (opener.altered) return 'fails';
+      // Its opening post under a key the app cannot trust or find, or
+      // missing from the history: the app cannot know the referee.
+      if (opener.untrusted || opener.missing) return 'referee-unknown';
       const home = opener.home;
       if (!home) return 'cannot-check';
       if (signed === null) return 'fails';
@@ -2016,7 +2050,12 @@ export class FreeqClient extends EventEmitter {
     venue: string | null,
     delivered: Verdict | undefined,
     checked: Promise<Verdict>,
+    signed: Promise<Signed | null>,
   ): void {
+    // Its check, asked once more when it rests on a key only the server
+    // vouched for (`openerVerdict`).
+    const settledOf = (settled: Verdict): Promise<Verdict> =>
+      signed.then((s) => (s && this.checker ? this.openerVerdict(s, settled, this.checker) : settled));
     // Named unless a checked live opener's answer is already held: what a
     // fetched copy gave, under way, failed, answered or found altered, gives
     // way.
@@ -2028,13 +2067,13 @@ export class FreeqClient extends EventEmitter {
       return;
     }
     if (this.taskHomes.has(taskId)) {
-      void checked.then((settled) => {
+      void checked.then(settledOf).then((settled) => {
         if (checksOut(settled)) name();
       });
       return;
     }
     const abort = new AbortController();
-    const naming = checked.then((settled) => {
+    const naming = checked.then(settledOf).then((settled) => {
       if (checksOut(settled)) return { home, venue };
       // Read instead: from here on, what it gives is a fetched copy's.
       const held = this.taskHomes.get(taskId);
@@ -2051,9 +2090,14 @@ export class FreeqClient extends EventEmitter {
   /** What `taskId`'s opener says; undefined when the opener was not seen
    *  and its history could not be read and checked. Rulings of one task
    *  asking at once share one read; an opener that checks while it is under
-   *  way answers instead when it fails or finds the copy altered. */
+   *  way answers instead when it fails or finds a copy that does not name
+   *  the referee. Such a kept copy is checked again from its bytes when it
+   *  is due (`recheckDue`), with no history read, and changed in place. */
   private async homeOf(taskId: string): Promise<TaskOpener | undefined> {
-    let known = this.taskHomes.get(taskId)?.home;
+    const entry = this.taskHomes.get(taskId);
+    // Held before this ruling asked: only such a copy can be due.
+    let held = entry?.settled === true;
+    let known = entry?.home;
     if (known === undefined) {
       const abort = new AbortController();
       const reading = this.readHome(taskId, abort.signal);
@@ -2068,19 +2112,51 @@ export class FreeqClient extends EventEmitter {
     let answer: TaskOpener | undefined;
     try {
       answer = await known;
-      if (!answer.altered) return answer;
+      if (openerChecked(answer)) return answer;
     } catch {
       answer = undefined;
     }
     // An opener that checked while the read was under way replaced it:
     // what the map holds now is awaited once more.
-    const now = this.taskHomes.get(taskId)?.home;
-    if (now === undefined || now === known) return answer;
-    try {
-      return await now;
-    } catch {
-      return undefined;
+    const now = this.taskHomes.get(taskId);
+    if (now !== undefined && now.home !== known) {
+      held = now.settled;
+      try {
+        answer = await now.home;
+      } catch {
+        return undefined;
+      }
+      if (openerChecked(answer)) return answer;
     }
+    if (!held || answer === undefined || !(await this.recheckDue(answer))) return answer;
+    let checked: TaskOpener;
+    try {
+      checked = await this.checkedSigned(answer.signed!, this.checker!);
+    } catch {
+      // Still pending is no answer: the kept copy and its time stand.
+      return answer;
+    }
+    Object.assign(
+      answer,
+      { altered: undefined, untrusted: undefined, keyNotFound: undefined, since: undefined, signed: undefined },
+      checked,
+    );
+    return answer;
+  }
+
+  /**
+   * Whether a kept copy that does not name the referee is checked again now:
+   * one altered or untrusted once the lookup's ttl has passed since it was
+   * checked; one whose key was found nowhere as soon as the lookup remembers
+   * no miss for it, which it does not when a source failed. A copy missing
+   * from the history, or with nothing to check, never is. Twin of the Rust
+   * `recheck_due`.
+   */
+  private async recheckDue(kept: TaskOpener): Promise<boolean> {
+    const lookup = this.opts.keyLookup;
+    if (!lookup || !this.checker || kept.signed === undefined || kept.since === undefined) return false;
+    if (kept.keyNotFound) return !(await lookup.holdsMiss(kept.signed.did, kept.signed.kid));
+    return Date.now() - kept.since >= lookup.ttl();
   }
 
   private keepHome(taskId: string, home: Promise<TaskOpener>, read: boolean, abort?: AbortController): void {
@@ -2110,6 +2186,22 @@ export class FreeqClient extends EventEmitter {
   }
 
   /**
+   * An opening post's verdict, once more when it rests on a key only the
+   * connected server vouched for: its poster's records are taken again
+   * through the connected server (`relistVouched`, at most once per poster
+   * per the lookup's ttl, the server's key kept when nothing is published),
+   * and the post is checked once more, so a key published since names the
+   * referee. A chat line keeps the vouched layer: only an opening post asks.
+   * Twin of the Rust `opener_verdict`.
+   */
+  private async openerVerdict(signed: Signed, verdict: Verdict, checker: SignatureChecker): Promise<Verdict> {
+    const lookup = this.opts.keyLookup;
+    if (!lookup || verdict.state !== 'device' || verdict.layer !== 'vouched') return verdict;
+    await lookup.relistVouched(signed.did, signed.kid);
+    return checker.resolve(signed);
+  }
+
+  /**
    * What `taskId`'s opener says, read from the task's history on the
    * connected server and checked (`checkedOpener`); given up when `signal`
    * aborts.
@@ -2122,12 +2214,10 @@ export class FreeqClient extends EventEmitter {
   /**
    * What `taskId`'s opener among `events` (a task's history, or the openers
    * a channel's audit sends) says, once its own signature is checked as a
-   * live opener's is: the referee it names and the venue it was signed for
-   * when it checks; `ALTERED_OPENER` when its signature contradicts its key
-   * (invalid, made at or after the key stopped counting, or missing or
-   * unreadable, as a ruling's is). Rejects when the opener is not among
-   * them, this client checks no signatures, or its signature cannot be
-   * checked (its key not found). Twin of the Rust `checked_opener_in`.
+   * live opener's is (`checkedSigned`); marked missing when it is not among
+   * them, and altered when it carries no document or signature that can be
+   * read, as a ruling's is. Rejects when this client checks no signatures.
+   * Twin of the Rust `checked_opener_in`.
    */
   private async checkedOpener(
     events: readonly { event_id?: string; canonical?: string | null; signature?: string | null }[],
@@ -2136,23 +2226,47 @@ export class FreeqClient extends EventEmitter {
   ): Promise<TaskOpener> {
     if (!checker) throw new Error('this client checks no signatures');
     const event = events.find((e) => e.event_id === taskId);
-    if (!event) throw new Error('the task history holds no opener');
+    if (!event) return { home: null, venue: null, missing: true };
     const act = historyAct(event);
-    if (act === undefined || act.signed === null) return ALTERED_OPENER;
+    if (act === undefined || act.signed === null) return { home: null, venue: null, altered: true };
+    return this.checkedSigned(act.signed, checker);
+  }
+
+  /**
+   * What a fetched opener says once its signature is checked: the referee
+   * it names and the venue it was signed for (its document's `act-home` and
+   * `target`) when it checks; marked altered when its signature contradicts
+   * its key (invalid, made at or after the key stopped counting, or a found
+   * key that cannot check it); marked untrusted when its key is one only the
+   * connected server vouched for or the server's own, or was found nowhere.
+   * Each but a copy that checks keeps `signed` and the time, so a later
+   * ruling can check it again with no history read. Rejects when it is still
+   * pending, which a finished check never is. Twin of the Rust
+   * `checked_opener`.
+   */
+  private async checkedSigned(signed: Signed, checker: SignatureChecker): Promise<TaskOpener> {
     let verdict: Verdict;
     try {
-      verdict = await checker.resolve(act.signed);
+      verdict = await this.openerVerdict(signed, await checker.resolve(signed), checker);
     } catch {
-      verdict = { state: 'unverifiable', kid: act.signed.kid };
+      verdict = { state: 'unverifiable', kid: signed.kid };
     }
-    const field = (name: string) => (typeof act.fields[name] === 'string' ? (act.fields[name] as string) : null);
-    switch (openerStanding(verdict)) {
-      case 'checks':
-        return { home: field('act-home'), venue: field('target') };
+    const standing = openerStanding(verdict);
+    if (standing === 'checks') {
+      const doc = signed.doc;
+      if (doc.kind !== 'act') throw new Error('the opener is no task event');
+      return { home: doc.tags['+freeq.at/act-home'] ?? null, venue: doc.venue };
+    }
+    const kept = { home: null, venue: null, since: Date.now(), signed };
+    switch (standing) {
       case 'altered':
-        return ALTERED_OPENER;
+        return { ...kept, altered: true };
+      case 'untrusted':
+        return { ...kept, untrusted: true };
+      case 'key-not-found':
+        return { ...kept, untrusted: true, keyNotFound: true };
       default:
-        throw new Error("the opener's signature cannot be checked");
+        throw new Error("the opener's check has not finished");
     }
   }
 
@@ -3808,7 +3922,10 @@ export class FreeqClient extends EventEmitter {
             openerChecked = resolve;
           });
           const opening = verdict ?? this.startingVerdict(msg.tags, true);
-          this.nameOnceChecked(act.taskId, act.home, actVenue(look), opening, checked);
+          const openerSigned = firstLook(look)
+            .then((first) => (first.kind === 'check' ? first.signed : null))
+            .catch(() => null);
+          this.nameOnceChecked(act.taskId, act.home, actVenue(look), opening, checked, openerSigned);
           if (verdict === undefined) {
             this.checkLater(opening, { tags: msg.tags, target, from: isSelf ? undefined : from }, openerChecked, undefined, undefined, false);
           }

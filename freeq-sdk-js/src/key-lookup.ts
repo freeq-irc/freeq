@@ -492,8 +492,9 @@ export class KeyLookup {
 
   /**
    * A found key's cached answer with the DID's current proven records: the
-   * last listing while inside the ttl, else a new one. A listing that fails
-   * leaves `hit` as it was.
+   * last listing while inside the ttl, else a new one. The answer held
+   * beside the records (the origin's) stands unless the records now hold the
+   * key. A listing that fails leaves `hit` as it was.
    */
   private async relisted(slot: string, did: string, kid: string, hit: Cached): Promise<Cached> {
     let records: unknown[];
@@ -502,7 +503,8 @@ export class KeyLookup {
     } catch {
       return hit;
     }
-    this.remember(slot, records, undefined);
+    const published = (await deviceKeyHistory(did, records)).some((k) => k.kid === kid);
+    this.remember(slot, records, published ? undefined : hit.other);
     await this.save();
     return this.cache.get(slot)!;
   }
@@ -972,6 +974,27 @@ export class KeyLookup {
   async holdsOriginAnswer(did: string, kid: string): Promise<boolean> {
     await this.load();
     return this.cache.get(JSON.stringify([did, kid]))?.other?.source === 'OriginServer';
+  }
+
+  /**
+   * When the answer held for `(did, kid)` is a key the origin server vouched
+   * for, take `did`'s records again as any lookup does past the ttl
+   * (`deviceRecords`: through the home server, at most once per DID per
+   * ttl), so a key published since is answered from them; one still
+   * unpublished keeps the server's answer. For a task's opening post, which
+   * only a published key lets name its referee. Never rejects. Twin of the
+   * Rust `relist_vouched`.
+   */
+  async relistVouched(did: string, kid: string): Promise<void> {
+    if (!(await this.holdsOriginAnswer(did, kid))) return;
+    const slot = JSON.stringify([did, kid]);
+    const hit = this.cache.get(slot);
+    if (hit !== undefined) await this.relisted(slot, did, kid, hit);
+  }
+
+  /** How long a miss and a listing are held, in milliseconds. */
+  ttl(): number {
+    return this.ttlMs;
   }
 
   /**

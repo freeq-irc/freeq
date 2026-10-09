@@ -1121,6 +1121,24 @@ describe('KeyLookup through the home server', () => {
     expect(hits.origin).toBe(1);
   });
 
+  it("reads a did:key signer's own key from its DID with no request and keeps nothing, and asks for any other kid as before", async () => {
+    const BOT = `did:key:${(await key(7)).publicKeyMultibase}`;
+    const { home, pds, hits, fetch, resolveDid } = await homeNetwork({
+      [`${BOT} ${await kidOf(7)}`]: await raw(7),
+      [`${BOT} ${await kidOf(8)}`]: await raw(8),
+    });
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    const own = await lookup.keyForAt(BOT, await kidOf(7), new Date());
+    expect(own?.source).toBe('DidKey');
+    expect(own?.publicKey).toEqual(await raw(7));
+    expect(hits.origin, 'no request').toBe(0);
+    expect((lookup as unknown as { cache: Map<string, unknown> }).cache.size, 'nothing kept').toBe(0);
+    expect((await lookup.keyForAt(BOT, await kidOf(8), new Date()))?.source).toBe('OriginServer');
+    expect(hits.origin, 'asked as before').toBe(1);
+    expect(home.hits, 'no record request').toEqual(noHome);
+    expect(pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+  });
+
   it('asks nothing for a batch of did:key signers alone', async () => {
     const { home, fetch, resolveDid } = await homeNetwork();
     const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
@@ -1243,6 +1261,37 @@ describe('KeyLookup through the home server', () => {
     expect(pds).toEqual({ listings: 1, proofs: 1 });
     expect(hits.origin).toBe(0);
     expect(home.hits.batch).toBe(1);
+  });
+
+  it('takes the records of a vouched key again through the home server past the ttl, not the PDS, and finds it published since', async () => {
+    const { alice, home, pds, fetch, resolveDid } = await homeNetwork({ [`${ALICE} ${await kidOf(4)}`]: await raw(4) });
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, 1_000, NO_RETRIES);
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('OriginServer');
+    await alice.add('at.freeq.deviceKey', await buildDeviceRecord(await key(4), ALICE, T0));
+    await new Promise((res) => setTimeout(res, 1_100));
+    const listed = home.hits.batch + home.hits.listing;
+    await lookup.relistVouched(ALICE, await kidOf(4));
+    expect(home.hits.batch + home.hits.listing - listed, 'one listing').toBe(1);
+    expect(pds.listings, 'the PDS was not asked').toBe(0);
+    expect(await lookup.holdsOriginAnswer(ALICE, await kidOf(4))).toBe(false);
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
+  });
+
+  it("keeps the origin's answer for a vouched key still unpublished, and takes the records again at most once per ttl", async () => {
+    const { home, pds, hits, fetch, resolveDid } = await homeNetwork({ [`${ALICE} ${await kidOf(4)}`]: await raw(4) });
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, 1_000, NO_RETRIES);
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('OriginServer');
+    await new Promise((res) => setTimeout(res, 1_100));
+    const listed = home.hits.batch + home.hits.listing;
+    await lookup.relistVouched(ALICE, await kidOf(4));
+    expect(home.hits.batch + home.hits.listing - listed, 'one listing').toBe(1);
+    expect(await lookup.holdsOriginAnswer(ALICE, await kidOf(4))).toBe(true);
+    await lookup.relistVouched(ALICE, await kidOf(4));
+    expect(home.hits.batch + home.hits.listing - listed, 'none again inside the ttl').toBe(1);
+    const asked = hits.origin;
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('OriginServer');
+    expect(hits.origin, 'no key request').toBe(asked);
+    expect(pds.listings, 'the PDS was not asked').toBe(0);
   });
 
   it('replaces an origin answer for a key published since, in memory and in the store', async () => {

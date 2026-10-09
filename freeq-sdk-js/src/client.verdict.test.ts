@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { importDidKey } from './did-key.js';
 import { type DidDocument, buildDeviceRecord } from './identity-records.js';
-import { KeyLookup } from './key-lookup.js';
+import { KeyLookup, MemoryKeyLookupStore, SNAPSHOT_VERSION } from './key-lookup.js';
 import { format } from './parser.js';
 import * as signing from './signing.js';
 import type { Message } from './types.js';
@@ -110,6 +110,8 @@ interface Origin {
   recordsReads: number;
   batchReads: number;
   kidReads: number;
+  /** The DID each per-kid request named, in order. */
+  kidReadsOf: string[];
   /** The DIDs each records request named, one entry per DID, in the order asked. */
   recordsAsked: string[];
   /** The `did/kid` items each batch key request named, one list per request. */
@@ -124,6 +126,14 @@ function b64url(bytes: Uint8Array): string {
 
 function rawKey(b64: string): Uint8Array {
   return new Uint8Array(Buffer.from(b64, 'base64url'));
+}
+
+/** Requests to the origin for one of `did`'s keys, per kid or in a batch. */
+function keysAskedFor(did: string): number {
+  return (
+    origin.kidReadsOf.filter((d) => d === did).length +
+    origin.keysAsked.flat().filter((k) => k.startsWith(`${did}/`)).length
+  );
 }
 
 async function hold(did: string, key: Uint8Array, removedAt?: number) {
@@ -203,6 +213,7 @@ const stubFetch = async (input: string): Promise<Response> => {
     return Response.json({ did, keys });
   }
   origin.kidReads++;
+  origin.kidReadsOf.push(did!);
   if (origin.delayMs > 0 && (origin.slowDid === undefined || did === origin.slowDid)) {
     await new Promise((r) => setTimeout(r, origin.delayMs));
   }
@@ -234,6 +245,7 @@ beforeEach(() => {
     recordsReads: 0,
     batchReads: 0,
     kidReads: 0,
+    kidReadsOf: [],
     recordsAsked: [],
     keysAsked: [],
   };
@@ -509,6 +521,82 @@ describe('checking received signatures', () => {
     const tags = { account: SIGNER, msgid, [signing.SIG_TAG]: `ed25519:${kid}:${sig}` };
     return { wire: line(tags, 'PRIVMSG', '#room', body), msgid, pub, kid, key };
   }
+
+  it("reads a did:key signer's key from its DID, with no request and nothing kept, and a mismatched kid as before", async () => {
+    const bot = await importDidKey(new Uint8Array(32).fill(27));
+    const other = await importDidKey(new Uint8Array(32).fill(28));
+    const raw = (k: { publicKeyMultibase: string }) =>
+      import('./did-key.js').then((m) => m.decodeMultibaseEd25519(k.publicKeyMultibase));
+    const [ownKey, otherKey] = [await raw(bot), await raw(other)];
+    const [own, otherKid] = [await signing.deriveKid(ownKey), await signing.deriveKid(otherKey)];
+    origin.keys.set(`${bot.did} ${own}`, { key: ownKey });
+    origin.keys.set(`${bot.did} ${otherKid}`, { key: otherKey });
+    // Held as the origin vouched for it, as an app that met the bot before
+    // the lookup read a did:key from its DID holds it.
+    const store = new MemoryKeyLookupStore();
+    await store.save({
+      version: SNAPSHOT_VERSION,
+      accounts: [],
+      keys: [
+        [
+          JSON.stringify([bot.did, own]),
+          { other: { publicKey: ownKey, source: 'OriginServer', retiredAt: null, expiresAt: null }, at: Date.now() },
+        ],
+      ],
+      records: [],
+      refreshed: [],
+      proven: [],
+    });
+    const resolveDid = async (did: string): Promise<DidDocument> => {
+      throw new Error(`unknown DID ${did}`);
+    };
+    const lk = new KeyLookup({ fetch: stubFetch, resolveDid }, ORIGIN, 3_600_000, [], store);
+    expect(await lk.holdsOriginAnswer(bot.did, own)).toBe(true);
+    const reads = origin.kidReads + origin.batchReads;
+    const s = await session(OWN_DID, lk);
+    const message = async (key: typeof bot, body: string) => {
+      const msgid = signing.newEventId();
+      const canonical = await signing.messageCanonical({ from: bot.did, msgid, target: '#room', body });
+      const sig = await key.signer(new TextEncoder().encode(canonical));
+      const kid = await signing.deriveKid(await raw(key));
+      return { msgid, wire: line({ account: bot.did, msgid, [signing.SIG_TAG]: `ed25519:${kid}:${sig}` }, 'PRIVMSG', '#room', body) };
+    };
+    const m = await message(bot, 'from the bot');
+    expect((await s.lineFor([m.wire], m.msgid)).settled).toEqual({
+      state: 'device',
+      layer: 'did-key',
+      kid: own,
+      keySource: 'DidKey',
+    });
+    expect(origin.kidReads + origin.batchReads, 'no key request').toBe(reads);
+    expect(await lk.holdsOriginAnswer(bot.did, own), 'nothing kept for it').toBe(true);
+    const { sentence } = await import('./verdict.js');
+    expect(sentence('device', 'did-key')).toBe('Signed with the sender’s own key. The key is their identity.');
+    const o = await message(other, 'with another key');
+    expect((await s.lineFor([o.wire], o.msgid)).settled, 'not the DID\'s key: looked up as before').toEqual({
+      state: 'device',
+      layer: 'vouched',
+      kid: otherKid,
+      keySource: 'OriginServer',
+    });
+    s.client.disconnect();
+  });
+
+  it('asks no key for a did:key signer in a history batch', async () => {
+    const bot = await importDidKey(new Uint8Array(32).fill(27));
+    const s = await session();
+    const msgid = signing.newEventId();
+    const canonical = await signing.messageCanonical({ from: bot.did, msgid, target: '#room', body: 'replayed' });
+    const sig = await bot.signer(new TextEncoder().encode(canonical));
+    const pub = (await import('./did-key.js')).decodeMultibaseEd25519(bot.publicKeyMultibase);
+    const tags = { batch: 'h', account: bot.did, msgid, [signing.SIG_TAG]: `ed25519:${await signing.deriveKid(pub)}:${sig}` };
+    s.ws.recv(':srv BATCH +h chathistory #room');
+    s.ws.recv(line(tags, 'PRIVMSG', '#room', 'replayed'));
+    const seen = await s.lineFor([':srv BATCH -h'], msgid);
+    expect(seen.settled?.layer).toBe('did-key');
+    expect(origin.batchReads + origin.kidReads, 'no key request').toBe(0);
+    s.client.disconnect();
+  });
 
   it('is unverifiable for a key no source holds', async () => {
     const m = await signedMessage(21, 'hello');
@@ -1048,7 +1136,8 @@ describe('a line a peer server signed', () => {
 // ── task events and rulings ─────────────────────────────────────────────
 
 describe('a task event', () => {
-  const ALICE = 'did:plc:alice';
+  /** Seed 90's did:key: her openers check under the key her DID is. */
+  const ALICE = 'did:key:z6MkfMo6gxqdBhaHMNnmfhgZFBjpCDTkmJMJLoypsBZS9PwD';
   const ROOM = '#tasks';
 
   async function keyOf(seed: number) {
@@ -1514,10 +1603,11 @@ describe('a task event', () => {
     expect(messages, 'no verdict on a chat line').toEqual([undefined]);
     expect(origin.batchReads + origin.kidReads + origin.setReads, 'no key asked for either').toBe(0);
 
+    // The opener is checked, its key read from ALICE's did:key: the ruling
+    // below counts with no history read.
     const o = await opener(REFEREE);
     await w.send(o.wire);
     await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(origin.batchReads + origin.kidReads, "the opener's key is asked for").toBeGreaterThan(0);
     expect(
       w.up.filter((u) => u.id === o.id).map((u) => [u.kind, u.verdict]),
       'and no verdict is put on it',
@@ -2142,19 +2232,81 @@ describe('a task event', () => {
     w.client.disconnect();
   });
 
-  it("that is a ruling on a task whose fetched opener's key cannot be found is hidden, and is read again", async () => {
+  it("that is a ruling on a task whose fetched opener's key is found nowhere is hidden, and the opener kept while the miss stands", async () => {
     await list(91);
+    // The server lists CAROL's account and finds no record: a settled miss.
+    origin.recordRoutes = true;
     const CAROL = 'did:plc:carol';
     const task = signing.newEventId();
     const o = await taskEvent(92, CAROL, 'offer', undefined, { '+freeq.at/act-home': REFEREE }, undefined, ROOM, task);
     const fetch = vi.fn(async () => Response.json({ act_id: task, events: [served(o)] }));
     vi.stubGlobal('fetch', fetch);
     const w = await watching();
-    for (const reads of [1, 2]) {
+    let asked: number | undefined;
+    for (let i = 0; i < 2; i++) {
       const r = await taskEvent(91, REFEREE, 'expire', task);
       await w.send(r.wire);
       expect(await w.wentUpAs(r.id, task), 'hidden').toBeNull();
-      expect(fetch).toHaveBeenCalledTimes(reads);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      const now = keysAskedFor(CAROL);
+      asked ??= now;
+      expect(now, 'no key asked again').toBe(asked);
+    }
+    w.client.disconnect();
+  });
+
+  it("that is a ruling on a task whose fetched opener's key lookup failed checks the kept opener again at the next ruling, with no history read", async () => {
+    await list(91);
+    // CAROL's records cannot be read: the server has no record routes and
+    // her DID does not resolve.
+    const CAROL = 'did:plc:carol';
+    const task = signing.newEventId();
+    const o = await taskEvent(92, CAROL, 'offer', undefined, { '+freeq.at/act-home': REFEREE }, undefined, ROOM, task);
+    const fetch = vi.fn(async () => Response.json({ act_id: task, events: [served(o)] }));
+    vi.stubGlobal('fetch', fetch);
+    const w = await watching();
+    const asked: number[] = [];
+    for (let i = 0; i < 2; i++) {
+      const r = await taskEvent(91, REFEREE, 'expire', task);
+      await w.send(r.wire);
+      expect(await w.wentUpAs(r.id, task), 'hidden').toBeNull();
+      expect(fetch).toHaveBeenCalledTimes(1);
+      asked.push(keysAskedFor(CAROL));
+    }
+    expect(asked[1]! - asked[0]!, 'one key request').toBe(1);
+    w.client.disconnect();
+  });
+
+  it('that is a ruling on a task whose history holds no opener is hidden, and the history read once', async () => {
+    await list(91);
+    const task = signing.newEventId();
+    const claim = await taskEvent(90, ALICE, 'claim', task);
+    const fetch = histories(new Map([[task, [claim]]]));
+    const w = await watching();
+    for (let i = 0; i < 2; i++) {
+      const r = await taskEvent(91, REFEREE, 'expire', task);
+      await w.send(r.wire);
+      expect(await w.wentUpAs(r.id, task), 'hidden').toBeNull();
+      expect(fetch).toHaveBeenCalledTimes(1);
+    }
+    w.client.disconnect();
+  });
+
+  it('that is a ruling on a task whose fetched opener was altered reads the history once, inside the ttl and after it', async () => {
+    await list(91);
+    const o = await opener(REFEREE);
+    const fetch = vi.fn(async () => Response.json({ act_id: o.id, events: [stripped(served(o), 'act-home')] }));
+    vi.stubGlobal('fetch', fetch);
+    const resolveDid = async (did: string): Promise<DidDocument> => {
+      throw new Error(`unknown DID ${did}`);
+    };
+    const w = await watching(new KeyLookup({ fetch: stubFetch, resolveDid }, ORIGIN, 1_000, []));
+    for (const wait of [false, false, true]) {
+      if (wait) await new Promise((res) => setTimeout(res, 1_100));
+      const r = await taskEvent(91, REFEREE, 'expire', o.id);
+      await w.send(r.wire);
+      expect(await w.wentUpAs(r.id, o.id), 'fails').toBeNull();
+      expect(fetch).toHaveBeenCalledTimes(1);
     }
     w.client.disconnect();
   });
@@ -2328,6 +2480,152 @@ describe('a task event', () => {
       await w.send(r.wire.replace('@', '@batch=replay;'));
       expect((await w.actFor(r.id))?.ruling, task === altered.id ? 'thrown out, then' : 'hidden, then').toBe('counts');
     }
+    w.client.disconnect();
+  });
+
+  it('that opens a task under a key only the server vouches for names no referee, live or fetched', async () => {
+    await list(91);
+    const CAROL = 'did:plc:carol';
+    await hold(CAROL, (await keyOf(92)).pub);
+    const home = { '+freeq.at/act-home': REFEREE };
+    const fetched = await taskEvent(92, CAROL, 'offer', undefined, home);
+    const onFetched = await taskEvent(91, REFEREE, 'expire', fetched.id);
+    histories(new Map([[fetched.id, [fetched, onFetched]]]));
+    const w = await watching();
+    const live = await taskEvent(92, CAROL, 'offer', undefined, home);
+    await w.send(live.wire);
+    await new Promise((res) => setTimeout(res, 100));
+    const onLive = await taskEvent(91, REFEREE, 'expire', live.id);
+    await w.send(onLive.wire);
+    expect(await w.wentUpAs(onLive.id, live.id), 'live: hidden').toBeNull();
+    const again = await taskEvent(91, REFEREE, 'expire', fetched.id);
+    await w.send(again.wire);
+    expect(await w.wentUpAs(again.id, fetched.id), 'fetched: hidden').toBeNull();
+    expect((await w.client.taskHistory(fetched.id)).events.map((e) => e.event_id)).toEqual([fetched.id]);
+    w.client.disconnect();
+  });
+
+  /**
+   * POSTER, whose key 26 the connected server vouches for and whose records
+   * the server's record routes serve from the repository POSTER's PDS
+   * lists; the key lookup's ttl one second. POSTER's key is met through the
+   * server on a chat line first, before it is published.
+   */
+  async function vouchedPoster() {
+    await list(91);
+    const POSTER = 'did:plc:poster';
+    const { stubRepo, stubHome } = await import('../test/repo-proofs.js');
+    const repo = await stubRepo(POSTER);
+    const home = stubHome([repo]);
+    const doc = await repo.document(PDS);
+    const pds = { listings: 0 };
+    /** Listings of POSTER's records at the server, batch or per account. */
+    const listed = { atHome: 0 };
+    const fetch = async (input: string): Promise<Response> => {
+      const url = new URL(input);
+      if (url.origin === ORIGIN) {
+        const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+        const batch = url.pathname === '/api/v1/records' && (url.searchParams.get('dids') ?? '').split(',').includes(POSTER);
+        if (batch || (parts.length === 5 && parts[3] === POSTER)) listed.atHome++;
+        return (await home.respond(url)) ?? stubFetch(input);
+      }
+      if (url.origin !== PDS) return stubFetch(input);
+      if (url.pathname.endsWith('/com.atproto.repo.listRecords')) pds.listings++;
+      return (await repo.respond(url)) ?? new Response('unexpected', { status: 500 });
+    };
+    const resolveDid = async (did: string): Promise<DidDocument> => {
+      if (did !== POSTER) throw new Error(`unknown DID ${did}`);
+      return doc;
+    };
+    const { key, pub, kid } = await keyOf(26);
+    await hold(POSTER, pub);
+    const keyLookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, 1_000, []);
+    const w = await watching(keyLookup);
+    /** A chat line POSTER signed, and what it settled to. */
+    const chat = async (body: string) => {
+      const msgid = signing.newEventId();
+      const canonical = await signing.messageCanonical({ from: POSTER, msgid, target: ROOM, body });
+      const sig = await key.signer(new TextEncoder().encode(canonical));
+      const wire = line({ account: POSTER, msgid, [signing.SIG_TAG]: `ed25519:${kid}:${sig}` }, 'PRIVMSG', ROOM, body);
+      return (await w.lineFor([wire], msgid)).settled;
+    };
+    expect((await chat('before publishing'))?.layer).toBe('vouched');
+    const keysAsked = () => keysAskedFor(POSTER);
+    const publish = async () =>
+      repo.add('at.freeq.deviceKey', await buildDeviceRecord(key, POSTER, new Date(Date.now() - 86_400_000).toISOString()));
+    const opener = () => taskEvent(26, POSTER, 'offer', undefined, { '+freeq.at/act-home': REFEREE });
+    return { w, listed, pds, keyLookup, kid, POSTER, chat, keysAsked, publish, opener };
+  }
+
+  const pastTheTtl = () => new Promise((res) => setTimeout(res, 1_100));
+
+  it("that opens a task under a key held as server-vouched lists its poster's records once through the server, and names the referee once published", async () => {
+    const { w, listed: atHome, pds, keyLookup, kid, POSTER, publish, opener } = await vouchedPoster();
+    await publish();
+    await pastTheTtl();
+    const listed = atHome.atHome;
+    const atPds = pds.listings;
+    const o = await opener();
+    await w.send(o.wire);
+    await new Promise((res) => setTimeout(res, 300));
+    const r = await taskEvent(91, REFEREE, 'expire', o.id);
+    await w.send(r.wire);
+    expect((await w.actFor(r.id))?.ruling).toBe('counts');
+    expect(atHome.atHome - listed, 'its records listed once, through the server').toBe(1);
+    expect(pds.listings, 'the PDS is not asked').toBe(atPds);
+    expect(await keyLookup.holdsOriginAnswer(POSTER, kid)).toBe(false);
+    w.client.disconnect();
+  });
+
+  it("that opens a task under a key still unpublished keeps the server's key, and its ruling is hidden", async () => {
+    const { w, listed: atHome, pds, chat, keysAsked, opener } = await vouchedPoster();
+    await pastTheTtl();
+    const listed = atHome.atHome;
+    const atPds = pds.listings;
+    const o = await opener();
+    await w.send(o.wire);
+    await new Promise((res) => setTimeout(res, 300));
+    const r = await taskEvent(91, REFEREE, 'expire', o.id);
+    await w.send(r.wire);
+    expect(await w.wentUpAs(r.id, o.id), 'hidden').toBeNull();
+    expect(atHome.atHome - listed).toBe(1);
+    expect(pds.listings).toBe(atPds);
+    const asked = keysAsked();
+    expect((await chat('still unpublished'))?.layer).toBe('vouched');
+    expect(keysAsked(), 'no key request').toBe(asked);
+    w.client.disconnect();
+  });
+
+  it('that is a ruling on a task whose fetched opener rests on a vouched key keeps the opener, and checks it again after the ttl', async () => {
+    const { w, listed: atHome, publish, opener } = await vouchedPoster();
+    const o = await opener();
+    const fetch = histories(new Map([[o.id, [o]]]));
+    await pastTheTtl();
+    const listed = atHome.atHome;
+    const listings = () => atHome.atHome - listed;
+    const first = await taskEvent(91, REFEREE, 'expire', o.id);
+    await w.send(first.wire);
+    expect(await w.wentUpAs(first.id, o.id), 'hidden').toBeNull();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(listings()).toBe(1);
+    const second = await taskEvent(91, REFEREE, 'expire', o.id);
+    await w.send(second.wire);
+    expect(await w.wentUpAs(second.id, o.id)).toBeNull();
+    expect(fetch, 'inside the ttl: no history read').toHaveBeenCalledTimes(1);
+    expect(listings(), 'inside the ttl: no listing').toBe(1);
+    await pastTheTtl();
+    const third = await taskEvent(91, REFEREE, 'expire', o.id);
+    await w.send(third.wire);
+    expect(await w.wentUpAs(third.id, o.id)).toBeNull();
+    expect(fetch, 'after the ttl: no history read').toHaveBeenCalledTimes(1);
+    expect(listings(), 'after the ttl: one listing').toBe(2);
+    await publish();
+    await pastTheTtl();
+    const fourth = await taskEvent(91, REFEREE, 'confirm', o.id);
+    await w.send(fourth.wire);
+    expect((await w.actFor(fourth.id))?.ruling).toBe('counts');
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(listings()).toBe(3);
     w.client.disconnect();
   });
 
