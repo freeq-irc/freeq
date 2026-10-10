@@ -151,6 +151,24 @@ describe('a row of a task s history', () => {
     expect(useStore.getState().scrollToMsgId).toBeNull();
     expect(onClose).not.toHaveBeenCalled();
   });
+
+  it('lays a step row and a receipt row out on the same columns', async () => {
+    seed();
+    const { container, getByText } = open(() => {});
+    await waitFor(() => expect(container.textContent).toContain('accepted'));
+
+    // The receipt has no line to jump to, but it is padded and columned
+    // like the step above it, so its words start on the same line.
+    const step = getByText('accepted').parentElement!;
+    const receipt = getByText('confirmed').parentElement!;
+    const columns = 'grid-cols-[minmax(128px,max-content)_minmax(0,1fr)_auto_auto]';
+    for (const row of [step, receipt]) {
+      expect(row.className).toContain('px-1');
+      expect(row.className).toContain(columns);
+    }
+    expect(step.className).toContain('hover:bg-surface/30');
+    expect(receipt.className).not.toContain('hover:bg-surface/30');
+  });
 });
 
 describe('public receipt permalink', () => {

@@ -101,17 +101,21 @@ function ActionTimeline({ actId, onClose }: { actId: string; onClose: () => void
           // A receipt and an expiry send no companion line, so there is
           // nothing for their row to jump to and it does not react.
           const msgId = task?.events.find(e => e.eventId === event.event_id)?.msgId;
+          // Every row is the same four columns, verb, name, time, verify, so
+          // the names start on one line whatever word the verb is; the verb
+          // column is wide enough for "revisions requested" and only grows
+          // for the one longer word a review window closing writes.
           return (
           <div
             key={event.event_id}
-            className={`flex items-center gap-2 text-xs py-1${msgId ? ' rounded px-1 hover:bg-surface/30' : ''}`}
+            className={`grid grid-cols-[minmax(128px,max-content)_minmax(0,1fr)_auto_auto] items-center gap-2 text-xs py-1 px-1 rounded${msgId ? ' hover:bg-surface/30' : ''}`}
             onClick={msgId ? () => { setScrollToMsgId(msgId); onClose(); } : undefined}
           >
             <span className="font-semibold text-fg-muted">{actHeadline(doc['act-verb'] ?? '')}</span>
             <span className="text-fg-dim truncate">
               {event.actor_did ? displayNameForKey(event.actor_did) : ''}
             </span>
-            <span className="ml-auto text-[10px] text-fg-dim/50">
+            <span className="text-[10px] text-fg-dim/50 tabular-nums">
               {new Date(event.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
             </span>
             <button
