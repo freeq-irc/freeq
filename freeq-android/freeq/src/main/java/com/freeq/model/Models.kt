@@ -1107,6 +1107,11 @@ class AppState(application: Application) : AndroidViewModel(application) {
         // notice handler then has to swallow. Gate only the DM case.
         val isChannel = channel.startsWith("#") || channel.startsWith("&")
         if (!isChannel && authenticatedDID.value == null) return
+        // The server drops a CHATHISTORY sent before registration without a
+        // word, and the cache restores DM threads before the client even
+        // exists. Marking one asked then meant it was never asked at all;
+        // the TARGETS reply after registration asks for it instead.
+        if (!isChannel && connectionState.value != ConnectionState.Registered) return
         if (!isChannel) dmHistoryAsked.add(channel.lowercase())
         sendRaw("CHATHISTORY LATEST $channel * 100")
     }
@@ -2078,8 +2083,12 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                 // fetched — and getOrCreateDM only asks for a thread it had to
                 // create, so a restored one would never ask at all. A thread
                 // with no messages is also hidden from the chat list, so this
-                // is what makes it visible again.
-                if (dm.messages.isEmpty()) state.requestHistory(key)
+                // is what makes it visible again. A thread that holds messages
+                // asks too when the server's newest is newer than ours — what
+                // arrived while this connection was down; see [DmCatchUp].
+                if (DmCatchUp.shouldFetch(parseServerTimeMillis(event.timestamp), dm.messages)) {
+                    state.requestHistory(key)
+                }
             }
 
             is FreeqEvent.MemberDid -> {
