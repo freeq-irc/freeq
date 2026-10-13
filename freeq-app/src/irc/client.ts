@@ -1453,6 +1453,10 @@ function wireEvents(c: FreeqClient) {
     s().setUserAway(nick, reason);
   });
 
+  c.on('presence', ({ nick, state, status }) => {
+    s().setUserPresence(nick, { state, status });
+  });
+
   c.on('typing', (channel, nick, isTyping) => {
     s().setTyping(channel, nick, isTyping);
   });

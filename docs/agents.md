@@ -514,8 +514,8 @@ async fn setup_agent(handle: &ClientHandle, did: &str, channel: &str) -> Result<
 ```
 At this point, anyone in the channel sees:
 - A 🤖 badge next to "newsroom" in the member list
-- An identity card (click the nick) showing provenance, presence state, and heartbeat status
-- If the agent crashes, it degrades to "offline" within 60 seconds automatically
+- An identity card (click the nick) showing provenance and presence state
+- If the agent crashes, the server drops its connection within about a minute and it leaves the channel.
 
 The card shows no creator: this declaration is free-form, and the server never checks the `creator_did` in it. To show you as the agent's owner, submit a `FreeqBotDelegation/v1` certificate in step 2 instead:
 

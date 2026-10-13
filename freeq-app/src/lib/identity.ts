@@ -93,11 +93,11 @@ export function isPeerBlocked(
   return false;
 }
 
-export function findMemberByKey(
-  channels: Map<string, ChannelLike>,
+export function findMemberByKey<M extends MemberLike>(
+  channels: Map<string, { members: Map<string, M> }>,
   key: string,
   channelsOnly = false,
-): { nick: string; member: MemberLike } | null {
+): { nick: string; member: M } | null {
   const byDid = isDid(key);
   const lower = key.toLowerCase();
   for (const [name, ch] of channels) {

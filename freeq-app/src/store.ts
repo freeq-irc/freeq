@@ -42,6 +42,8 @@ export interface Member {
   away?: string | null;
   typing?: boolean;
   actorClass?: 'human' | 'agent' | 'external_agent';
+  /** State and status from the last `presence` event for this nick. */
+  presence?: { state: string; status?: string };
 }
 
 /** Count members collapsed to one per account (same DID) — multi-session or
@@ -351,6 +353,7 @@ export interface Store {
   removeUserFromAll: (nick: string, reason: string) => void;
   renameUser: (oldNick: string, newNick: string) => void;
   setUserAway: (nick: string, reason: string | null) => void;
+  setUserPresence: (nick: string, presence: { state: string; status?: string }) => void;
   setTyping: (channel: string, nick: string, typing: boolean) => void;
   updateMemberDid: (nick: string, did: string) => void;
   /**
@@ -918,6 +921,7 @@ export const useStore = create<Store>((set, get) => ({
       away: existing?.away,
       typing: existing?.typing,
       actorClass: member.actorClass ?? existing?.actorClass,
+      presence: existing?.presence,
     });
     channels.set(channel.toLowerCase(), ch);
     return { channels };
@@ -944,6 +948,7 @@ export const useStore = create<Store>((set, get) => ({
         away: existing?.away,
         typing: existing?.typing,
         actorClass: member.actorClass ?? existing?.actorClass,
+        presence: existing?.presence,
       });
     }
     channels.set(channel.toLowerCase(), ch);
@@ -1031,6 +1036,18 @@ export const useStore = create<Store>((set, get) => ({
       const member = ch.members.get(nick.toLowerCase());
       if (member) {
         ch.members.set(nick.toLowerCase(), { ...member, away: reason });
+        channels.set(key, { ...ch });
+      }
+    }
+    return { channels };
+  }),
+
+  setUserPresence: (nick, presence) => set((s) => {
+    const channels = new Map(s.channels);
+    for (const [key, ch] of channels) {
+      const member = ch.members.get(nick.toLowerCase());
+      if (member) {
+        ch.members.set(nick.toLowerCase(), { ...member, presence });
         channels.set(key, { ...ch });
       }
     }
