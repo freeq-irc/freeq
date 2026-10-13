@@ -31,6 +31,7 @@ import { prefetchProfiles } from '@freeq/sdk';
 import { shouldRejoinCall, AV_REJOIN_WINDOW_MS, type PendingCallRejoin } from '../lib/av-mesh';
 import { fetchFavorites, pushFavorites, mergeFavorites, favoritesEqual } from '../lib/favorites-sync';
 import { createDmSendGate, dmThreadKey } from './dm-resolve';
+import { findMemberByKey, isDid } from '../lib/identity';
 
 // ── This device's signing key ──────────────────────────────────────────
 //
@@ -615,6 +616,15 @@ function ensureDmThread(target: string): void {
   }
 }
 
+/**
+ * The DID of a DM's peer, from the thread key: the key itself when it is a
+ * DID, else what the SDK knows for the nick (its map, then the rosters), else
+ * the WHOIS answer the caller holds. The one way the app takes it.
+ */
+export function dmPeerDid(key: string, whoisDid?: string): string | undefined {
+  return isDid(key) ? key : client?.getDidForNick(key) ?? whoisDid;
+}
+
 const SAVED_CHANNELS_KEY = 'freeq-joined-channels';
 
 function saveJoinedChannels() {
@@ -741,15 +751,8 @@ export function connect(url: string, desiredNick: string, channels?: string[], f
   }
 
   // Provide nick→DID resolver for E2EE
-  client.nickToDid = (targetNick: string) => {
-    const s = useStore.getState();
-    const lower = targetNick.toLowerCase();
-    for (const ch of s.channels.values()) {
-      const m = ch.members.get(lower);
-      if (m?.did) return m.did;
-    }
-    return undefined;
-  };
+  client.nickToDid = (targetNick: string) =>
+    findMemberByKey(useStore.getState().channels, targetNick)?.member.did;
 
   // A DM to someone we share no channel with reaches the SDK as a bare nick,
   // which it will not sign — no venue a verifier could rebuild. One WHOIS

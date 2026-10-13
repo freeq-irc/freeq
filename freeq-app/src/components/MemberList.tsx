@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { useStore, type Member } from '../store';
 import { fetchProfile, getCachedProfile, type ATProfile } from '../lib/profiles';
 import { UserPopover } from './UserPopover';
-import { sendWhois, getClient } from '../irc/client';
+import { sendWhois, getClient, dmPeerDid } from '../irc/client';
 import { SpeakerIcon } from './SessionIndicator';
 import { parseAwayStatus } from '../lib/status';
 import { isDid, resolveIdentityName, findMemberByKey } from '../lib/identity';
@@ -136,8 +136,7 @@ function DMProfilePanel({ nick, channel }: { nick: string; channel: { members: M
     : nick;
   const whoisCache = useStore((s) => s.whoisCache);
   const whois = peerNick ? whoisCache.get(peerNick.toLowerCase()) : undefined;
-  const partnerMember = channel.members.values().next().value;
-  const did = isDid(nick) ? nick : (partnerMember?.did || whois?.did);
+  const did = dmPeerDid(nick, whois?.did);
   const [profile, setProfile] = useState<ATProfile | null>(null);
   const [safetyNumber, setSafetyNumber] = useState<string | null>(null);
   const presence = usePresence(nick);
