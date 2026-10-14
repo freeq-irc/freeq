@@ -3134,9 +3134,8 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                 isAction: ircMsg.isAction,
                 timestamp: Date(timeIntervalSince1970: Double(ircMsg.timestampMs) / 1000.0),
                 replyTo: ircMsg.replyTo,
-                // Covers both signals: a live edit (`edit_of`) and one the
-                // server already collapsed into join replay, which carries no
-                // `+draft/edit` and would otherwise read as the original.
+                // Set by the FFI from `edit_of`, live or replayed: a replayed
+                // edit arrives as its own line carrying `+draft/edit`.
                 isEdited: ircMsg.edited,
                 isSigned: ircMsg.isSigned,
                 isEncrypted: wasEncrypted,

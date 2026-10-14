@@ -328,12 +328,10 @@ pub struct IrcMessage {
     /// server's `+freeq.at/reactions` tag (CHATHISTORY / JOIN replay).
     /// Live reactions still arrive as separate `TagMsg` events.
     pub reactions: Vec<ReactionTally>,
-    /// This message has been edited since it was sent.
-    ///
-    /// A live edit is recognizable from `edit_of`, but join replay collapses
-    /// every revision into one row and sends no `+draft/edit` — so without
-    /// the server's `+freeq.at/edited` tag (which this reads), a message
-    /// edited before you joined renders as though it were the original.
+    /// This line is an edit: set from `edit_of`. Join replay and
+    /// CHATHISTORY send a replayed edit as its own line carrying
+    /// `+draft/edit`, so an edit made before you joined is marked the same
+    /// way as one seen live.
     pub edited: bool,
     /// For a DM: the canonical conversation key — the peer's DID when known,
     /// else their nick. `None` for channel messages. Key DM threads by this,
@@ -1260,11 +1258,7 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
                 .get("+freeq.at/reactions")
                 .map(|raw| parse_reactions_tag(raw))
                 .unwrap_or_default();
-            let is_edited = edit_of.is_some()
-                || tags
-                    .get("+freeq.at/edited")
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
+            let is_edited = edit_of.is_some();
             // Agent coordination event: the `+freeq.at/event` tag (with the
             // `freeq.at/` unprefixed fallback some senders use) turns this
             // message into a structured card on every client.
@@ -1299,8 +1293,6 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
                     account: tags.get("account").cloned(),
                     origin: tags.get("+freeq.at/origin").cloned(),
                     reactions,
-                    // Either signal: `edit_of` for an edit seen live, the tag
-                    // for one the server already collapsed into replay.
                     edited: is_edited,
                     dm_key: dm_key.clone(),
                     coordination,
@@ -3286,12 +3278,10 @@ mod tests {
         assert!(parse_reactions_tag("").is_empty());
     }
 
-    /// A message edited before you joined arrives already collapsed: the
-    /// server sends one row, the current text, and no `+draft/edit` to hint
-    /// that it was ever revised. `+freeq.at/edited` is the only signal, so a
-    /// client that doesn't surface it renders the revision as the original.
+    /// A line is marked edited when it carries `+draft/edit`, live or
+    /// replayed; a line without it is not.
     #[test]
-    fn convert_event_message_marks_edited_from_replay_tag() {
+    fn convert_event_message_marks_edited_from_draft_edit() {
         let mk = |extra: Option<(&str, &str)>| {
             let mut tags = std::collections::HashMap::new();
             tags.insert("msgid".to_string(), "01ABC".to_string());
@@ -3313,11 +3303,6 @@ mod tests {
         };
 
         assert!(!mk(None).edited, "an untouched message must not be marked");
-        assert!(
-            mk(Some(("+freeq.at/edited", "1"))).edited,
-            "replay marker ignored — an edited message would look original"
-        );
-        // A live edit is still recognizable on its own.
         assert!(mk(Some(("+draft/edit", "01ORIG"))).edited);
     }
 

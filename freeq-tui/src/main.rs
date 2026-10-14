@@ -1123,11 +1123,6 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
             if refetch {
                 fetch_server_signing_kids(app);
             }
-            // Join replay collapses an edited message into one row with no
-            // `+draft/edit`; the server's `+freeq.at/edited` tag is the only
-            // thing that says the text isn't the original.
-            let replay_edited = tags.get("+freeq.at/edited").is_some_and(|v| v == "1");
-
             // Pin/unpin: server sends a NOTICE CTCP ACTION with a tag. Update
             // the channel's pin set; let the action message itself fall through
             // so the user sees who pinned what.
@@ -1206,7 +1201,7 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                             is_system: true,
                             image_url: None,
                             msgid: msgid.clone(),
-                            is_edited: replay_edited,
+                            is_edited: false,
                             is_deleted: false,
                             reply_to: reply_to.clone(),
                             edit_of: None,
@@ -1238,7 +1233,7 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                         is_system: false,
                         image_url: img_url,
                         msgid: msgid.clone(),
-                        is_edited: replay_edited,
+                        is_edited: false,
                         is_deleted: false,
                         reply_to: reply_to.clone(),
                         edit_of: None,
@@ -1262,7 +1257,7 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                             is_system: false,
                             image_url: None,
                             msgid: msgid.clone(),
-                            is_edited: replay_edited,
+                            is_edited: false,
                             is_deleted: false,
                             reply_to: reply_to.clone(),
                             edit_of: None,
@@ -1282,7 +1277,7 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                             is_system: false,
                             image_url: None,
                             msgid: msgid.clone(),
-                            is_edited: replay_edited,
+                            is_edited: false,
                             is_deleted: false,
                             reply_to: reply_to.clone(),
                             edit_of: None,
