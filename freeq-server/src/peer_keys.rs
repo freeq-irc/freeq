@@ -585,17 +585,6 @@ struct PeerKey {
 /// signature by that key would verify — the kid is what binds the answer to
 /// the question.
 async fn fetch_key(base: &str, did: &str, kid: &str) -> anyhow::Result<PeerKey> {
-    let client = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?;
-    fetch_key_with(&client, base, did, kid).await
-}
-
-/// [`fetch_key`] through a client the caller chose.
-async fn fetch_key_with(
-    client: &reqwest::Client,
-    base: &str,
-    did: &str,
-    kid: &str,
-) -> anyhow::Result<PeerKey> {
     use base64::Engine;
 
     let url = format!(
@@ -603,6 +592,7 @@ async fn fetch_key_with(
         urlencoding::encode(did),
         urlencoding::encode(kid)
     );
+    let client = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?;
     let body: serde_json::Value = client
         .get(&url)
         .send()
@@ -637,83 +627,6 @@ async fn fetch_key_with(
             }
         }),
     })
-}
-
-/// Once at startup, off the startup path: ask each `did:web:` key on file
-/// with an expiry, other than this server's own, from its own host, and clear
-/// the expiry of every key that host confirms. Copies filed before a server's
-/// own key was exempt carry an expiry, and the row does not say which host
-/// answered, so the owner is asked again.
-pub(crate) async fn confirm_own_host_keys(state: &Arc<SharedState>) {
-    let clients = checked_clients();
-    confirm_own_host_keys_with(state, &clients, |host| format!("https://{host}")).await;
-}
-
-/// [`confirm_own_host_keys`] through `clients`, asking a host's key API at
-/// `api_base(host)`.
-async fn confirm_own_host_keys_with(
-    state: &Arc<SharedState>,
-    clients: &LookupClients,
-    api_base: impl Fn(&str) -> String,
-) {
-    let own_did = crate::server::server_did(&state.server_name);
-    let keys = state
-        .with_db(|db| db.did_web_keys_with_expiry(&own_did))
-        .unwrap_or_default();
-    for (did, row) in keys {
-        match own_host_key(state, clients, &api_base, &did, &row.kid).await {
-            Ok(key) if key == row.pubkey => {
-                state.with_db(|db| db.set_signing_key_expiry(&did, &row.kid, None));
-                tracing::info!(did = %did, kid = %row.kid, "Its own host confirmed a server key; it no longer expires");
-            }
-            Ok(_) => tracing::info!(
-                did = %did, kid = %row.kid,
-                "Its own host answered with a different key; the expiry stays"
-            ),
-            Err(e) => tracing::info!(
-                did = %did, kid = %row.kid, error = %e,
-                "Its own host did not confirm the key; the expiry stays"
-            ),
-        }
-    }
-}
-
-/// The key `did`'s own host gives for `kid`: from its document, else from the
-/// key API at that host answering for its own DID.
-async fn own_host_key(
-    state: &Arc<SharedState>,
-    clients: &LookupClients,
-    api_base: &impl Fn(&str) -> String,
-    did: &str,
-    kid: &str,
-) -> anyhow::Result<[u8; 32]> {
-    use freeq_oauth::ClientProvider;
-
-    let in_document = match state.did_resolver.resolve(did).await {
-        Ok(doc) => doc
-            .verification_method
-            .iter()
-            .filter_map(|m| m.public_key_multibase.as_deref())
-            .filter_map(|multibase| {
-                match freeq_sdk::crypto::PublicKey::from_multibase(multibase).ok()? {
-                    freeq_sdk::crypto::PublicKey::Ed25519(key) => Some(*key.as_bytes()),
-                    freeq_sdk::crypto::PublicKey::Secp256k1(_) => None,
-                }
-            })
-            .find(|key| freeq_sdk::sigtag::derive_kid_bytes(key) == kid),
-        Err(_) => None,
-    };
-    if let Some(key) = in_document {
-        return Ok(key);
-    }
-    // A path-bearing did:web names no host on its own, so it has no key API.
-    let host = did
-        .strip_prefix("did:web:")
-        .filter(|host| !host.contains(':'))
-        .ok_or_else(|| anyhow::anyhow!("not in its document, and it names no host"))?;
-    let base = api_base(host);
-    let client = clients.client_for(&base).await?;
-    Ok(fetch_key_with(&client, &base, did, kid).await?.pubkey)
 }
 
 /// A PDS on a loopback port listing `records` as `did`'s device keys, and a
@@ -1835,110 +1748,6 @@ mod tests {
         )
         .await;
         assert_eq!(row.expires_at, Some(1_700_000_000 + 90 * DAY));
-    }
-
-    /// A did:web document listing `keys` under `did`.
-    fn document_listing(did: &str, keys: &[[u8; 32]]) -> freeq_sdk::did::DidDocument {
-        freeq_sdk::did::DidDocument {
-            id: did.to_string(),
-            also_known_as: vec![],
-            verification_method: keys
-                .iter()
-                .enumerate()
-                .map(|(i, key)| freeq_sdk::did::VerificationMethod {
-                    id: format!("{did}#k{i}"),
-                    method_type: "Multikey".to_string(),
-                    controller: did.to_string(),
-                    public_key_multibase: Some(
-                        freeq_sdk::crypto::PublicKey::Ed25519(
-                            ed25519_dalek::VerifyingKey::from_bytes(key).unwrap(),
-                        )
-                        .to_multibase(),
-                    ),
-                })
-                .collect(),
-            authentication: vec![],
-            assertion_method: vec![],
-            service: vec![],
-        }
-    }
-
-    fn fresh_key() -> [u8; 32] {
-        *ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
-            .verifying_key()
-            .as_bytes()
-    }
-
-    fn expiry_of(state: &Arc<SharedState>, did: &str, key: &[u8; 32]) -> Option<i64> {
-        let kid = freeq_sdk::act::derive_kid_bytes(key);
-        state
-            .with_db(|db| db.get_signing_key_row(did, &kid))
-            .flatten()
-            .unwrap()
-            .expires_at
-    }
-
-    /// The startup check clears a did:web key's expiry only when the DID's
-    /// own host confirms the key, by its document or its key API; a did:plc
-    /// key and a key the host does not confirm keep theirs.
-    #[tokio::test]
-    async fn the_startup_check_clears_only_a_confirmed_row() {
-        // Confirmed by the key API at its own host.
-        let by_api = fresh_key();
-        // Confirmed by its own document.
-        let by_doc = fresh_key();
-        let doc_did = "did:web:doc-host.example";
-        // A did:web person's session key: their document lists their sign-in
-        // key, not it, and their host runs no key API.
-        let session = fresh_key();
-        let person = "did:web:person.example";
-        let sign_in = fresh_key();
-        // A key whose host answers with another key.
-        let other = fresh_key();
-        let mismatched = "did:web:mismatch.example";
-        let user = fresh_key();
-
-        let resolver = freeq_sdk::did::DidResolver::static_map(HashMap::from([
-            (doc_did.to_string(), document_listing(doc_did, &[by_doc])),
-            (person.to_string(), document_listing(person, &[sign_in])),
-            (mismatched.to_string(), document_listing(mismatched, &[])),
-        ]));
-        let state = crate::server::test_state_with_resolver(
-            crate::config::ServerConfig::default(),
-            resolver,
-        );
-        let api = dated_key_server(by_api, serde_json::json!({})).await;
-        let wrong = dated_key_server(other, serde_json::json!({})).await;
-        let rows = [
-            ("did:web:127.0.0.1", by_api, "origin-server"),
-            (doc_did, by_doc, "origin-server"),
-            (person, session, "local-session"),
-            (mismatched, user, "origin-server"),
-            ("did:plc:someone", user, "local-session"),
-        ];
-        for (did, key, source) in rows {
-            state
-                .with_db(|db| db.save_signing_key_from(did, &key, source, 1, Some(2_000_000_000)))
-                .unwrap();
-        }
-
-        let clients = LookupClients::Plain(freeq_oauth::SharedClient(reqwest::Client::new()));
-        confirm_own_host_keys_with(&state, &clients, |host| match host {
-            "127.0.0.1" => api.clone(),
-            "mismatch.example" => wrong.clone(),
-            // No key API there.
-            _ => "http://127.0.0.1:9".to_string(),
-        })
-        .await;
-
-        assert_eq!(expiry_of(&state, "did:web:127.0.0.1", &by_api), None);
-        assert_eq!(expiry_of(&state, doc_did, &by_doc), None);
-        assert_eq!(expiry_of(&state, person, &session), Some(2_000_000_000));
-        assert_eq!(expiry_of(&state, mismatched, &user), Some(2_000_000_000));
-        assert_eq!(
-            expiry_of(&state, "did:plc:someone", &user),
-            Some(2_000_000_000)
-        );
     }
 
     /// A key record of `did` made at `created_at` and expiring at `expires_at`.
