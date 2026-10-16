@@ -10,6 +10,7 @@ import {
   creatorPublicKeyB64,
   interpretProvenanceNotice,
   loadOrCreateCreatorSeed,
+  signedCertificateLine,
   waitForProvenance,
 } from "./owner-key.js";
 
@@ -54,12 +55,11 @@ describe("authorize", () => {
     expect(shown.toLowerCase()).not.toMatch(/password/);
   });
 
-  it("names --sign-cert for a server that doesn't read agent records yet", async () => {
+  it("no longer points at --sign-cert", async () => {
     const root = await mkdtemp(join(tmpdir(), "freeq-owner-"));
     const ins = await agentInstructions({ ownerDid: "did:plc:alice", botDid: BOT, root });
-    expect(ins.steps.join("\n")).toContain(
-      "On a server that doesn't read agent records yet, use /freeq authorize --sign-cert instead.",
-    );
+    expect(ins.steps.join("\n")).not.toMatch(/sign-cert|doesn't read agent records/);
+    expect(ins.steps.at(-1)).toBe("Then run:  /freeq authorize verify");
   });
 
   it("makes no creator key", async () => {
@@ -68,16 +68,42 @@ describe("authorize", () => {
     await expect(access(creatorKeyPath(root, "did:plc:alice"))).rejects.toThrow();
   });
 
-  it("says an installation with a creator key keeps signing with it", async () => {
+  it("prints the deprecation line when told the certificate is signed", async () => {
     const root = await mkdtemp(join(tmpdir(), "freeq-owner-"));
-    await loadOrCreateCreatorSeed(creatorKeyPath(root, "did:plc:alice"));
-    const ins = await agentInstructions({ ownerDid: "did:plc:alice", botDid: BOT, root });
-    expect(ins.steps.join("\n")).toMatch(/older creator key/);
-    expect(ins.steps.join("\n")).not.toMatch(/MSGSIG|\/raw/);
+    const keyPath = creatorKeyPath(root, "did:plc:alice");
+    const stateDir = join(root, "bots", "pi-x");
+    const certPath = join(stateDir, "delegation.json");
+
+    // A creator key alone, with an unsigned certificate, says nothing more.
+    await loadOrCreateCreatorSeed(keyPath);
+    const unsigned = await agentInstructions({ ownerDid: "did:plc:alice", botDid: BOT, root, signature: null, stateDir });
+    expect(unsigned.steps.at(-1)).toBe("Then run:  /freeq authorize verify");
+
+    const signed = await agentInstructions({ ownerDid: "did:plc:alice", botDid: BOT, root, signature: "sig", stateDir });
+    expect(signed.steps.at(-1)).toBe(signedCertificateLine({ botDid: BOT, certPath, keyPath }));
+    expect(signed.steps.at(-1)).toBe(
+      "This bot's certificate is signed with a creator key. Signed certificates will stop counting in a later release; " +
+        "every server now reads agent records instead. Add this agent under Settings → Agents in the freeq web app, " +
+        `or with \`freeq-bot-id register --owner <handle> ${BOT}\`, then delete the creator key at ${keyPath} if it exists, ` +
+        `and the certificate at ${certPath}, so an unsigned certificate is made at the next start.`,
+    );
+    expect(signed.steps.join("\n")).not.toMatch(/MSGSIG|\/raw/);
+
+    // A copied certificate, with no creator key on this machine.
+    const other = await mkdtemp(join(tmpdir(), "freeq-owner-"));
+    const copied = await agentInstructions({ ownerDid: "did:plc:alice", botDid: BOT, root: other, signature: "sig", stateDir });
+    expect(copied.steps.at(-1)).toBe(signedCertificateLine({ botDid: BOT, certPath }));
+    expect(copied.steps.at(-1)).toContain(`then delete the certificate at ${certPath}, so`);
+  });
+
+  it("names the signed certificate on the bot's machine when given no path", () => {
+    expect(signedCertificateLine({ botDid: BOT, keyPath: "/k" })).toContain(
+      "then delete the creator key at /k if it exists, and the signed certificate on the bot's machine, so",
+    );
   });
 });
 
-describe("authorize --sign-cert, the way for servers without agent records", () => {
+describe("authorize --sign-cert, deprecated", () => {
   it("makes the creator key and prints the line to paste, a public key and nothing else", async () => {
     const root = await mkdtemp(join(tmpdir(), "freeq-owner-"));
     const ins = await authorizeInstructions({ ownerDid: "did:plc:alice", root });
@@ -125,7 +151,7 @@ describe("reading the server's verdict", () => {
       expect(v.verified).toBe(false);
       expect(v.message).toMatch(/Settings → Agents/);
       expect(v.message).toMatch(/freeq-bot-id register/);
-      expect(v.message).toContain("/freeq authorize --sign-cert");
+      expect(v.message).not.toContain("sign-cert");
       expect(v.message).not.toMatch(/MSGSIG|\/raw|paste/i);
     }
   });

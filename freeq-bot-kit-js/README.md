@@ -151,7 +151,8 @@ Settings → Agents, or with `freeq-bot-id register --owner <handle> <bot-did>`.
 The server reads that record when the bot connects and marks the certificate
 verified; nothing of the owner's is kept with the bot. The older way,
 `creatorKeyPath` (a path to an owner key the owner registered with `MSGSIG`),
-signs the certificate instead and keeps working.
+signs the certificate instead; it is deprecated, to be removed in a later release, and
+a bot started with a signed certificate warns once.
 
 After connecting, the bot writes the server's verdict to stderr as one line, `provenance verified: <reason>` or `provenance unverified: <reason>`, waiting up to 5 seconds for a "verified" answer before reporting "unverified". It writes another line whenever the verdict changes later, for example when the owner removes the record. A bot whose record is added after it connected is verified when it next connects, so restart it after adding it. The program running the bot can read the same verdict: `bot.provenance` is the server's latest answer (`verified`, `reason`, and the server's full `text`), and `bot.onProvenance(handler)` calls `handler` with each verdict written to stderr.
 

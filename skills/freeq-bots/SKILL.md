@@ -61,7 +61,8 @@ or with `freeq-bot-id register --owner <handle> <bot-did>`. That writes an
 `at.freeq.agentKey` record to the owner's account, the server reads it when
 the bot connects and reports the certificate verified, and nothing of the
 owner's is kept on the bot's machine. The older way, `creatorKeyPath`, signs
-the certificate with an owner key kept on the bot's machine; it keeps working.
+the certificate with an owner key kept on the bot's machine; it is deprecated
+and to be removed in a later release.
 
 Never send a private key to the server. The SASL flow signs a challenge; the
 key stays local.

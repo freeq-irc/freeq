@@ -42,11 +42,11 @@ enum Command {
         #[arg(long)]
         domain: Option<String>,
 
-        /// Creator's DID (signs a delegation certificate binding this bot to the creator)
+        /// Creator's DID (writes a delegation certificate naming the creator as this bot's owner)
         #[arg(long)]
         creator_did: Option<String>,
 
-        /// Path to creator's ed25519 private key (for signing the delegation)
+        /// Path to creator's ed25519 private key, to sign the delegation (deprecated; to be removed in a later release)
         #[arg(long)]
         creator_key: Option<PathBuf>,
 
@@ -232,8 +232,7 @@ fn create(
 
             eprintln!("✅ Delegation signed by {creator}");
         } else {
-            eprintln!("⚠  Creator DID set but no --creator-key provided. Delegation is unsigned.");
-            eprintln!("   The server will show this creator claim as unverified.");
+            eprintln!("{}", delegation_line(Some(&deleg)));
         }
 
         Some(deleg)
@@ -241,8 +240,9 @@ fn create(
         None
     };
 
-    // Build DID document for did:web
-    if let Some(domain) = domain {
+    // Build DID document for did:web. Evaluates to the file that holds the
+    // certificate besides identity.json, for the signed-certificate warning.
+    let cert_file = if let Some(domain) = domain {
         let mut did_doc = serde_json::json!({
             "@context": [
                 "https://www.w3.org/ns/did/v1",
@@ -277,14 +277,18 @@ fn create(
         eprintln!("✅ DID document: {}", doc_path.display());
 
         eprintln!("   Serve at: https://{domain}/bots/{name}/did.json");
+        format!("{}, which you serve", doc_path.display())
     } else {
         // For did:key, save delegation as separate file
+        let deleg_path = key_dir.join("delegation.json");
         if let Some(ref deleg) = delegation {
-            let deleg_path = key_dir.join("delegation.json");
             std::fs::write(&deleg_path, serde_json::to_string_pretty(deleg)?)?;
             eprintln!("✅ Delegation cert: {}", deleg_path.display());
         }
-    }
+        deleg_path.display().to_string()
+    };
+
+    let signed = delegation.as_ref().is_some_and(|d| d.signature.is_some());
 
     // Save identity metadata
     let identity = BotIdentity {
@@ -299,6 +303,20 @@ fn create(
         key_dir.join("identity.json"),
         serde_json::to_string_pretty(&identity)?,
     )?;
+
+    // Signed certificates will stop counting in a later release. A bot run on these
+    // files alone never mints a new certificate, so the signature is nulled
+    // in place rather than the files deleted.
+    if signed {
+        eprintln!(
+            "This bot's certificate is signed with a creator key. Signed certificates will stop \
+             counting in a later release; every server now reads agent records instead. Add this \
+             agent under Settings → Agents in the freeq web app, or with `freeq-bot-id register \
+             --owner <handle> {bot_did}`, then set `\"signature\": null` in {} and {cert_file}. \
+             The DID stays; the server then verifies the certificate from your agent record.",
+            key_dir.join("identity.json").display()
+        );
+    }
 
     eprintln!("✅ DID: {bot_did}");
     eprintln!("✅ Private key: {}", key_dir.join("key.ed25519").display());

@@ -3,7 +3,7 @@
  *  has a real wire layer, just with no actual network. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm, readFile, stat } from "node:fs/promises";
+import { mkdtemp, rm, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -120,6 +120,49 @@ describe("FreeqBot.create", () => {
     }
     const cert = JSON.parse(await readFile(join(bot.stateDir, "delegation.json"), "utf8"));
     expect(cert.type).toBe("FreeqBotDelegation/v1");
+  });
+
+  // The signed-certificate warning is said once per process, so these two
+  // run in this order and no earlier test in the file starts a signed bot.
+  it("does not warn about an unsigned certificate", async () => {
+    const { FreeqBot } = await import("./bot.js");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const bot = await FreeqBot.create({
+      name: "unsigned-bot",
+      ownerDid: "did:plc:owner",
+      nick: "unsigned-bot",
+      url: "wss://test/irc",
+      root,
+    });
+    expect(bot.delegation.signature).toBeNull();
+    expect(warn.mock.calls.filter(([m]) => String(m).includes("signed with a creator key"))).toEqual([]);
+  });
+
+  it("warns once per process when a bot starts with a signed certificate", async () => {
+    const { FreeqBot } = await import("./bot.js");
+    const { generateDidKey } = await import("@freeq/sdk");
+    const keyPath = join(root, "creator.key");
+    await writeFile(keyPath, await (await generateDidKey()).exportSeed(), { mode: 0o600 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const opts = {
+      name: "signed-bot",
+      ownerDid: "did:plc:owner",
+      nick: "signed-bot",
+      url: "wss://test/irc",
+      root,
+      creatorKeyPath: keyPath,
+    };
+    const bot = await FreeqBot.create(opts);
+    await FreeqBot.create(opts);
+    expect(bot.delegation.signature).toBeTruthy();
+    const lines = warn.mock.calls.map(([m]) => String(m)).filter((m) => m.includes("signed with a creator key"));
+    expect(lines).toEqual([
+      "This bot's certificate is signed with a creator key. Signed certificates will stop counting in a later release; " +
+        "every server now reads agent records instead. Add this agent under Settings → Agents in the freeq web app, " +
+        `or with \`freeq-bot-id register --owner <handle> ${bot.identity.did}\`, then delete the key at ${keyPath}, ` +
+        `the certificate at ${join(bot.stateDir, "delegation.json")}, and the \`creatorKeyPath\` option from this bot's code, ` +
+        "so an unsigned certificate is made at the next start.",
+    ]);
   });
 
   it("hands its client the key lookup it is given", async () => {

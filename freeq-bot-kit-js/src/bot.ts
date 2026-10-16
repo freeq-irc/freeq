@@ -26,6 +26,7 @@ import {
   MemoryDeviceKeyStore,
   importDidKeyPair,
   makeDidResolver,
+  log,
   type FreeqEvents,
   type NickCollisionPolicy,
   type TransportState,
@@ -94,11 +95,12 @@ export interface FreeqBotCreateOptions {
   // ── Optional ─────────────────────────────────────────────────────────
   /** Override the parent dir for bot state. Defaults to `~/.freeq/bots`. */
   root?: string;
-  /** The older way to prove ownership. Path to the owner's ed25519 seed
-   *  (32 bytes; the file `freeq-bot-id --creator-key` reads). When set, the
-   *  delegation cert is SIGNED by the owner — the server shows
-   *  `_verified: true` provided the owner has registered this key via
-   *  MSGSIG. Unset → an unsigned cert naming the owner, which the server
+  /** Deprecated; to be removed in a later release, when signed certificates stop
+   *  counting. Path to the owner's ed25519 seed (32 bytes; the file
+   *  `freeq-bot-id --creator-key` reads). When set, the delegation cert is
+   *  SIGNED by the owner — the server shows `_verified: true` provided the
+   *  owner has registered this key via MSGSIG — and the bot warns once at
+   *  start. Unset → an unsigned cert naming the owner, which the server
    *  verifies from the owner's agent record: the owner adds the bot's DID
    *  in the freeq web app under Settings → Agents, or with
    *  `freeq-bot-id register --owner <handle> <bot-did>`, and no key of
@@ -180,6 +182,28 @@ export interface FreeqBotStopOptions {
   /** How long to wait after PRESENCE=offline/QUIT before disconnecting.
    *  Default 250ms. */
   drainMs?: number;
+}
+
+/** Whether this process has said that a bot started with a signed
+ *  certificate. Once per process, like the SDK's deprecation warnings. */
+let signedCertificateWarned = false;
+
+/** Say once, through the SDK's logger, that this bot's certificate is signed
+ *  with a creator key, and what to delete so an unsigned one replaces it.
+ *  The harness kit's `signedCertificateLine` says the same sentence; it
+ *  depends on bot-kit, so the text cannot be shared from there. */
+function warnSignedCertificate(botDid: string, certPath: string, creatorKeyPath?: string): void {
+  if (signedCertificateWarned) return;
+  signedCertificateWarned = true;
+  const toDelete = creatorKeyPath
+    ? `the key at ${creatorKeyPath}, the certificate at ${certPath}, and the \`creatorKeyPath\` option from this bot's code`
+    : `the certificate at ${certPath}`;
+  log.warn(
+    "This bot's certificate is signed with a creator key. Signed certificates will stop counting in a later release; " +
+      "every server now reads agent records instead. Add this agent under Settings → Agents in the freeq web app, " +
+      `or with \`freeq-bot-id register --owner <handle> ${botDid}\`, then delete ${toDelete}, ` +
+      "so an unsigned certificate is made at the next start.",
+  );
 }
 
 export class FreeqBot {
@@ -266,12 +290,16 @@ export class FreeqBot {
     const identity = await loadOrCreateIdentity({
       seedPath: join(stateDir, "agent.key"),
     });
+    const certPath = join(stateDir, "delegation.json");
     const delegation = await loadOrMintDelegation({
-      certPath: join(stateDir, "delegation.json"),
+      certPath,
       agentDid: identity.did,
       ownerDid: opts.ownerDid,
       creatorKeyPath: opts.creatorKeyPath,
     });
+    if (delegation.signature) {
+      warnSignedCertificate(identity.did, certPath, opts.creatorKeyPath);
+    }
 
     const client = new FreeqClient({
       url: opts.url,

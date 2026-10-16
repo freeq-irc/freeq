@@ -39,6 +39,7 @@ import {
   agentInstructions,
   authorizeInstructions,
   creatorKeyPath,
+  firstSignedCertificateWarning,
   interpretProvenanceNotice,
   waitForProvenance,
 } from "./owner-key.js";
@@ -93,12 +94,14 @@ export const FREEQ_ROOT = joinPath(homedir(), ".freeq");
 export const BOTS_ROOT = joinPath(FREEQ_ROOT, "bots");
 
 /**
- * The owner's creator key, if an older `/freeq authorize` made one. When
+ * The owner's creator key, if an older `/freeq authorize`, `--sign-cert` or
+ * the signer made one. When
  * present, bot-kit signs the installation's delegation certificate with it
  * and the server can verify that signature against a key the owner
- * registered. Absent, the cert ships unsigned and the server proves it from
- * the owner's agent record naming this installation (Settings → Agents in
- * the web app, or `freeq-bot-id register`).
+ * registered; that is deprecated, and signed certificates will stop counting
+ * in a later release. Absent, the cert ships unsigned and the server proves it
+ * from the owner's agent record naming this installation (Settings → Agents
+ * in the web app, or `freeq-bot-id register`).
  */
 async function existingCreatorKey(cfg: { ownerDid?: string }): Promise<string | undefined> {
   if (!cfg.ownerDid) return undefined;
@@ -1344,8 +1347,17 @@ export class AgentRuntime {
           return;
         }
         if (rest[0] === "--sign-cert") {
-          // For a server that does not read agent records yet: sign the
-          // certificate with a creator key the owner registers by MSGSIG.
+          // Deprecated; to be removed in a later release: sign the certificate with a
+          // creator key the owner registers by MSGSIG. It still works; it
+          // says so first, once per process, and the `authorize verify` it
+          // points to does not say it again.
+          if (firstSignedCertificateWarning()) {
+            this.notify(
+              "Signing certificates with a creator key is deprecated: signed certificates will stop counting in a later release, " +
+                `and every server now reads agent records instead. Prefer \`${this.names.hint("authorize")}\` and add this agent under Settings → Agents.`,
+              "warning",
+            );
+          }
           const ins = await authorizeInstructions({ ownerDid: cfg.ownerDid, root: FREEQ_ROOT, names: this.names });
           this.notify(
             [
@@ -1370,7 +1382,15 @@ export class AgentRuntime {
           );
           return;
         }
-        const ins = await agentInstructions({ ownerDid: cfg.ownerDid, botDid, root: FREEQ_ROOT, names: this.names });
+        const bot = (this.conn as FreeqConnection | undefined)?.bot;
+        const ins = await agentInstructions({
+          ownerDid: cfg.ownerDid,
+          botDid,
+          root: FREEQ_ROOT,
+          signature: bot?.delegation?.signature,
+          stateDir: bot?.stateDir,
+          names: this.names,
+        });
         this.notify(
           ["freeq authorize — add this installation as one of your agents", "", ...ins.steps].join("\n"),
           "info",

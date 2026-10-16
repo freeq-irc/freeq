@@ -33,6 +33,7 @@ import {
 } from "./discovery.js";
 import { scrubOutbound } from "./scrub.js";
 import { PI_NAMES, type HarnessNames } from "./names.js";
+import { firstSignedCertificateWarning, signedCertificateLine } from "./owner-key.js";
 import {
   AskRegistry,
   encodePayload,
@@ -78,13 +79,19 @@ export interface BotLike {
   readonly provenance: { verified: boolean; reason: string; text: string } | null;
   /** Called with each verdict bot-kit reports, when it arrives or changes. */
   onProvenance?(handler: (verdict: { verified: boolean; reason: string }) => void): () => void;
+  /** The delegation certificate bot-kit loaded or minted; a signature means
+   *  it is signed with a creator key (deprecated). */
+  readonly delegation?: { signature: string | null };
+  /** Where bot-kit keeps this bot's identity and certificate. */
+  readonly stateDir?: string;
 }
 
 /** How a bot gets built. Overridden in tests. */
 export type BotFactory = (opts: {
   name: string;
   ownerDid: string;
-  /** Owner's creator seed; when set, bot-kit signs the delegation cert. */
+  /** Owner's creator seed; when set, bot-kit signs the delegation cert
+   *  (deprecated; to be removed in a later release). */
   creatorKeyPath?: string;
   nick: string;
   url: string;
@@ -123,7 +130,8 @@ export interface ConnectionOptions {
    */
   names?: HarnessNames;
   ownerDid: string;
-  /** Owner's creator seed; when set, bot-kit signs the delegation cert. */
+  /** Owner's creator seed; when set, bot-kit signs the delegation cert
+   *  (deprecated; to be removed in a later release). */
   creatorKeyPath?: string;
   server: string;
   slug: string;
@@ -329,6 +337,19 @@ export class FreeqConnection {
         logProvenance: false,
       });
       this.#bot = bot;
+      // Signed certificates will stop counting in a later release. Said once per
+      // process: a retry or `authorize verify` builds a new bot and a new
+      // connection, and `#notice`'s set belongs to this one.
+      if (bot.delegation?.signature && firstSignedCertificateWarning()) {
+        this.#opts.onNotice?.(
+          signedCertificateLine({
+            botDid: bot.identity.did,
+            certPath: bot.stateDir ? join(bot.stateDir, "delegation.json") : undefined,
+            keyPath: this.#opts.creatorKeyPath,
+          }),
+          "warning",
+        );
+      }
       bot.onProvenance?.((v) =>
         this.#opts.onNotice?.(
           `freeq: provenance ${v.verified ? "verified" : "unverified"}: ${v.reason}`,
