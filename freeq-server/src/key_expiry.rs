@@ -4,7 +4,10 @@
 //! refused at registration once that date has passed; one that stays
 //! connected across it is found here, once a minute, and closed the way a
 //! device signed out from elsewhere is (`web::api_device_sign_out`), with the
-//! words the web shows so it lands on sign-in.
+//! words the web shows so it lands on sign-in. It is also refused the same
+//! way at its next `PRIVMSG`, `NOTICE`, `BATCH` or signed `TAGMSG`, which the
+//! read loop checks with `refuse_if_expired`; a `TAGMSG` without the client's
+//! signature is not checked.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,15 +38,12 @@ pub fn spawn(state: Arc<SharedState>) {
     });
 }
 
-/// Close every connection whose registered key has reached its expiry: send
-/// `FAIL MSGSIG KEY_EXPIRED`, drop the session's key (so a close that finds
-/// the session already gone is not refused again), end the login token behind
-/// the key, and close the session. Returns how many were refused.
+/// Close every connection whose registered key has reached its expiry, with
+/// [`refuse_if_expired`]. Returns how many were refused.
 pub async fn sweep(state: &Arc<SharedState>) -> usize {
     if state.db.is_none() {
         return 0;
     }
-    let now = chrono::Utc::now().timestamp();
     let connected: Vec<(String, String, String)> = {
         let dids = state.session_dids.lock();
         let keys = state.session_msg_keys.lock();
@@ -56,55 +56,68 @@ pub async fn sweep(state: &Arc<SharedState>) -> usize {
     };
     let mut refused = 0;
     for (sid, did, kid) in connected {
-        let expired = state
-            .with_db(|db| db.get_signing_key_row(&did, &kid))
-            .flatten()
-            .is_some_and(|row| row.expired_at(now));
-        if !expired {
-            continue;
+        if refuse_if_expired(state, &sid, &did, &kid).await {
+            refused += 1;
         }
-        // The session may have registered another key since it was listed.
-        {
-            let mut keys = state.session_msg_keys.lock();
-            let still_this_key = keys
-                .get(&sid)
-                .is_some_and(|vk| freeq_sdk::sigtag::derive_kid(vk) == kid);
-            if !still_this_key {
-                continue;
-            }
-            keys.remove(&sid);
-        }
-        let reply = crate::irc::Message::from_server(
-            &state.server_name,
-            "FAIL",
-            vec![
-                "MSGSIG",
-                "KEY_EXPIRED",
-                crate::connection::KEY_EXPIRED_WORDS,
-            ],
-        );
-        if let Some(tx) = state.connections.lock().get(&sid) {
-            let _ = tx.try_send(format!("{reply}\r\n"));
-        }
-        let tokens: Vec<String> = {
-            let mut linked = state.device_key_tokens.lock();
-            let mut found = Vec::new();
-            linked.retain(|(d, k), token| {
-                if d == &did && k == &kid {
-                    found.push(token.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-            found
-        };
-        for token in &tokens {
-            crate::connection::end_login_token(state, token).await;
-        }
-        crate::connection::close_session(state, &sid, "Signing key expired");
-        tracing::info!(session = %sid, %did, %kid, "Closed a session whose signing key expired");
-        refused += 1;
     }
     refused
+}
+
+/// If the key `kid` that session `sid` registered under `did` has reached its
+/// expiry: send `FAIL MSGSIG KEY_EXPIRED`, drop the session's key (so a close
+/// that finds the session already gone is not refused again), end the login
+/// token behind the key, and close the session. Returns whether it refused.
+/// The once-a-minute sweep calls it for every connected key, and the read
+/// loop for each message line from a session holding a key.
+pub async fn refuse_if_expired(state: &Arc<SharedState>, sid: &str, did: &str, kid: &str) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    let expired = state
+        .with_db(|db| db.get_signing_key_row(did, kid))
+        .flatten()
+        .is_some_and(|row| row.expired_at(now));
+    if !expired {
+        return false;
+    }
+    // The session may have registered another key since it was listed.
+    {
+        let mut keys = state.session_msg_keys.lock();
+        let still_this_key = keys
+            .get(sid)
+            .is_some_and(|vk| freeq_sdk::sigtag::derive_kid(vk) == kid);
+        if !still_this_key {
+            return false;
+        }
+        keys.remove(sid);
+    }
+    let reply = crate::irc::Message::from_server(
+        &state.server_name,
+        "FAIL",
+        vec![
+            "MSGSIG",
+            "KEY_EXPIRED",
+            crate::connection::KEY_EXPIRED_WORDS,
+        ],
+    );
+    if let Some(tx) = state.connections.lock().get(sid) {
+        let _ = tx.try_send(format!("{reply}\r\n"));
+    }
+    let tokens: Vec<String> = {
+        let mut linked = state.device_key_tokens.lock();
+        let mut found = Vec::new();
+        linked.retain(|(d, k), token| {
+            if d == did && k == kid {
+                found.push(token.clone());
+                false
+            } else {
+                true
+            }
+        });
+        found
+    };
+    for token in &tokens {
+        crate::connection::end_login_token(state, token).await;
+    }
+    crate::connection::close_session(state, sid, "Signing key expired");
+    tracing::info!(session = %sid, %did, %kid, "Closed a session whose signing key expired");
+    true
 }

@@ -975,6 +975,32 @@ where
             // Trigger auto-op etc. in channels (already handled by complete_irc_login)
         }
 
+        // A message line from a session whose registered key has expired is
+        // refused and the session closed, instead of being relayed until the
+        // once-a-minute sweep. A `TAGMSG` counts only when it carries the
+        // client's signature, the one kind a reader would mark invalid; an
+        // unsigned one, such as a typing notice, passes. `break`, not
+        // `continue`: a line buffered behind this one would otherwise be read
+        // with the key already dropped.
+        if conn.registered
+            && match msg.command.as_str() {
+                "PRIVMSG" | "NOTICE" | "BATCH" => true,
+                "TAGMSG" => {
+                    msg.tags.contains_key("+freeq.at/sig") || msg.tags.contains_key("freeq.at/sig")
+                }
+                _ => false,
+            }
+            && let Some(did) = conn.authenticated_did.as_deref()
+        {
+            let key = state.session_msg_keys.lock().get(&session_id).copied();
+            if let Some(vk) = key {
+                let kid = freeq_sdk::sigtag::derive_kid(&vk);
+                if crate::key_expiry::refuse_if_expired(&state, &session_id, did, &kid).await {
+                    break;
+                }
+            }
+        }
+
         match msg.command.as_str() {
             "CAP" => {
                 handle_cap(&mut conn, &msg, &state, &server_name, &session_id, &send);
@@ -5073,6 +5099,236 @@ mod retired_key_tests {
             .flatten()
             .unwrap();
         assert_eq!(row.removed_at, None);
+    }
+
+    /// A fresh state, and alice signed in with `broker_token` and `key`
+    /// registered.
+    async fn keyed_alice(
+        key: &ed25519_dalek::SigningKey,
+        broker_token: &str,
+    ) -> (Arc<SharedState>, Client) {
+        let resolver = crate::peer_keys::stub_pds_resolver(DID, vec![]).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            resolver,
+        );
+        let mut alice = Client::signed_in(&state, broker_token).await;
+        alice.tx(&msgsig_line(key)).await;
+        alice
+            .rx(|l| l.contains("MSGSIG OK"))
+            .await
+            .expect("the key is registered");
+        (state, alice)
+    }
+
+    /// Alice joins `#guard`, then a watcher does; returns the watcher.
+    async fn watcher_beside(state: &Arc<SharedState>, alice: &mut Client) -> Client {
+        alice.tx("JOIN #guard").await;
+        alice
+            .rx(|l| l.split_whitespace().nth(1) == Some("366"))
+            .await
+            .expect("alice joins");
+        let mut watcher =
+            Client::signed_in_as(state, "did:plc:guardwatcher", "watcher", "WT-GUARD-WATCHER")
+                .await;
+        watcher.tx("JOIN #guard").await;
+        watcher
+            .rx(|l| l.split_whitespace().nth(1) == Some("366"))
+            .await
+            .expect("the watcher joins");
+        watcher
+    }
+
+    /// Every line the watcher received up to the answer to its own PING. A
+    /// line relayed from a session that has already closed was queued to the
+    /// watcher before that answer.
+    async fn watcher_lines(watcher: &mut Client) -> Vec<String> {
+        watcher.tx("PING :guard-marker").await;
+        let lines = std::sync::Mutex::new(Vec::new());
+        watcher
+            .rx(|l| {
+                lines.lock().unwrap().push(l.to_string());
+                l.contains("PONG") && l.contains("guard-marker")
+            })
+            .await
+            .expect("the PING is answered");
+        lines.into_inner().unwrap()
+    }
+
+    /// Whether any of `lines` is a message line from alice.
+    fn relayed_from_alice(lines: &[String]) -> bool {
+        lines.iter().any(|l| {
+            l.contains("alice!")
+                && [" PRIVMSG ", " NOTICE ", " TAGMSG ", " BATCH "]
+                    .iter()
+                    .any(|c| l.contains(c))
+        })
+    }
+
+    #[tokio::test]
+    async fn a_line_after_the_key_expires_is_refused_with_the_line_behind_it() {
+        // A single run catches `continue` in place of `break` about half the
+        // time, so run on twenty fresh states.
+        let mut relayed = 0;
+        for run in 0..20 {
+            let key = signing_key(67);
+            let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+            let (state, mut alice) = keyed_alice(&key, "BT-GUARD-LINE").await;
+            let mut watcher = watcher_beside(&state, &mut alice).await;
+
+            state.with_db(|db| db.set_signing_key_expiry(DID, &kid, Some(now() - 1)));
+            alice.tx("PRIVMSG #guard :one\r\nPRIVMSG #guard :two").await;
+            refused_as_expired(&alice.rest().await);
+            if relayed_from_alice(&watcher_lines(&mut watcher).await) {
+                relayed += 1;
+            }
+            assert!(
+                state
+                    .revoked_token_hashes
+                    .lock()
+                    .contains(&freeq_auth_broker::token_hash("BT-GUARD-LINE")),
+                "run {run}"
+            );
+            let row = state
+                .with_db(|db| db.get_signing_key_row(DID, &kid))
+                .flatten()
+                .unwrap();
+            assert_eq!(row.removed_at, None, "run {run}");
+        }
+        assert_eq!(relayed, 0, "runs that relayed a line: {relayed}/20");
+    }
+
+    #[tokio::test]
+    async fn a_multiline_batch_closed_after_the_key_expires_is_refused() {
+        let key = signing_key(68);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let (state, mut alice) = keyed_alice(&key, "BT-GUARD-BATCH").await;
+        alice.tx("CAP REQ :batch draft/multiline").await;
+        alice
+            .rx(|l| l.contains("ACK"))
+            .await
+            .expect("multiline acked");
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        alice.tx("BATCH +ml draft/multiline #guard").await;
+        alice.tx("@batch=ml PRIVMSG #guard :one").await;
+        alice.tx("@batch=ml PRIVMSG #guard :two").await;
+        alice.tx("PING :taken").await;
+        alice
+            .rx(|l| l.contains("PONG") && l.contains("taken"))
+            .await
+            .expect("the batch lines were taken");
+        state.with_db(|db| db.set_signing_key_expiry(DID, &kid, Some(now() - 1)));
+        alice.tx("BATCH -ml").await;
+        refused_as_expired(&alice.rest().await);
+        let lines = watcher_lines(&mut watcher).await;
+        assert!(!relayed_from_alice(&lines), "{lines:?}");
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-GUARD-BATCH"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tagmsg_after_the_key_expires_is_refused() {
+        let key = signing_key(69);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let (state, mut alice) = keyed_alice(&key, "BT-GUARD-TAGMSG").await;
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        state.with_db(|db| db.set_signing_key_expiry(DID, &kid, Some(now() - 1)));
+        alice
+            .tx("@+typing=active;+freeq.at/sig=ed25519:k:s TAGMSG #guard")
+            .await;
+        refused_as_expired(&alice.rest().await);
+        let lines = watcher_lines(&mut watcher).await;
+        assert!(!relayed_from_alice(&lines), "{lines:?}");
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-GUARD-TAGMSG"))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_tagmsg_after_the_key_expires_is_relayed_and_the_next_line_refused() {
+        let key = signing_key(72);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let (state, mut alice) = keyed_alice(&key, "BT-GUARD-UNSIGNED").await;
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        state.with_db(|db| db.set_signing_key_expiry(DID, &kid, Some(now() - 1)));
+        alice.tx("@+typing=active TAGMSG #guard").await;
+        watcher
+            .rx(|l| l.contains("alice!") && l.contains(" TAGMSG #guard") && l.contains("+typing"))
+            .await
+            .expect("the typing notice is relayed");
+        assert!(still_answers(&mut alice).await);
+
+        alice.tx("PRIVMSG #guard :hello").await;
+        refused_as_expired(&alice.rest().await);
+        let lines = watcher_lines(&mut watcher).await;
+        assert!(!relayed_from_alice(&lines), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn a_tagmsg_signed_under_the_bare_tag_after_the_key_expires_is_refused() {
+        let key = signing_key(73);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let (state, mut alice) = keyed_alice(&key, "BT-GUARD-BARE-SIG").await;
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        state.with_db(|db| db.set_signing_key_expiry(DID, &kid, Some(now() - 1)));
+        alice
+            .tx("@+typing=active;freeq.at/sig=ed25519:k:s TAGMSG #guard")
+            .await;
+        refused_as_expired(&alice.rest().await);
+        let lines = watcher_lines(&mut watcher).await;
+        assert!(!relayed_from_alice(&lines), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn a_notice_after_the_key_expires_is_refused() {
+        let key = signing_key(74);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let (state, mut alice) = keyed_alice(&key, "BT-GUARD-NOTICE").await;
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        state.with_db(|db| db.set_signing_key_expiry(DID, &kid, Some(now() - 1)));
+        alice.tx("NOTICE #guard :hello").await;
+        refused_as_expired(&alice.rest().await);
+        let lines = watcher_lines(&mut watcher).await;
+        assert!(!relayed_from_alice(&lines), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn a_line_under_a_live_key_is_delivered() {
+        let (state, mut alice) = keyed_alice(&signing_key(70), "BT-GUARD-LIVE").await;
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        alice.tx("PRIVMSG #guard :hello").await;
+        watcher
+            .rx(|l| l.contains("PRIVMSG #guard") && l.ends_with("hello"))
+            .await
+            .expect("the line is delivered");
+        assert!(still_answers(&mut alice).await);
+    }
+
+    #[tokio::test]
+    async fn a_session_that_never_registered_a_key_is_not_checked() {
+        let (state, _) = state_holding_an_expired_row(&signing_key(71)).await;
+        let mut alice = Client::signed_in(&state, "BT-GUARD-NO-KEY").await;
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        alice.tx("PRIVMSG #guard :hello").await;
+        watcher
+            .rx(|l| l.contains("PRIVMSG #guard") && l.ends_with("hello"))
+            .await
+            .expect("the line is delivered");
+        assert!(still_answers(&mut alice).await);
     }
 }
 
