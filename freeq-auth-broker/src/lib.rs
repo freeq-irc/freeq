@@ -2393,4 +2393,295 @@ mod tests {
         sql.insert(&record("R")).await.unwrap();
         assert_eq!(sql.get("BT").await.unwrap().client_id, "");
     }
+
+    // --- request signing (verify_signed_body) ---
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// The MAC a sender would produce for an arbitrary timestamp string, so
+    /// the 60 s window can be probed without sleeping.
+    fn sign_at(secret: &str, ts: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(format!("ts={ts}\n").as_bytes());
+        mac.update(body);
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    }
+
+    #[test]
+    fn a_body_signed_by_sign_body_verifies() {
+        let body = serde_json::json!({"did": "did:plc:x"});
+        let (sig, ts) = sign_body("s3cret", &body).unwrap();
+        let bytes = serde_json::to_vec(&body).unwrap();
+        assert_eq!(
+            verify_signed_body("s3cret", Some(&ts), Some(&sig), &bytes),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_signed_body_missing_a_header_is_refused() {
+        let ts = now_secs().to_string();
+        let sig = sign_at("s", &ts, b"{}");
+        assert_eq!(
+            verify_signed_body("s", Some(&ts), None, b"{}"),
+            Err("Missing broker signature")
+        );
+        assert_eq!(
+            verify_signed_body("s", None, Some(&sig), b"{}"),
+            Err("Missing X-Broker-Timestamp header")
+        );
+    }
+
+    #[test]
+    fn a_non_numeric_timestamp_is_refused() {
+        for ts in ["", "soon", "-5", "1.5", "12abc"] {
+            assert_eq!(
+                verify_signed_body("s", Some(ts), Some("x"), b"{}"),
+                Err("Invalid X-Broker-Timestamp"),
+                "timestamp {ts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_timestamp_window_is_sixty_seconds_either_way() {
+        let now = now_secs();
+        // Well inside the window (margin absorbs the clock ticking mid-test).
+        for ts in [now - 50, now + 50] {
+            let ts = ts.to_string();
+            let sig = sign_at("s", &ts, b"{}");
+            assert_eq!(
+                verify_signed_body("s", Some(&ts), Some(&sig), b"{}"),
+                Ok(()),
+                "ts {ts}"
+            );
+        }
+        // Past it: a correctly signed but stale (or far-future) request.
+        for ts in [now - 120, now + 120, 0] {
+            let ts = ts.to_string();
+            let sig = sign_at("s", &ts, b"{}");
+            assert_eq!(
+                verify_signed_body("s", Some(&ts), Some(&sig), b"{}"),
+                Err("Broker request expired (timestamp > 60s)"),
+                "ts {ts}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tampered_signed_request_is_refused() {
+        let ts = now_secs().to_string();
+        let sig = sign_at("s", &ts, br#"{"did":"a"}"#);
+        let invalid = Err("Invalid broker signature");
+        // Altered body.
+        assert_eq!(
+            verify_signed_body("s", Some(&ts), Some(&sig), br#"{"did":"b"}"#),
+            invalid
+        );
+        // Wrong secret.
+        assert_eq!(
+            verify_signed_body("other", Some(&ts), Some(&sig), br#"{"did":"a"}"#),
+            invalid
+        );
+        // The MAC covers the timestamp: a fresh ts can't reuse an old MAC.
+        let later = (now_secs() + 1).to_string();
+        assert_eq!(
+            verify_signed_body("s", Some(&later), Some(&sig), br#"{"did":"a"}"#),
+            invalid
+        );
+        // Garbage signature.
+        assert_eq!(
+            verify_signed_body("s", Some(&ts), Some("!!"), br#"{"did":"a"}"#),
+            invalid
+        );
+    }
+
+    // --- field encryption edge cases ---
+
+    #[test]
+    fn encrypting_twice_gives_different_ciphertexts() {
+        let key = derive_encryption_key("k");
+        let (a, b) = (encrypt_field(&key, "same"), encrypt_field(&key, "same"));
+        assert_ne!(a, b, "nonce must be fresh per call");
+        assert_eq!(decrypt_field(&key, &a).unwrap(), "same");
+        assert_eq!(decrypt_field(&key, &b).unwrap(), "same");
+    }
+
+    #[test]
+    fn the_empty_string_round_trips() {
+        let key = derive_encryption_key("k");
+        assert_eq!(decrypt_field(&key, &encrypt_field(&key, "")).unwrap(), "");
+    }
+
+    #[test]
+    fn malformed_encrypted_fields_are_refused() {
+        let key = derive_encryption_key("k");
+        let err = |s: &str| decrypt_field(&key, s).unwrap_err().to_string();
+        assert!(err("not base64 !!").contains("base64"));
+        assert!(err("").contains("too short"));
+        // 12-byte nonce with no ciphertext at all is still too short.
+        let nonce_only = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 12]);
+        assert!(err(&nonce_only).contains("too short"));
+        // Long enough, but not a valid AES-GCM message.
+        let junk = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 40]);
+        assert!(err(&junk).contains("decryption failed"));
+    }
+
+    #[test]
+    fn different_secrets_derive_different_keys() {
+        assert_ne!(derive_encryption_key("a"), derive_encryption_key("b"));
+    }
+
+    // --- return_to edge cases the allowlist test doesn't cover ---
+
+    #[test]
+    fn return_to_rejects_userinfo_scheme_and_garbage_tricks() {
+        for url in [
+            // Userinfo makes the real host evil.example.
+            "https://irc.freeq.at@evil.example/",
+            "https://irc.freeq.at:pw@evil.example/",
+            "javascript:alert(1)",
+            "data:text/html,hi",
+            "ftp://irc.freeq.at/",
+            "irc.freeq.at",
+            "",
+            "https://",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+        ] {
+            assert!(!is_valid_return_to(url), "must reject {url:?}");
+        }
+        // Host match is exact, but case-insensitive after URL parsing.
+        assert!(is_valid_return_to("https://IRC.FREEQ.AT/"));
+        assert!(!is_valid_return_to("https://sub.irc.freeq.at/"));
+    }
+
+    // --- token hash ---
+
+    #[test]
+    fn token_hash_is_lowercase_hex_sha256() {
+        assert_eq!(
+            token_hash("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let h = token_hash("");
+        assert_eq!(h.len(), 64);
+        assert!(
+            h.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        assert_ne!(token_hash("a"), token_hash("b"));
+    }
+
+    // --- SSRF address classification ---
+
+    fn private(addr: &str) -> bool {
+        is_private_ip(&addr.parse().unwrap())
+    }
+
+    #[test]
+    fn private_and_internal_ipv4_ranges_are_refused() {
+        for ip in [
+            "127.0.0.1",
+            "127.255.255.254",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254",
+            "255.255.255.255",
+            "0.0.0.0",
+            "100.64.0.1",
+            "100.127.255.255",
+        ] {
+            assert!(private(ip), "{ip} must be private");
+        }
+    }
+
+    #[test]
+    fn public_ipv4_neighbours_of_private_ranges_are_allowed() {
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "172.15.255.255",
+            "172.32.0.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "192.169.0.1",
+            "11.0.0.1",
+        ] {
+            assert!(!private(ip), "{ip} must be public");
+        }
+    }
+
+    #[test]
+    fn private_and_internal_ipv6_ranges_are_refused() {
+        for ip in ["::1", "::", "fc00::1", "fd12:3456::1", "fe80::1", "febf::1"] {
+            assert!(private(ip), "{ip} must be private");
+        }
+    }
+
+    #[test]
+    fn public_ipv6_addresses_are_allowed() {
+        for ip in ["2606:4700:4700::1111", "2001:4860:4860::8888"] {
+            assert!(!private(ip), "{ip} must be public");
+        }
+    }
+
+    // --- small helpers ---
+
+    #[test]
+    fn only_the_documented_spellings_are_truthy() {
+        for v in ["1", "true", "yes"] {
+            assert!(is_truthy(Some(v)), "{v}");
+        }
+        for v in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("TRUE"),
+            Some("on"),
+        ] {
+            assert!(!is_truthy(v), "{v:?}");
+        }
+    }
+
+    fn did_doc(services: &[(&str, &str)]) -> DidDocument {
+        DidDocument {
+            service: services
+                .iter()
+                .map(|(t, e)| DidService {
+                    service_type: (*t).into(),
+                    service_endpoint: (*e).into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_pds_is_the_atproto_personal_data_server_service() {
+        let doc = did_doc(&[
+            ("SomethingElse", "https://other.example"),
+            ("AtprotoPersonalDataServer", "https://pds.example"),
+            ("AtprotoPersonalDataServer", "https://second.example"),
+        ]);
+        assert_eq!(pds_endpoint(&doc).as_deref(), Some("https://pds.example"));
+    }
+
+    #[test]
+    fn a_did_document_without_a_pds_names_none() {
+        assert_eq!(pds_endpoint(&did_doc(&[])), None);
+        assert_eq!(
+            pds_endpoint(&did_doc(&[("atprotopersonaldataserver", "https://x")])),
+            None,
+            "service type match is case-sensitive"
+        );
+    }
 }
