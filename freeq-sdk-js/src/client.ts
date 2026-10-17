@@ -2817,6 +2817,7 @@ export class FreeqClient extends EventEmitter {
     stored: StoredDeviceKey,
   ): Promise<StoredDeviceKey> {
     const replace = async (): Promise<StoredDeviceKey> => {
+      if (store.replace) return store.replace();
       const keyPair = (await crypto.subtle.generateKey('Ed25519', false, [
         'sign',
         'verify',
@@ -2876,9 +2877,9 @@ export class FreeqClient extends EventEmitter {
 
   /**
    * Publish a stored device key through the broker's `/enroll`, off the
-   * connect path. 200 saves the record URI; 401 or 403 means the session
-   * lacks the permission, reported once; anything else waits for the next
-   * connect.
+   * connect path. 200 saves the record URI while the store still holds the
+   * published key; 401 or 403 means the session lacks the permission,
+   * reported once; anything else waits for the next connect.
    */
   private startEnrollment(): void {
     const stored = this.pendingEnrollment;
@@ -2903,7 +2904,28 @@ export class FreeqClient extends EventEmitter {
         if (resp.status === 200) {
           const answer = (await resp.json()) as { uri?: unknown };
           if (typeof answer.uri === 'string') {
-            await store.save({ ...stored, recordUri: answer.uri });
+            // Read again: a refusal may have marked the key meanwhile, and a
+            // key replaced meanwhile must not take this key's URI, or it
+            // would read as published.
+            let current: StoredDeviceKey | null = null;
+            let read = true;
+            try {
+              current = await store.load();
+            } catch (e) {
+              read = false;
+              log.warn('[freeq-sdk] published device key not read back:', e);
+            }
+            if (read) {
+              if (current && (await samePublicKey(current.keyPair, stored.keyPair))) {
+                try {
+                  await store.save({ ...current, recordUri: answer.uri });
+                } catch (e) {
+                  log.warn('[freeq-sdk] published device key not saved:', e);
+                }
+              } else {
+                log.warn('[freeq-sdk] device key replaced while it was published');
+              }
+            }
             // The listing taken at connect predates this record, and so may
             // the home server's copy. Our own lines are checked against it,
             // so the account is listed at the PDS now.

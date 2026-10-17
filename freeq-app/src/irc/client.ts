@@ -88,14 +88,14 @@ function chosenStoreFor(did: string): ChosenDeviceKeyStore {
 }
 
 class ChosenDeviceKeyStore implements DeviceKeyStore {
-  private inner: Promise<DeviceKeyStore> | null = null;
+  private inner: Promise<IndexedDbDeviceKeyStore> | null = null;
   private readonly did: string;
 
   constructor(did: string) {
     this.did = did;
   }
 
-  private resolve(): Promise<DeviceKeyStore> {
+  private resolve(): Promise<IndexedDbDeviceKeyStore> {
     return (this.inner ??= (async () => {
       setDeviceKeyState({ store: 'browser' });
       return new IndexedDbDeviceKeyStore(this.did);
@@ -111,6 +111,12 @@ class ChosenDeviceKeyStore implements DeviceKeyStore {
   async save(key: StoredDeviceKey): Promise<void> {
     await (await this.resolve()).save(key);
     await noteDeviceKey(key);
+  }
+
+  async replace(): Promise<StoredDeviceKey> {
+    const key = await (await this.resolve()).replace();
+    await noteDeviceKey(key);
+    return key;
   }
 }
 

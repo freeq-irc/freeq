@@ -5,7 +5,9 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MemoryDeviceKeyStore, type StoredDeviceKey } from './device-key.js';
+import 'fake-indexeddb/auto';
+import { IDBFactory } from 'fake-indexeddb';
+import { IndexedDbDeviceKeyStore, MemoryDeviceKeyStore, type DeviceKeyStore, type StoredDeviceKey } from './device-key.js';
 import { decodeMultibaseEd25519, verifyEd25519 } from './did-key.js';
 import { recordSignedBytes } from './identity-records.js';
 import { deriveKid } from './signing.js';
@@ -416,7 +418,7 @@ describe('a stored key the account has retired', () => {
 
   /** A client whose key lookup reads the account from `repo`, with an empty
    *  proven set; how many listings and proofs it served. */
-  async function clientReading(store: MemoryDeviceKeyStore, repo: StubRepo, freshSignIn?: boolean) {
+  async function clientReading(store: DeviceKeyStore, repo: StubRepo, freshSignIn?: boolean) {
     const { FreeqClient } = await import('./client.js');
     const { KeyLookup } = await import('./key-lookup.js');
     let listings = 0;
@@ -508,6 +510,205 @@ describe('a stored key the account has retired', () => {
     expect(replaced.recordUri).toBeUndefined();
     await until(() => enrollCalls.length > 0);
     again.client.disconnect();
+  });
+
+  /** Two browsers that keep their key wrapped: one refuses a locked Ed25519
+   *  key, the other makes one but cannot store it. */
+  const WRAPPED_BROWSERS: [string, () => void][] = [
+    ['refuses a locked key', () => {
+      const generate = crypto.subtle.generateKey.bind(crypto.subtle);
+      vi.spyOn(crypto.subtle, 'generateKey').mockImplementation(((a: any, extractable: boolean, u: KeyUsage[]) => {
+        if (a === 'Ed25519' && !extractable) return Promise.reject(new DOMException('refused', 'NotSupportedError'));
+        return generate(a, extractable, u);
+      }) as any);
+    }],
+    ['cannot store a locked key', () => {
+      const P = (globalThis as any).IDBObjectStore.prototype;
+      const put = P.put;
+      const holdsEd = (v: any): boolean =>
+        v instanceof CryptoKey ? v.algorithm.name === 'Ed25519'
+        : v && typeof v === 'object' && !(v instanceof ArrayBuffer) && !ArrayBuffer.isView(v) ? Object.values(v).some(holdsEd)
+        : false;
+      vi.spyOn(P, 'put').mockImplementation(function (this: any, value: any, key?: any) {
+        if (holdsEd(value)) throw new DOMException('could not clone', 'DataCloneError');
+        return put.call(this, value, key);
+      });
+    }],
+  ];
+  for (const [browser, mock] of WRAPPED_BROWSERS)
+  describe(`on a browser that ${browser}, so keeps its key wrapped`, () => {
+    beforeEach(() => {
+      globalThis.indexedDB = new IDBFactory();
+      mock();
+    });
+
+    /** A wrapped key in IndexedDB, made two days ago, carrying `recordUri`. */
+    async function wrappedStore(recordUri: string): Promise<{ store: IndexedDbDeviceKeyStore; stored: StoredDeviceKey }> {
+      const store = new IndexedDbDeviceKeyStore(DID);
+      const made = (await store.load())!;
+      expect(store.storage).toBe('wrapped');
+      await store.save({ ...made, createdAt: hoursAgo(48), recordUri });
+      return { store, stored: (await new IndexedDbDeviceKeyStore(DID).load())! };
+    }
+
+    /** What a fresh store loads once it holds `uri`, and how it keeps it. */
+    async function publishedAs(uri: string) {
+      for (let i = 0; i < 200; i++) {
+        if ((await new IndexedDbDeviceKeyStore(DID).load())!.recordUri === uri) break;
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      const reader = new IndexedDbDeviceKeyStore(DID);
+      const key = (await reader.load())!;
+      return { key, storage: reader.storage };
+    }
+
+    it('presents a new key at the next fresh sign-in after KEY_EXPIRED, and keeps it wrapped', async () => {
+      const { store, stored } = await wrappedStore('at://did:plc:alice/at.freeq.deviceKey/3k');
+      const { record } = await recordsOf(stored);
+      const repo = await repoHolding(record);
+      const first = await clientReading(store, repo);
+      const ws = await login(first.client);
+      ws.recv(`:srv FAIL MSGSIG KEY_EXPIRED :${EXPIRED_WORDS}`);
+      for (let i = 0; i < 200; i++) {
+        if ((await new IndexedDbDeviceKeyStore(DID).load())!.refused) break;
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      first.client.disconnect();
+
+      const uri = 'at://did:plc:alice/at.freeq.deviceKey/3new';
+      enrollAnswer = { status: 200, body: { uri } };
+      const again = await clientReading(store, repo, true);
+      const next = await login(again.client);
+      expect(msgsigOf(next)).not.toBe(await rawPublicB64(stored.keyPair));
+      const reader = new IndexedDbDeviceKeyStore(DID);
+      const replaced = (await reader.load())!;
+      expect(reader.storage).toBe('wrapped');
+      expect(msgsigOf(next)).toBe(await rawPublicB64(replaced.keyPair));
+      expect(replaced.refused).toBeUndefined();
+      await until(() => enrollCalls.length > 0);
+      expect(enrollCalls).toHaveLength(1);
+      const published = await publishedAs(uri);
+      expect(published.storage).toBe('wrapped');
+      expect(published.key.recordUri).toBe(uri);
+      expect(await rawPublicB64(published.key.keyPair)).toBe(msgsigOf(next));
+      again.client.disconnect();
+    });
+
+    it('is replaced right after a new sign-in when the account retired it, and the new key kept wrapped', async () => {
+      const { store, stored } = await wrappedStore('at://did:plc:alice/at.freeq.deviceKey/3old');
+      const { record, retirement } = await recordsOf(stored);
+      const uri = 'at://did:plc:alice/at.freeq.deviceKey/3r';
+      enrollAnswer = { status: 200, body: { uri } };
+      const { client } = await clientReading(store, await repoHolding(record, retirement), true);
+      const ws = await login(client);
+      expect(msgsigOf(ws)).not.toBe(await rawPublicB64(stored.keyPair));
+      const reader = new IndexedDbDeviceKeyStore(DID);
+      const now = (await reader.load())!;
+      expect(reader.storage).toBe('wrapped');
+      expect(msgsigOf(ws)).toBe(await rawPublicB64(now.keyPair));
+      await until(() => enrollCalls.length > 0);
+      expect(enrollCalls).toHaveLength(1);
+      const published = await publishedAs(uri);
+      expect(published.storage).toBe('wrapped');
+      expect(published.key.recordUri).toBe(uri);
+      expect(await rawPublicB64(published.key.keyPair)).toBe(msgsigOf(ws));
+      client.disconnect();
+    });
+  });
+
+  describe('saving the record URI reads the store back', () => {
+    const URI = 'at://did:plc:alice/at.freeq.deviceKey/3kdevice';
+
+    /** Publish `store`'s key through a broker that runs `meanwhile` while the
+     *  publish is out, then answers 200 with URI; how often the account was
+     *  re-listed, and what was warned. */
+    async function publishWhile(store: MemoryDeviceKeyStore, meanwhile: () => Promise<unknown>) {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string, init?: RequestInit) => {
+          if (url === `${BROKER}/enroll`) {
+            enrollCalls.push(JSON.parse(String(init?.body)));
+            await meanwhile();
+            return new Response(JSON.stringify({ uri: URI }), { status: 200 });
+          }
+          return new Response('{}', { status: 404 });
+        }),
+      );
+      const { KeyLookup } = await import('./key-lookup.js');
+      const lookup = new KeyLookup(
+        { fetch: globalThis.fetch as never, resolveDid: async () => ({ id: DID }) as never },
+        null,
+        3_600_000,
+      );
+      const refresh = vi.spyOn(lookup, 'refreshAccount').mockResolvedValue(undefined);
+      const warn = vi.spyOn(console, 'warn');
+      const { client } = await makeClient(store, true, lookup);
+      await login(client);
+      await until(() => enrollCalls.length > 0);
+      await pause();
+      client.disconnect();
+      return {
+        relisted: refresh.mock.calls.length,
+        warns: warn.mock.calls.map((c) => String(c[0])),
+      };
+    }
+
+    it('gives no URI to a key replaced meanwhile', async () => {
+      const store = new MemoryDeviceKeyStore(await storedKey());
+      const other = await storedKey();
+      const { relisted, warns } = await publishWhile(store, () => store.save(other));
+      const kept = (await store.load())!;
+      expect(kept.keyPair).toBe(other.keyPair);
+      expect(kept.recordUri).toBeUndefined();
+      expect(warns).toEqual(['[freeq-sdk] device key replaced while it was published']);
+      expect(relisted).toBe(1);
+    });
+
+    it('keeps a refused mark set meanwhile', async () => {
+      const stored = await storedKey();
+      const store = new MemoryDeviceKeyStore(stored);
+      const { relisted, warns } = await publishWhile(store, () => store.save({ ...stored, refused: true }));
+      const kept = (await store.load())!;
+      expect(kept.keyPair).toBe(stored.keyPair);
+      expect(kept.recordUri).toBe(URI);
+      expect(kept.refused).toBe(true);
+      expect(warns).toEqual([]);
+      expect(relisted).toBe(1);
+    });
+
+    it('saves nothing when the store reads back empty', async () => {
+      const stored = await storedKey();
+      const store = new MemoryDeviceKeyStore(stored);
+      const save = vi.spyOn(store, 'save');
+      const { relisted, warns } = await publishWhile(store, async () => {
+        vi.spyOn(store, 'load').mockResolvedValueOnce(null);
+      });
+      expect(save).not.toHaveBeenCalled();
+      expect((await store.load())!.recordUri).toBeUndefined();
+      expect(warns).toEqual(['[freeq-sdk] device key replaced while it was published']);
+      expect(relisted).toBe(1);
+    });
+
+    it('saves nothing when the store cannot be read back', async () => {
+      const store = new MemoryDeviceKeyStore(await storedKey());
+      const save = vi.spyOn(store, 'save');
+      const { relisted, warns } = await publishWhile(store, async () => {
+        vi.spyOn(store, 'load').mockRejectedValueOnce(new Error('gone'));
+      });
+      expect(save).not.toHaveBeenCalled();
+      expect(warns).toEqual(['[freeq-sdk] published device key not read back:']);
+      expect(relisted).toBe(1);
+    });
+
+    it('says so when the URI cannot be saved', async () => {
+      const store = new MemoryDeviceKeyStore(await storedKey());
+      const { relisted, warns } = await publishWhile(store, async () => {
+        vi.spyOn(store, 'save').mockRejectedValueOnce(new Error('full'));
+      });
+      expect((await store.load())!.recordUri).toBeUndefined();
+      expect(warns).toEqual(['[freeq-sdk] published device key not saved:']);
+      expect(relisted).toBe(1);
+    });
   });
 
   it('replaces a stored key past its lifetime at a fresh sign-in', async () => {

@@ -143,4 +143,89 @@ describe('IndexedDbDeviceKeyStore', () => {
     expect(refused!.refused).toBe(true);
     expect(refused!.recordUri).toBe(uri);
   });
+
+  /** The mock above: a browser that refuses a locked Ed25519 key. */
+  function refuseLocked() {
+    const generate = crypto.subtle.generateKey.bind(crypto.subtle);
+    vi.spyOn(crypto.subtle, 'generateKey').mockImplementation(((a: any, extractable: boolean, u: KeyUsage[]) => {
+      if (a === 'Ed25519' && !extractable) return Promise.reject(new DOMException('refused', 'NotSupportedError'));
+      return generate(a, extractable, u);
+    }) as any);
+  }
+
+  /** A browser that makes a locked Ed25519 key but cannot store one. */
+  function cannotStore() {
+    const P = (globalThis as any).IDBObjectStore.prototype;
+    const put = P.put;
+    const holdsEd = (v: any): boolean =>
+      v instanceof CryptoKey ? v.algorithm.name === 'Ed25519'
+      : v && typeof v === 'object' && !(v instanceof ArrayBuffer) && !ArrayBuffer.isView(v) ? Object.values(v).some(holdsEd)
+      : false;
+    return vi.spyOn(P, 'put').mockImplementation(function (this: any, value: any, key?: any) {
+      if (holdsEd(value)) throw new DOMException('could not clone', 'DataCloneError');
+      return put.call(this, value, key);
+    });
+  }
+
+  const OLD_DATE = '2026-01-01T00:00:00.000Z';
+
+  it('replaces its key with a new locked pair, unpublished and unrefused', async () => {
+    const store = new IndexedDbDeviceKeyStore();
+    const old = (await store.load())!;
+    await store.save({ ...old, createdAt: OLD_DATE, recordUri: 'at://x/at.freeq.deviceKey/3a', refused: true });
+    const made = await store.replace();
+    expect(store.storage).toBe('pair');
+    expect(made.keyPair.privateKey.extractable).toBe(false);
+    expect(await kidOf(made.keyPair)).not.toBe(await kidOf(old.keyPair));
+    expect(made.createdAt).not.toBe(OLD_DATE);
+    expect(made.recordUri).toBeUndefined();
+    expect(made.refused).toBeUndefined();
+    const fresh = new IndexedDbDeviceKeyStore();
+    const back = (await fresh.load())!;
+    expect(fresh.storage).toBe('pair');
+    expect(await kidOf(back.keyPair)).toBe(await kidOf(made.keyPair));
+    expect(back.createdAt).toBe(made.createdAt);
+    expect(back.recordUri).toBeUndefined();
+    expect(back.refused).toBeUndefined();
+    expect(await signsAndVerifies(back.keyPair)).toBe(true);
+  });
+
+  it('replaces a wrapped key with a new wrapped one where the browser refuses a locked key', async () => {
+    refuseLocked();
+    const store = new IndexedDbDeviceKeyStore();
+    const old = (await store.load())!;
+    await store.save({ ...old, createdAt: OLD_DATE, recordUri: 'at://x/at.freeq.deviceKey/3a', refused: true });
+    const made = await store.replace();
+    expect(store.storage).toBe('wrapped');
+    expect(made.keyPair.privateKey.extractable).toBe(false);
+    expect(await kidOf(made.keyPair)).not.toBe(await kidOf(old.keyPair));
+    expect(made.createdAt).not.toBe(OLD_DATE);
+    const fresh = new IndexedDbDeviceKeyStore();
+    const back = (await fresh.load())!;
+    expect(fresh.storage).toBe('wrapped');
+    expect(await kidOf(back.keyPair)).toBe(await kidOf(made.keyPair));
+    expect(back.createdAt).toBe(made.createdAt);
+    expect(back.recordUri).toBeUndefined();
+    expect(back.refused).toBeUndefined();
+    expect(await signsAndVerifies(back.keyPair)).toBe(true);
+  });
+
+  it('replaces a wrapped key with a new wrapped one where the browser cannot store a locked key', async () => {
+    const put = cannotStore();
+    const store = new IndexedDbDeviceKeyStore();
+    const old = (await store.load())!;
+    expect(store.storage).toBe('wrapped');
+    const thrownBefore = put.mock.results.filter((r) => r.type === 'throw').length;
+    const made = await store.replace();
+    const thrown = put.mock.results.filter((r) => r.type === 'throw');
+    expect(thrown.length - thrownBefore).toBe(1);
+    expect((thrown.at(-1)!.value as DOMException).name).toBe('DataCloneError');
+    expect(store.storage).toBe('wrapped');
+    const fresh = new IndexedDbDeviceKeyStore();
+    const back = (await fresh.load())!;
+    expect(fresh.storage).toBe('wrapped');
+    expect(await kidOf(back.keyPair)).toBe(await kidOf(made.keyPair));
+    expect(await kidOf(back.keyPair)).not.toBe(await kidOf(old.keyPair));
+    expect(await signsAndVerifies(back.keyPair)).toBe(true);
+  });
 });
