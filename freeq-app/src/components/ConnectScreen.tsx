@@ -184,9 +184,12 @@ export function ConnectScreen() {
   const handleRef = useRef<HTMLInputElement>(null);
   const nickRef = useRef<HTMLInputElement>(null);
 
+  // The handle box takes the focus only when empty, so keys still being typed
+  // when the screen appears do not land in a saved handle.
   useEffect(() => {
-    if (mode === 'at-proto') handleRef.current?.focus();
-    else nickRef.current?.focus();
+    if (mode === 'at-proto') {
+      if (!handleRef.current?.value.trim()) handleRef.current?.focus();
+    } else nickRef.current?.focus();
   }, [mode]);
 
   // Update derived nick when handle changes
@@ -671,7 +674,7 @@ export function ConnectScreen() {
         </div>
 
         {displayError && (
-          <div className="mt-3 bg-danger/10 border border-danger/20 rounded-lg px-3 py-2.5 text-xs animate-fadeIn">
+          <div role="alert" className="mt-3 bg-danger/10 border border-danger/20 rounded-lg px-3 py-2.5 text-xs animate-fadeIn">
             <div className="font-semibold text-danger mb-0.5">
               {displayError.includes('SASL') || displayError.includes('auth') || displayError.includes('Auth')
                 ? '🔑 Authentication Error'
