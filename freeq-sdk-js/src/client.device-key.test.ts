@@ -840,6 +840,44 @@ describe('a stored key the account has retired', () => {
     await until(() => enrollCalls.length > 0);
   });
 
+  it('keeps the stored key when the check outlasts sixty seconds, and does not replace it after', async () => {
+    const old = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3old');
+    const { record, retirement } = await recordsOf(old);
+    const repo = await repoHolding(record, retirement);
+    // The account's listing is answered only once the test lets it go.
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const respond = repo.respond.bind(repo);
+    repo.respond = async (url: URL) => {
+      if (url.pathname === '/xrpc/com.atproto.repo.listRecords') await held;
+      return respond(url);
+    };
+    // The sixty-second bound, fired by hand; every other timer runs.
+    const bounds: (() => void)[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: () => void, ms?: number) => {
+      if (ms === 60_000) {
+        bounds.push(fn);
+        return 0;
+      }
+      return realSetTimeout(fn, ms);
+    }) as unknown as typeof setTimeout);
+    const store = new MemoryDeviceKeyStore(old);
+    const { client } = await clientReading(store, repo, true);
+
+    const loggedIn = login(client);
+    await until(() => bounds.length > 0);
+    expect(bounds).toHaveLength(1);
+    bounds[0]!();
+    const ws = await loggedIn;
+    expect(msgsigOf(ws), 'the stored key, at the bound').toBe(await rawPublicB64(old.keyPair));
+
+    release();
+    await pause();
+    expect((await store.load())!.keyPair, 'the late answer replaced nothing').toBe(old.keyPair);
+    client.disconnect();
+  });
+
   it('is kept on a connect that does not follow a new sign-in', async () => {
     const old = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3old');
     const { record, retirement } = await recordsOf(old);

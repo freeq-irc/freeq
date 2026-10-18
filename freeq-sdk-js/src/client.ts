@@ -2850,6 +2850,10 @@ export class FreeqClient extends EventEmitter {
     const lookup =
       this.opts.keyLookup ??
       new KeyLookup({ fetch: (target, init) => fetch(target, init), resolveDid: makeDidResolver() }, null, 0);
+    // Whichever comes first decides: the check committing to a replacement,
+    // or the sixty-second bound. A check that outlasts the bound changes
+    // nothing after it, as the Rust SDK drops its check there.
+    let decided = false;
     const check = async (): Promise<StoredDeviceKey> => {
       const raw = new Uint8Array(await crypto.subtle.exportKey('raw', stored.keyPair.publicKey));
       const kid = await signing.deriveKid(raw);
@@ -2861,12 +2865,15 @@ export class FreeqClient extends EventEmitter {
         (k) => k.kid === kid && retiredOrExpired(k, now),
       );
       // Retired, or expired by its record.
-      if (!retired) return stored;
+      if (!retired || decided) return stored;
+      decided = true;
       return replace();
     };
     let timer: ReturnType<typeof setTimeout> | undefined;
     const giveUp = new Promise<StoredDeviceKey>((resolve) => {
       timer = setTimeout(() => {
+        if (decided) return;
+        decided = true;
         log.warn('[freeq-sdk] the account read outlasted sixty seconds; keeping the stored key');
         resolve(stored);
       }, 60_000);
