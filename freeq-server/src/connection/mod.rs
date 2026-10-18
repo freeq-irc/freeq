@@ -4393,6 +4393,39 @@ mod retired_key_tests {
                     broker_token.map(str::to_string),
                 ),
             );
+            let mut c = Self::authenticating(state, nick, web_token).await;
+            c.rx(|l| l.split_whitespace().nth(1) == Some("903"))
+                .await
+                .expect("903");
+            if let Some(line) = before_welcome {
+                c.tx(line).await;
+                c.tx("CAP END").await;
+                return c;
+            }
+            c.tx("CAP END").await;
+            c.rx(|l| l.split_whitespace().nth(1) == Some("001"))
+                .await
+                .expect("001");
+            c
+        }
+
+        /// Signed in with `web_token`, which a sign-in route minted, and
+        /// registered.
+        async fn registered_with(state: &Arc<SharedState>, web_token: &str) -> Client {
+            let mut c = Self::authenticating(state, "alice", web_token).await;
+            c.rx(|l| l.split_whitespace().nth(1) == Some("903"))
+                .await
+                .expect("903");
+            c.tx("CAP END").await;
+            c.rx(|l| l.split_whitespace().nth(1) == Some("001"))
+                .await
+                .expect("001");
+            c
+        }
+
+        /// Through `AUTHENTICATE` with the web token `web_token`, not waiting
+        /// for its answer.
+        async fn authenticating(state: &Arc<SharedState>, nick: &str, web_token: &str) -> Client {
             let (client_side, server_side) = tokio::io::duplex(16384);
             let served = state.clone();
             tokio::spawn(async move {
@@ -4421,18 +4454,6 @@ mod retired_key_tests {
             let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .encode(payload.to_string().as_bytes());
             c.tx(&format!("AUTHENTICATE {encoded}")).await;
-            c.rx(|l| l.split_whitespace().nth(1) == Some("903"))
-                .await
-                .expect("903");
-            if let Some(line) = before_welcome {
-                c.tx(line).await;
-                c.tx("CAP END").await;
-                return c;
-            }
-            c.tx("CAP END").await;
-            c.rx(|l| l.split_whitespace().nth(1) == Some("001"))
-                .await
-                .expect("001");
             c
         }
 
@@ -4693,6 +4714,12 @@ mod retired_key_tests {
     async fn a_registration_listing_lands_in_the_record_cache() {
         let (state, listings, _) =
             state_counting(Arc::new(parking_lot::Mutex::new(fifty_keys(45)))).await;
+        // A login a key registered under here before, so its login lists
+        // nothing and the listing is the registration's.
+        state.device_key_tokens.lock().insert(
+            (DID.to_string(), "an-earlier-key".to_string()),
+            "BT-RECORD-CACHE".to_string(),
+        );
 
         let mut client = Client::signed_in(&state, "BT-RECORD-CACHE").await;
         client.tx(&msgsig_line(&signing_key(45))).await;
@@ -4826,6 +4853,444 @@ mod retired_key_tests {
             .expect("the key row");
         assert_eq!(row.removed_at, None);
     }
+    // ── a fresh sign-in reads the account's device keys again ────────
+
+    const BROKER_SECRET: &str = "retired-key-test-broker-secret";
+
+    /// The two ways a device signs in here: a separate broker that pushes
+    /// each login to the web-token route, and this server's own OAuth
+    /// callback with its `/session` refresh.
+    #[derive(Clone, Copy, Debug)]
+    enum SignIn {
+        Broker,
+        BuiltIn,
+    }
+
+    impl SignIn {
+        const BOTH: [SignIn; 2] = [SignIn::Broker, SignIn::BuiltIn];
+
+        /// A state signing devices in this way, resolving through `resolver`.
+        fn state(self, resolver: freeq_sdk::did::DidResolver) -> Arc<SharedState> {
+            let config = match self {
+                SignIn::Broker => crate::config::ServerConfig {
+                    broker_shared_secret: Some(BROKER_SECRET.to_string()),
+                    ..Default::default()
+                },
+                SignIn::BuiltIn => crate::config::ServerConfig::default(),
+            };
+            let mut state = crate::server::test_state_with_resolver(config, resolver);
+            if let SignIn::BuiltIn = self {
+                // The store a server with no separate broker files logins in.
+                Arc::get_mut(&mut state)
+                    .expect("a state nothing else holds yet")
+                    .embedded_session_store =
+                    Some(Arc::new(freeq_auth_broker::InMemoryStore::new()));
+            }
+            state
+        }
+
+        /// A new sign-in: its login token, and the web token the app gets.
+        async fn sign_in(self, state: &Arc<SharedState>, base: &str) -> (String, String) {
+            static LOGINS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = LOGINS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self {
+                SignIn::Broker => {
+                    // The broker makes a new login token at each sign-in.
+                    let login = format!("BT-FRESH-{n}");
+                    let web_token = broker_push(base, &login).await;
+                    (login, web_token)
+                }
+                SignIn::BuiltIn => {
+                    let oauth_state = format!("st-fresh-{n}");
+                    let created_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    state.oauth_pending.lock().insert(
+                        oauth_state.clone(),
+                        crate::server::OAuthPending {
+                            handle: "alice.test".to_string(),
+                            did: DID.to_string(),
+                            pds_url: "https://pds.example".to_string(),
+                            code_verifier: "verifier".to_string(),
+                            redirect_uri: format!("{base}/auth/callback"),
+                            client_id: format!("{base}/client-metadata.json"),
+                            token_endpoint: stub_token_endpoint().await,
+                            dpop_key_b64: freeq_sdk::oauth::DpopKey::generate().to_base64url(),
+                            created_at,
+                            // The app's redirect carries both tokens.
+                            mobile: true,
+                            irc_state: None,
+                            purpose: crate::server::OauthPurpose::Login,
+                            requested_scope: "atproto".to_string(),
+                        },
+                    );
+                    let html =
+                        reqwest::get(format!("{base}/auth/callback?state={oauth_state}&code=C"))
+                            .await
+                            .unwrap()
+                            .text()
+                            .await
+                            .unwrap();
+                    let start = html.find("freeq://auth?").expect("the app's redirect");
+                    let rest = &html[start..];
+                    let end = rest.find(['"', '\'']).unwrap_or(rest.len());
+                    let url = url::Url::parse(&rest[..end]).unwrap();
+                    let param = |name: &str| {
+                        url.query_pairs()
+                            .find(|(k, _)| k == name)
+                            .map(|(_, v)| v.into_owned())
+                            .unwrap()
+                    };
+                    (param("broker_token"), param("token"))
+                }
+            }
+        }
+
+        /// A reconnect on the login `login`: the web token the app gets.
+        async fn reconnect(self, base: &str, login: &str) -> String {
+            match self {
+                SignIn::Broker => broker_push(base, login).await,
+                SignIn::BuiltIn => {
+                    let answer: serde_json::Value = reqwest::Client::new()
+                        .post(format!("{base}/session"))
+                        .header("origin", base)
+                        .json(&serde_json::json!({ "broker_token": login }))
+                        .send()
+                        .await
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    answer["token"].as_str().expect("a web token").to_string()
+                }
+            }
+        }
+    }
+
+    /// The separate broker's push for `login`, as it makes at a sign-in and
+    /// at each refresh: the web token the route answers with.
+    async fn broker_push(base: &str, login: &str) -> String {
+        let body = serde_json::json!({ "did": DID, "handle": "alice.test", "broker_token": login });
+        let (sig, ts) = freeq_auth_broker::sign_body(BROKER_SECRET, &body).unwrap();
+        let answer: serde_json::Value = reqwest::Client::new()
+            .post(format!("{base}/auth/broker/web-token"))
+            .header("x-broker-signature", sig)
+            .header("x-broker-timestamp", ts)
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(&body).unwrap())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        answer["token"].as_str().expect("a web token").to_string()
+    }
+
+    /// A PDS token endpoint that answers the code exchange and the refresh.
+    async fn stub_token_endpoint() -> String {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(|body: axum::body::Bytes| async move {
+                let form: std::collections::HashMap<String, String> =
+                    serde_urlencoded::from_bytes(&body).unwrap();
+                match form.get("grant_type").map(String::as_str) {
+                    Some("authorization_code") => axum::Json(serde_json::json!({
+                        "access_token": "ACCESS-1",
+                        "refresh_token": "REFRESH-1",
+                        "scope": "atproto",
+                        "sub": DID,
+                    }))
+                    .into_response(),
+                    Some("refresh_token") => axum::Json(serde_json::json!({
+                        "access_token": "ACCESS-2",
+                        "refresh_token": "REFRESH-2",
+                        "scope": "atproto",
+                    }))
+                    .into_response(),
+                    _ => axum::http::StatusCode::BAD_REQUEST.into_response(),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/token")
+    }
+
+    /// The real web routes for `state` on a loopback port; their base URL.
+    async fn serve_web(state: &Arc<SharedState>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = crate::web::router(state.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// What the records route serves for the account's device keys: how
+    /// many records, and whether the copy is marked stale.
+    async fn served_device_keys(base: &str) -> (usize, bool) {
+        let body: serde_json::Value = reqwest::get(format!(
+            "{base}/api/v1/records/{DID}/{}",
+            freeq_sdk::identity_records::DEVICE_KEY_TYPE
+        ))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        (
+            body["records"].as_array().map_or(0, Vec::len),
+            body["stale"].as_bool().expect("a listing"),
+        )
+    }
+
+    /// The listing the account's device keys had before a sign-out, kept
+    /// as any earlier read of them keeps it.
+    async fn keep_a_listing(state: &Arc<SharedState>) {
+        state
+            .key_lookup
+            .reader()
+            .list_record_entries(DID, freeq_sdk::identity_records::DEVICE_KEY_TYPE, None)
+            .await
+            .unwrap();
+    }
+
+    /// A sign-out lands at the PDS after the server kept a listing; then the
+    /// device signs in afresh. The records route serves the sign-out.
+    async fn a_fresh_sign_in_lists_the_device_keys_again(setup: SignIn) {
+        let records = Arc::new(parking_lot::Mutex::new(vec![record_for(80)]));
+        let (resolver, listings, _) =
+            crate::peer_keys::stub_pds_counting(DID, records.clone()).await;
+        let state = setup.state(resolver);
+        let base = serve_web(&state).await;
+        keep_a_listing(&state).await;
+        records.lock().push(retirement_by(80, 80));
+
+        let (_, web_token) = setup.sign_in(&state, &base).await;
+        let _client = Client::registered_with(&state, &web_token).await;
+
+        assert_eq!(
+            served_device_keys(&base).await,
+            (2, false),
+            "the copy holds the sign-out"
+        );
+        assert_eq!(count(&listings), 2, "listed again at the login");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_sign_in_through_the_broker_lists_the_device_keys_again() {
+        a_fresh_sign_in_lists_the_device_keys_again(SignIn::Broker).await;
+    }
+
+    #[tokio::test]
+    async fn a_fresh_built_in_sign_in_lists_the_device_keys_again() {
+        a_fresh_sign_in_lists_the_device_keys_again(SignIn::BuiltIn).await;
+    }
+
+    /// A web token that names no login, as an older broker's push makes,
+    /// cannot be matched to a key registered here, so its sign-in reads the
+    /// account's device keys again too.
+    #[tokio::test]
+    async fn a_sign_in_that_names_no_login_lists_the_device_keys_again() {
+        let records = Arc::new(parking_lot::Mutex::new(vec![record_for(84)]));
+        let (resolver, listings, _) =
+            crate::peer_keys::stub_pds_counting(DID, records.clone()).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            resolver,
+        );
+        let base = serve_web(&state).await;
+        keep_a_listing(&state).await;
+        records.lock().push(retirement_by(84, 84));
+
+        let _client = Client::signed_in_as(&state, DID, "alice", "WT-NO-LOGIN").await;
+
+        assert_eq!(
+            served_device_keys(&base).await,
+            (2, false),
+            "the copy holds the sign-out"
+        );
+        assert_eq!(count(&listings), 2, "listed again at the login");
+    }
+
+    #[tokio::test]
+    async fn the_login_answers_903_only_once_the_listing_is_in() {
+        let repo = Arc::new(parking_lot::Mutex::new(
+            freeq_sdk::test_support::StubRepo::new(DID),
+        ));
+        repo.lock().add(
+            freeq_sdk::identity_records::DEVICE_KEY_TYPE,
+            &record_for(83),
+        );
+        let pds = crate::peer_keys::stub_pds_repos(vec![repo]).await;
+        let state = SignIn::Broker.state(pds.resolver.clone());
+        let base = serve_web(&state).await;
+        let (_, web_token) = SignIn::Broker.sign_in(&state, &base).await;
+
+        pds.hold.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut client = Client::authenticating(&state, "alice", &web_token).await;
+        wait_for_count(&pds.arrivals, 1).await;
+        assert_eq!(count(&pds.arrivals), 1, "the login lists the account");
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            client.rx(|l| l.split_whitespace().nth(1) == Some("903")),
+        )
+        .await;
+        assert!(early.is_err(), "no 903 while the listing is out: {early:?}");
+        pds.hold.store(false, std::sync::atomic::Ordering::SeqCst);
+        client
+            .rx(|l| l.split_whitespace().nth(1) == Some("903"))
+            .await
+            .expect("903 once the listing is in");
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_of_a_login_that_registered_a_key_here_lists_nothing_at_the_login() {
+        for setup in SignIn::BOTH {
+            let records = Arc::new(parking_lot::Mutex::new(vec![record_for(81)]));
+            let (resolver, listings, _) =
+                crate::peer_keys::stub_pds_counting(DID, records.clone()).await;
+            let state = setup.state(resolver);
+            let base = serve_web(&state).await;
+            let (login, web_token) = setup.sign_in(&state, &base).await;
+            let mut first = Client::registered_with(&state, &web_token).await;
+            first.tx(&msgsig_line(&signing_key(81))).await;
+            first
+                .rx(|l| l.contains("MSGSIG OK"))
+                .await
+                .expect("the key is registered");
+            // The registration's own check lists the account as well.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            first.tx("QUIT").await;
+            assert_eq!(first.rx(|_| false).await, None);
+            records.lock().push(retirement_by(81, 81));
+            let before = count(&listings);
+
+            let web_token = setup.reconnect(&base, &login).await;
+            let _again = Client::registered_with(&state, &web_token).await;
+
+            assert_eq!(
+                count(&listings),
+                before,
+                "{setup:?}: no listing at the login"
+            );
+            assert_eq!(
+                served_device_keys(&base).await,
+                (1, false),
+                "{setup:?}: the copy is the registration's"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_sign_in_with_the_pds_unreadable_signs_in_and_the_kept_copy_is_served() {
+        for setup in SignIn::BOTH {
+            // A port nothing is listening on: bind it, learn the number, drop it.
+            let dead = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let repo_key =
+                freeq_sdk::crypto::PrivateKey::generate_secp256k1().public_key_multibase();
+            let doc = freeq_sdk::did::make_test_did_document_with_pds(
+                DID,
+                &repo_key,
+                Some(&format!("http://127.0.0.1:{dead}")),
+            );
+            let state = setup.state(freeq_sdk::did::DidResolver::static_map(
+                std::collections::HashMap::from([(DID.to_string(), doc)]),
+            ));
+            let base = serve_web(&state).await;
+            state.record_cache.keep_listing(
+                DID,
+                freeq_sdk::identity_records::DEVICE_KEY_TYPE,
+                &repo_key,
+                &[freeq_sdk::identity_records::RecordEntry {
+                    uri: format!("at://{DID}/at.freeq.deviceKey/rk1"),
+                    cid: String::new(),
+                    value: record_for(82),
+                }],
+            );
+
+            let (_, web_token) = setup.sign_in(&state, &base).await;
+            let _client = Client::registered_with(&state, &web_token).await;
+
+            assert_eq!(
+                served_device_keys(&base).await,
+                (1, false),
+                "{setup:?}: the kept copy, not marked stale"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_sign_in_whose_did_document_never_answers_signs_in_within_the_bound() {
+        for setup in SignIn::BOTH {
+            let repo_key =
+                freeq_sdk::crypto::PrivateKey::generate_secp256k1().public_key_multibase();
+            let doc = freeq_sdk::did::make_test_did_document_with_pds(
+                DID,
+                &repo_key,
+                Some("http://127.0.0.1:9"),
+            );
+            // The account's DID document is answered an hour after it is asked for.
+            let (resolver, _) = freeq_sdk::did::DidResolver::static_map_counting_after(
+                std::collections::HashMap::from([(DID.to_string(), doc)]),
+                std::time::Duration::from_secs(3600),
+            );
+            let state = setup.state(resolver);
+            let base = serve_web(&state).await;
+            state.record_cache.keep_listing(
+                DID,
+                freeq_sdk::identity_records::DEVICE_KEY_TYPE,
+                &repo_key,
+                &[freeq_sdk::identity_records::RecordEntry {
+                    uri: format!("at://{DID}/at.freeq.deviceKey/rk1"),
+                    cid: String::new(),
+                    value: record_for(84),
+                }],
+            );
+            let (_, web_token) = setup.sign_in(&state, &base).await;
+
+            let bound = crate::peer_keys::FETCH_TIMEOUT;
+            let started = std::time::Instant::now();
+            let mut client = Client::authenticating(&state, "alice", &web_token).await;
+            // `rx` waits five seconds at most, so start it a second before the bound.
+            tokio::time::sleep(bound - std::time::Duration::from_secs(1)).await;
+            client
+                .rx(|l| l.split_whitespace().nth(1) == Some("903"))
+                .await
+                .expect("903");
+            let waited = started.elapsed();
+            assert!(
+                waited < bound + std::time::Duration::from_secs(2),
+                "{setup:?}: the sign-in waited {waited:?}"
+            );
+            client.tx("CAP END").await;
+            client
+                .rx(|l| l.split_whitespace().nth(1) == Some("001"))
+                .await
+                .expect("001");
+
+            assert_eq!(
+                served_device_keys(&base).await,
+                (1, false),
+                "{setup:?}: the kept copy, not marked stale"
+            );
+        }
+    }
+
     // ── expired keys ─────────────────────────────────────────────────
 
     const EXPIRED_WORDS: &str = "This device's signing key has expired. Sign in again to continue.";

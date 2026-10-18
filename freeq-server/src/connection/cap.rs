@@ -290,6 +290,46 @@ pub(super) async fn handle_authenticate(
                             );
                         }
                         Ok(did) => {
+                            // A sign-in with a one-time web token whose login
+                            // token is not on file for any key here is a fresh
+                            // sign-in (or the first connect of that login since
+                            // a restart). One that names no login, as an
+                            // older broker sends, counts as fresh too. The
+                            // account's device keys are read again from its
+                            // data server (the PDS) before the SASL success
+                            // reply (903), so the device's own check right
+                            // after it reads a copy that holds any sign-out
+                            // made since. The read waits no longer than the
+                            // server's other key reads; one that fails or runs
+                            // out of time leaves the saved copy as it was.
+                            if response.method.as_deref() == Some("web-token") {
+                                let unseen = match conn.broker_token.as_deref() {
+                                    Some(token) => {
+                                        !state.device_key_tokens.lock().values().any(|t| t == token)
+                                    }
+                                    None => true,
+                                };
+                                if unseen {
+                                    let listed = tokio::time::timeout(
+                                        crate::peer_keys::FETCH_TIMEOUT,
+                                        state.key_lookup.reader().list_record_entries(
+                                            &did,
+                                            freeq_sdk::identity_records::DEVICE_KEY_TYPE,
+                                            None,
+                                        ),
+                                    )
+                                    .await;
+                                    match listed {
+                                        Ok(Ok(_)) => {}
+                                        Ok(Err(e)) => {
+                                            tracing::debug!(%did, error = %e, "Could not read the account's device keys at a new login");
+                                        }
+                                        Err(_) => {
+                                            tracing::debug!(%did, "The account's device keys did not answer in time at a new login");
+                                        }
+                                    }
+                                }
+                            }
                             conn.authenticated_did = Some(did.clone());
                             conn.sasl_in_progress = false;
                             state

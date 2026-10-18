@@ -45,7 +45,8 @@ use crate::server::SharedState;
 
 /// A key server that does not answer promptly is treated as unreachable. This
 /// runs off the delivery path, so the bound is about not accumulating tasks.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// The device-key read at a new sign-in waits no longer than this either.
+pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `(did, kid)` lookups in flight or recently finished without a key.
 ///
