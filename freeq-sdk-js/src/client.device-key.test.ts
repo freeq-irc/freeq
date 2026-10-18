@@ -467,6 +467,40 @@ describe('a stored key the account has retired', () => {
     client.disconnect();
   });
 
+  const RETIRED_WORDS = 'This device was signed out from another device. Sign in again to continue.';
+
+  it('marks its stored key refused on KEY_RETIRED, and only a fresh sign-in replaces it, unread', async () => {
+    // A failed publish, so the client does not list its own account after it.
+    enrollAnswer = { status: 502, body: {} };
+    const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+    const { record } = await recordsOf(stored);
+    // The account still lists the key as live: the mark alone replaces it.
+    const repo = await repoHolding(record);
+    const store = new MemoryDeviceKeyStore(stored);
+    const first = await clientReading(store, repo);
+    const heard: (boolean | undefined)[] = [];
+    first.client.on('serverFail', () => heard.push((store as unknown as { key: StoredDeviceKey }).key.refused));
+    const ws = await login(first.client);
+    ws.recv(`:srv FAIL MSGSIG KEY_RETIRED :${RETIRED_WORDS}`);
+    await until(() => heard.length > 0);
+    expect(heard, 'marked before the app hears of it').toEqual([true]);
+    first.client.disconnect();
+
+    MockWebSocket.instances = [];
+    const reconnect = await clientReading(store, repo);
+    const ws2 = await login(reconnect.client);
+    expect(msgsigOf(ws2), 'a reconnect presents it still').toBe(await rawPublicB64(stored.keyPair));
+    reconnect.client.disconnect();
+
+    MockWebSocket.instances = [];
+    const again = await clientReading(store, repo, true);
+    const next = await login(again.client);
+    expect(msgsigOf(next)).not.toBe(await rawPublicB64(stored.keyPair));
+    expect((await store.load())!.keyPair).not.toBe(stored.keyPair);
+    expect(again.listings(), 'the account was not read').toBe(0);
+    again.client.disconnect();
+  });
+
   it('leaves its stored key unmarked when KEY_EXPIRED refuses a session key it fell back to', async () => {
     const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
     const { record } = await recordsOf(stored);

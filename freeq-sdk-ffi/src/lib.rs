@@ -266,8 +266,8 @@ pub struct StoredDeviceKey {
     pub seed: Vec<u8>,
     pub created_at: String,
     pub record_uri: Option<String>,
-    /// The server refused the key as expired; the next fresh sign-in
-    /// replaces it.
+    /// The server refused the key as expired or retired; the next fresh
+    /// sign-in replaces it.
     pub refused: bool,
 }
 

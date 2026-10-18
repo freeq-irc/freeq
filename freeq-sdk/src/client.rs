@@ -2237,8 +2237,8 @@ fn spawn_relist_if_vouched(
 
 /// Right after a new sign-in, replace a stored key with a new one, saved with
 /// no record URI so this connect publishes it, when the server refused it as
-/// expired, when it is past its lifetime by its own date, or when the
-/// account's records retired it or let it expire. A saved login or a
+/// expired or retired, when it is past its lifetime by its own date, or when
+/// the account's records retired it or let it expire. A saved login or a
 /// reconnect reads and changes nothing. Records count only once their
 /// repository proof checks, through `lookup`'s cache, and only the records
 /// that can retire the key are proven.
@@ -2254,10 +2254,10 @@ async fn replace_retired_device_key<P: freeq_oauth::ClientProvider>(
     let Ok(Some(stored)) = store.load(did) else {
         return;
     };
-    // Refused by the server as expired, or past its lifetime by its own
-    // date: replaced without asking the account. The flag is what makes a
-    // server with a shorter lifetime, or a clock ahead of this one, still
-    // converge.
+    // Refused by the server as expired or retired, or past its lifetime by
+    // its own date: replaced without asking the account. The flag is what
+    // makes a server with a shorter lifetime, or a clock ahead of this one,
+    // still converge.
     if stored.refused || crate::device_key::past_key_lifetime(&stored.created_at) {
         save_replacement(store, did);
         return;
@@ -4063,10 +4063,13 @@ where
                         }
                         "FAIL" => {
                             // The server refused the presented device key as
-                            // expired: marked before the app hears of it, so
-                            // the next fresh sign-in replaces it.
+                            // expired or retired: marked before the app hears
+                            // of it, so the next fresh sign-in replaces it.
                             if msg.params.first().map(String::as_str) == Some("MSGSIG")
-                                && msg.params.get(1).map(String::as_str) == Some("KEY_EXPIRED")
+                                && matches!(
+                                    msg.params.get(1).map(String::as_str),
+                                    Some("KEY_EXPIRED" | "KEY_RETIRED")
+                                )
                             {
                                 mark_device_key_refused(
                                     config.device_key_store.as_deref(),
@@ -11555,6 +11558,48 @@ mod device_key_tests {
         assert_eq!(
             kept.record_uri.as_deref(),
             Some("at://did:plc:tester/at.freeq.deviceKey/3k")
+        );
+    }
+
+    const RETIRED: &str = ":srv FAIL MSGSIG KEY_RETIRED :This device was signed out from another device. Sign in again to continue.";
+
+    #[tokio::test]
+    async fn marks_its_stored_key_refused_on_key_retired_and_only_a_fresh_sign_in_replaces_it() {
+        let store = MemoryStore::holding(5, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
+        let mut live = connect_live(config_with(Some(store.clone()), None)).await;
+        live.send(RETIRED).await;
+        let heard = live.notice().await;
+        assert!(heard.starts_with("MSGSIG KEY_RETIRED"), "{heard}");
+        let kept = store.key.lock().clone().unwrap();
+        assert!(kept.refused, "marked before the notice went out");
+        assert_eq!(kept.seed, [5; 32], "the same key, marked");
+        drop(live);
+
+        let again = connect_once(config_with(Some(store.clone()), None)).await;
+        assert_eq!(
+            again.msgsig(),
+            public_b64(&[5; 32]),
+            "a reconnect presents it still"
+        );
+
+        // The account still lists the key as live: the mark alone replaces it.
+        let (lookup, listings, _, base) = lookup_counting_at(repo_holding(&[record_for(5)])).await;
+        lookup.set_default_origin_base(base);
+        let config = ConnectConfig {
+            fresh_sign_in: true,
+            key_lookup: Some(Arc::new(lookup)),
+            ..config_with(Some(store.clone()), None)
+        };
+        let next = connect_once(config).await;
+        assert_ne!(next.msgsig(), public_b64(&[5; 32]));
+        assert_eq!(
+            next.msgsig(),
+            public_b64(&store.key.lock().clone().unwrap().seed)
+        );
+        assert_eq!(
+            listings.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the account was not read"
         );
     }
 

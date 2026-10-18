@@ -2812,8 +2812,8 @@ export class FreeqClient extends EventEmitter {
   /**
    * Right after a new sign-in, replace a stored key with a new one, saved with
    * no record URI so this connect publishes it, when the server refused it as
-   * expired, when it is past its lifetime by its own date, or when the
-   * account's records retired it or let it expire. Reading the records is
+   * expired or retired, when it is past its lifetime by its own date, or when
+   * the account's records retired it or let it expire. Reading the records is
    * bounded, so a slow account provider cannot hold up signing; a failed read
    * keeps the stored key.
    */
@@ -2831,9 +2831,10 @@ export class FreeqClient extends EventEmitter {
       await store.save(replacement);
       return replacement;
     };
-    // Refused by the server as expired, or past its lifetime by its own date:
-    // replaced without asking the account. The flag is what makes a server
-    // with a shorter lifetime, or a clock ahead of this one, still converge.
+    // Refused by the server as expired or retired, or past its lifetime by its
+    // own date: replaced without asking the account. The flag is what makes a
+    // server with a shorter lifetime, or a clock ahead of this one, still
+    // converge.
     if (stored.refused || Date.parse(stored.createdAt) + KEY_LIFETIME_MS <= Date.now()) {
       try {
         return await replace();
@@ -3858,10 +3859,11 @@ export class FreeqClient extends EventEmitter {
         // that target stays one behind for the rest of the connection and
         // every later batch is labelled with the request before it.
         if (msg.params[0] === 'CHATHISTORY') this.dropRefusedHistoryRequest(msg.params);
-        // The server refused this device's key as expired. The stored key is
-        // marked first, so the next fresh sign-in replaces it whatever its
-        // dates say: an app disconnects as soon as it hears of this.
-        if (msg.params[0] === 'MSGSIG' && msg.params[1] === 'KEY_EXPIRED') {
+        // The server refused this device's key as expired or retired. The
+        // stored key is marked first, so the next fresh sign-in replaces it
+        // whatever its dates and the account's records say: an app
+        // disconnects as soon as it hears of this.
+        if (msg.params[0] === 'MSGSIG' && (msg.params[1] === 'KEY_EXPIRED' || msg.params[1] === 'KEY_RETIRED')) {
           const text = msg.params.join(' ');
           void this.markDeviceKeyRefused().finally(() => this.emit('serverFail', text));
           break;

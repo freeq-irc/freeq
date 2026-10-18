@@ -18,8 +18,8 @@ export interface StoredDeviceKey {
   createdAt: string;
   /** The `at://` URI of the record that publishes the key, once written. */
   recordUri?: string;
-  /** The server refused the key as expired: the next fresh sign-in replaces
-   *  it, whatever its dates say. */
+  /** The server refused the key as expired or retired: the next fresh sign-in
+   *  replaces it, whatever its dates say. */
   refused?: boolean;
 }
 
