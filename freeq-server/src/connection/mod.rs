@@ -178,14 +178,19 @@ pub(crate) fn file_session_signing_key(
         .map_err(|_| ("INVALID_KEY", "Invalid ed25519 public key"))?;
     let kid = freeq_sdk::sigtag::derive_kid(&vk);
 
-    // A key on file past its expiry is refused before anything is written, so
-    // the caller's FAIL is the last word it gets for it.
+    // A key on file that this server retired, or past its expiry, is refused
+    // before anything is written, so the caller's FAIL is the last word it
+    // gets for it. A retirement counts whatever its date.
     let now = chrono::Utc::now().timestamp();
-    let expired = state
+    let row = state
         .with_db(|db| db.get_signing_key_row(did, &kid))
-        .flatten()
-        .is_some_and(|row| row.expired_at(now));
-    if expired {
+        .flatten();
+    if row.as_ref().is_some_and(|row| row.removed_at.is_some()) {
+        tracing::info!(session = %session_id, %did, %kid, "Refused a signing key this server has marked retired");
+        return Err(("KEY_RETIRED", KEY_RETIRED_WORDS));
+    }
+    if row.is_some_and(|row| row.expired_at(now)) {
+        tracing::info!(session = %session_id, %did, %kid, "Refused a signing key whose row has expired");
         return Err(("KEY_EXPIRED", KEY_EXPIRED_WORDS));
     }
 
@@ -232,21 +237,32 @@ pub(crate) fn file_session_signing_key(
 pub(crate) const KEY_EXPIRED_WORDS: &str =
     "This device's signing key has expired. Sign in again to continue.";
 
-/// After the caller has sent `FAIL MSGSIG KEY_EXPIRED` for a key refused at
-/// registration: end the login token this connection came in on and close
-/// it. Spawned, so the FAIL already queued goes out first.
-pub(crate) fn close_for_expired_key(
+/// What a device whose signing key was retired is told.
+pub(crate) const KEY_RETIRED_WORDS: &str =
+    "This device was signed out from another device. Sign in again to continue.";
+
+/// After the caller has sent `FAIL MSGSIG <code>` for a key refused at
+/// registration: for `KEY_EXPIRED` or `KEY_RETIRED`, end the login token this
+/// connection came in on and close it; any other code leaves both. Spawned,
+/// so the FAIL already queued goes out first.
+pub(crate) fn close_for_refused_key(
     state: &Arc<SharedState>,
     session_id: &str,
+    code: &str,
     broker_token: Option<&str>,
 ) {
+    let reason = match code {
+        "KEY_EXPIRED" => "Signing key expired",
+        "KEY_RETIRED" => "Signing key retired",
+        _ => return,
+    };
     let state = Arc::clone(state);
     let (session_id, token) = (session_id.to_string(), broker_token.map(str::to_string));
     tokio::spawn(async move {
         if let Some(token) = token {
             end_login_token(&state, &token).await;
         }
-        close_session(&state, &session_id, "Signing key expired");
+        close_session(&state, &session_id, reason);
     });
 }
 
@@ -307,11 +323,7 @@ async fn refuse_if_retired(
     let reply = irc::Message::from_server(
         &state.server_name,
         "FAIL",
-        vec![
-            "MSGSIG",
-            "KEY_RETIRED",
-            "This device was signed out from another device. Sign in again to continue.",
-        ],
+        vec!["MSGSIG", "KEY_RETIRED", KEY_RETIRED_WORDS],
     );
     if let Some(tx) = state.connections.lock().get(session_id) {
         let _ = tx.try_send(format!("{reply}\r\n"));
@@ -975,13 +987,14 @@ where
             // Trigger auto-op etc. in channels (already handled by complete_irc_login)
         }
 
-        // A message line from a session whose registered key has expired is
-        // refused and the session closed, instead of being relayed until the
-        // once-a-minute sweep. A `TAGMSG` counts only when it carries the
-        // client's signature, the one kind a reader would mark invalid; an
-        // unsigned one, such as a typing notice, passes. `break`, not
-        // `continue`: a line buffered behind this one would otherwise be read
-        // with the key already dropped.
+        // A message line from a session whose registered key has expired, or
+        // whose row this server has marked retired, is refused and the
+        // session closed, instead of being relayed until the once-a-minute
+        // sweep. A `TAGMSG` counts only when it carries the client's
+        // signature, the one kind a reader would mark invalid; an unsigned
+        // one, such as a typing notice, passes. `break`, not `continue`: a
+        // line buffered behind this one would otherwise be read with the key
+        // already dropped.
         if conn.registered
             && match msg.command.as_str() {
                 "PRIVMSG" | "NOTICE" | "BATCH" => true,
@@ -995,7 +1008,10 @@ where
             let key = state.session_msg_keys.lock().get(&session_id).copied();
             if let Some(vk) = key {
                 let kid = freeq_sdk::sigtag::derive_kid(&vk);
-                if crate::key_expiry::refuse_if_expired(&state, &session_id, did, &kid).await {
+                if crate::key_expiry::refuse_if_retired_or_expired(&state, &session_id, did, &kid)
+                    .await
+                    .is_some()
+                {
                     break;
                 }
             }
@@ -1575,13 +1591,12 @@ where
                                 vec!["MSGSIG", code, detail],
                             );
                             send(&state, &session_id, format!("{reply}\r\n"));
-                            if code == "KEY_EXPIRED" {
-                                close_for_expired_key(
-                                    &state,
-                                    &session_id,
-                                    conn.broker_token.as_deref(),
-                                );
-                            }
+                            close_for_refused_key(
+                                &state,
+                                &session_id,
+                                code,
+                                conn.broker_token.as_deref(),
+                            );
                         }
                     }
                 }
@@ -4853,6 +4868,56 @@ mod retired_key_tests {
             .expect("the key row");
         assert_eq!(row.removed_at, None);
     }
+    #[tokio::test]
+    async fn a_key_this_server_retired_is_refused_at_registration_with_the_pds_unreadable() {
+        let key = signing_key(47);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        // The resolver knows no document, so the records cannot be read.
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            freeq_sdk::did::DidResolver::static_map(std::collections::HashMap::new()),
+        );
+        state.with_db(|db| {
+            db.save_signing_key_from(
+                DID,
+                key.verifying_key().as_bytes(),
+                "local-session",
+                now() - 3600,
+                Some(now() + 24 * 3600),
+            )
+        });
+        // Dated five minutes ahead of the clock, as the records check may
+        // stamp it: a sign-out counts whatever its date.
+        assert_eq!(
+            state.with_db(|db| db.retire_signing_key(DID, &kid, now() + 300)),
+            Some(true)
+        );
+
+        let mut client =
+            Client::offering_at_registration(&state, "BT-RETIRED-HERE", &msgsig_line(&key)).await;
+        let lines = client.rest().await;
+        let fail = lines
+            .iter()
+            .position(|l| l.contains("FAIL MSGSIG KEY_RETIRED"))
+            .unwrap_or_else(|| panic!("no KEY_RETIRED FAIL in {lines:?}"));
+        assert!(
+            lines[fail].ends_with(
+                "This device was signed out from another device. Sign in again to continue."
+            ),
+            "{}",
+            lines[fail]
+        );
+        assert!(!lines.iter().any(|l| l.contains("MSGSIG OK")), "{lines:?}");
+        assert!(lines.last().unwrap().starts_with("ERROR"), "{lines:?}");
+        assert!(state.session_msg_keys.lock().is_empty());
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-RETIRED-HERE"))
+        );
+    }
+
     // ── a fresh sign-in reads the account's device keys again ────────
 
     const BROKER_SECRET: &str = "retired-key-test-broker-secret";
@@ -5323,11 +5388,17 @@ mod retired_key_tests {
 
     /// The FAIL, then the close, and no `MSGSIG OK` among `lines`.
     fn refused_as_expired(lines: &[String]) {
+        refused_as(lines, "KEY_EXPIRED", EXPIRED_WORDS);
+    }
+
+    /// `FAIL MSGSIG <code>` with `words`, then the close, and no `MSGSIG OK`
+    /// among `lines`.
+    fn refused_as(lines: &[String], code: &str, words: &str) {
         let fail = lines
             .iter()
-            .position(|l| l.contains("FAIL MSGSIG KEY_EXPIRED"))
-            .unwrap_or_else(|| panic!("no KEY_EXPIRED FAIL in {lines:?}"));
-        assert!(lines[fail].contains(EXPIRED_WORDS), "{}", lines[fail]);
+            .position(|l| l.contains(&format!("FAIL MSGSIG {code}")))
+            .unwrap_or_else(|| panic!("no {code} FAIL in {lines:?}"));
+        assert!(lines[fail].contains(words), "{}", lines[fail]);
         let error = lines
             .iter()
             .position(|l| l.starts_with("ERROR"))
@@ -5794,6 +5865,144 @@ mod retired_key_tests {
             .await
             .expect("the line is delivered");
         assert!(still_answers(&mut alice).await);
+    }
+
+    // ── keys whose row is marked retired while connected ─────────────
+
+    const RETIRED_WORDS: &str =
+        "This device was signed out from another device. Sign in again to continue.";
+
+    /// Mark `key`'s row retired, as the sign-out route or the records check
+    /// of another connection of the same key does. Dated five minutes ahead
+    /// of the clock, as the records check may stamp it: a sign-out counts
+    /// whatever its date.
+    fn mark_retired(state: &Arc<SharedState>, key: &ed25519_dalek::SigningKey) {
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        assert_eq!(
+            state.with_db(|db| db.retire_signing_key(DID, &kid, now() + 300)),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_after_the_key_row_is_marked_retired_is_refused_and_closed() {
+        let key = signing_key(75);
+        let (state, mut alice) = keyed_alice(&key, "BT-GUARD-RETIRED").await;
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        mark_retired(&state, &key);
+        alice.tx("PRIVMSG #guard :one\r\nPRIVMSG #guard :two").await;
+        refused_as(&alice.rest().await, "KEY_RETIRED", RETIRED_WORDS);
+        let lines = watcher_lines(&mut watcher).await;
+        assert!(!relayed_from_alice(&lines), "{lines:?}");
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-GUARD-RETIRED"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sweeper_closes_a_session_whose_key_row_is_marked_retired_once() {
+        let key = signing_key(76);
+        let (state, mut alice) = keyed_alice(&key, "BT-SWEPT-RETIRED").await;
+        assert_eq!(crate::key_expiry::sweep(&state).await, 0, "a live key");
+
+        mark_retired(&state, &key);
+        assert_eq!(crate::key_expiry::sweep(&state).await, 1);
+        assert_eq!(crate::key_expiry::sweep(&state).await, 0, "refused once");
+        refused_as(&alice.rest().await, "KEY_RETIRED", RETIRED_WORDS);
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-SWEPT-RETIRED"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sign_out_route_refuses_a_connected_device_of_the_key_once() {
+        let key = signing_key(78);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let (state, mut alice) = keyed_alice(&key, "BT-ROUTE-SIGNED-OUT").await;
+        let device = state
+            .session_msg_keys
+            .lock()
+            .keys()
+            .next()
+            .cloned()
+            .expect("alice's session");
+        // Another session of the account presses Sign out. Its sign-in sends
+        // alice a liveness probe, which she answers here.
+        let _other = Client::signed_in_as(&state, DID, "alice2", "WT-ROUTE-OTHER").await;
+        assert!(still_answers(&mut alice).await);
+        let bearer = state
+            .session_dids
+            .lock()
+            .keys()
+            .find(|sid| **sid != device)
+            .cloned()
+            .expect("the other session");
+        let base = serve_web(&state).await;
+
+        let answer: serde_json::Value = reqwest::Client::new()
+            .post(format!("{base}/api/v1/devices/sign-out"))
+            .header("authorization", format!("Bearer {bearer}"))
+            .json(&serde_json::json!({ "kid": kid }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            answer,
+            serde_json::json!({ "ok": true, "sessions_closed": 1, "tokens_revoked": 1 })
+        );
+        assert!(
+            !state.session_msg_keys.lock().contains_key(&device),
+            "the device's key is dropped by the time the route answers"
+        );
+        assert_eq!(crate::key_expiry::sweep(&state).await, 0, "refused once");
+        let lines = alice.rest().await;
+        refused_as(&lines, "KEY_RETIRED", RETIRED_WORDS);
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("FAIL MSGSIG")).count(),
+            1,
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("ERROR")).count(),
+            1,
+            "{lines:?}"
+        );
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-ROUTE-SIGNED-OUT"))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_tagmsg_under_a_retired_row_is_relayed_and_the_next_line_refused() {
+        let key = signing_key(77);
+        let (state, mut alice) = keyed_alice(&key, "BT-GUARD-RETIRED-UNSIGNED").await;
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        mark_retired(&state, &key);
+        alice.tx("@+typing=active TAGMSG #guard").await;
+        watcher
+            .rx(|l| l.contains("alice!") && l.contains(" TAGMSG #guard") && l.contains("+typing"))
+            .await
+            .expect("the typing notice is relayed");
+        assert!(still_answers(&mut alice).await);
+
+        alice.tx("PRIVMSG #guard :hello").await;
+        refused_as(&alice.rest().await, "KEY_RETIRED", RETIRED_WORDS);
+        let lines = watcher_lines(&mut watcher).await;
+        assert!(!relayed_from_alice(&lines), "{lines:?}");
     }
 }
 

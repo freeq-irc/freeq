@@ -493,3 +493,74 @@ async fn sign_out_by_another_did_closes_nothing() {
     );
     let _ = &mut mallory;
 }
+
+#[tokio::test]
+async fn a_signed_out_key_is_refused_at_its_next_registration_and_that_login_ended() {
+    // The resolver knows no DID document, so the account's records cannot be
+    // read: the refusal rests on the key row the sign-out retired.
+    let (irc, web, state) = start_embedded_with_irc().await;
+    let (_first_login, web_token) = login(web, &state, "st-refused-1").await;
+    let other_token = second_web_token(&state);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+    let (mut device, kid) = tokio::task::spawn_blocking(move || {
+        let mut c = Irc::connect(irc, "alice", &web_token);
+        let kid = c.msgsig(&key);
+        (c, kid)
+    })
+    .await
+    .unwrap();
+    let mut other = tokio::task::spawn_blocking(move || Irc::connect(irc, "alice2", &other_token))
+        .await
+        .unwrap();
+    assert_eq!(sign_out(web, &other.bearer, &kid).await.status(), 200);
+    assert!(
+        tokio::task::spawn_blocking(move || device.closed_within(3000))
+            .await
+            .unwrap()
+    );
+
+    // Signed in afresh, the device presents the same key.
+    let (second_login, web_token) = login(web, &state, "st-refused-2").await;
+    let (refused, closed) = tokio::task::spawn_blocking(move || {
+        let mut c = Irc::connect(irc, "alice", &web_token);
+        use base64::Engine;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+        let pubkey =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
+        c.tx(&format!("MSGSIG {pubkey}"));
+        let refused = c.rx(
+            |l| l.contains("MSGSIG OK") || l.contains("FAIL MSGSIG"),
+            "the answer to MSGSIG",
+        );
+        (refused, c.closed_within(3000))
+    })
+    .await
+    .unwrap();
+    assert!(
+        refused.contains("FAIL MSGSIG KEY_RETIRED")
+            && refused.ends_with(
+                "This device was signed out from another device. Sign in again to continue."
+            ),
+        "{refused}"
+    );
+    assert!(closed, "the refused connection is closed");
+    let resp = http()
+        .post(format!("http://{web}/session"))
+        .header("origin", format!("http://{web}"))
+        .json(&serde_json::json!({ "broker_token": second_login }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "the login it came in on is ended");
+
+    // A new key on a new login registers as before.
+    let (_third_login, web_token) = login(web, &state, "st-refused-3").await;
+    tokio::task::spawn_blocking(move || {
+        let mut c = Irc::connect(irc, "alice", &web_token);
+        c.msgsig(&ed25519_dalek::SigningKey::from_bytes(&[14u8; 32]));
+        assert!(!c.closed_within(500), "a live key keeps its connection");
+    })
+    .await
+    .unwrap();
+    let _ = &mut other;
+}

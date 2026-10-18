@@ -1,20 +1,23 @@
-//! Closing connections whose signing key has expired.
+//! Closing connections whose signing key has expired or was retired.
 //!
-//! A key's row says when it expires (`signing_keys.expires_at`). A device is
-//! refused at registration once that date has passed; one that stays
-//! connected across it is found here, once a minute, and closed the way a
-//! device signed out from elsewhere is (`web::api_device_sign_out`), with the
-//! words the web shows so it lands on sign-in. It is also refused the same
-//! way at its next `PRIVMSG`, `NOTICE`, `BATCH` or signed `TAGMSG`, which the
-//! read loop checks with `refuse_if_expired`; a `TAGMSG` without the client's
-//! signature is not checked.
+//! A key's row says when it expires (`signing_keys.expires_at`) and, once the
+//! key is signed out, when it was retired (`signing_keys.removed_at`). A
+//! device is refused at registration once its key has expired or is marked
+//! retired; one that stays connected across either is found here, once a
+//! minute, and closed the way a device signed out from elsewhere is
+//! (`web::api_device_sign_out`), with the words the web shows so it lands on
+//! sign-in. It is also refused the same way at its next `PRIVMSG`, `NOTICE`,
+//! `BATCH` or signed `TAGMSG`, which the read loop checks with
+//! `refuse_if_retired_or_expired`; a `TAGMSG` without the client's signature
+//! is not checked.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::server::SharedState;
 
-/// How often connected keys are checked against their expiry.
+/// How often connected keys are checked against their expiry and their
+/// row's retirement mark.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 /// The configured lifetime of a key this server files, in seconds.
@@ -38,8 +41,9 @@ pub fn spawn(state: Arc<SharedState>) {
     });
 }
 
-/// Close every connection whose registered key has reached its expiry, with
-/// [`refuse_if_expired`]. Returns how many were refused.
+/// Close every connection whose registered key has reached its expiry or is
+/// marked retired, with [`refuse_if_retired_or_expired`]. Returns how many
+/// were refused.
 pub async fn sweep(state: &Arc<SharedState>) -> usize {
     if state.db.is_none() {
         return 0;
@@ -56,28 +60,48 @@ pub async fn sweep(state: &Arc<SharedState>) -> usize {
     };
     let mut refused = 0;
     for (sid, did, kid) in connected {
-        if refuse_if_expired(state, &sid, &did, &kid).await {
+        if refuse_if_retired_or_expired(state, &sid, &did, &kid)
+            .await
+            .is_some()
+        {
             refused += 1;
         }
     }
     refused
 }
 
-/// If the key `kid` that session `sid` registered under `did` has reached its
-/// expiry: send `FAIL MSGSIG KEY_EXPIRED`, drop the session's key (so a close
-/// that finds the session already gone is not refused again), end the login
-/// token behind the key, and close the session. Returns whether it refused.
-/// The once-a-minute sweep calls it for every connected key, and the read
-/// loop for each message line from a session holding a key.
-pub async fn refuse_if_expired(state: &Arc<SharedState>, sid: &str, did: &str, kid: &str) -> bool {
+/// If the key `kid` that session `sid` registered under `did` is marked
+/// retired on its row, whatever the date, or has reached its expiry: send
+/// `FAIL MSGSIG KEY_RETIRED` or `KEY_EXPIRED`, as registration does, drop the
+/// session's key (so a close that finds the session already gone is not
+/// refused again), end the login token behind the key, and close the
+/// session. Returns how many login tokens it ended, or `None` when it did not
+/// refuse. The once-a-minute sweep calls it for every connected key, the read
+/// loop for each message line from a session holding a key, and the sign-out
+/// route for each session of the key it signs out.
+pub async fn refuse_if_retired_or_expired(
+    state: &Arc<SharedState>,
+    sid: &str,
+    did: &str,
+    kid: &str,
+) -> Option<usize> {
     let now = chrono::Utc::now().timestamp();
-    let expired = state
+    let row = state
         .with_db(|db| db.get_signing_key_row(did, kid))
-        .flatten()
-        .is_some_and(|row| row.expired_at(now));
-    if !expired {
-        return false;
-    }
+        .flatten();
+    let (code, words, reason) = match row {
+        Some(row) if row.removed_at.is_some() => (
+            "KEY_RETIRED",
+            crate::connection::KEY_RETIRED_WORDS,
+            "Signing key retired",
+        ),
+        Some(row) if row.expired_at(now) => (
+            "KEY_EXPIRED",
+            crate::connection::KEY_EXPIRED_WORDS,
+            "Signing key expired",
+        ),
+        _ => return None,
+    };
     // The session may have registered another key since it was listed.
     {
         let mut keys = state.session_msg_keys.lock();
@@ -85,22 +109,32 @@ pub async fn refuse_if_expired(state: &Arc<SharedState>, sid: &str, did: &str, k
             .get(sid)
             .is_some_and(|vk| freeq_sdk::sigtag::derive_kid(vk) == kid);
         if !still_this_key {
-            return false;
+            return None;
         }
         keys.remove(sid);
     }
-    let reply = crate::irc::Message::from_server(
-        &state.server_name,
-        "FAIL",
-        vec![
-            "MSGSIG",
-            "KEY_EXPIRED",
-            crate::connection::KEY_EXPIRED_WORDS,
-        ],
-    );
+    let reply =
+        crate::irc::Message::from_server(&state.server_name, "FAIL", vec!["MSGSIG", code, words]);
     if let Some(tx) = state.connections.lock().get(sid) {
         let _ = tx.try_send(format!("{reply}\r\n"));
     }
+    let ended = end_login_tokens_of_key(state, did, kid).await;
+    crate::connection::close_session(state, sid, reason);
+    if code == "KEY_RETIRED" {
+        tracing::info!(session = %sid, %did, %kid, "Closed a session whose signing key was retired");
+    } else {
+        tracing::info!(session = %sid, %did, %kid, "Closed a session whose signing key expired");
+    }
+    Some(ended)
+}
+
+/// End the login token filed for `did`'s key `kid` when a connection
+/// registered it, and drop it from the map. Returns how many it ended.
+pub(crate) async fn end_login_tokens_of_key(
+    state: &Arc<SharedState>,
+    did: &str,
+    kid: &str,
+) -> usize {
     let tokens: Vec<String> = {
         let mut linked = state.device_key_tokens.lock();
         let mut found = Vec::new();
@@ -117,7 +151,5 @@ pub async fn refuse_if_expired(state: &Arc<SharedState>, sid: &str, did: &str, k
     for token in &tokens {
         crate::connection::end_login_token(state, token).await;
     }
-    crate::connection::close_session(state, sid, "Signing key expired");
-    tracing::info!(session = %sid, %did, %kid, "Closed a session whose signing key expired");
-    true
+    tokens.len()
 }

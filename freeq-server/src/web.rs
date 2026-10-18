@@ -2984,7 +2984,8 @@ struct DeviceSignOutRequest {
 ///
 /// The account's own retirement record is the durable statement that the key
 /// is stood down; this is the eviction that follows it. Three things end: the
-/// key row is retired, every connection signing with that key is closed, and
+/// key row is retired, every connection signing with that key is closed with
+/// `FAIL MSGSIG KEY_RETIRED` (`key_expiry::refuse_if_retired_or_expired`), and
 /// the login token behind it stops working — refused here from now on, and
 /// its session deleted where it lives: the embedded session store, or the
 /// standalone broker, which is asked over a signed call and retried until it
@@ -3034,34 +3035,27 @@ async fn api_device_sign_out(
             .map(|(sid, _)| sid.clone())
             .collect()
     };
+    // Each is refused as the read loop and the sweep refuse a retired key:
+    // `FAIL MSGSIG KEY_RETIRED`, its key dropped, the login token behind it
+    // ended, then the close.
     let mut sessions_closed = 0usize;
+    let mut tokens_revoked = 0usize;
     for sid in &doomed {
-        if crate::connection::close_session(&state, sid, "Signed out from another device") {
+        if let Some(ended) =
+            crate::key_expiry::refuse_if_retired_or_expired(&state, sid, &did, &req.kid).await
+        {
             sessions_closed += 1;
+            tokens_revoked += ended;
         }
     }
 
-    // The login token behind that key: filed as signed out, then its session
-    // ended where it lives — the embedded store, or the standalone broker.
-    let tokens: Vec<String> = {
-        let mut linked = state.device_key_tokens.lock();
-        let mut found = Vec::new();
-        linked.retain(|(d, k), token| {
-            if d == &did && k == &req.kid {
-                found.push(token.clone());
-                false
-            } else {
-                true
-            }
-        });
-        found
-    };
-    for token in &tokens {
-        crate::connection::end_login_token(&state, token).await;
-    }
+    // The login token of a device with no connection here: filed as signed
+    // out, then its session ended where it lives — the embedded store, or the
+    // standalone broker.
+    tokens_revoked += crate::key_expiry::end_login_tokens_of_key(&state, &did, &req.kid).await;
 
     tracing::info!(
-        %did, kid = %req.kid, sessions_closed, tokens_revoked = tokens.len(),
+        %did, kid = %req.kid, sessions_closed, tokens_revoked,
         "device signed out"
     );
     (
@@ -3069,7 +3063,7 @@ async fn api_device_sign_out(
         Json(serde_json::json!({
             "ok": true,
             "sessions_closed": sessions_closed,
-            "tokens_revoked": tokens.len(),
+            "tokens_revoked": tokens_revoked,
         })),
     )
 }
