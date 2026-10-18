@@ -122,6 +122,7 @@ export {
   verifyProof,
   verifyRecord,
   deviceKeyHistory,
+  retiredOrExpired,
   agentLinkHistory,
   retirementClosure,
 } from './identity-records.js';

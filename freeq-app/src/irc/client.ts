@@ -19,6 +19,7 @@ import {
   format,
   makeDidResolver,
   recordKeyOf,
+  retiredOrExpired,
   type DeviceKeyRecord,
   type DeviceKeyStore,
   type StoredDeviceKey,
@@ -246,7 +247,7 @@ export async function deviceRowsFrom(
   const signedOut: { row: DeviceRow; since: string }[] = [];
   for (const key of await deviceKeyHistory(did, records)) {
     const label = (key.record as Partial<DeviceKeyRecord>).label;
-    const retired = key.retiredAt !== null && key.retiredAt.getTime() <= now;
+    const retired = retiredOrExpired(key, new Date(now));
     const active = key.createdAt.getTime() <= now && !retired;
     if (!active && !retired) continue;
     if (retired && now - key.retiredAt!.getTime() > SIGNED_OUT_LISTED_MS) continue;

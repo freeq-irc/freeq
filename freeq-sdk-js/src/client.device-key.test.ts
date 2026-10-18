@@ -398,14 +398,14 @@ describe('a stored key the account has retired', () => {
   const KEY_TYPE = 'at.freeq.deviceKey';
   type StubRepo = Awaited<ReturnType<typeof import('../test/repo-proofs.js')['stubRepo']>>;
 
-  /** `stored`'s own record, and a retirement of it signed by the key itself. */
-  async function recordsOf(stored: StoredDeviceKey): Promise<{ record: unknown; retirement: unknown }> {
+  /** `stored`'s own record, and a retirement of it dated `at`, signed by the key itself. */
+  async function recordsOf(stored: StoredDeviceKey, at = RETIRED): Promise<{ record: unknown; retirement: unknown }> {
     const { buildDeviceRecord, buildDeviceRetirement } = await import('./identity-records.js');
     const { recordKeyOf } = await import('./device-key.js');
     const key = await recordKeyOf(stored.keyPair);
     const record = await buildDeviceRecord(key, DID, stored.createdAt);
     const kid = await deriveKid(decodeMultibaseEd25519(key.publicKeyMultibase));
-    return { record, retirement: await buildDeviceRetirement(key, DID, kid, RETIRED) };
+    return { record, retirement: await buildDeviceRetirement(key, DID, kid, at) };
   }
 
   /** The account's repository holding `records`, each with its proof. */
@@ -755,6 +755,17 @@ describe('a stored key the account has retired', () => {
     await until(() => enrollCalls.length > 0);
     expect(enrollCalls).toHaveLength(1);
     expect(enrollCalls[0]!.record.publicKeyMultibase).toBeDefined();
+  });
+
+  it('is replaced right after a new sign-in when its retirement is dated ahead of the clock', async () => {
+    const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+    const ahead = new Date(Date.now() + 3_600_000).toISOString();
+    const { record, retirement } = await recordsOf(stored, ahead);
+    const store = new MemoryDeviceKeyStore(stored);
+    const { client } = await clientReading(store, await repoHolding(record, retirement), true);
+    const ws = await login(client);
+    expect(msgsigOf(ws)).not.toBe(await rawPublicB64(stored.keyPair));
+    expect((await store.load())!.keyPair).not.toBe(stored.keyPair);
   });
 
   it('is not replaced when it is still live', async () => {

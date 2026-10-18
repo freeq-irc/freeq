@@ -15,7 +15,12 @@ import * as e2ee from './e2ee.js';
 import { dmPeerKey, isDid } from './address.js';
 import { prefetchProfiles } from './profiles.js';
 import { recordKeyOf, type DeviceKeyStore, type StoredDeviceKey } from './device-key.js';
-import { KEY_LIFETIME_MS, buildDeviceRecord, deviceKeyHistory } from './identity-records.js';
+import {
+  KEY_LIFETIME_MS,
+  buildDeviceRecord,
+  deviceKeyHistory,
+  retiredOrExpired,
+} from './identity-records.js';
 import { KeyLookup, type KeyPair, didKeyAnswer, makeDidResolver } from './key-lookup.js';
 import {
   RULING_VERBS,
@@ -2850,9 +2855,9 @@ export class FreeqClient extends EventEmitter {
       // Listed afresh: the retirement may be newer than the listing held. Only
       // the records that can retire this key are proven.
       const records = await lookup.provenRetirementClosure(did, kid);
-      const now = Date.now();
+      const now = new Date();
       const retired = (await deviceKeyHistory(did, records)).some(
-        (k) => k.kid === kid && k.retiredAt !== null && k.retiredAt.getTime() <= now,
+        (k) => k.kid === kid && retiredOrExpired(k, now),
       );
       // Retired, or expired by its record.
       if (!retired) return stored;

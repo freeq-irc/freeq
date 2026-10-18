@@ -276,6 +276,18 @@ export async function deviceKeyHistory(
 }
 
 /**
+ * Whether a device holding `key` must stop using it at `now`: a retirement
+ * before its expiry counts at once, whatever its date, and an expiry once it
+ * is reached. Message verdicts judge by date instead.
+ */
+export function retiredOrExpired(key: DeviceKeyHistory, now: Date): boolean {
+  return (
+    key.retiredAt !== null &&
+    (key.retiredAt.getTime() < key.expiresAt.getTime() || key.retiredAt.getTime() <= now.getTime())
+  );
+}
+
+/**
  * The entries of `did`'s device key records that decide whether key `kid` is
  * retired: `kid`'s own key record, which carries its expiry; the retirements
  * of `kid`, and, repeatedly, of each key that signed one of those; and the

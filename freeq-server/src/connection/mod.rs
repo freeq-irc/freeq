@@ -299,7 +299,7 @@ async fn refuse_if_retired(
     // The published key's row follows its record (a key published after its
     // last registration keeps the local date until it connects again).
     state.with_db(|db| db.set_signing_key_expiry(did, kid, Some(key.expires_at.timestamp())));
-    let Some(retired_at) = key.retired_at.filter(|at| *at <= now) else {
+    let Some(retired_at) = key.retired_at.filter(|_| key.retired_or_expired(now)) else {
         return;
     };
     if retired_at == key.expires_at {
@@ -4868,6 +4868,49 @@ mod retired_key_tests {
             .expect("the key row");
         assert_eq!(row.removed_at, None);
     }
+    #[tokio::test]
+    async fn a_key_retired_with_a_date_ahead_of_the_clock_is_refused() {
+        let key = signing_key(48);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let signer = freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&key.to_bytes()).unwrap();
+        let ahead = at(now() + 3600);
+        let mut records = device_records(&key, false);
+        records.push(
+            serde_json::to_value(
+                freeq_sdk::identity_records::build_device_retirement(&signer, DID, &kid, &ahead)
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        let resolver = crate::peer_keys::stub_pds_resolver(DID, records).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            resolver,
+        );
+
+        let mut client = Client::signed_in(&state, "BT-RETIRED-AHEAD").await;
+        client.tx(&msgsig_line(&key)).await;
+        let lines = client.rest().await;
+        assert!(
+            lines.iter().any(|l| l.contains("FAIL MSGSIG KEY_RETIRED")),
+            "{lines:?}"
+        );
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-RETIRED-AHEAD"))
+        );
+        let row = state
+            .with_db(|db| db.get_signing_key_row(DID, &kid))
+            .flatten()
+            .expect("the key row");
+        let stamped = chrono::DateTime::parse_from_rfc3339(&ahead)
+            .unwrap()
+            .timestamp();
+        assert_eq!(row.removed_at, Some(stamped), "stamped with its own date");
+    }
+
     #[tokio::test]
     async fn a_key_this_server_retired_is_refused_at_registration_with_the_pds_unreadable() {
         let key = signing_key(47);

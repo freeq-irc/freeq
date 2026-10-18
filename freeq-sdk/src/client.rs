@@ -2275,7 +2275,7 @@ async fn replace_retired_device_key<P: freeq_oauth::ClientProvider>(
     let now = chrono::Utc::now();
     let retired = crate::identity_records::device_key_history(did, &records)
         .iter()
-        .any(|k| k.kid == kid && k.retired_at.is_some_and(|r| r <= now));
+        .any(|k| k.kid == kid && k.retired_or_expired(now));
     if retired {
         save_replacement(store, did);
     }
@@ -12001,6 +12001,17 @@ mod device_key_tests {
         let live = MemoryStore::holding(12, Some("at://did:plc:tester/at.freeq.deviceKey/3live"));
         replace_retired_device_key(true, Some(live.as_ref()), &lookup, "did:plc:tester").await;
         assert!(live.saves.lock().is_empty(), "a live key is kept");
+    }
+
+    #[tokio::test]
+    async fn after_a_new_sign_in_a_retirement_dated_ahead_of_the_clock_replaces_the_key() {
+        let ahead = (chrono::Utc::now() + chrono::TimeDelta::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let records = [record_for(15), retirement_by(15, 15, &ahead)];
+        let (lookup, _) = lookup_listing(repo_holding(&records)).await;
+        let store = MemoryStore::holding(15, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
+        replace_retired_device_key(true, Some(store.as_ref()), &lookup, "did:plc:tester").await;
+        assert_eq!(store.saves.lock().len(), 1, "the key is replaced");
     }
 
     /// A retirement of `target`'s key signed by `signer`'s, dated `at`.
