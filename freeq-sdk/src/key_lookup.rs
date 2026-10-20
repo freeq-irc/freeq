@@ -1063,6 +1063,14 @@ impl<P: ClientProvider> KeyLookup<P> {
             {
                 cached = Some(match hit.other {
                     None => self.relisted(&slot, did, kid, hit).await,
+                    // A key the origin vouched for takes the listing again
+                    // too, so a record published since lands on it; the
+                    // origin is not asked for the key again. A server's DID
+                    // has no records to list.
+                    Some(Some(FoundKey {
+                        source: KeySource::OriginServer,
+                        ..
+                    })) if !ask.server => self.relisted(&slot, did, kid, hit).await,
                     Some(_) => hit,
                 });
             }
@@ -3431,8 +3439,11 @@ mod tests {
         assert_eq!(pds.hits(), 1, "neither kid listed the account again");
     }
 
+    /// A key the origin vouched for takes the account's records again past
+    /// the ttl, as one found in them does, so a record published since
+    /// lands on it; the origin is never asked for the key again.
     #[tokio::test]
-    async fn a_found_key_is_answered_after_the_ttl_with_no_request() {
+    async fn a_vouched_key_is_listed_for_again_after_the_ttl() {
         let pds = pds(vec![]).await;
         let origin = origin(vec![(ALICE, kid_of(2), raw(2))]).await;
         let keys = lookup(
@@ -3454,8 +3465,20 @@ mod tests {
         );
         assert_eq!(
             (pds.hits(), origin.hits()),
-            asked,
-            "a found key does not expire"
+            (asked.0 + 1, asked.1),
+            "one listing, and the origin not asked again"
+        );
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(2))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::OriginServer)
+        );
+        assert_eq!(
+            (pds.hits(), origin.hits()),
+            (asked.0 + 1, asked.1),
+            "none again inside the ttl"
         );
     }
 
@@ -4760,6 +4783,32 @@ mod tests {
         assert_eq!(pds.hits(), 0, "the PDS was not asked");
     }
 
+    /// A line that reaches the reader before the device's record is
+    /// published reads as the server vouching for it, and turns into a
+    /// records answer at the re-check past the ttl.
+    #[tokio::test]
+    async fn a_line_before_the_publish_reads_the_record_at_the_re_check_past_the_ttl() {
+        let (home_server, pds, repos, docs) = three_signers().await;
+        let keys = lookup_at_home_for(docs, &home_server, Duration::from_millis(400));
+        home_server
+            .keys
+            .lock()
+            .insert((ALICE.to_string(), kid_of(4)), raw(4));
+        keys.prefetch(&[ALICE.to_string()]).await;
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::OriginServer));
+
+        alice_publishes(&home_server, &repos, 4);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let listed = home_listings(&home_server);
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::IdentityRecord));
+        assert_eq!(
+            home_listings(&home_server) - listed,
+            1,
+            "one listing at the re-check"
+        );
+        assert_eq!(pds.hits(), 0, "the PDS was not asked");
+    }
+
     #[tokio::test]
     async fn refresh_account_lists_the_pds_while_the_home_server_serves_an_older_copy() {
         let (home_server, pds, repos, docs) = three_signers().await;
@@ -4946,6 +4995,42 @@ mod tests {
         assert_eq!(home_server.counts(), (0, 0, 0), "no records asked for");
         assert!(home_server.batches.lock().is_empty());
         assert_eq!(pds.hits(), 0);
+    }
+
+    /// A server's own identity has no records: a key the origin vouched for
+    /// under one is not listed for past the ttl, where an account's is.
+    #[tokio::test]
+    async fn a_vouched_key_of_a_server_is_not_listed_for_after_the_ttl() {
+        const PEER: &str = "did:web:peer.example";
+        let (home_server, pds, _repos, docs) = three_signers().await;
+        home_server
+            .keys
+            .lock()
+            .insert((PEER.to_string(), kid_of(7)), raw(7));
+        let keys = lookup_at_home_for(docs, &home_server, Duration::from_millis(400));
+        let ask = KeyAsk {
+            retry: false,
+            server: true,
+        };
+        assert_eq!(
+            keys.key_for_at_with(PEER, &kid_of(7), Utc::now(), ask)
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::OriginServer)
+        );
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            keys.key_for_at_with(PEER, &kid_of(7), Utc::now(), ask)
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::OriginServer)
+        );
+        assert_eq!(home_server.counts(), (0, 0, 0), "no records asked for");
+        assert!(home_server.batches.lock().is_empty());
+        assert_eq!(pds.hits(), 0, "the PDS was not asked");
     }
 
     #[tokio::test]

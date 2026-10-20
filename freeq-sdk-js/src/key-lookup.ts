@@ -416,9 +416,13 @@ export class KeyLookup {
       const hit = this.cache.get(slot);
       let cached = hit !== undefined && Date.now() - hit.at < this.ttlMs ? hit : undefined;
       // A found key does not expire; one found in the records takes the DID's
-      // listing again past the ttl, so a retirement since lands on it.
+      // listing again past the ttl, so a retirement since lands on it. A key
+      // the origin vouched for takes it too, so a record published since
+      // lands on it; the origin is not asked for the key again. A server's
+      // DID has no records to list.
       if (cached === undefined && hit !== undefined && hit.other !== null) {
-        cached = hit.other === undefined ? await this.relisted(slot, did, kid, hit) : hit;
+        const vouched = hit.other?.source === 'OriginServer' && options.server !== true;
+        cached = hit.other === undefined || vouched ? await this.relisted(slot, did, kid, hit) : hit;
       }
       if (cached !== undefined) {
         const inRecords = await fromRecords(did, kid, cached.records, at);
