@@ -832,7 +832,7 @@ describe('a replayed history batch', () => {
     expect(s.seen.get(multi.msgid)?.settled?.state).toBe('device');
   });
 
-  it('asks for its signers in one records request and their keys in one key request', async () => {
+  it('asks for its signers in one records request, their keys in one key request, and the vouched accounts once more', async () => {
     origin.recordRoutes = true;
     const s = await session(OWN_DID, lookup());
     const lines = [
@@ -854,7 +854,9 @@ describe('a replayed history batch', () => {
       'device',
       'device',
     ]);
-    expect(origin.recordsReads, 'records').toBe(1);
+    // The batch's own records request, then one for the accounts of the
+    // keys the server vouched for, in case a record was published since.
+    expect(origin.recordsReads, 'records').toBe(2);
     expect(origin.batchReads, 'keys').toBe(1);
     expect(origin.kidReads, 'no key asked on its own').toBe(0);
   });

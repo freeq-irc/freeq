@@ -469,6 +469,7 @@ export class KeyLookup {
   ): Promise<Settled> {
     const started = performance.now();
     const refreshes = this.refreshes.get(did);
+    const listedBefore = this.refreshed.get(did);
     const listed = cached === undefined;
     let settled = await this.ask(did, kid, at, cached?.records ?? (server ? [] : undefined));
     // Only a line signed just now is asked about again.
@@ -478,6 +479,22 @@ export class KeyLookup {
       if (!missed) break;
       await new Promise((resolve) => setTimeout(resolve, Math.max(0, started + after - performance.now())));
       settled = await this.ask(did, kid, at, settled.records, true);
+    }
+    // The server vouches for a key the held listing lacks: the account's
+    // records are taken once more, whatever the hour, so a key published
+    // since is answered from them. A server's DID has none.
+    if (settled.other?.source === 'OriginServer' && !server) {
+      try {
+        const records = await this.listedSince(did, kid, listedBefore);
+        if ((await fromRecords(did, kid, records, at)) !== null) {
+          settled = { records, other: undefined, failed: false, failure: undefined };
+        } else {
+          settled = { ...settled, records };
+        }
+      } catch {
+        // The listing failed: the origin's answer stands and is kept, so the
+        // lines after it inside the ttl ask nothing.
+      }
     }
     if (settled.other === undefined) {
       if (listed && !settled.failed) this.remember(slot, settled.records, undefined);
@@ -619,6 +636,8 @@ export class KeyLookup {
   /** `prefetchKeys`' requests for the pairs it asks. */
   private async askBatchRoute(base: string, asked: KeyPair[]): Promise<void> {
     let kept = false;
+    /** Keys the origin vouched for, held back until their accounts are listed. */
+    const vouched: [string, string, FoundKey][] = [];
     for (let i = 0; i < asked.length; i += MAX_KEYS_PER_REQUEST) {
       const chunk = asked.slice(i, i + MAX_KEYS_PER_REQUEST);
       let answered: Map<string, OriginAnswer>;
@@ -640,9 +659,28 @@ export class KeyLookup {
         // A miss counts only when the account's records were read: without
         // them, the line's own lookup lists the account.
         if (other === null && !server && !this.records.has(did) && !did.startsWith('did:key:')) continue;
+        if (other !== null && !server) {
+          vouched.push([did, kid, other]);
+          continue;
+        }
         this.remember(slot, records, other);
         kept = true;
       }
+    }
+    // The accounts of the keys the origin vouched for are listed once more,
+    // in one request, and in one of its own for an account a read was
+    // already running for, before their answers are kept, so a key
+    // published since is answered from the records; the lines of the history
+    // batch that brought them are checked after this. `prefetch` leaves out
+    // a `did:key`, which has no records at all.
+    if (vouched.length > 0) {
+      await this.prefetchWith(vouched.map(([did]) => did), true);
+      for (const [did, kid, other] of vouched) {
+        const records = this.records.get(did)?.records ?? [];
+        const published = (await fromRecords(did, kid, records, new Date())) !== null;
+        this.remember(JSON.stringify([did, kid]), records, published ? undefined : other);
+      }
+      kept = true;
     }
     if (kept) await this.save();
   }
@@ -686,6 +724,16 @@ export class KeyLookup {
    * without an origin. Never fails.
    */
   async prefetch(dids: string[]): Promise<void> {
+    await this.prefetchWith(dids, false);
+  }
+
+  /**
+   * [`prefetch`]; `relist` takes each account's records again however
+   * recently they were listed, and waits for a listing in flight rather
+   * than leaving that account out, for the keys a batch key request found
+   * the origin vouching for.
+   */
+  private async prefetchWith(dids: string[], relist: boolean): Promise<void> {
     await this.load();
     const home = this.originBase();
     if (home === null) return;
@@ -700,8 +748,25 @@ export class KeyLookup {
         waits.push(inFlight);
         continue;
       }
+      const listing = this.listing.get(did);
+      if (listing !== undefined) {
+        // The listing in flight is waited for and then the account is read
+        // through `listRecordsOf`, which starts a listing of its own: the
+        // promise waited for drops its own entry in the map before it
+        // settles, so the only listing left to join is one begun since.
+        // Neither failing rejects out of here, which would drop the batch's
+        // answers.
+        if (relist)
+          waits.push(
+            listing
+              .catch(() => undefined)
+              .then(() => this.listRecordsOf(did, DEVICE_KEY_TYPE).catch(() => undefined))
+              .then(() => undefined),
+          );
+        continue;
+      }
       const last = this.records.get(did);
-      if (this.listing.has(did) || (last !== undefined && now - last.at < this.ttlMs)) continue;
+      if (!relist && last !== undefined && now - last.at < this.ttlMs) continue;
       asked.push(did);
     }
     if (asked.length > 0) {
@@ -833,12 +898,28 @@ export class KeyLookup {
   }
 
   /**
+   * `did`'s records from a listing begun no earlier than this lookup was:
+   * the one in flight, else what is held, if anything, when the DID was
+   * listed since (`before` is what `refreshed` held when the lookup began),
+   * else a listing of its own, the once-per-ttl rule skipped. For a key the
+   * origin vouched for, whose record may have been published since the
+   * listing in hand. A `did:key` has no records, and is answered without a
+   * request.
+   */
+  private async listedSince(did: string, kid: string, before: number | undefined): Promise<unknown[]> {
+    if (this.listing.has(did) || this.prefetching.has(did)) return this.listRecordsOf(did, DEVICE_KEY_TYPE);
+    if (this.refreshed.get(did) !== before) return this.records.get(did)?.records ?? [];
+    return this.deviceRecords(did, kid, true);
+  }
+
+  /**
    * `did`'s proven device records: the last listing while inside the ttl, if
    * it names `kid` or the DID was already listed for a lookup inside the ttl;
    * else a listing, so a key published since is found within the ttl. A
-   * `did:key` has none, and is answered without a request.
+   * `did:key` has none, and is answered without a request. `listNow` skips
+   * the once-per-ttl rule, for `listedSince`.
    */
-  private async deviceRecords(did: string, kid: string): Promise<unknown[]> {
+  private async deviceRecords(did: string, kid: string, listNow = false): Promise<unknown[]> {
     // A did:key has no repository to list: the DID is the key. Answering
     // before anything is looked up or asked for keeps the records step from
     // making a request the server can only answer empty.
@@ -848,7 +929,7 @@ export class KeyLookup {
     if (last !== undefined && now - last.at < this.ttlMs) {
       if ((await deviceKeyHistory(did, last.records)).some((k) => k.kid === kid)) return last.records;
       const refreshed = this.refreshed.get(did);
-      if (refreshed !== undefined && now - refreshed < this.ttlMs) return last.records;
+      if (!listNow && refreshed !== undefined && now - refreshed < this.ttlMs) return last.records;
     }
     this.refreshed.set(did, now);
     return this.listRecordsOf(did, DEVICE_KEY_TYPE);

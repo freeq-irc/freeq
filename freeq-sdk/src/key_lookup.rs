@@ -1120,6 +1120,7 @@ impl<P: ClientProvider> KeyLookup<P> {
     ) -> Settled {
         let started = tokio::time::Instant::now();
         let refreshes = self.refresh_count(did);
+        let listed_before = self.refreshed.lock().get(did).copied();
         let listed = cached.is_none();
         // A server's DID has no device records to list.
         let held = cached
@@ -1145,6 +1146,31 @@ impl<P: ClientProvider> KeyLookup<P> {
             tokio::time::sleep_until(started + *after).await;
             // The first ask listed the records; a retry asks the origin only.
             settled = self.ask(did, kid, at, Some(settled.records), true).await;
+        }
+        // The server vouches for a key the held listing lacks: the account's
+        // records are taken once more, whatever the ttl, so a key published
+        // since is answered from them. A server's DID has none. A listing
+        // that fails leaves the origin's answer to stand, and be kept, so
+        // the lines after it inside the ttl ask nothing.
+        if !ask.server
+            && matches!(
+                settled.other,
+                Some(Some(FoundKey {
+                    source: KeySource::OriginServer,
+                    ..
+                }))
+            )
+            && let Ok(records) = self.listed_since(did, kid, listed_before).await
+        {
+            if in_records(did, kid, &records, at).is_some() {
+                settled = Settled {
+                    records,
+                    other: None,
+                    failure: None,
+                };
+            } else {
+                settled.records = records;
+            }
         }
         match (&settled.other, &settled.failure) {
             (None, None) if listed => self.remember(slot.clone(), settled.records.clone(), None),
@@ -1181,7 +1207,7 @@ impl<P: ClientProvider> KeyLookup<P> {
         let mut failure = None;
         let records = match held {
             Some(records) => records,
-            None => match self.device_records(did, kid).await {
+            None => match self.device_records(did, kid, false).await {
                 Ok(records) => records,
                 Err(e) => {
                     failure = Some(e);
@@ -1381,6 +1407,9 @@ impl<P: ClientProvider> KeyLookup<P> {
     /// was kept.
     async fn ask_batch_route_for(&self, base: &str, asked: &[KeyPair]) -> bool {
         let mut kept = false;
+        // Keys the origin vouched for, held back until their accounts are
+        // listed.
+        let mut vouched: Vec<((String, String), FoundKey)> = Vec::new();
         for chunk in asked.chunks(MAX_KEYS_PER_REQUEST) {
             let slots: Vec<(String, String)> = chunk
                 .iter()
@@ -1421,9 +1450,37 @@ impl<P: ClientProvider> KeyLookup<P> {
                 if found.is_none() && records.is_none() && !did.starts_with("did:key:") {
                     continue;
                 }
+                if let Some(found) = found
+                    && !pair.server
+                {
+                    vouched.push((slot, found));
+                    continue;
+                }
                 self.remember(slot, records.unwrap_or_default(), Some(found));
                 kept = true;
             }
+        }
+        // The accounts of the keys the origin vouched for are listed once
+        // more, in one request, and in one of its own for an account a read
+        // was already running for, before their answers are kept, so a key
+        // published since is answered from the records; the lines of the
+        // history batch that brought them are checked after this.
+        // `prefetch_with` leaves out a `did:key`, which has no records.
+        if !vouched.is_empty() {
+            let dids: Vec<String> = vouched.iter().map(|((did, _), _)| did.clone()).collect();
+            self.prefetch_with(&dids, true).await;
+            for ((did, kid), found) in vouched {
+                let records = self
+                    .records
+                    .lock()
+                    .get(&did)
+                    .map(|(records, _)| records.clone())
+                    .unwrap_or_default();
+                let published = in_records(&did, &kid, &records, Utc::now()).is_some();
+                let other = if published { None } else { Some(Some(found)) };
+                self.remember((did, kid), records, other);
+            }
+            kept = true;
         }
         kept
     }
@@ -1502,6 +1559,14 @@ impl<P: ClientProvider> KeyLookup<P> {
     /// awaited rather than asked for again. Nothing is asked without an
     /// origin. Never fails.
     pub async fn prefetch(&self, dids: &[String]) {
+        self.prefetch_with(dids, false).await;
+    }
+
+    /// [`Self::prefetch`]; `relist` takes each account's records again
+    /// however recently they were listed, and waits for a listing in flight
+    /// rather than leaving that account out, for the keys a batch key
+    /// request found the origin vouching for.
+    async fn prefetch_with(&self, dids: &[String], relist: bool) {
         self.load().await;
         let Some(home) = self.origin_base() else {
             return;
@@ -1509,6 +1574,8 @@ impl<P: ClientProvider> KeyLookup<P> {
         // The prefetches to await: the one this call starts, if any, and the
         // ones already in flight for DIDs it was given.
         let mut flights: Vec<Arc<Prefetch>> = Vec::new();
+        // Accounts with a listing of their own in flight, waited for after.
+        let mut listed: Vec<String> = Vec::new();
         {
             let mut asked: Vec<String> = Vec::new();
             let held = self.records.lock();
@@ -1529,9 +1596,12 @@ impl<P: ClientProvider> KeyLookup<P> {
                     continue;
                 }
                 if listing.contains_key(did) {
+                    if relist && !listed.contains(did) {
+                        listed.push(did.clone());
+                    }
                     continue;
                 }
-                if held.get(did).is_some_and(|(_, at)| self.inside_ttl(*at)) {
+                if !relist && held.get(did).is_some_and(|(_, at)| self.inside_ttl(*at)) {
                     continue;
                 }
                 asked.push(did.clone());
@@ -1547,19 +1617,32 @@ impl<P: ClientProvider> KeyLookup<P> {
                 flights.push(flight);
             }
         }
-        if flights.is_empty() {
-            return;
-        }
         for flight in &flights {
             self.settle_prefetch(home, flight).await;
         }
-        let mut prefetching = self.prefetching.lock();
-        for flight in &flights {
-            for did in &flight.asked {
-                if prefetching.get(did).is_some_and(|f| Arc::ptr_eq(f, flight)) {
-                    prefetching.remove(did);
+        if !flights.is_empty() {
+            let mut prefetching = self.prefetching.lock();
+            for flight in &flights {
+                for did in &flight.asked {
+                    if prefetching.get(did).is_some_and(|f| Arc::ptr_eq(f, flight)) {
+                        prefetching.remove(did);
+                    }
                 }
             }
+        }
+        for did in listed {
+            // The listing this batch found in flight is waited for, and the
+            // account is then listed again: a listing begun before the key
+            // was published cannot name it, so joining it alone leaves the
+            // line dim. The first call joins that listing and, on its way
+            // out, drops its finished cell, so the second lists the account
+            // itself; where the listing has ended already, that one call
+            // lists it. Either failing changes nothing here.
+            let in_flight = self.listing.lock().contains_key(&did);
+            if in_flight {
+                let _ = self.list_records_of(&did, DEVICE_KEY_TYPE, false).await;
+            }
+            let _ = self.list_records_of(&did, DEVICE_KEY_TYPE, false).await;
         }
     }
 
@@ -1666,11 +1749,48 @@ impl<P: ClientProvider> KeyLookup<P> {
         Ok(records)
     }
 
+    /// `did`'s records from a listing begun no earlier than this lookup was:
+    /// the one in flight, else what is held, if anything, when the DID was
+    /// listed since (`before` is what `refreshed` held when the lookup
+    /// began), else a listing of its own, the once-per-ttl rule skipped. For
+    /// a key the origin vouched for, whose record may have been published
+    /// since the listing in hand. A `did:key` has no records, and is answered
+    /// without a request.
+    async fn listed_since(
+        &self,
+        did: &str,
+        kid: &str,
+        before: Option<DateTime<Utc>>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let in_flight =
+            self.listing.lock().contains_key(did) || self.prefetching.lock().contains_key(did);
+        if in_flight {
+            return Ok(values(
+                self.list_records_of(did, DEVICE_KEY_TYPE, false).await?,
+            ));
+        }
+        let held = self
+            .records
+            .lock()
+            .get(did)
+            .map(|(records, _)| records.clone());
+        if self.refreshed.lock().get(did).copied() != before {
+            return Ok(held.unwrap_or_default());
+        }
+        self.device_records(did, kid, true).await
+    }
+
     /// `did`'s proven device records: the last listing while inside the ttl,
     /// if it names `kid` or the DID was already listed for a lookup inside
     /// the ttl; else a listing, so a key published since is found within the
     /// ttl. A `did:key` has none, and is answered without a request.
-    async fn device_records(&self, did: &str, kid: &str) -> Result<Vec<serde_json::Value>> {
+    /// `list_now` skips the once-per-ttl rule, for [`Self::listed_since`].
+    async fn device_records(
+        &self,
+        did: &str,
+        kid: &str,
+        list_now: bool,
+    ) -> Result<Vec<serde_json::Value>> {
         // A did:key has no repository to list: the DID is the key. Answering
         // before anything is looked up or asked for keeps the records step
         // from making a request the server can only answer empty.
@@ -1691,7 +1811,7 @@ impl<P: ClientProvider> KeyLookup<P> {
                 return Ok(records);
             }
             let refreshed = self.refreshed.lock().get(did).copied();
-            if refreshed.is_some_and(|at| self.inside_ttl(at)) {
+            if !list_now && refreshed.is_some_and(|at| self.inside_ttl(at)) {
                 return Ok(records);
             }
         }
@@ -2027,7 +2147,7 @@ impl<P: ClientProvider> KeyLookup<P> {
     /// beside the records (the origin's) stands unless the records now hold
     /// the key. A listing that fails leaves `hit` as it was.
     async fn relisted(&self, slot: &(String, String), did: &str, kid: &str, hit: Cached) -> Cached {
-        let Ok(records) = self.device_records(did, kid).await else {
+        let Ok(records) = self.device_records(did, kid, false).await else {
             return hit;
         };
         let other = match device_key_history(did, &records)
@@ -2490,6 +2610,12 @@ mod tests {
         /// How long the signing-key route waits before answering, in
         /// milliseconds.
         keys_delay_ms: Arc<AtomicU64>,
+        /// How long the per-account listing route holds its answer back
+        /// after reading the records, in milliseconds: `batch_delay_ms`'s
+        /// shape, waiting after the read rather than before it, so a test
+        /// can hold a listing on the wire whose answer is from before what
+        /// it publishes next.
+        listing_hold_ms: Arc<AtomicU64>,
     }
 
     impl Home {
@@ -2580,6 +2706,7 @@ mod tests {
         let copies: FrozenCopies = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let batch_delay_ms = Arc::new(AtomicU64::new(0));
         let keys_delay_ms = Arc::new(AtomicU64::new(0));
+        let listing_hold_ms = Arc::new(AtomicU64::new(0));
         let router = axum::Router::new()
             .route(
                 "/api/v1/records",
@@ -2660,12 +2787,13 @@ mod tests {
                         unseen.clone(),
                         not_found.clone(),
                     );
-                    let (frozen, copies) = (frozen.clone(), copies.clone());
+                    let (frozen, copies, hold) =
+                        (frozen.clone(), copies.clone(), listing_hold_ms.clone());
                     move |Path((did, collection)): Path<(String, String)>| {
                         hits.listing.fetch_add(1, Ordering::SeqCst);
                         let (repos, down, unseen, not_found) =
                             (repos.clone(), down.clone(), unseen.clone(), not_found.clone());
-                        let (frozen, copies) = (frozen.clone(), copies.clone());
+                        let (frozen, copies, hold) = (frozen.clone(), copies.clone(), hold.clone());
                         async move {
                             if not_found.load(Ordering::SeqCst) {
                                 return StatusCode::NOT_FOUND.into_response();
@@ -2676,23 +2804,33 @@ mod tests {
                             if unseen.lock().contains(&did) {
                                 return StatusCode::NOT_FOUND.into_response();
                             }
-                            let mut held = repos.lock();
-                            let Some(repo) = held.get_mut(&did) else {
-                                return StatusCode::NOT_FOUND.into_response();
+                            let answer = {
+                                let mut held = repos.lock();
+                                let Some(repo) = held.get_mut(&did) else {
+                                    return StatusCode::NOT_FOUND.into_response();
+                                };
+                                let Some(served) =
+                                    served_collection(repo, &collection, &frozen, &copies)
+                                else {
+                                    return StatusCode::BAD_GATEWAY.into_response();
+                                };
+                                axum::Json(json!({
+                                    "did": did,
+                                    "collection": collection,
+                                    "fetched_at": served["fetched_at"],
+                                    "stale": false,
+                                    "records": served["records"],
+                                }))
+                                .into_response()
                             };
-                            let Some(served) =
-                                served_collection(repo, &collection, &frozen, &copies)
-                            else {
-                                return StatusCode::BAD_GATEWAY.into_response();
-                            };
-                            axum::Json(json!({
-                                "did": did,
-                                "collection": collection,
-                                "fetched_at": served["fetched_at"],
-                                "stale": false,
-                                "records": served["records"],
-                            }))
-                            .into_response()
+                            // The records are read now and the answer handed
+                            // back after `listing_hold_ms`, so a test can keep
+                            // this listing on the wire.
+                            let wait = hold.load(Ordering::SeqCst);
+                            if wait > 0 {
+                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                            }
+                            answer
                         }
                     }
                 }),
@@ -2815,6 +2953,7 @@ mod tests {
             frozen,
             batch_delay_ms,
             keys_delay_ms,
+            listing_hold_ms,
         }
     }
 
@@ -4222,6 +4361,402 @@ mod tests {
             "none again inside the ttl"
         );
         assert!(keys.holds_origin_answer(ALICE, &kid_of(4)).await);
+        assert_eq!(pds.hits(), 0, "the PDS was not asked");
+    }
+
+    /// Alice's device `seed` as a reader meets it once its record is
+    /// published and the device has registered the key again: the home
+    /// server vouches for the key, and its copy of her account, frozen since
+    /// the registration, holds the record.
+    fn alice_publishes(home: &Home, repos: &HomeRepos, seed: u8) {
+        home.keys
+            .lock()
+            .insert((ALICE.to_string(), kid_of(seed)), raw(seed));
+        repos
+            .lock()
+            .get_mut(ALICE)
+            .unwrap()
+            .add(DEVICE_KEY_TYPE, &record_for(ALICE, seed));
+        home.frozen.store(false, Ordering::SeqCst);
+    }
+
+    /// The reader holds Alice's listing from before the publish and uses it
+    /// for her older device's line. The new device's first line, inside the
+    /// ttl, takes the list once more and reads the record.
+    #[tokio::test]
+    async fn a_line_of_a_key_published_since_the_held_listing_reads_the_record() {
+        let (home_server, pds, repos, docs) = three_signers().await;
+        let keys = lookup_at_home(docs, &home_server);
+        home_server.frozen.store(true, Ordering::SeqCst);
+        keys.prefetch(&[ALICE.to_string()]).await;
+        assert_eq!(source_of(&keys, 1).await, Some(KeySource::IdentityRecord));
+        let before = home_server.counts();
+
+        alice_publishes(&home_server, &repos, 4);
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::IdentityRecord));
+        let asked = home_server.counts();
+        assert_eq!(
+            (asked.0 - before.0, asked.1 - before.1, asked.2 - before.2),
+            (0, 1, 1),
+            "one listing and the new record's proof"
+        );
+        assert_eq!(pds.hits(), 0, "the PDS was not asked");
+
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::IdentityRecord));
+        assert_eq!(
+            home_server.counts(),
+            asked,
+            "the lines after it ask nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn twenty_lines_of_two_keys_published_since_read_the_records_with_one_listing() {
+        let (home_server, _pds, repos, docs) = three_signers().await;
+        let keys = Arc::new(lookup_at_home(docs, &home_server));
+        home_server.frozen.store(true, Ordering::SeqCst);
+        keys.prefetch(&[ALICE.to_string()]).await;
+        alice_publishes(&home_server, &repos, 4);
+        alice_publishes(&home_server, &repos, 5);
+
+        let listed = home_listings(&home_server);
+        let mut lines = tokio::task::JoinSet::new();
+        for i in 0..20u8 {
+            let keys = keys.clone();
+            lines.spawn(async move { source_of(&keys, 4 + i % 2).await });
+        }
+        let mut full = 0;
+        while let Some(done) = lines.join_next().await {
+            if done.unwrap() == Some(KeySource::IdentityRecord) {
+                full += 1;
+            }
+        }
+        assert_eq!(full, 20, "every line read from the records");
+        assert_eq!(
+            home_listings(&home_server) - listed,
+            1,
+            "one listing for the lot"
+        );
+    }
+
+    /// A reconnect's history batch brings two keys of one account the server
+    /// vouches for: their accounts are listed once more before the answers
+    /// are kept, so every line of the batch reads from the records.
+    #[tokio::test]
+    async fn a_history_batchs_keys_published_since_read_the_records() {
+        let (home_server, _pds, repos, docs) = three_signers().await;
+        let store = Arc::new(MemoryKeyLookupStore::default());
+        let first = lookup_at_home(docs.clone(), &home_server).with_store(store.clone());
+        home_server.frozen.store(true, Ordering::SeqCst);
+        first.prefetch(&[ALICE.to_string()]).await;
+        first.flush().await;
+        alice_publishes(&home_server, &repos, 4);
+        alice_publishes(&home_server, &repos, 5);
+
+        let again = lookup_at_home(docs, &home_server).with_store(store);
+        again.prefetch(&[ALICE.to_string()]).await;
+        let listed = home_listings(&home_server);
+        again
+            .prefetch_keys(&[
+                KeyPair::new(ALICE, kid_of(4)),
+                KeyPair::new(ALICE, kid_of(5)),
+            ])
+            .await;
+        for seed in [4u8, 4, 4, 5, 5] {
+            assert_eq!(
+                source_of(&again, seed).await,
+                Some(KeySource::IdentityRecord),
+                "the history line of key {seed}"
+            );
+        }
+        assert_eq!(
+            home_listings(&home_server) - listed,
+            1,
+            "one records request for the batch"
+        );
+    }
+
+    /// A history batch for an account that has a listing of its own in
+    /// flight: the batch waits for that listing and then lists the account
+    /// again, since a listing begun before the key was published cannot name
+    /// it. The listing in flight here is an answered cell, which is what the
+    /// map holds between a listing's answer and the removal of its cell by
+    /// the call that awaited it.
+    #[tokio::test]
+    async fn a_history_batch_lists_an_account_again_after_the_listing_it_waited_on() {
+        let (home_server, pds, repos, docs) = three_signers().await;
+        let keys = lookup_at_home(docs, &home_server);
+        keys.prefetch(&[ALICE.to_string()]).await;
+        alice_publishes(&home_server, &repos, 4);
+        let asked = home_server.counts();
+        // Her listing in flight: the one the lookup holds, which was begun
+        // before key 4 and so cannot name it.
+        let in_flight: Listing = Arc::new(tokio::sync::OnceCell::new());
+        let held = keys.records.lock().get(ALICE).unwrap().0.clone();
+        in_flight.set(Ok(unnamed(held))).unwrap();
+        keys.listing.lock().insert(ALICE.to_string(), in_flight);
+
+        keys.prefetch_keys(&[KeyPair::new(ALICE, kid_of(4))]).await;
+        assert_eq!(
+            source_of(&keys, 4).await,
+            Some(KeySource::IdentityRecord),
+            "the key published since the listing waited on"
+        );
+        let (batch, listing, proof) = home_server.counts();
+        assert_eq!(
+            (batch - asked.0, listing - asked.1, proof - asked.2),
+            (0, 1, 1),
+            "one listing of the account, and the new record's proof"
+        );
+        assert!(
+            !keys.listing.lock().contains_key(ALICE),
+            "the cell waited on was dropped by the call that joined it"
+        );
+        assert_eq!(pds.hits(), 0, "the PDS was not asked");
+    }
+
+    /// The same batch step where the listing it noted has ended before the
+    /// loop reaches it: the account is listed once, not twice, which is the
+    /// count the web makes on this path.
+    #[tokio::test]
+    async fn a_history_batch_lists_an_account_once_when_the_listing_it_noted_has_ended() {
+        let (home_server, pds, repos, docs) = three_signers().await;
+        let keys = Arc::new(lookup_at_home(docs, &home_server));
+        keys.prefetch(&[ALICE.to_string()]).await;
+        alice_publishes(&home_server, &repos, 4);
+        // A key of Bob's the server vouches for, so his account is asked for
+        // in the same batch and the loop runs after that request.
+        home_server
+            .keys
+            .lock()
+            .insert((BOB.to_string(), kid_of(6)), raw(6));
+        let asked = home_server.counts();
+        let in_flight: Listing = Arc::new(tokio::sync::OnceCell::new());
+        let held = keys.records.lock().get(ALICE).unwrap().0.clone();
+        in_flight.set(Ok(unnamed(held))).unwrap();
+        keys.listing.lock().insert(ALICE.to_string(), in_flight);
+        // Alice's cell is dropped while Bob's request is out, as the call
+        // that awaited her listing does.
+        home_server.batch_delay_ms.store(500, Ordering::SeqCst);
+        let dropped = {
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                keys.listing.lock().remove(ALICE);
+            })
+        };
+
+        keys.prefetch_keys(&[KeyPair::new(ALICE, kid_of(4)), KeyPair::new(BOB, kid_of(6))])
+            .await;
+        dropped.await.unwrap();
+        assert_eq!(
+            source_of(&keys, 4).await,
+            Some(KeySource::IdentityRecord),
+            "the key published since the listing that ended"
+        );
+        let (batch, listing, proof) = home_server.counts();
+        assert_eq!(
+            (batch - asked.0, listing - asked.1, proof - asked.2),
+            (1, 1, 1),
+            "Bob's records request, one listing of Alice's account, and her new record's proof"
+        );
+        assert_eq!(pds.hits(), 0, "the PDS was not asked");
+    }
+
+    /// The same batch step with a listing still on the wire: the batch
+    /// waits for it, and because the answer it brings was read before the
+    /// key was published, lists the account itself, so the key is found.
+    /// The twin of the web's 'lists an account again after the listing a
+    /// history batch waited on', which holds its listing back the same way.
+    #[tokio::test]
+    async fn a_history_batch_waits_for_a_listing_on_the_wire_and_lists_the_account() {
+        let (home_server, pds, repos, docs) = three_signers().await;
+        let keys = lookup_at_home(docs, &home_server);
+        keys.prefetch(&[ALICE.to_string()]).await;
+        // The origin vouches for key 4 before its record is published, as it
+        // does for a key a device has registered but not yet published.
+        home_server
+            .keys
+            .lock()
+            .insert((ALICE.to_string(), kid_of(4)), raw(4));
+        // Her account is listed again for a line of a kid nobody has, and
+        // that listing's answer held back while the batch below runs.
+        backdate_alice(&keys);
+        home_server.listing_hold_ms.store(500, Ordering::SeqCst);
+        let asked = home_server.counts();
+
+        let unknown = kid_of(9);
+        let pairs = [KeyPair::new(ALICE, kid_of(4))];
+        let (live, _) = tokio::join!(keys.key_for(ALICE, &unknown), async {
+            // The batch runs once that listing is on the wire, and key 4 is
+            // published while the batch is waiting for it.
+            while home_server.counts().1 == asked.1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            tokio::join!(keys.prefetch_keys(&pairs), async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                publish_alice_4(&repos);
+            });
+        });
+
+        assert_eq!(live.unwrap(), None, "the kid nobody has");
+        assert_eq!(
+            source_of(&keys, 4).await,
+            Some(KeySource::IdentityRecord),
+            "the key published while the batch waited on her listing"
+        );
+        let (batch, listing, proof) = home_server.counts();
+        assert_eq!(
+            (batch - asked.0, listing - asked.1, proof - asked.2),
+            (0, 2, 1),
+            "the listing waited on, the batch's own, and the new record's proof"
+        );
+        assert_eq!(pds.hits(), 0, "the PDS was not asked");
+    }
+
+    #[tokio::test]
+    async fn a_lookup_rebuilt_on_the_store_asks_nothing_for_a_key_already_settled() {
+        let (home_server, _pds, repos, docs) = three_signers().await;
+        let store = Arc::new(MemoryKeyLookupStore::default());
+        let keys = lookup_at_home(docs.clone(), &home_server).with_store(store.clone());
+        home_server.frozen.store(true, Ordering::SeqCst);
+        keys.prefetch(&[ALICE.to_string()]).await;
+        alice_publishes(&home_server, &repos, 4);
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::IdentityRecord));
+        keys.flush().await;
+
+        let asked = home_server.counts();
+        let again = lookup_at_home(docs, &home_server).with_store(store);
+        assert_eq!(source_of(&again, 4).await, Some(KeySource::IdentityRecord));
+        assert_eq!(
+            home_server.counts(),
+            asked,
+            "nothing asked after the reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unpublished_key_is_listed_for_once_however_many_lines() {
+        let (home_server, pds, _repos, docs) = three_signers().await;
+        let keys = lookup_at_home(docs, &home_server);
+        keys.prefetch(&[ALICE.to_string()]).await;
+        home_server
+            .keys
+            .lock()
+            .insert((ALICE.to_string(), kid_of(4)), raw(4));
+
+        let listed = home_listings(&home_server);
+        for _ in 0..20 {
+            assert_eq!(source_of(&keys, 4).await, Some(KeySource::OriginServer));
+        }
+        assert_eq!(
+            home_listings(&home_server) - listed,
+            1,
+            "one listing in all"
+        );
+        assert_eq!(pds.hits(), 0, "the PDS was not asked");
+    }
+
+    /// The reader's own listing fails outright: the server's answer stands
+    /// and is kept, so the lines after it inside the ttl ask nothing.
+    #[tokio::test]
+    async fn a_first_sight_listing_that_fails_keeps_the_origins_answer() {
+        let listings = Arc::new(AtomicUsize::new(0));
+        let counter = listings.clone();
+        let failing = axum::Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::INTERNAL_SERVER_ERROR }
+            }),
+        );
+        let pds = serve(failing, listings).await;
+        let origin = origin(vec![(ALICE, kid_of(2), raw(2))]).await;
+        let keys = lookup(vec![alice_on(&pds)], Some(&origin), HOUR);
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(2))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::OriginServer)
+        );
+
+        // The account was listed since the lookup began, so the first-sight
+        // read takes what is held of it, nothing, and tries no listing of
+        // its own.
+        assert_eq!(pds.hits(), 1, "the ask's listing, and no second attempt");
+        let asked = (pds.hits(), origin.hits());
+        for _ in 0..5 {
+            assert_eq!(
+                keys.key_for(ALICE, &kid_of(2))
+                    .await
+                    .unwrap()
+                    .map(|f| f.source),
+                Some(KeySource::OriginServer)
+            );
+        }
+        assert_eq!(
+            (pds.hits(), origin.hits()),
+            asked,
+            "nothing asked again inside the ttl"
+        );
+    }
+
+    /// A server's DID has no device records: a history batch naming one
+    /// lists nothing for it. Its live lines are
+    /// `asks_for_no_device_records_of_a_server`.
+    #[tokio::test]
+    async fn a_history_batch_holding_a_servers_own_key_lists_nothing_for_it() {
+        const PEER: &str = "did:web:peer.example";
+        let (home_server, pds, _repos, docs) = three_signers().await;
+        home_server
+            .keys
+            .lock()
+            .insert((PEER.to_string(), kid_of(7)), raw(7));
+        let keys = lookup_at_home(docs, &home_server);
+        keys.prefetch_keys(&[KeyPair::server(PEER, kid_of(7))])
+            .await;
+        assert_eq!(home_server.counts(), (0, 0, 0), "no records asked for");
+        assert_eq!(pds.hits(), 0, "the PDS was not asked");
+        assert_eq!(
+            keys.key_for_at_with(
+                PEER,
+                &kid_of(7),
+                Utc::now(),
+                KeyAsk {
+                    retry: false,
+                    server: true,
+                },
+            )
+            .await
+            .unwrap()
+            .map(|f| f.source),
+            Some(KeySource::OriginServer)
+        );
+    }
+
+    /// A did:key account signing under a kid its DID does not name: it has
+    /// no repository, so neither a history batch nor the line itself lists
+    /// anything for it.
+    #[tokio::test]
+    async fn a_did_key_accounts_other_kid_is_never_listed_for() {
+        const BOT: &str = "did:key:z6MkExampleBotSigner";
+        let (home_server, pds, _repos, docs) = three_signers().await;
+        {
+            let mut held = home_server.keys.lock();
+            held.insert((BOT.to_string(), kid_of(7)), raw(7));
+            held.insert((BOT.to_string(), kid_of(8)), raw(8));
+        }
+        let keys = lookup_at_home(docs, &home_server);
+        keys.prefetch_keys(&[KeyPair::new(BOT, kid_of(8))]).await;
+        assert_eq!(
+            keys.key_for(BOT, &kid_of(7))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::OriginServer)
+        );
+        assert_eq!(home_server.counts(), (0, 0, 0), "no records asked for");
         assert_eq!(pds.hits(), 0, "the PDS was not asked");
     }
 

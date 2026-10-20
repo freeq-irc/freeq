@@ -1248,6 +1248,211 @@ describe('KeyLookup through the home server', () => {
     expect(fetch.mock.calls.length).toBe(requests);
   });
 
+  /**
+   * Alice's device `seed` as a reader meets it once its record is published
+   * and the device has registered the key again: the home server's copy,
+   * frozen since the registration, holds the record. The server vouches for
+   * the key from the registration, so `homeNetwork` is given it.
+   */
+  async function alicePublishes(net: Awaited<ReturnType<typeof homeNetwork>>, seed: number): Promise<void> {
+    await net.alice.add('at.freeq.deviceKey', await buildDeviceRecord(await key(seed), ALICE, T0));
+    net.home.frozen = false;
+  }
+
+  it('reads a key published since the held listing from the records, with one listing and its proof', async () => {
+    const net = await homeNetwork({ [`${ALICE} ${await kidOf(4)}`]: await raw(4) });
+    const lookup = new KeyLookup({ fetch: net.fetch, resolveDid: net.resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    net.home.frozen = true;
+    await lookup.prefetch([ALICE]);
+    expect((await lookup.keyFor(ALICE, await kidOf(1)))?.source).toBe('IdentityRecord');
+    const before = { ...net.home.hits };
+
+    await alicePublishes(net, 4);
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
+    expect(net.home.hits, 'one listing and the new record’s proof').toEqual({
+      ...before,
+      listing: before.listing + 1,
+      proof: before.proof + 1,
+    });
+    expect(net.pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+
+    const asked = { ...net.home.hits };
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
+    expect(net.home.hits, 'the lines after it ask nothing').toEqual(asked);
+  });
+
+  it('reads twenty lines of two keys published since from the records, with one listing', async () => {
+    const net = await homeNetwork({
+      [`${ALICE} ${await kidOf(4)}`]: await raw(4),
+      [`${ALICE} ${await kidOf(5)}`]: await raw(5),
+    });
+    // A listing takes a moment to come back, as one over a network does,
+    // so the second key's lookup finds the first key's listing in flight.
+    const slow = async (input: string): Promise<Response> => {
+      if (new URL(input).pathname.startsWith('/api/v1/records/')) await new Promise((r) => setTimeout(r, 20));
+      return net.fetch(input);
+    };
+    const lookup = new KeyLookup({ fetch: slow, resolveDid: net.resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    net.home.frozen = true;
+    await lookup.prefetch([ALICE]);
+    await alicePublishes(net, 4);
+    await alicePublishes(net, 5);
+
+    const listed = net.home.hits.batch + net.home.hits.listing;
+    const kids = [await kidOf(4), await kidOf(5)];
+    const lines = await Promise.all(Array.from({ length: 20 }, (_, i) => lookup.keyFor(ALICE, kids[i % 2]!)));
+    expect(lines.filter((f) => f?.source === 'IdentityRecord')).toHaveLength(20);
+    expect(net.home.hits.batch + net.home.hits.listing - listed, 'one listing for the lot').toBe(1);
+  });
+
+  it('reads a history batch of keys published since from the records, in one records request', async () => {
+    const net = await homeNetwork({
+      [`${ALICE} ${await kidOf(4)}`]: await raw(4),
+      [`${ALICE} ${await kidOf(5)}`]: await raw(5),
+    });
+    const reader = { fetch: net.fetch, resolveDid: net.resolveDid };
+    const store = new MemoryKeyLookupStore();
+    const first = new KeyLookup(reader, ORIGIN, HOUR, NO_RETRIES, store);
+    net.home.frozen = true;
+    await first.prefetch([ALICE]);
+    await first.flush();
+    await alicePublishes(net, 4);
+    await alicePublishes(net, 5);
+
+    const again = new KeyLookup(reader, ORIGIN, HOUR, NO_RETRIES, store);
+    await again.prefetch([ALICE]);
+    const listed = net.home.hits.batch + net.home.hits.listing;
+    await again.prefetchKeys([[ALICE, await kidOf(4)], [ALICE, await kidOf(5)]]);
+    for (const seed of [4, 4, 4, 5, 5]) {
+      expect((await again.keyFor(ALICE, await kidOf(seed)))?.source, `the history line of key ${seed}`).toBe(
+        'IdentityRecord',
+      );
+    }
+    expect(net.home.hits.batch + net.home.hits.listing - listed, 'one records request for the batch').toBe(1);
+  });
+
+  // The twin of Rust's
+  // `a_history_batch_lists_an_account_again_after_the_listing_it_waited_on`,
+  // which stands an answered listing in the map where this one holds a real
+  // one back, the Rust home stub having no way to answer late.
+  it('lists an account again after the listing a history batch waited on', async () => {
+    const net = await homeNetwork({ [`${ALICE} ${await kidOf(4)}`]: await raw(4) });
+    // Alice's listing is answered before she publishes key 4 and handed back
+    // while the history batch is running, so the batch finds it in flight and
+    // what it brings cannot name the key.
+    const late = async (url: string): Promise<Response> => {
+      if (new URL(url).pathname !== '/api/v1/records') return net.fetch(url);
+      const answer = await net.fetch(url);
+      await new Promise((r) => setTimeout(r, 100));
+      return answer;
+    };
+    const lookup = new KeyLookup({ fetch: late, resolveDid: net.resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    const live = lookup.keyFor(ALICE, await kidOf(1));
+    await new Promise((r) => setTimeout(r, 20));
+    await alicePublishes(net, 4);
+    await lookup.prefetchKeys([[ALICE, await kidOf(4)]]);
+
+    expect(
+      (await lookup.keyFor(ALICE, await kidOf(4)))?.source,
+      'the key published since the listing waited on',
+    ).toBe('IdentityRecord');
+    expect((await live)?.source).toBe('IdentityRecord');
+    expect(net.home.hits, "one listing of its own, and the new record's proof").toEqual({
+      ...noHome,
+      batch: 1,
+      listing: 1,
+      proof: 1,
+    });
+    expect(net.pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+  });
+
+  it('asks nothing for a key already settled when the lookup is rebuilt on the store', async () => {
+    const net = await homeNetwork({ [`${ALICE} ${await kidOf(4)}`]: await raw(4) });
+    const reader = { fetch: net.fetch, resolveDid: net.resolveDid };
+    const store = new MemoryKeyLookupStore();
+    const lookup = new KeyLookup(reader, ORIGIN, HOUR, NO_RETRIES, store);
+    net.home.frozen = true;
+    await lookup.prefetch([ALICE]);
+    await alicePublishes(net, 4);
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
+    await lookup.flush();
+
+    const asked = { ...net.home.hits };
+    const again = new KeyLookup(reader, ORIGIN, HOUR, NO_RETRIES, store);
+    expect((await again.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
+    expect(net.home.hits, 'nothing asked after the reload').toEqual(asked);
+  });
+
+  it('lists once for an unpublished key, however many lines it signs', async () => {
+    const net = await homeNetwork({ [`${ALICE} ${await kidOf(4)}`]: await raw(4) });
+    const lookup = new KeyLookup({ fetch: net.fetch, resolveDid: net.resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    await lookup.prefetch([ALICE]);
+
+    const listed = net.home.hits.batch + net.home.hits.listing;
+    for (let i = 0; i < 20; i++) {
+      expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('OriginServer');
+    }
+    expect(net.home.hits.batch + net.home.hits.listing - listed, 'one listing in all').toBe(1);
+    expect(net.pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+  });
+
+  it("keeps the origin's answer when the first-sight listing fails, and asks nothing again inside the ttl", async () => {
+    const { fetch: working } = await network([], { [`${ALICE} ${await kidOf(2)}`]: await raw(2) });
+    let listings = 0;
+    const fetch = vi.fn(async (input: string): Promise<Response> => {
+      if (new URL(input).origin !== PDS) return working(input);
+      listings++;
+      return new Response('down', { status: 500 });
+    });
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
+    expect((await lookup.keyFor(ALICE, await kidOf(2)))?.source).toBe('OriginServer');
+
+    // The account was listed since the lookup began, so the first-sight read
+    // takes what is held of it, nothing, and tries no listing of its own.
+    expect(listings, "the ask's listing, and no second attempt").toBe(1);
+    const asked = [listings, fetch.mock.calls.length];
+    for (let i = 0; i < 5; i++) {
+      expect((await lookup.keyFor(ALICE, await kidOf(2)))?.source).toBe('OriginServer');
+    }
+    expect([listings, fetch.mock.calls.length], 'nothing asked again inside the ttl').toEqual(asked);
+  });
+
+  it('lists nothing for a server of its own in a history batch', async () => {
+    const PEER = 'did:web:peer.example';
+    const net = await homeNetwork({ [`${PEER} ${await kidOf(7)}`]: await raw(7) });
+    const lookup = new KeyLookup({ fetch: net.fetch, resolveDid: net.resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    await lookup.prefetchKeys([[PEER, await kidOf(7), true]]);
+    expect(net.home.hits, 'no records asked for').toEqual(noHome);
+    expect(net.pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+    expect((await lookup.keyForAt(PEER, await kidOf(7), new Date(), { server: true }))?.source).toBe('OriginServer');
+  });
+
+  // The twin of Rust's `asks_for_no_device_records_of_a_server`: the live
+  // path, with nothing kept for the key beforehand, so the ask itself
+  // reaches the first-sight re-list and must leave a server's DID out of it.
+  it('lists nothing for a server of its own on a live line', async () => {
+    const PEER = 'did:web:peer.example';
+    const net = await homeNetwork({ [`${PEER} ${await kidOf(7)}`]: await raw(7) });
+    const lookup = new KeyLookup({ fetch: net.fetch, resolveDid: net.resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    expect((await lookup.keyForAt(PEER, await kidOf(7), new Date(), { server: true }))?.source).toBe('OriginServer');
+    expect(net.home.hits, 'no records asked for').toEqual(noHome);
+    expect(net.home.batches, 'no account named in a batch').toEqual([]);
+    expect(net.pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+  });
+
+  it('lists nothing for another kid of a did:key account, live or in a history batch', async () => {
+    const BOT = 'did:key:z6MkExampleBotSigner';
+    const net = await homeNetwork({
+      [`${BOT} ${await kidOf(7)}`]: await raw(7),
+      [`${BOT} ${await kidOf(8)}`]: await raw(8),
+    });
+    const lookup = new KeyLookup({ fetch: net.fetch, resolveDid: net.resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    await lookup.prefetchKeys([[BOT, await kidOf(8)]]);
+    expect((await lookup.keyFor(BOT, await kidOf(7)))?.source).toBe('OriginServer');
+    expect(net.home.hits, 'no records asked for').toEqual(noHome);
+    expect(net.pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+  });
+
   it('lists the PDS on refreshAccount while the home server serves an older copy', async () => {
     const { alice, home, pds, hits, fetch, resolveDid } = await homeNetwork();
     const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);

@@ -14000,8 +14000,7 @@ mod verdict_tests {
     }
 
     #[tokio::test]
-    async fn a_closed_batch_asks_for_its_signers_in_one_records_request_and_their_keys_in_one_key_request()
-     {
+    async fn a_closed_batch_asks_for_its_signers_their_keys_and_the_vouched_accounts_once_more() {
         const A: &str = "did:plc:alice";
         const B: &str = "did:plc:bob";
         const C: &str = "did:plc:carol";
@@ -14032,7 +14031,9 @@ mod verdict_tests {
         start_deferred_checks(held, Some(&checker), &DidMaps::default(), &tx);
         verdicts(&mut rx, 5).await;
 
-        assert_eq!(routes.records.load(Ordering::SeqCst), 1, "records");
+        // The batch's own records request, then one for the accounts of the
+        // keys the server vouched for, in case a record was published since.
+        assert_eq!(routes.records.load(Ordering::SeqCst), 2, "records");
         assert_eq!(routes.batch.load(Ordering::SeqCst), 1, "keys");
         assert_eq!(routes.named.lock()[0].len(), 4, "each key named once");
         assert_eq!(
