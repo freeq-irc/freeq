@@ -34,7 +34,7 @@ import {
   type Tier,
 } from "./config.js";
 import { defaultNick, deriveInstallSlug, isDid, resolveBotName } from "./identity.js";
-import { isTerminal } from "@freeq/bot-kit";
+import { isTerminal, loadOrCreateIdentity } from "@freeq/bot-kit";
 import {
   agentInstructions,
   authorizeInstructions,
@@ -1372,9 +1372,10 @@ export class AgentRuntime {
           );
           return;
         }
-        // The DID is this project's identity, made on its first connect.
+        // The DID is this project's identity, minted on its first connect.
         if (!this.conn?.did) await this.connect();
-        const botDid = (this.conn as FreeqConnection | undefined)?.did;
+        const onDisk = await this.#identityOnDisk(cfg);
+        const botDid = (this.conn as FreeqConnection | undefined)?.did ?? onDisk?.did;
         if (!botDid) {
           this.notify(
             `freeq: not connected yet, so this installation has no DID to show. Run ${this.names.hint("status")}.`,
@@ -1388,7 +1389,7 @@ export class AgentRuntime {
           botDid,
           root: FREEQ_ROOT,
           signature: bot?.delegation?.signature,
-          stateDir: bot?.stateDir,
+          stateDir: bot?.stateDir ?? onDisk?.stateDir,
           names: this.names,
         });
         this.notify(
@@ -2033,6 +2034,24 @@ export class AgentRuntime {
    * minted at some point), or this is a git repository rather than a scratch
    * directory.
    */
+  /** This project's identity as its key file holds it, and where that file
+   *  lives; none before the first connect mints it. */
+  async #identityOnDisk(cfg: FreeqConfig): Promise<{ did: string; stateDir: string } | undefined> {
+    const meta = await collectSessionMeta({ cwd: this.harness.cwd(), model: this.harness.modelId() });
+    const slug = cfg.install ?? deriveInstallSlug();
+    const name = resolveBotName(
+      slug,
+      meta.project,
+      (n: string) => existsSync(joinPath(BOTS_ROOT, n)),
+      this.names.name,
+    );
+    const stateDir = joinPath(BOTS_ROOT, name);
+    const seedPath = joinPath(stateDir, "agent.key");
+    if (!existsSync(seedPath)) return undefined;
+    const identity = await loadOrCreateIdentity({ seedPath }).catch(() => null);
+    return identity ? { did: identity.did, stateDir } : undefined;
+  }
+
   async #projectIsKnown(cfg: FreeqConfig): Promise<boolean> {
     const meta = await collectSessionMeta({ cwd: this.harness.cwd(), model: this.harness.modelId() });
     this.currentProject = meta.project;

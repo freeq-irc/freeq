@@ -26,6 +26,8 @@ class FakeBot implements BotLike {
   mentionResult: { kind: string; stripped?: string } = { kind: "ignore" };
   senderDid: string | null = "did:key:zSender";
   failStart = false;
+  /** Reported through the authError handler before start() fails. */
+  authError: string | null = null;
 
   identity = { did: "did:key:zSelf" };
 
@@ -54,7 +56,10 @@ class FakeBot implements BotLike {
   }
   async start(): Promise<unknown> {
     this.startCalls++;
-    if (this.failStart) throw new Error("boom");
+    if (this.authError) {
+      for (const h of this.handlers.get("authError") ?? []) (h as (e: string) => void)(this.authError);
+    }
+    if (this.failStart) throw new Error(this.authError ?? "boom");
     return this;
   }
   async stop(reason?: string): Promise<unknown> {
@@ -122,6 +127,24 @@ describe("connect lifecycle", () => {
     expect(conn.state).toBe("error");
     expect(conn.lastError).toMatch(/boom/);
     expect(notices.some((n) => /could not connect/.test(n.text))).toBe(true);
+  });
+
+  it("points a refused delegated agent at /freeq authorize", async () => {
+    const { conn, bot, notices } = mk();
+    bot.failStart = true;
+    bot.authError = "SASL authentication failed (Not authorized to connect to this server: the agent records of did:plc:owner do not name this agent)";
+    await conn.start();
+    const auth = notices.find((n) => /authentication failed/.test(n.text))?.text ?? "";
+    expect(auth).toContain("Run /freeq authorize to add this installation as one of your agents.");
+  });
+
+  it("does not hint at authorize for an unrelated refusal", async () => {
+    const { conn, bot, notices } = mk();
+    bot.failStart = true;
+    bot.authError = "SASL authentication failed (bad response: response is not JSON)";
+    await conn.start();
+    const auth = notices.find((n) => /authentication failed/.test(n.text))?.text ?? "";
+    expect(auth).not.toContain("/freeq authorize");
   });
 
   it("discards a half-built bot on failure so a retry cannot double up", async () => {
