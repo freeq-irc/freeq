@@ -567,11 +567,17 @@ intended behavior; this section records reality.
    or verify the PLC audit log (`/log/audit`). Audit-log verification is
    mentioned in Security considerations as an option for higher-assurance
    deployments, not as implemented behavior.
-7. **Response fields undocumented in protocol notes.** The project's
+7. **An extra response member.** The reference server also reads an
+   `owner_did` member: the DID of the account the authenticating agent acts
+   for. A server with a connect allowlist may admit an agent whose own DID
+   it does not know when that account is allowed and its public agent
+   records (`at.freeq.agentKey`) name the agent. This draft does not define
+   the member; servers that do not implement it ignore it.
+8. **Response fields undocumented in protocol notes.** The project's
    protocol notes omit the `challenge_nonce` and `dpop_proof` response
    fields (both required by the PDS methods of Appendix A) and the
    `web-token` method entirely; the implementation defines all three.
-8. **Key rotation.** Sessions are not revalidated on DID-document key
+9. **Key rotation.** Sessions are not revalidated on DID-document key
    changes; the SHOULD in Security considerations is aspirational and
    noted there as an open consideration.
 

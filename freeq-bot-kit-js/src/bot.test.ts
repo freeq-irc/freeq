@@ -1096,6 +1096,28 @@ describe("session signing", () => {
     await flushAsync();
   }
 
+  it("a bot names its owner in the SASL response", async () => {
+    const { FreeqBot } = await import("./bot.js");
+    const bot = await FreeqBot.create({
+      name: "test-bot",
+      ownerDid: "did:plc:owner",
+      nick: "test-bot",
+      url: "wss://test/irc",
+      root,
+    });
+    const startPromise = bot.start();
+    await flushAsync();
+    const ws = MockWebSocket.instances[0]!;
+    await driveSigningReady(ws, "test-bot");
+    await startPromise;
+
+    const response = ws.sent.find((l) => l.startsWith("AUTHENTICATE ") && l !== "AUTHENTICATE ATPROTO-CHALLENGE")!;
+    const payload = JSON.parse(Buffer.from(response.slice("AUTHENTICATE ".length), "base64url").toString());
+    expect(payload.owner_did).toBe("did:plc:owner");
+    expect(payload.did).toBe(bot.identity.did);
+    await bot.stop();
+  });
+
   it("a bot registers a session signing key like every other client", async () => {
     const { FreeqBot } = await import("./bot.js");
     const bot = await FreeqBot.create({

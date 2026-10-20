@@ -4233,6 +4233,7 @@ fn cleanup_session_state(state: &Arc<SharedState>, session_id: &str) {
     state.session_kill.lock().remove(session_id);
     state.liveness_probes.lock().remove(session_id);
     state.session_dids.lock().remove(session_id);
+    state.delegated_sessions.lock().remove(session_id);
     state.session_handles.lock().remove(session_id);
     state.session_iroh_ids.lock().remove(session_id);
     state.session_away.lock().remove(session_id);
@@ -4472,8 +4473,22 @@ mod retired_key_tests {
             c
         }
 
+        /// A connection to `state` with nothing sent yet.
+        pub(super) async fn open(state: &Arc<SharedState>) -> Client {
+            let (client_side, server_side) = tokio::io::duplex(16384);
+            let served = state.clone();
+            tokio::spawn(async move {
+                let _ = handle_generic(server_side, served).await;
+            });
+            let (reader, writer) = tokio::io::split(client_side);
+            Client {
+                reader: BufReader::new(reader),
+                writer,
+            }
+        }
+
         /// Every line until the server closes the connection.
-        async fn rest(&mut self) -> Vec<String> {
+        pub(super) async fn rest(&mut self) -> Vec<String> {
             let lines = std::sync::Mutex::new(Vec::new());
             self.rx(|l| {
                 lines.lock().unwrap().push(l.to_string());
@@ -6144,6 +6159,7 @@ mod agent_record_tests {
     const OWNER: &str = "did:plc:agentowner";
     const BOT: &str = "did:plc:agentbot";
     const OTHER_BOT: &str = "did:plc:otherbot";
+    const STRANGER: &str = "did:plc:stranger";
 
     /// `hours` before one instant fixed for the test run.
     fn hours_ago(hours: i64) -> String {
@@ -6896,5 +6912,266 @@ mod agent_record_tests {
             .unwrap();
         assert_eq!(stored["type"], "SomethingElse/v1");
         assert_eq!(stored["_verified"], false);
+    }
+
+    /// One ATPROTO-CHALLENGE exchange on an open connection, as `key`,
+    /// naming `owner` if any; the 903 or 904 line.
+    async fn sasl_exchange(
+        c: &mut Client,
+        key: &freeq_sdk::crypto::PrivateKey,
+        owner: Option<&str>,
+    ) -> String {
+        use base64::Engine;
+        let did = format!("did:key:{}", key.public_key_multibase());
+        c.tx("AUTHENTICATE ATPROTO-CHALLENGE").await;
+        let challenge = c
+            .rx(|l| l.starts_with("AUTHENTICATE "))
+            .await
+            .expect("challenge");
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(challenge.trim_start_matches("AUTHENTICATE "))
+            .unwrap();
+        let mut payload = serde_json::json!({
+            "did": did,
+            "signature": key.sign_base64url(&bytes),
+        });
+        if let Some(owner) = owner {
+            payload["owner_did"] = serde_json::Value::String(owner.to_string());
+        }
+        let encoded =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        c.tx(&format!("AUTHENTICATE {encoded}")).await;
+        c.rx(|l| matches!(l.split_whitespace().nth(1), Some("903") | Some("904")))
+            .await
+            .expect("a SASL verdict")
+    }
+
+    /// The SASL exchange a did:key agent makes, naming `owner`; the 903 or
+    /// 904 line.
+    async fn sasl_as_agent(
+        state: &Arc<SharedState>,
+        key: &freeq_sdk::crypto::PrivateKey,
+        nick: &str,
+        owner: &str,
+    ) -> (Client, String) {
+        let mut c = Client::open(state).await;
+        c.tx("CAP LS 302").await;
+        c.tx(&format!("NICK {nick}")).await;
+        c.tx(&format!("USER {nick} 0 * :test")).await;
+        c.tx("CAP REQ :sasl").await;
+        c.rx(|l| l.contains("ACK")).await.expect("CAP ACK");
+        let verdict = sasl_exchange(&mut c, key, Some(owner)).await;
+        (c, verdict)
+    }
+
+    /// Finish registration after a 903.
+    async fn register(c: &mut Client) {
+        c.tx("CAP END").await;
+        c.rx(|l| l.split_whitespace().nth(1) == Some("001"))
+            .await
+            .expect("registered");
+    }
+
+    /// An instance that refuses guests and allows OWNER and `also`, with
+    /// delegated agents admitted.
+    async fn gated_with(
+        repo: &Arc<parking_lot::Mutex<StubRepo>>,
+        also: &[&str],
+    ) -> Arc<SharedState> {
+        let pds = crate::peer_keys::stub_pds_repos(vec![repo.clone()]).await;
+        let mut allowed = vec![OWNER.to_string()];
+        allowed.extend(also.iter().map(|d| d.to_string()));
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig {
+                allowed_dids: allowed,
+                no_guest: true,
+                allow_delegated_agents: true,
+                ..Default::default()
+            },
+            pds.resolver.clone(),
+        );
+        reuse_for(&state, 0);
+        state
+    }
+
+    async fn gated(repo: &Arc<parking_lot::Mutex<StubRepo>>) -> Arc<SharedState> {
+        gated_with(repo, &[]).await
+    }
+
+    /// Mark the connection of `agent_did` as admitted on `owner`'s record.
+    fn admitted_under(state: &SharedState, owner: &str, agent_did: &str) {
+        let session = state
+            .did_sessions
+            .lock()
+            .get(agent_did)
+            .and_then(|s| s.iter().next().cloned())
+            .expect("the agent is connected");
+        let key = (owner.to_string(), agent_did.to_string());
+        state.agent_links.lock().insert(
+            key.clone(),
+            (std::time::Instant::now(), "at://old".to_string()),
+        );
+        state.delegated_sessions.lock().insert(session, key);
+    }
+
+    #[tokio::test]
+    async fn an_agent_the_owners_record_names_connects_through_the_allowlist_until_the_record_goes()
+    {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[63; 32]).unwrap();
+        let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
+        let state = gated(&repo).await;
+
+        let (mut agent, verdict) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(
+            verdict.contains(" 903 "),
+            "admitted on the record: {verdict}"
+        );
+        register(&mut agent).await;
+
+        repo.lock().add(AGENT_KEY_TYPE, &removal(&agent_did, 1));
+        recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        let closing = agent.rest().await;
+        assert!(
+            closing
+                .iter()
+                .any(|l| l.starts_with("ERROR :Delegation withdrawn")),
+            "the connection is closed with the reason: {closing:?}"
+        );
+        assert!(state.delegated_sessions.lock().is_empty());
+    }
+
+    /// The record goes and the agent's own PROVENANCE is what reads the
+    /// owner's records next, hours before the re-check would.
+    #[tokio::test]
+    async fn a_delegated_connection_is_closed_when_its_own_provenance_finds_the_record_gone() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[65; 32]).unwrap();
+        let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
+        let state = gated(&repo).await;
+
+        let (mut agent, verdict) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(verdict.contains(" 903 "), "{verdict}");
+        register(&mut agent).await;
+
+        repo.lock().add(AGENT_KEY_TYPE, &removal(&agent_did, 1));
+        agent.tx(&provenance_line(&unsigned_cert(&agent_did))).await;
+        let closing = agent.rest().await;
+        assert!(
+            closing
+                .iter()
+                .any(|l| l.starts_with("ERROR :Delegation withdrawn")),
+            "{closing:?}"
+        );
+    }
+
+    /// Withdrawal is per record: the owner's other agent stays.
+    #[tokio::test]
+    async fn withdrawing_one_agent_leaves_the_owners_other_agent_connected() {
+        let first_key = PrivateKey::ed25519_from_bytes(&[66; 32]).unwrap();
+        let second_key = PrivateKey::ed25519_from_bytes(&[67; 32]).unwrap();
+        let first = format!("did:key:{}", first_key.public_key_multibase());
+        let second = format!("did:key:{}", second_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&first, 24));
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&second, 24));
+        let state = gated(&repo).await;
+
+        let (mut a, v) = sasl_as_agent(&state, &first_key, "one", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        register(&mut a).await;
+        let (mut b, v) = sasl_as_agent(&state, &second_key, "two", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        register(&mut b).await;
+
+        repo.lock().add(AGENT_KEY_TYPE, &removal(&first, 1));
+        recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        assert!(
+            a.rest()
+                .await
+                .iter()
+                .any(|l| l.starts_with("ERROR :Delegation withdrawn"))
+        );
+        b.tx("PING keep").await;
+        assert!(
+            b.rx(|l| l.contains("PONG")).await.is_some(),
+            "the sibling is still served"
+        );
+        assert_eq!(state.delegated_sessions.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_reauthenticates_on_its_own_standing_is_not_withdrawn() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[68; 32]).unwrap();
+        let own_key = PrivateKey::ed25519_from_bytes(&[69; 32]).unwrap();
+        let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
+        let own_did = format!("did:key:{}", own_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
+        let state = gated_with(&repo, &[&own_did]).await;
+
+        let (mut c, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        let v = sasl_exchange(&mut c, &own_key, None).await;
+        assert!(v.contains(" 903 "), "{v}");
+        register(&mut c).await;
+        assert!(state.delegated_sessions.lock().is_empty());
+
+        repo.lock().add(AGENT_KEY_TYPE, &removal(&agent_did, 1));
+        recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        c.tx("PING keep").await;
+        assert!(c.rx(|l| l.contains("PONG")).await.is_some(), "still served");
+    }
+
+    #[tokio::test]
+    async fn a_delegated_connection_is_closed_when_its_owner_is_no_longer_allowed() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[70; 32]).unwrap();
+        let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
+        let state = gated(&repo).await;
+        let (mut agent, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        register(&mut agent).await;
+
+        admitted_under(&state, STRANGER, &agent_did);
+        recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        let closing = agent.rest().await;
+        assert!(
+            closing
+                .iter()
+                .any(|l| l.starts_with("ERROR :Delegation withdrawn")),
+            "{closing:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_agent_cannot_register_as_a_guest() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[71; 32]).unwrap();
+        let repo = owner_repo();
+        let state = gated(&repo).await;
+        let (mut agent, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(v.contains(" 904 "), "{v}");
+        agent.tx("CAP END").await;
+        let answer = agent
+            .rx(|l| l.starts_with("ERROR :") || l.split_whitespace().nth(1) == Some("001"))
+            .await
+            .expect("an answer to registration");
+        assert!(answer.contains("requires authentication"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_the_owners_records_do_not_name_is_refused_with_the_reason() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[64; 32]).unwrap();
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(OTHER_BOT, 24));
+        let state = gated(&repo).await;
+        let (_agent, verdict) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(
+            verdict.contains(" 904 ") && verdict.contains("do not name this agent"),
+            "{verdict}"
+        );
     }
 }

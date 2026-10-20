@@ -175,6 +175,10 @@ freeq-server --config /etc/freeq/server.toml
 | `--signing-key-lifetime-days` / `SIGNING_KEY_LIFETIME_DAYS` | How long a signing key this server files lasts before it expires, counted from when it was first seen; a connection whose key expires is closed and the device signs in again. A key published in the account's records follows its record instead, and this server's own keys, other servers' own keys and a bot's did:key never expire (default: 90) |
 | `GITHUB_CLIENT_ID` | GitHub OAuth for credential verifier |
 | `GITHUB_CLIENT_SECRET` | GitHub OAuth secret |
+| `--allowed-dids` / `FREEQ_ALLOWED_DIDS` | Restrict authentication to these DIDs |
+| `--allowed-did-domains` / `FREEQ_ALLOWED_DID_DOMAINS` | Restrict authentication to DIDs whose handle is under one of the listed domains |
+| `--no-guest` / `FREEQ_NO_GUEST` | Refuse guest connections |
+| `--allow-delegated-agents` / `FREEQ_ALLOW_DELEGATED_AGENTS` | Admit an agent not on the allowlist when it's listed in an allowed owner's `at.freeq.agentKey` record |
 
 ### Federation
 

@@ -903,6 +903,9 @@ pub struct SharedState {
     /// old the owner's records are read again (`recheck_agent_links`); an
     /// unverified lookup is not kept.
     pub agent_links: Mutex<HashMap<(String, String), (std::time::Instant, String)>>,
+    /// Session → (owner DID, bot DID) of every connection admitted on the
+    /// owner's agent record.
+    pub delegated_sessions: Mutex<HashMap<String, (String, String)>>,
     /// Per owner DID, the one read of their records at a time and the last
     /// answer, reused while younger than `owner_read_reuse_ms`
     /// (`provenance::read_owner_links`).
@@ -2175,6 +2178,7 @@ impl Server {
             session_actor_class: Mutex::new(HashMap::new()),
             provenance_declarations: Mutex::new(HashMap::new()),
             agent_links: Mutex::new(HashMap::new()),
+            delegated_sessions: Mutex::new(HashMap::new()),
             owner_reads: Mutex::new(HashMap::new()),
             owner_read_reuse_ms: std::sync::atomic::AtomicU64::new(
                 crate::connection::OWNER_READ_REUSE.as_millis() as u64,
@@ -9504,6 +9508,7 @@ mod s2s_adversarial_tests {
             session_actor_class: Mutex::new(HashMap::new()),
             provenance_declarations: Mutex::new(HashMap::new()),
             agent_links: Mutex::new(HashMap::new()),
+            delegated_sessions: Mutex::new(HashMap::new()),
             owner_reads: Mutex::new(HashMap::new()),
             owner_read_reuse_ms: std::sync::atomic::AtomicU64::new(
                 crate::connection::OWNER_READ_REUSE.as_millis() as u64,

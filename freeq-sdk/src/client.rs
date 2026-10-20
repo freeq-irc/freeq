@@ -83,6 +83,9 @@ pub struct ConnectConfig {
     /// puts a verdict on each. Built without an origin base, it asks the
     /// connected server ([`server_http_origin`]). `None`: no verdicts.
     pub key_lookup: Option<Arc<crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>>>,
+    /// The account this agent acts for, named in the SASL response so its
+    /// agent records can admit the agent.
+    pub owner_did: Option<String>,
 }
 
 impl std::fmt::Debug for ConnectConfig {
@@ -101,6 +104,7 @@ impl std::fmt::Debug for ConnectConfig {
             .field("device_label", &self.device_label)
             .field("fresh_sign_in", &self.fresh_sign_in)
             .field("key_lookup", &self.key_lookup.is_some())
+            .field("owner_did", &self.owner_did)
             .finish()
     }
 }
@@ -121,6 +125,7 @@ impl Default for ConnectConfig {
             device_label: None,
             fresh_sign_in: false,
             key_lookup: None,
+            owner_did: None,
         }
     }
 }
@@ -3208,7 +3213,7 @@ where
                                     writer.write_all(format!("AUTHENTICATE {encoded}\r\n").as_bytes()).await?;
                                 }
                             } else if let Some(ref signer) = signer {
-                                handle_authenticate_challenge(&msg, signer.as_ref(), &mut writer).await?;
+                                handle_authenticate_challenge(&msg, signer.as_ref(), config.owner_did.as_deref(), &mut writer).await?;
                             }
                         }
                         // Handle DPOP_NONCE notice during SASL — update signer nonce
@@ -6566,6 +6571,7 @@ fn parse_multiline_cap(caps_str: &str) -> Option<(usize, usize)> {
 async fn handle_authenticate_challenge<W: AsyncWrite + Unpin>(
     msg: &Message,
     signer: &dyn ChallengeSigner,
+    owner_did: Option<&str>,
     writer: &mut W,
 ) -> Result<()> {
     let encoded_challenge = msg.params.first().map(|s| s.as_str()).unwrap_or("");
@@ -6576,7 +6582,8 @@ async fn handle_authenticate_challenge<W: AsyncWrite + Unpin>(
     // eprintln!("  Challenge decoded ({} bytes), signing with {}...", challenge_bytes.len(), signer.did());
 
     // Produce the response using the signer
-    let response = signer.respond(&challenge_bytes)?;
+    let mut response = signer.respond(&challenge_bytes)?;
+    response.owner_did = owner_did.map(str::to_string);
     let encoded = auth::encode_response(&response);
     // eprintln!("  Sending AUTHENTICATE response ({} bytes)", encoded.len());
 
@@ -6724,6 +6731,43 @@ fn rand_jitter(max: u64) -> u64 {
         return 0;
     }
     rand::random::<u64>() % max
+}
+
+#[cfg(test)]
+mod sasl_response_tests {
+    use super::*;
+    use base64::Engine;
+
+    async fn response_naming(owner: Option<&str>) -> serde_json::Value {
+        let key = crate::crypto::PrivateKey::generate_ed25519();
+        let signer = auth::KeySigner::new(format!("did:key:{}", key.public_key_multibase()), key);
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"challenge");
+        let msg = Message::new("AUTHENTICATE", vec![&challenge]);
+        let mut out: Vec<u8> = Vec::new();
+        handle_authenticate_challenge(&msg, &signer, owner, &mut out)
+            .await
+            .unwrap();
+        let line = String::from_utf8(out).unwrap();
+        let encoded = line.trim_end().strip_prefix("AUTHENTICATE ").unwrap();
+        serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_response_names_the_owner_it_was_given() {
+        let payload = response_naming(Some("did:plc:owner")).await;
+        assert_eq!(payload["owner_did"], "did:plc:owner");
+    }
+
+    #[tokio::test]
+    async fn the_response_carries_no_owner_field_when_none_was_given() {
+        let payload = response_naming(None).await;
+        assert!(payload.get("owner_did").is_none());
+    }
 }
 
 #[cfg(test)]

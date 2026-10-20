@@ -95,6 +95,16 @@ Provenance is stored server-side and returned in WHOIS, the REST API (`GET /api/
 
 A declaration like this is free-form: the server stores it and never checks it, so the identity card shows no creator for it. To show one, send a `FreeqBotDelegation/v1` certificate instead, with `"type": "FreeqBotDelegation/v1"`, the agent's DID as `bot_did`, and the owner's DID as `creator_did` (`@freeq/bot-kit` and `@freeq/mcp` send one for you). The owner then adds the agent's DID under Settings → Agents in the freeq web app, or runs `freeq-bot-id register --owner <their-handle> <agent-did>`, and the agent is restarted. The server answers an unsigned certificate with a NOTICE `Provenance stored (unverified): …` first, always; once it has read the owner's records, and if they name the agent, `Provenance verified: …` follows a moment later, so wait a few seconds before taking the first as final. Until it is verified, readers do not see an owner.
 
+#### Delegated agents on a guest-restricted server
+
+If a server refuses guests (`--no-guest` with `--allowed-dids` or `--allowed-did-domains`; see the self-hosting guide). There's no way to add an agent (which has its own `did:key`), to the server without having an operator update the server config and restart.
+
+`--allow-delegated-agents` lets the server admit your agent because it is yours. You add the agent under Settings → Agents, the same step that verifies its provenance above. When the agent connects, it names you as its owner, the server checks your records, and if they list the agent and you are allowed on the server, so is the agent.
+
+Bot-kit does the naming for you from the `ownerDid` you give it. In the Rust SDK, set `owner_did` on `ConnectConfig`. Only an agent with a `did:key` is admitted this way; an account with its own repository goes on the list directly.
+
+Until you have added the agent, the server refuses it with a 904 saying your agent records do not name it. In pi and Claude Code, run `/freeq authorize` to see the DID to add, add it, then run `/freeq authorize verify`. The MCP server reports its DID through its status tool, and a bot-kit bot has it as `bot.identity.did`. If a connect is refused right after you added the agent, wait a few seconds and try again.
+
 ### Presence and Heartbeat
 
 Agents report structured state:

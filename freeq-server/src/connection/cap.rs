@@ -183,6 +183,56 @@ pub(super) fn handle_cap(
     }
 }
 
+/// Handles the case where the allowlist has never heard of an agent's own
+/// `did:key` but the owner it names claims it and is allowed.
+async fn delegated_admit(
+    state: &Arc<SharedState>,
+    session_id: &str,
+    agent_did: &str,
+    owner_did: Option<&str>,
+) -> Result<(), String> {
+    let Some(owner) = owner_did else {
+        return Err("no owner named".to_string());
+    };
+    if !state.config.allow_delegated_agents {
+        return Err("this server does not admit delegated agents".to_string());
+    }
+    if !agent_did.starts_with("did:key:") {
+        return Err("only an agent with a did:key can be delegated".to_string());
+    }
+    if owner.starts_with("did:key:") {
+        return Err("an owner must be an account with a repository".to_string());
+    }
+    let links = super::provenance::read_owner_links(state, owner)
+        .await
+        .map_err(|e| {
+            tracing::warn!(agent = %agent_did, %owner, error = %e, "delegated connect: could not read the owner's agent records");
+            format!("could not read the agent records of {owner}")
+        })?;
+    let Some(link) = links.into_iter().find(|l| l.link.agent_did == agent_did) else {
+        return Err(format!(
+            "the agent records of {owner} do not name this agent"
+        ));
+    };
+    if !state.did_is_allowed_resolved(owner, None).await {
+        return Err(format!("{owner} is not allowed to connect here"));
+    }
+    let key = (owner.to_string(), agent_did.to_string());
+    state
+        .agent_links
+        .lock()
+        .insert(key.clone(), (std::time::Instant::now(), link.uri.clone()));
+    state
+        .delegated_sessions
+        .lock()
+        .insert(session_id.to_string(), key);
+    tracing::info!(
+        agent = %agent_did, %owner, uri = %link.uri,
+        "admitting an agent on its owner's agent record"
+    );
+    Ok(())
+}
+
 pub(super) async fn handle_authenticate(
     conn: &mut Connection,
     msg: &Message,
@@ -259,6 +309,10 @@ pub(super) async fn handle_authenticate(
                         )
                         .await
                     };
+                    // An agent the allowlist does not know may still come in on
+                    // the owner it names.
+                    let mut refusal = "Not authorized to connect to this server".to_string();
+                    let mut delegated = false;
                     // Connect-time allowlist, if the instance opted in. A web
                     // token brings its handle along; the challenge path doesn't.
                     let allowed = match &verify_result {
@@ -266,6 +320,25 @@ pub(super) async fn handle_authenticate(
                             state
                                 .did_is_allowed_resolved(did, web_handle.as_deref())
                                 .await
+                                || match delegated_admit(
+                                    state,
+                                    session_id,
+                                    did,
+                                    response.owner_did.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        delegated = true;
+                                        true
+                                    }
+                                    Err(reason) => {
+                                        if response.owner_did.is_some() {
+                                            refusal = format!("{refusal}: {reason}");
+                                        }
+                                        false
+                                    }
+                                }
                         }
                         Err(_) => true,
                     };
@@ -277,10 +350,7 @@ pub(super) async fn handle_authenticate(
                             let fail = Message::from_server(
                                 server_name,
                                 irc::ERR_SASLFAIL,
-                                vec![
-                                    conn.nick_or_star(),
-                                    "Not authorized to connect to this server",
-                                ],
+                                vec![conn.nick_or_star(), refusal.as_str()],
                             );
                             send(state, session_id, format!("{fail}\r\n"));
                             tracing::warn!(
@@ -332,6 +402,11 @@ pub(super) async fn handle_authenticate(
                             }
                             conn.authenticated_did = Some(did.clone());
                             conn.sasl_in_progress = false;
+                            // Handles a connection that was let in on an owner's record and
+                            // has since authenticated as a DID the allowlist accepts directly.
+                            if !delegated {
+                                state.delegated_sessions.lock().remove(session_id);
+                            }
                             state
                                 .session_dids
                                 .lock()
@@ -574,5 +649,192 @@ pub(super) async fn handle_authenticate(
             vec![conn.nick_or_star(), "Unsupported SASL mechanism"],
         );
         send(state, session_id, format!("{fail}\r\n"));
+    }
+}
+
+#[cfg(test)]
+mod delegated_admit_tests {
+    use super::*;
+    use freeq_sdk::crypto::PrivateKey;
+    use freeq_sdk::identity_records::{
+        AGENT_KEY_TYPE, DEVICE_KEY_TYPE, build_agent_record, build_agent_retirement,
+        build_device_record,
+    };
+    use freeq_sdk::test_support::StubRepo;
+
+    const AGENT: &str = "did:key:z6MkAgent";
+    const OTHER_AGENT: &str = "did:key:z6MkOther";
+    const OWNER: &str = "did:plc:owner";
+    const STRANGER: &str = "did:plc:stranger";
+
+    fn hours_ago(hours: i64) -> String {
+        static NOW: std::sync::LazyLock<chrono::DateTime<chrono::Utc>> =
+            std::sync::LazyLock::new(chrono::Utc::now);
+        (*NOW - chrono::TimeDelta::hours(hours))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    fn owner_key() -> PrivateKey {
+        PrivateKey::ed25519_from_bytes(&[62; 32]).unwrap()
+    }
+
+    fn value(record: &impl serde::Serialize) -> serde_json::Value {
+        serde_json::to_value(record).unwrap()
+    }
+
+    fn claim(owner: &str, bot: &str, hours: i64) -> serde_json::Value {
+        value(&build_agent_record(&owner_key(), owner, bot, &hours_ago(hours), None).unwrap())
+    }
+
+    fn removal(owner: &str, bot: &str, hours: i64) -> serde_json::Value {
+        value(&build_agent_retirement(&owner_key(), owner, bot, &hours_ago(hours)).unwrap())
+    }
+
+    /// `owner`'s repository, holding their device record and `agents`.
+    fn repo_of(owner: &str, agents: &[serde_json::Value]) -> Arc<parking_lot::Mutex<StubRepo>> {
+        let mut repo = StubRepo::new(owner);
+        repo.add(
+            DEVICE_KEY_TYPE,
+            &value(&build_device_record(&owner_key(), owner, &hours_ago(48), None).unwrap()),
+        );
+        for record in agents {
+            repo.add(AGENT_KEY_TYPE, record);
+        }
+        Arc::new(parking_lot::Mutex::new(repo))
+    }
+
+    /// An instance that allows `allowed` and nobody else, serving `repos`.
+    async fn state_allowing(
+        allow_delegated: bool,
+        allowed: &[&str],
+        repos: Vec<Arc<parking_lot::Mutex<StubRepo>>>,
+    ) -> Arc<SharedState> {
+        let pds = crate::peer_keys::stub_pds_repos(repos).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig {
+                allowed_dids: allowed.iter().map(|d| d.to_string()).collect(),
+                allow_delegated_agents: allow_delegated,
+                ..Default::default()
+            },
+            pds.resolver.clone(),
+        );
+        state
+            .owner_read_reuse_ms
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        state
+    }
+
+    async fn state_allowing_owner(
+        allow_delegated: bool,
+        repos: Vec<Arc<parking_lot::Mutex<StubRepo>>>,
+    ) -> Arc<SharedState> {
+        state_allowing(allow_delegated, &[OWNER], repos).await
+    }
+
+    async fn admit(state: &Arc<SharedState>, owner: Option<&str>) -> Result<(), String> {
+        delegated_admit(state, "sess-1", AGENT, owner).await
+    }
+
+    #[tokio::test]
+    async fn an_agent_its_allowed_owner_claims_is_admitted_and_kept_for_the_recheck() {
+        let repo = repo_of(OWNER, &[claim(OWNER, OTHER_AGENT, 20)]);
+        let own = repo.lock().add(AGENT_KEY_TYPE, &claim(OWNER, AGENT, 24));
+        let state = state_allowing_owner(true, vec![repo]).await;
+        assert_eq!(admit(&state, Some(OWNER)).await, Ok(()));
+        let key = (OWNER.to_string(), AGENT.to_string());
+        assert_eq!(state.delegated_sessions.lock().get("sess-1"), Some(&key));
+        let kept = state
+            .agent_links
+            .lock()
+            .get(&key)
+            .map(|(_, uri)| uri.clone());
+        assert_eq!(kept.as_deref(), Some(own.as_str()));
+    }
+
+    /// The attack this exists to stop: naming an allowed owner who has not
+    /// claimed you.
+    #[tokio::test]
+    async fn an_owner_whose_records_name_other_agents_admits_nobody() {
+        let state =
+            state_allowing_owner(true, vec![repo_of(OWNER, &[claim(OWNER, OTHER_AGENT, 24)])])
+                .await;
+        let refused = admit(&state, Some(OWNER)).await.unwrap_err();
+        assert!(refused.contains("do not name this agent"), "{refused}");
+        assert!(state.delegated_sessions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_claim_the_owner_withdrew_admits_nobody() {
+        let records = [claim(OWNER, AGENT, 24), removal(OWNER, AGENT, 12)];
+        let state = state_allowing_owner(true, vec![repo_of(OWNER, &records)]).await;
+        let refused = admit(&state, Some(OWNER)).await.unwrap_err();
+        assert!(refused.contains("do not name this agent"), "{refused}");
+    }
+
+    /// A record lifted into the listing without the repository's proof.
+    #[tokio::test]
+    async fn a_claim_whose_proof_fails_admits_nobody() {
+        let repo = repo_of(OWNER, &[]);
+        repo.lock().add_forged(
+            AGENT_KEY_TYPE,
+            &claim(OWNER, AGENT, 24),
+            &claim(OWNER, OTHER_AGENT, 30),
+        );
+        let state = state_allowing_owner(true, vec![repo]).await;
+        let refused = admit(&state, Some(OWNER)).await.unwrap_err();
+        assert!(refused.contains("do not name this agent"), "{refused}");
+    }
+
+    /// Delegation carries the owner's standing, so it cannot exceed it.
+    #[tokio::test]
+    async fn a_claim_from_an_owner_who_is_not_allowed_admits_nobody() {
+        let state =
+            state_allowing_owner(true, vec![repo_of(STRANGER, &[claim(STRANGER, AGENT, 24)])])
+                .await;
+        let refused = admit(&state, Some(STRANGER)).await.unwrap_err();
+        assert!(refused.contains("not allowed"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn the_instance_must_opt_in() {
+        let state =
+            state_allowing_owner(false, vec![repo_of(OWNER, &[claim(OWNER, AGENT, 24)])]).await;
+        let refused = admit(&state, Some(OWNER)).await.unwrap_err();
+        assert!(refused.contains("does not admit"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_naming_no_owner_admits_nobody() {
+        let state = state_allowing_owner(true, vec![]).await;
+        assert!(admit(&state, None).await.is_err());
+    }
+
+    /// A did:key has no repository to read.
+    #[tokio::test]
+    async fn an_agent_naming_itself_admits_nobody() {
+        let state = state_allowing(true, &[AGENT], vec![]).await;
+        let refused = admit(&state, Some(AGENT)).await.unwrap_err();
+        assert!(refused.contains("account with a repository"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn only_an_agent_with_a_did_key_is_delegated() {
+        let person = "did:plc:someone";
+        let state =
+            state_allowing_owner(true, vec![repo_of(OWNER, &[claim(OWNER, person, 24)])]).await;
+        let refused = delegated_admit(&state, "sess-1", person, Some(OWNER))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("did:key"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_does_not_say_whether_the_named_owner_is_allowed() {
+        let allowed = state_allowing_owner(true, vec![repo_of(OWNER, &[])]).await;
+        let not_allowed = state_allowing(true, &[STRANGER], vec![repo_of(OWNER, &[])]).await;
+        assert_eq!(
+            admit(&allowed, Some(OWNER)).await,
+            admit(&not_allowed, Some(OWNER)).await
+        );
     }
 }

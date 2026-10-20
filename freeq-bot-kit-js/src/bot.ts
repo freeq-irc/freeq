@@ -327,6 +327,8 @@ export class FreeqBot {
         signer: identity.didKey.signer,
         token: "",
         pdsUrl: "",
+        // Lets an allowlisted server admit the bot on the owner's agent record.
+        ownerDid: opts.ownerDid === identity.did ? undefined : opts.ownerDid,
       },
       // The bot signs its messages and mutations with its did:key itself:
       // held as the client's stored device key, it is what MSGSIG registers

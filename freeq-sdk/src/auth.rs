@@ -47,6 +47,9 @@ pub struct ChallengeResponse {
     /// the challenge it issued (the PDS itself has no knowledge of our nonce).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub challenge_nonce: Option<String>,
+    /// The account this agent acts for, whose agent records can admit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_did: Option<String>,
 }
 
 /// Decode a base64url-encoded challenge from the server.
@@ -105,6 +108,7 @@ impl ChallengeSigner for KeySigner {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None, // Not needed: crypto method signs the full challenge
+            owner_did: None,
         })
     }
 }
@@ -250,6 +254,7 @@ impl ChallengeSigner for PdsSessionSigner {
                 pds_url: Some(self.pds_url.clone()),
                 dpop_proof: Some(dpop_proof),
                 challenge_nonce,
+                owner_did: None,
             })
         } else {
             // App-password mode: plain Bearer token
@@ -260,6 +265,7 @@ impl ChallengeSigner for PdsSessionSigner {
                 pds_url: Some(self.pds_url.clone()),
                 dpop_proof: None,
                 challenge_nonce,
+                owner_did: None,
             })
         }
     }
@@ -361,6 +367,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            owner_did: None,
         };
         let encoded = encode_response(&resp);
         let bytes = URL_SAFE_NO_PAD.decode(&encoded).unwrap();
@@ -379,6 +386,7 @@ mod tests {
             pds_url: Some("https://pds.example.com".to_string()),
             dpop_proof: Some("dpop.proof.jwt".to_string()),
             challenge_nonce: Some("server-nonce-xyz".to_string()),
+            owner_did: None,
         };
         let encoded = encode_response(&resp);
         let bytes = URL_SAFE_NO_PAD.decode(&encoded).unwrap();
