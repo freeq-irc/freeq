@@ -112,3 +112,23 @@ describe('SASL response', () => {
     expect('owner_did' in payload).toBe(false);
   });
 });
+
+describe('saslResponseLines', () => {
+  it('sends a short response as one line with no terminator', async () => {
+    const { saslResponseLines } = await import('./client.js');
+    expect(saslResponseLines('abc')).toEqual(['AUTHENTICATE abc']);
+  });
+
+  it('terminates a response that fills its last chunk', async () => {
+    const { saslResponseLines } = await import('./client.js');
+    const full = 'x'.repeat(400);
+    expect(saslResponseLines(full)).toEqual([`AUTHENTICATE ${full}`, 'AUTHENTICATE +']);
+  });
+
+  it('splits a longer response without a terminator', async () => {
+    const { saslResponseLines } = await import('./client.js');
+    const lines = saslResponseLines('y'.repeat(412));
+    expect(lines).toHaveLength(2);
+    expect(lines[1]).toBe(`AUTHENTICATE ${'y'.repeat(12)}`);
+  });
+});

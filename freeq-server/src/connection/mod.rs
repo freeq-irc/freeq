@@ -434,6 +434,7 @@ pub struct Connection {
     pub(crate) sasl_in_progress: bool,
     pub(crate) sasl_failures: u8,
     pub(crate) dpop_retries: u8,
+    pub(crate) sasl_response_buf: String,
 }
 
 impl Connection {
@@ -471,6 +472,7 @@ impl Connection {
             sasl_in_progress: false,
             sasl_failures: 0,
             dpop_retries: 0,
+            sasl_response_buf: String::new(),
         }
     }
 
@@ -6156,7 +6158,7 @@ mod agent_record_tests {
     use freeq_sdk::test_support::StubRepo;
     use std::sync::atomic::Ordering;
 
-    const OWNER: &str = "did:plc:agentowner";
+    const OWNER: &str = "did:plc:agentownerq2w3e4r5t6y7u8";
     const BOT: &str = "did:plc:agentbot";
     const OTHER_BOT: &str = "did:plc:otherbot";
     const STRANGER: &str = "did:plc:stranger";
@@ -6931,16 +6933,24 @@ mod agent_record_tests {
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(challenge.trim_start_matches("AUTHENTICATE "))
             .unwrap();
+        let nonce: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // The fields the SDKs send, so the response is as long as theirs.
         let mut payload = serde_json::json!({
             "did": did,
+            "method": "crypto",
             "signature": key.sign_base64url(&bytes),
+            "pds_url": "",
+            "challenge_nonce": nonce["nonce"],
         });
         if let Some(owner) = owner {
             payload["owner_did"] = serde_json::Value::String(owner.to_string());
         }
         let encoded =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
-        c.tx(&format!("AUTHENTICATE {encoded}")).await;
+        // Split as the SDKs do; a response naming an owner can be greater than a single chunk.
+        for line in freeq_sdk::auth::sasl_response_lines(&encoded) {
+            c.tx(&line).await;
+        }
         c.rx(|l| matches!(l.split_whitespace().nth(1), Some("903") | Some("904")))
             .await
             .expect("a SASL verdict")

@@ -7,7 +7,53 @@ use super::registration::try_complete_registration;
 use crate::irc::{self, Message};
 use crate::sasl;
 use crate::server::SharedState;
+use freeq_sdk::auth::{MAX_SASL_RESPONSE_LEN, SASL_CHUNK_LEN};
 use std::sync::Arc;
+
+/// What a single `AUTHENTICATE` line contributed to the response.
+enum Reassembly {
+    /// A piece landed and the rest is still coming.
+    Partial,
+    /// The whole response, ready to decode.
+    Complete(String),
+    /// More than any real response could need.
+    TooLong,
+}
+
+/// Join the pieces of a SASL response. A short piece, a bare `+`, or a full
+/// chunk that already decodes ends it.
+fn accumulate_response(conn: &mut Connection, param: &str) -> Reassembly {
+    let chunk = if param == "+" { "" } else { param };
+    if conn.sasl_response_buf.len() + chunk.len() > MAX_SASL_RESPONSE_LEN {
+        conn.sasl_response_buf.clear();
+        return Reassembly::TooLong;
+    }
+    conn.sasl_response_buf.push_str(chunk);
+    if chunk.len() == SASL_CHUNK_LEN
+        && sasl::decode_response_explained(&conn.sasl_response_buf).is_err()
+    {
+        return Reassembly::Partial;
+    }
+    Reassembly::Complete(std::mem::take(&mut conn.sasl_response_buf))
+}
+
+/// Close the connection once it has failed SASL three times.
+fn close_after_too_many_failures(
+    conn: &Connection,
+    state: &Arc<SharedState>,
+    session_id: &str,
+    send: &impl Fn(&Arc<SharedState>, &str, String),
+) {
+    if conn.sasl_failures >= 3 {
+        send(
+            state,
+            session_id,
+            "ERROR :Too many SASL failures\r\n".to_string(),
+        );
+        // Drop the send channel to force-close the connection.
+        state.connections.lock().remove(session_id);
+    }
+}
 
 pub(super) fn handle_cap(
     conn: &mut Connection,
@@ -251,6 +297,7 @@ pub(super) async fn handle_authenticate(
     if param == "*" {
         // SASL abort — client is cancelling the authentication attempt
         conn.sasl_in_progress = false;
+        conn.sasl_response_buf.clear();
         let fail = Message::from_server(
             server_name,
             irc::ERR_SASLFAIL,
@@ -260,13 +307,39 @@ pub(super) async fn handle_authenticate(
         return;
     }
 
+    // Handles a stray terminator with nothing to end, after a short chunk or a
+    // re-issued challenge.
+    if param == "+" && conn.sasl_response_buf.is_empty() {
+        return;
+    }
+
     if param.eq_ignore_ascii_case("ATPROTO-CHALLENGE") {
         conn.sasl_in_progress = true;
         conn.dpop_retries = 0; // Reset DPoP retry counter on new SASL attempt
+        conn.sasl_response_buf.clear();
         let encoded = state.challenge_store.create(session_id);
         let reply = Message::new("AUTHENTICATE", vec![&encoded]);
         send(state, session_id, format!("{reply}\r\n"));
     } else if conn.sasl_in_progress {
+        let full = match accumulate_response(conn, param) {
+            Reassembly::Partial => return,
+            Reassembly::TooLong => {
+                conn.sasl_in_progress = false;
+                conn.sasl_failures += 1;
+                crate::server::Metrics::bump(&state.metrics.sasl_failure_total);
+                let fail = Message::from_server(
+                    server_name,
+                    irc::ERR_SASLFAIL,
+                    vec![conn.nick_or_star(), "SASL response too long"],
+                );
+                send(state, session_id, format!("{fail}\r\n"));
+                tracing::warn!(%session_id, "SASL response exceeded the reassembly limit");
+                close_after_too_many_failures(conn, state, session_id, send);
+                return;
+            }
+            Reassembly::Complete(full) => full,
+        };
+        let param = full.as_str();
         let decoded = sasl::decode_response_explained(param);
         if let Ok(response) = decoded {
             // Check for web-token method first (server-side OAuth pre-verified)
@@ -564,15 +637,7 @@ pub(super) async fn handle_authenticate(
                                     ],
                                 );
                                 send(state, session_id, format!("{fail}\r\n"));
-                                if conn.sasl_failures >= 3 {
-                                    send(
-                                        state,
-                                        session_id,
-                                        "ERROR :Too many SASL failures\r\n".to_string(),
-                                    );
-                                    // Drop the send channel to force-close the connection.
-                                    state.connections.lock().remove(session_id);
-                                }
+                                close_after_too_many_failures(conn, state, session_id, send);
                             } else {
                                 // DPoP nonce rotation: PDS requires a fresh nonce.
                                 // Re-issue a challenge so the client can retry with the nonce.
@@ -604,15 +669,7 @@ pub(super) async fn handle_authenticate(
                                 vec![conn.nick_or_star(), "SASL authentication failed"],
                             );
                             send(state, session_id, format!("{fail}\r\n"));
-                            if conn.sasl_failures >= 3 {
-                                send(
-                                    state,
-                                    session_id,
-                                    "ERROR :Too many SASL failures\r\n".to_string(),
-                                );
-                                // Drop the send channel to force-close the connection.
-                                state.connections.lock().remove(session_id);
-                            }
+                            close_after_too_many_failures(conn, state, session_id, send);
                         }
                     }
                 }
@@ -649,6 +706,76 @@ pub(super) async fn handle_authenticate(
             vec![conn.nick_or_star(), "Unsupported SASL mechanism"],
         );
         send(state, session_id, format!("{fail}\r\n"));
+    }
+}
+
+#[cfg(test)]
+mod sasl_reassembly_tests {
+    use super::*;
+
+    fn conn() -> Connection {
+        Connection::new("sess-1".to_string())
+    }
+
+    fn complete(r: Reassembly) -> Option<String> {
+        match r {
+            Reassembly::Complete(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_response_shorter_than_a_chunk_arrives_whole() {
+        let mut c = conn();
+        assert_eq!(
+            complete(accumulate_response(&mut c, "abc")),
+            Some("abc".to_string())
+        );
+        assert!(c.sasl_response_buf.is_empty());
+    }
+
+    #[test]
+    fn a_full_chunk_waits_for_more() {
+        let mut c = conn();
+        let chunk = "x".repeat(SASL_CHUNK_LEN);
+        assert!(matches!(
+            accumulate_response(&mut c, &chunk),
+            Reassembly::Partial
+        ));
+        assert_eq!(c.sasl_response_buf.len(), SASL_CHUNK_LEN);
+    }
+
+    #[test]
+    fn pieces_are_joined_in_order() {
+        let mut c = conn();
+        let first = "a".repeat(SASL_CHUNK_LEN);
+        accumulate_response(&mut c, &first);
+        let joined = complete(accumulate_response(&mut c, "bbb")).unwrap();
+        assert_eq!(joined, format!("{first}bbb"));
+        assert!(c.sasl_response_buf.is_empty());
+    }
+
+    #[test]
+    fn a_bare_plus_ends_a_response_that_fills_its_last_chunk() {
+        let mut c = conn();
+        let chunk = "y".repeat(SASL_CHUNK_LEN);
+        accumulate_response(&mut c, &chunk);
+        assert_eq!(complete(accumulate_response(&mut c, "+")), Some(chunk));
+    }
+
+    #[test]
+    fn an_endless_stream_is_refused_and_dropped() {
+        let mut c = conn();
+        let chunk = "z".repeat(SASL_CHUNK_LEN);
+        let mut refused = false;
+        for _ in 0..(MAX_SASL_RESPONSE_LEN / SASL_CHUNK_LEN + 2) {
+            if matches!(accumulate_response(&mut c, &chunk), Reassembly::TooLong) {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "an unbounded stream of chunks must be refused");
+        assert!(c.sasl_response_buf.is_empty());
     }
 }
 

@@ -64,6 +64,31 @@ pub fn decode_challenge_bytes(encoded: &str) -> anyhow::Result<Vec<u8>> {
     Ok(URL_SAFE_NO_PAD.decode(encoded)?)
 }
 
+/// One SASL chunk, per IRCv3; a full chunk tells the server more is coming.
+pub const SASL_CHUNK_LEN: usize = 400;
+
+/// Ceiling on a response, matching what the server will reassemble.
+pub const MAX_SASL_RESPONSE_LEN: usize = 8192;
+
+/// The `AUTHENTICATE` lines that carry an encoded response: 400-byte chunks,
+/// with a bare `+` after a response that fills its last chunk.
+pub fn sasl_response_lines(encoded: &str) -> Vec<String> {
+    let mut lines: Vec<String> = encoded
+        .as_bytes()
+        .chunks(SASL_CHUNK_LEN)
+        .map(|c| {
+            format!(
+                "AUTHENTICATE {}",
+                std::str::from_utf8(c).expect("base64url is ASCII")
+            )
+        })
+        .collect();
+    if encoded.len().is_multiple_of(SASL_CHUNK_LEN) {
+        lines.push("AUTHENTICATE +".to_string());
+    }
+    lines
+}
+
 /// Encode a challenge response as base64url for sending via AUTHENTICATE.
 pub fn encode_response(response: &ChallengeResponse) -> String {
     let json = serde_json::to_vec(response).expect("response serialization");
