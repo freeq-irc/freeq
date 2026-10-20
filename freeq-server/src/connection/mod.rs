@@ -7180,8 +7180,28 @@ mod agent_record_tests {
         let state = gated(&repo).await;
         let (_agent, verdict) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
         assert!(
-            verdict.contains(" 904 ") && verdict.contains("do not name this agent"),
+            verdict.contains(" 904 ") && verdict.contains("do not admit this agent"),
             "{verdict}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_third_allowlist_refusal_closes_the_connection() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[72; 32]).unwrap();
+        let repo = owner_repo();
+        let state = gated(&repo).await;
+        let (mut agent, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(v.contains(" 904 "), "{v}");
+        for _ in 0..2 {
+            let v = sasl_exchange(&mut agent, &agent_key, Some(OWNER)).await;
+            assert!(v.contains(" 904 "), "{v}");
+        }
+        assert!(
+            agent
+                .rx(|l| l.starts_with("ERROR :Too many SASL failures"))
+                .await
+                .is_some(),
+            "the third refusal ends the connection"
         );
     }
 }

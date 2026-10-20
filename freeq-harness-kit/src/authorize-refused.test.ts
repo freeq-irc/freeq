@@ -39,7 +39,7 @@ class RefusedBot implements BotLike {
     return this;
   }
   async start(): Promise<unknown> {
-    throw new Error("SASL auth failed: the agent records of did:plc:owner do not name this agent");
+    throw new Error("SASL auth failed: the agent records of did:plc:owner do not admit this agent");
   }
   async stop(): Promise<unknown> {
     return this;

@@ -97,13 +97,13 @@ A declaration like this is free-form: the server stores it and never checks it, 
 
 #### Delegated agents on a guest-restricted server
 
-If a server refuses guests (`--no-guest` with `--allowed-dids` or `--allowed-did-domains`; see the self-hosting guide). There's no way to add an agent (which has its own `did:key`), to the server without having an operator update the server config and restart.
+A server can refuse guests and allow only listed DIDs (`--no-guest` with `--allowed-dids` or `--allowed-did-domains`; see the self-hosting guide). Your agent has its own `did:key`, so on such a server there is no way to add it without an operator updating the server config and restarting.
 
 `--allow-delegated-agents` lets the server admit your agent because it is yours. You add the agent under Settings → Agents, the same step that verifies its provenance above. When the agent connects, it names you as its owner, the server checks your records, and if they list the agent and you are allowed on the server, so is the agent.
 
 Bot-kit does the naming for you from the `ownerDid` you give it. In the Rust SDK, set `owner_did` on `ConnectConfig`. Only an agent with a `did:key` is admitted this way; an account with its own repository goes on the list directly.
 
-Until you have added the agent, the server refuses it with a 904 saying your agent records do not name it. In pi and Claude Code, run `/freeq authorize` to see the DID to add, add it, then run `/freeq authorize verify`. The MCP server reports its DID through its status tool, and a bot-kit bot has it as `bot.identity.did`. If a connect is refused right after you added the agent, wait a few seconds and try again.
+Until you have added the agent, the server refuses it with a 904 saying your agent records do not admit it. In pi and Claude Code, run `/freeq authorize` to see the DID to add, add it, then run `/freeq authorize verify`. The MCP server reports its DID through its status tool, and a bot-kit bot has it as `bot.identity.did`. If a connect is refused right after you added the agent, wait a few seconds and try again.
 
 ### Presence and Heartbeat
 

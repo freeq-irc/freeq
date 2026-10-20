@@ -6568,18 +6568,18 @@ fn parse_multiline_cap(caps_str: &str) -> Option<(usize, usize)> {
     Some((max_bytes, max_lines))
 }
 
-/// Write an encoded SASL response as `AUTHENTICATE` lines.
+/// Write an encoded SASL response as one `AUTHENTICATE` line, however long.
 async fn write_sasl_response<W: AsyncWrite + Unpin>(writer: &mut W, encoded: &str) -> Result<()> {
     if encoded.len() > auth::MAX_SASL_RESPONSE_LEN {
         anyhow::bail!(
-            "SASL response is {} bytes, over the {} the server will reassemble",
+            "SASL response is {} bytes, over the {} the server accepts",
             encoded.len(),
             auth::MAX_SASL_RESPONSE_LEN
         );
     }
-    for line in auth::sasl_response_lines(encoded) {
-        writer.write_all(format!("{line}\r\n").as_bytes()).await?;
-    }
+    writer
+        .write_all(format!("AUTHENTICATE {encoded}\r\n").as_bytes())
+        .await?;
     Ok(())
 }
 
@@ -6745,9 +6745,9 @@ fn rand_jitter(max: u64) -> u64 {
 }
 
 #[cfg(test)]
-mod sasl_chunking_tests {
+mod sasl_write_tests {
     use super::*;
-    use auth::{MAX_SASL_RESPONSE_LEN, SASL_CHUNK_LEN};
+    use auth::MAX_SASL_RESPONSE_LEN;
 
     async fn lines(encoded: &str) -> Vec<String> {
         let mut buf: Vec<u8> = Vec::new();
@@ -6760,37 +6760,20 @@ mod sasl_chunking_tests {
             .collect()
     }
 
+    /// A server that predates chunk reassembly still takes one long line.
     #[tokio::test]
-    async fn a_short_response_goes_out_whole() {
-        let out = lines("abc").await;
-        assert_eq!(out, vec!["AUTHENTICATE abc"]);
+    async fn a_response_of_any_length_goes_out_as_one_line() {
+        for len in [3, 400, 412, 1200] {
+            let payload = "x".repeat(len);
+            assert_eq!(
+                lines(&payload).await,
+                vec![format!("AUTHENTICATE {payload}")]
+            );
+        }
     }
 
     #[tokio::test]
-    async fn a_response_of_exactly_one_chunk_is_terminated() {
-        let payload = "x".repeat(SASL_CHUNK_LEN);
-        let out = lines(&payload).await;
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0], format!("AUTHENTICATE {payload}"));
-        assert_eq!(out[1], "AUTHENTICATE +");
-    }
-
-    #[tokio::test]
-    async fn a_response_ending_mid_chunk_needs_no_terminator() {
-        let out = lines(&"y".repeat(SASL_CHUNK_LEN + 1)).await;
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[1], "AUTHENTICATE y");
-    }
-
-    #[tokio::test]
-    async fn every_whole_multiple_of_a_chunk_is_terminated() {
-        let out = lines(&"z".repeat(SASL_CHUNK_LEN * 2)).await;
-        assert_eq!(out.len(), 3);
-        assert_eq!(out[2], "AUTHENTICATE +");
-    }
-
-    #[tokio::test]
-    async fn a_response_the_server_will_not_reassemble_is_refused() {
+    async fn a_response_the_server_will_not_accept_is_refused() {
         let mut buf: Vec<u8> = Vec::new();
         let err = write_sasl_response(&mut buf, &"w".repeat(MAX_SASL_RESPONSE_LEN + 1))
             .await

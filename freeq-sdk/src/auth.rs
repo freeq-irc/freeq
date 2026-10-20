@@ -70,8 +70,8 @@ pub const SASL_CHUNK_LEN: usize = 400;
 /// Ceiling on a response, matching what the server will reassemble.
 pub const MAX_SASL_RESPONSE_LEN: usize = 8192;
 
-/// The `AUTHENTICATE` lines that carry an encoded response: 400-byte chunks,
-/// with a bare `+` after a response that fills its last chunk.
+/// The `AUTHENTICATE` lines that carry an encoded response under IRCv3
+/// chunking: 400-byte chunks, with a bare `+` after one that fills the last.
 pub fn sasl_response_lines(encoded: &str) -> Vec<String> {
     let mut lines: Vec<String> = encoded
         .as_bytes()
@@ -418,5 +418,41 @@ mod tests {
         let decoded: ChallengeResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded.method.as_deref(), Some("pds-oauth"));
         assert_eq!(decoded.dpop_proof.as_deref(), Some("dpop.proof.jwt"));
+    }
+}
+
+#[cfg(test)]
+mod sasl_response_lines_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_response_is_one_line_with_no_terminator() {
+        assert_eq!(sasl_response_lines("abc"), vec!["AUTHENTICATE abc"]);
+    }
+
+    #[test]
+    fn a_response_of_exactly_one_chunk_is_terminated() {
+        let payload = "x".repeat(SASL_CHUNK_LEN);
+        assert_eq!(
+            sasl_response_lines(&payload),
+            vec![
+                format!("AUTHENTICATE {payload}"),
+                "AUTHENTICATE +".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_response_ending_mid_chunk_needs_no_terminator() {
+        let out = sasl_response_lines(&"y".repeat(SASL_CHUNK_LEN + 1));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1], "AUTHENTICATE y");
+    }
+
+    #[test]
+    fn every_whole_multiple_of_a_chunk_is_terminated() {
+        let out = sasl_response_lines(&"z".repeat(SASL_CHUNK_LEN * 2));
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[2], "AUTHENTICATE +");
     }
 }

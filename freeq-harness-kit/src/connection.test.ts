@@ -132,7 +132,7 @@ describe("connect lifecycle", () => {
   it("points a refused delegated agent at /freeq authorize", async () => {
     const { conn, bot, notices } = mk();
     bot.failStart = true;
-    bot.authError = "SASL authentication failed (Not authorized to connect to this server: the agent records of did:plc:owner do not name this agent)";
+    bot.authError = "SASL authentication failed (Not authorized to connect to this server: the agent records of did:plc:owner do not admit this agent)";
     await conn.start();
     const auth = notices.find((n) => /authentication failed/.test(n.text))?.text ?? "";
     expect(auth).toContain("Run /freeq authorize to add this installation as one of your agents.");

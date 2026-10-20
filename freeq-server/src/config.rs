@@ -313,7 +313,7 @@ pub struct ServerConfig {
     #[arg(long, env = "FREEQ_NO_GUEST", default_value_t = false)]
     pub no_guest: bool,
 
-    /// Allow an agent in if it's owner lists it in their at.freeq.agentKey record.
+    /// Allow an agent in if its owner lists it in their at.freeq.agentKey record.
     #[arg(long, env = "FREEQ_ALLOW_DELEGATED_AGENTS", default_value_t = false)]
     pub allow_delegated_agents: bool,
 

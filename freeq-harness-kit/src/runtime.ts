@@ -1374,7 +1374,8 @@ export class AgentRuntime {
         }
         // The DID is this project's identity, minted on its first connect.
         if (!this.conn?.did) await this.connect();
-        const onDisk = await this.#identityOnDisk(cfg);
+        const bot = (this.conn as FreeqConnection | undefined)?.bot;
+        const onDisk = this.conn?.did && bot?.stateDir ? undefined : await this.#identityOnDisk(cfg);
         const botDid = (this.conn as FreeqConnection | undefined)?.did ?? onDisk?.did;
         if (!botDid) {
           this.notify(
@@ -1383,7 +1384,6 @@ export class AgentRuntime {
           );
           return;
         }
-        const bot = (this.conn as FreeqConnection | undefined)?.bot;
         const ins = await agentInstructions({
           ownerDid: cfg.ownerDid,
           botDid,
@@ -2026,6 +2026,35 @@ export class AgentRuntime {
     return this.config;
   }
 
+  /** Where bot-kit keeps this project's state, named after the install and
+   *  the project. */
+  #botStateDir(cfg: FreeqConfig, project: string | undefined): string {
+    const slug = cfg.install ?? deriveInstallSlug();
+    const name = resolveBotName(
+      slug,
+      project,
+      (n: string) => existsSync(joinPath(BOTS_ROOT, n)),
+      this.names.name,
+    );
+    return joinPath(BOTS_ROOT, name);
+  }
+
+  /** This project's identity as its key file holds it, and where that file
+   *  lives; none before the first connect mints it. */
+  async #identityOnDisk(cfg: FreeqConfig): Promise<{ did: string; stateDir: string } | undefined> {
+    const meta = await collectSessionMeta({ cwd: this.harness.cwd(), model: this.harness.modelId() });
+    const stateDir = this.#botStateDir(cfg, meta.project);
+    const seedPath = joinPath(stateDir, "agent.key");
+    if (!existsSync(seedPath)) return undefined;
+    try {
+      const identity = await loadOrCreateIdentity({ seedPath });
+      return { did: identity.did, stateDir };
+    } catch (err) {
+      this.notify(`freeq: could not read ${seedPath}: ${(err as Error).message}`, "warning");
+      return undefined;
+    }
+  }
+
   /**
    * Has this installation used freeq in this project before?
    *
@@ -2034,36 +2063,11 @@ export class AgentRuntime {
    * minted at some point), or this is a git repository rather than a scratch
    * directory.
    */
-  /** This project's identity as its key file holds it, and where that file
-   *  lives; none before the first connect mints it. */
-  async #identityOnDisk(cfg: FreeqConfig): Promise<{ did: string; stateDir: string } | undefined> {
-    const meta = await collectSessionMeta({ cwd: this.harness.cwd(), model: this.harness.modelId() });
-    const slug = cfg.install ?? deriveInstallSlug();
-    const name = resolveBotName(
-      slug,
-      meta.project,
-      (n: string) => existsSync(joinPath(BOTS_ROOT, n)),
-      this.names.name,
-    );
-    const stateDir = joinPath(BOTS_ROOT, name);
-    const seedPath = joinPath(stateDir, "agent.key");
-    if (!existsSync(seedPath)) return undefined;
-    const identity = await loadOrCreateIdentity({ seedPath }).catch(() => null);
-    return identity ? { did: identity.did, stateDir } : undefined;
-  }
-
   async #projectIsKnown(cfg: FreeqConfig): Promise<boolean> {
     const meta = await collectSessionMeta({ cwd: this.harness.cwd(), model: this.harness.modelId() });
     this.currentProject = meta.project;
     if (meta.project && cfg.projects?.[meta.project]) return true;
-    const slug = cfg.install ?? deriveInstallSlug();
-    const name = resolveBotName(
-      slug,
-      meta.project,
-      (n: string) => existsSync(joinPath(BOTS_ROOT, n)),
-      this.names.name,
-    );
-    if (existsSync(joinPath(BOTS_ROOT, name))) return true;
+    if (existsSync(this.#botStateDir(cfg, meta.project))) return true;
     // A git checkout is somewhere someone means to keep working; a bare
     // directory is usually somewhere they are trying something out.
     return !!meta.repo || !!meta.branch;

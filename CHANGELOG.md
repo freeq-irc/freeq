@@ -9,7 +9,7 @@ From `v0.9.0-beta.1` onward this project follows [Keep a Changelog](https://keep
 June 2026.
 
 ### Added
-- SASL payload reassembly: the server joins an `AUTHENTICATE` response split into 400-byte chunks and honours a client-sent `AUTHENTICATE +`, per the IRCv3 base spec; the Rust SDK chunks its responses the same way.
+- SASL payload reassembly: the server joins an `AUTHENTICATE` response split into 400-byte chunks and honours a client-sent `AUTHENTICATE +`, per the IRCv3 base spec, and still accepts a single oversized line.
 - `--allow-delegated-agents`: an allowlisted server admits an agent its allowlist does not know when the owner it names (`owner_did` in the SASL response) is allowed and that owner's `at.freeq.agentKey` records claim it; removing the record, or the owner, closes the connection at the next re-read of the records (`--record-cache-secs`).
 - FTS5 full-text history search: `SEARCH` command plus REST endpoint backed by SQLite FTS5.
 - ATPROTO-CHALLENGE IRCv3 draft specification document.

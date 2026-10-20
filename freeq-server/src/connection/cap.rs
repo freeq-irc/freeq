@@ -229,6 +229,11 @@ pub(super) fn handle_cap(
     }
 }
 
+/// A DID as the wire may carry it: `did:` plus printable ASCII.
+fn is_wire_did(s: &str) -> bool {
+    s.starts_with("did:") && s.len() > 4 && s.bytes().all(|b| b.is_ascii_graphic())
+}
+
 /// Handles the case where the allowlist has never heard of an agent's own
 /// `did:key` but the owner it names claims it and is allowed.
 async fn delegated_admit(
@@ -240,6 +245,9 @@ async fn delegated_admit(
     let Some(owner) = owner_did else {
         return Err("no owner named".to_string());
     };
+    if !is_wire_did(owner) {
+        return Err("owner_did is not a DID".to_string());
+    }
     if !state.config.allow_delegated_agents {
         return Err("this server does not admit delegated agents".to_string());
     }
@@ -249,6 +257,11 @@ async fn delegated_admit(
     if owner.starts_with("did:key:") {
         return Err("an owner must be an account with a repository".to_string());
     }
+    let refusal = format!("the agent records of {owner} do not admit this agent");
+    if !state.did_is_allowed_resolved(owner, None).await {
+        tracing::warn!(agent = %agent_did, %owner, "delegated connect refused: the owner is not allowed here");
+        return Err(refusal);
+    }
     let links = super::provenance::read_owner_links(state, owner)
         .await
         .map_err(|e| {
@@ -256,13 +269,9 @@ async fn delegated_admit(
             format!("could not read the agent records of {owner}")
         })?;
     let Some(link) = links.into_iter().find(|l| l.link.agent_did == agent_did) else {
-        return Err(format!(
-            "the agent records of {owner} do not name this agent"
-        ));
+        tracing::warn!(agent = %agent_did, %owner, "delegated connect refused: the owner's records do not name the agent");
+        return Err(refusal);
     };
-    if !state.did_is_allowed_resolved(owner, None).await {
-        return Err(format!("{owner} is not allowed to connect here"));
-    }
     let key = (owner.to_string(), agent_did.to_string());
     state
         .agent_links
@@ -431,6 +440,7 @@ pub(super) async fn handle_authenticate(
                                 method = response.method.as_deref().unwrap_or("crypto"),
                                 "connection denied by connect allowlist"
                             );
+                            close_after_too_many_failures(conn, state, session_id, send);
                         }
                         Ok(did) => {
                             // A sign-in with a one-time web token whose login
@@ -886,7 +896,7 @@ mod delegated_admit_tests {
             state_allowing_owner(true, vec![repo_of(OWNER, &[claim(OWNER, OTHER_AGENT, 24)])])
                 .await;
         let refused = admit(&state, Some(OWNER)).await.unwrap_err();
-        assert!(refused.contains("do not name this agent"), "{refused}");
+        assert!(refused.contains("do not admit this agent"), "{refused}");
         assert!(state.delegated_sessions.lock().is_empty());
     }
 
@@ -895,7 +905,7 @@ mod delegated_admit_tests {
         let records = [claim(OWNER, AGENT, 24), removal(OWNER, AGENT, 12)];
         let state = state_allowing_owner(true, vec![repo_of(OWNER, &records)]).await;
         let refused = admit(&state, Some(OWNER)).await.unwrap_err();
-        assert!(refused.contains("do not name this agent"), "{refused}");
+        assert!(refused.contains("do not admit this agent"), "{refused}");
     }
 
     /// A record lifted into the listing without the repository's proof.
@@ -909,7 +919,7 @@ mod delegated_admit_tests {
         );
         let state = state_allowing_owner(true, vec![repo]).await;
         let refused = admit(&state, Some(OWNER)).await.unwrap_err();
-        assert!(refused.contains("do not name this agent"), "{refused}");
+        assert!(refused.contains("do not admit this agent"), "{refused}");
     }
 
     /// Delegation carries the owner's standing, so it cannot exceed it.
@@ -919,7 +929,40 @@ mod delegated_admit_tests {
             state_allowing_owner(true, vec![repo_of(STRANGER, &[claim(STRANGER, AGENT, 24)])])
                 .await;
         let refused = admit(&state, Some(STRANGER)).await.unwrap_err();
-        assert!(refused.contains("not allowed"), "{refused}");
+        assert!(refused.contains("do not admit this agent"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn an_owner_who_is_not_allowed_is_not_read() {
+        let pds = crate::peer_keys::stub_pds_repos(vec![repo_of(
+            STRANGER,
+            &[claim(STRANGER, AGENT, 24)],
+        )])
+        .await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig {
+                allowed_dids: vec![OWNER.to_string()],
+                allow_delegated_agents: true,
+                ..Default::default()
+            },
+            pds.resolver.clone(),
+        );
+        assert!(admit(&state, Some(STRANGER)).await.is_err());
+        assert_eq!(pds.arrivals.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_owner_that_is_not_a_did_is_refused_before_anything_else() {
+        let state = state_allowing_owner(true, vec![]).await;
+        for owner in [
+            "alice.example",
+            "did:",
+            "did:plc:bad\r\nQUIT",
+            "did:plc:with space",
+        ] {
+            let refused = admit(&state, Some(owner)).await.unwrap_err();
+            assert!(refused.contains("not a DID"), "{owner:?}: {refused}");
+        }
     }
 
     #[tokio::test]

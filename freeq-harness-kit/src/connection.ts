@@ -474,7 +474,7 @@ export class FreeqConnection {
         this.#lastError = e;
         // An allowlisted server names the owner's records; that is the
         // owner's cue to add this installation as one of their agents.
-        const hint = /agent records of .* do not name this agent/.test(e)
+        const hint = /agent records of .* do not admit this agent/.test(e)
           ? ` Run ${this.#names.hint("authorize")} to add this installation as one of your agents.`
           : "";
         this.#notice(`freeq: authentication failed — ${e}${hint}`, "error", "auth");
