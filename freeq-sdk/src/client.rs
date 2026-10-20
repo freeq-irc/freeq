@@ -1749,6 +1749,7 @@ pub fn connect_with_stream(
     let echo_reg = echo_registry.clone();
     let caps_for_loop = caps_acked.clone();
     let maps_for_loop = did_maps.clone();
+    let self_tx = cmd_tx.downgrade();
     tokio::spawn(async move {
         let _ = event_tx.send(Event::Connected).await;
         let result = match conn {
@@ -1761,6 +1762,7 @@ pub fn connect_with_stream(
                     signer,
                     event_tx.clone(),
                     cmd_rx,
+                    self_tx.clone(),
                     echo_reg,
                     caps_for_loop,
                     maps_for_loop,
@@ -1776,6 +1778,7 @@ pub fn connect_with_stream(
                     signer,
                     event_tx.clone(),
                     cmd_rx,
+                    self_tx.clone(),
                     echo_reg,
                     caps_for_loop,
                     maps_for_loop,
@@ -1792,6 +1795,7 @@ pub fn connect_with_stream(
                     signer,
                     event_tx.clone(),
                     cmd_rx,
+                    self_tx.clone(),
                     echo_reg,
                     caps_for_loop,
                     maps_for_loop,
@@ -1808,6 +1812,7 @@ pub fn connect_with_stream(
                     signer,
                     event_tx.clone(),
                     cmd_rx,
+                    self_tx.clone(),
                     echo_reg,
                     caps_for_loop,
                     maps_for_loop,
@@ -1854,12 +1859,14 @@ pub fn connect(
     let echo_reg = echo_registry.clone();
     let caps_for_loop = caps_acked.clone();
     let maps_for_loop = did_maps.clone();
+    let self_tx = cmd_tx.downgrade();
     tokio::spawn(async move {
         if let Err(e) = run_client(
             config,
             signer,
             event_tx.clone(),
             cmd_rx,
+            self_tx,
             echo_reg,
             caps_for_loop,
             maps_for_loop,
@@ -1882,6 +1889,7 @@ async fn run_client(
     signer: Option<Arc<dyn ChallengeSigner>>,
     event_tx: mpsc::Sender<Event>,
     cmd_rx: mpsc::Receiver<Command>,
+    self_tx: mpsc::WeakSender<Command>,
     echo_registry: EchoRegistry,
     caps_acked: CapsAcked,
     did_maps: DidMaps,
@@ -1898,6 +1906,7 @@ async fn run_client(
                 signer,
                 event_tx,
                 cmd_rx,
+                self_tx.clone(),
                 echo_registry,
                 caps_acked,
                 did_maps,
@@ -1913,6 +1922,7 @@ async fn run_client(
                 signer,
                 event_tx,
                 cmd_rx,
+                self_tx.clone(),
                 echo_registry,
                 caps_acked,
                 did_maps,
@@ -1929,6 +1939,7 @@ async fn run_client(
                 signer,
                 event_tx,
                 cmd_rx,
+                self_tx.clone(),
                 echo_registry,
                 caps_acked,
                 did_maps,
@@ -1945,6 +1956,7 @@ async fn run_client(
                 signer,
                 event_tx,
                 cmd_rx,
+                self_tx.clone(),
                 echo_registry,
                 caps_acked,
                 did_maps,
@@ -2939,6 +2951,7 @@ fn spawn_enrollment(
     label: Option<String>,
     event_tx: mpsc::Sender<Event>,
     key_lookup: Option<Arc<crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>>>,
+    self_tx: mpsc::WeakSender<Command>,
 ) {
     use crate::device_key::EnrollOutcome;
     // A key past its lifetime would be refused as soon as it is published.
@@ -2947,6 +2960,8 @@ fn spawn_enrollment(
         return;
     }
     tokio::spawn(async move {
+        let pubkey_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
         let key = crate::crypto::PrivateKey::Ed25519(key);
         let record = match crate::identity_records::build_device_record(
             &key,
@@ -2978,6 +2993,13 @@ fn spawn_enrollment(
                     Ok(_) => tracing::warn!("device key replaced while it was published"),
                     Err(e) => tracing::warn!(error = %e, "published device key not read back"),
                 }
+                // The key again, so the server reads the account as it does
+                // at every connect and its copy, which readers are served,
+                // holds this record. The queue is this connection's: once it
+                // has ended, nothing is sent.
+                if let Some(tx) = self_tx.upgrade() {
+                    let _ = tx.send(Command::Raw(format!("MSGSIG {pubkey_b64}"))).await;
+                }
                 // The listing taken at connect predates this record, and so
                 // may the home server's copy. Our own lines are checked
                 // against it, so the account is listed at the PDS now.
@@ -3002,6 +3024,7 @@ async fn run_irc<R, W>(
     signer: Option<Arc<dyn ChallengeSigner>>,
     event_tx: mpsc::Sender<Event>,
     mut cmd_rx: mpsc::Receiver<Command>,
+    self_tx: mpsc::WeakSender<Command>,
     echo_registry: EchoRegistry,
     caps_acked: CapsAcked,
     did_maps: DidMaps,
@@ -3430,6 +3453,7 @@ where
                                         config.device_label.clone(),
                                         event_tx.clone(),
                                         config.key_lookup.clone(),
+                                        self_tx.clone(),
                                     );
                                 }
                             }
@@ -7814,6 +7838,7 @@ mod multiline_tests {
                     None,
                     event_tx,
                     cmd_rx,
+                    mpsc::channel::<Command>(1).0.downgrade(),
                     Arc::new(parking_lot::Mutex::new(HashMap::new())),
                     Arc::new(parking_lot::Mutex::new(CapsState::default())),
                     Arc::new(parking_lot::Mutex::new(DidMapsState::default())),
@@ -7899,6 +7924,7 @@ mod multiline_tests {
                     None,
                     event_tx,
                     cmd_rx,
+                    mpsc::channel::<Command>(1).0.downgrade(),
                     Arc::new(parking_lot::Mutex::new(HashMap::new())),
                     Arc::new(parking_lot::Mutex::new(CapsState::default())),
                     Arc::new(parking_lot::Mutex::new(DidMapsState::default())),
@@ -7976,6 +8002,7 @@ mod multiline_tests {
                 None,
                 event_tx,
                 cmd_rx,
+                mpsc::channel::<Command>(1).0.downgrade(),
                 echo_registry,
                 caps_acked,
                 did_maps,
@@ -8092,6 +8119,7 @@ mod multiline_tests {
                 None,
                 event_tx,
                 cmd_rx,
+                mpsc::channel::<Command>(1).0.downgrade(),
                 echo_registry,
                 caps_acked,
                 did_maps,
@@ -8275,6 +8303,7 @@ mod irc_loop_tests {
                 None,
                 event_tx,
                 cmd_rx,
+                mpsc::channel::<Command>(1).0.downgrade(),
                 echo_registry,
                 caps_acked,
                 did_maps,
@@ -10048,6 +10077,7 @@ mod did_maps_tests {
                 None,
                 event_tx,
                 cmd_rx,
+                mpsc::channel::<Command>(1).0.downgrade(),
                 echo_registry,
                 caps_acked,
                 did_maps,
@@ -11001,6 +11031,9 @@ mod device_key_tests {
     struct StubEnrollment {
         outcome: EnrollOutcome,
         calls: parking_lot::Mutex<Vec<(DeviceKeyRecord, String)>>,
+        /// Held in front of the answer, for a test that needs one to land
+        /// after the connection it was started on has ended.
+        gate: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl StubEnrollment {
@@ -11008,6 +11041,15 @@ mod device_key_tests {
             Arc::new(Self {
                 outcome,
                 calls: Default::default(),
+                gate: None,
+            })
+        }
+
+        fn held(outcome: EnrollOutcome, gate: Arc<tokio::sync::Notify>) -> Arc<Self> {
+            Arc::new(Self {
+                outcome,
+                calls: Default::default(),
+                gate: Some(gate),
             })
         }
     }
@@ -11020,7 +11062,13 @@ mod device_key_tests {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = EnrollOutcome> + Send>> {
             self.calls.lock().push((record, signer_public_key));
             let outcome = self.outcome.clone();
-            Box::pin(async move { outcome })
+            let gate = self.gate.clone();
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                outcome
+            })
         }
     }
 
@@ -11531,6 +11579,24 @@ mod device_key_tests {
                 .unwrap();
         }
 
+        /// Everything the client has written and not been read yet.
+        async fn drain(&mut self) -> String {
+            let mut wire = Vec::new();
+            let mut chunk = vec![0u8; 4096];
+            while let Ok(Ok(n)) = tokio::time::timeout(
+                std::time::Duration::from_millis(120),
+                self.server.read(&mut chunk),
+            )
+            .await
+            {
+                if n == 0 {
+                    break;
+                }
+                wire.extend_from_slice(&chunk[..n]);
+            }
+            String::from_utf8_lossy(&wire).into_owned()
+        }
+
         /// The next server notice, as the app would hear it.
         async fn notice(&mut self) -> String {
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -11781,6 +11847,62 @@ mod device_key_tests {
         assert_eq!(
             kept.record_uri, None,
             "the new key does not read as published"
+        );
+    }
+
+    /// Every `MSGSIG` line of a wire, the key alone.
+    fn registered_keys(wire: &str) -> Vec<&str> {
+        wire.lines()
+            .filter_map(|l| l.strip_prefix("MSGSIG "))
+            .map(str::trim)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_published_key_is_registered_again() {
+        let store = MemoryStore::holding(6, None);
+        let enrollment = StubEnrollment::answering(EnrollOutcome::Published {
+            uri: "at://did:plc:tester/at.freeq.deviceKey/3kdevice".to_string(),
+        });
+        let conn = connect_once(config_with(Some(store), Some(enrollment))).await;
+        assert_eq!(
+            registered_keys(&conn.wire),
+            vec![public_b64(&[6; 32]), public_b64(&[6; 32])],
+            "one at 001, one after the publish, the key it presented"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_whose_publish_failed_is_not_registered_again() {
+        let store = MemoryStore::holding(6, None);
+        let enrollment = StubEnrollment::answering(EnrollOutcome::Failed("no".to_string()));
+        let conn = connect_once(config_with(Some(store), Some(enrollment))).await;
+        assert_eq!(registered_keys(&conn.wire), vec![public_b64(&[6; 32])]);
+    }
+
+    #[tokio::test]
+    async fn a_publish_answered_after_its_connection_ended_registers_nothing() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let store = MemoryStore::holding(6, None);
+        let enrollment = StubEnrollment::held(
+            EnrollOutcome::Published {
+                uri: "at://did:plc:tester/at.freeq.deviceKey/3kdevice".to_string(),
+            },
+            gate.clone(),
+        );
+        let first = connect_once(config_with(Some(store.clone()), Some(enrollment.clone()))).await;
+        assert_eq!(registered_keys(&first.wire), vec![public_b64(&[6; 32])]);
+        assert_eq!(enrollment.calls.lock().len(), 1, "the publish is out");
+
+        // The first connection has ended; another is up when its answer lands.
+        let mut live = connect_live(config_with(Some(store), None)).await;
+        gate.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let wire = live.drain().await;
+        assert_eq!(
+            registered_keys(&wire),
+            vec![public_b64(&[6; 32])],
+            "only the new connection's own: {wire}"
         );
     }
 

@@ -35,6 +35,15 @@ export const AGENT_KEY_TYPE = 'at.freeq.agentKey';
 export const KEY_LIFETIME_MS = 90 * 24 * 60 * 60 * 1000;
 
 /**
+ * Whether a key made at `createdAt` (RFC 3339) is past its lifetime now. A
+ * date that does not parse counts as not past it.
+ */
+export function pastKeyLifetime(createdAt: string): boolean {
+  const made = Date.parse(createdAt);
+  return !Number.isNaN(made) && made + KEY_LIFETIME_MS <= Date.now();
+}
+
+/**
  * An `at.freeq.deviceKey` entry: either a key the account publishes
  * (`publicKeyMultibase`) or a retirement of one (`revokes`), never both.
  */

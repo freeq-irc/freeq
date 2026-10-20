@@ -16,9 +16,9 @@ import { dmPeerKey, isDid } from './address.js';
 import { prefetchProfiles } from './profiles.js';
 import { recordKeyOf, type DeviceKeyStore, type StoredDeviceKey } from './device-key.js';
 import {
-  KEY_LIFETIME_MS,
   buildDeviceRecord,
   deviceKeyHistory,
+  pastKeyLifetime,
   retiredOrExpired,
 } from './identity-records.js';
 import { KeyLookup, type KeyPair, didKeyAnswer, makeDidResolver } from './key-lookup.js';
@@ -2835,7 +2835,7 @@ export class FreeqClient extends EventEmitter {
     // own date: replaced without asking the account. The flag is what makes a
     // server with a shorter lifetime, or a clock ahead of this one, still
     // converge.
-    if (stored.refused || Date.parse(stored.createdAt) + KEY_LIFETIME_MS <= Date.now()) {
+    if (stored.refused || pastKeyLifetime(stored.createdAt)) {
       try {
         return await replace();
       } catch (e) {
@@ -2894,12 +2894,17 @@ export class FreeqClient extends EventEmitter {
    * published key; 401 or 403 means the session lacks the permission,
    * reported once; anything else waits for the next connect.
    */
-  private startEnrollment(): void {
+  private startEnrollment(pubkey: string): void {
     const stored = this.pendingEnrollment;
     this.pendingEnrollment = null;
     const { brokerUrl, brokerToken, deviceKeyStore: store, deviceLabel } = this.opts;
     const did = this.sasl?.did;
     if (!stored || !store || !brokerUrl || !brokerToken || !did) return;
+    // A key past its lifetime would be refused as soon as it is published.
+    if (pastKeyLifetime(stored.createdAt)) {
+      log.warn('[freeq-sdk] device key past its lifetime; not published');
+      return;
+    }
     const epoch = this.enrollmentEpoch;
     void (async () => {
       try {
@@ -2939,6 +2944,12 @@ export class FreeqClient extends EventEmitter {
                 log.warn('[freeq-sdk] device key replaced while it was published');
               }
             }
+            // The key again, so the server reads the account as it does at
+            // every connect and its copy, which readers are served, holds
+            // this record. Only on the connection that presented the key:
+            // on another one the stored key may have changed under us, and
+            // a key the server refuses ends that connection's login.
+            if (epoch === this.enrollmentEpoch) this.raw(`MSGSIG ${pubkey}`);
             // The listing taken at connect predates this record, and so may
             // the home server's copy. Our own lines are checked against it,
             // so the account is listed at the PDS now.
@@ -3510,7 +3521,7 @@ export class FreeqClient extends EventEmitter {
               // Released either way: a key this platform could not generate
               // is a reason to send unsigned, never a reason to stop sending.
               this.msgSigRegistered();
-              if (pubkey) this.startEnrollment();
+              if (pubkey) this.startEnrollment(pubkey);
             },
             () => this.msgSigRegistered(),
           );

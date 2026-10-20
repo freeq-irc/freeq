@@ -77,6 +77,9 @@ interface EnrollCall {
 
 let enrollCalls: EnrollCall[];
 let enrollAnswer: { status: number; body: unknown };
+/** Held in front of every `/enroll` answer, for a test that needs one to
+ *  land after the connection it was started on. */
+let enrollGate: Promise<void> | null;
 
 beforeEach(() => {
   MockWebSocket.instances = [];
@@ -84,11 +87,13 @@ beforeEach(() => {
   globalThis.WebSocket = MockWebSocket;
   enrollCalls = [];
   enrollAnswer = { status: 200, body: {} };
+  enrollGate = null;
   vi.stubGlobal(
     'fetch',
     vi.fn(async (url: string, init?: RequestInit) => {
       if (url === `${BROKER}/enroll`) {
         enrollCalls.push(JSON.parse(String(init?.body)));
+        if (enrollGate !== null) await enrollGate;
         return new Response(JSON.stringify(enrollAnswer.body), { status: enrollAnswer.status });
       }
       return new Response('{}', { status: 404 });
@@ -265,6 +270,66 @@ describe('publishing the device key through the broker', () => {
 
     expect((await store.load())!.recordUri).toBe(uri);
     expect(unpublished()).toBe(0);
+  });
+
+  it('registers the key again once the publish is answered', async () => {
+    const uri = 'at://did:plc:alice/at.freeq.deviceKey/3kdevice';
+    enrollAnswer = { status: 200, body: { ok: true, uri, cid: 'bafy' } };
+    const stored = await storedKey();
+    const { client } = await makeClient(new MemoryDeviceKeyStore(stored));
+    const ws = await login(client);
+    await until(() => ws.sent.filter((l) => l.startsWith('MSGSIG ')).length > 1);
+    await pause();
+    const registered = ws.sent.filter((l) => l.startsWith('MSGSIG '));
+    expect(registered, 'one at 001, one after the publish').toHaveLength(2);
+    expect(registered[1]).toBe(`MSGSIG ${await rawPublicB64(stored.keyPair)}`);
+    expect(registered[1], 'the key it presented').toBe(registered[0]);
+  });
+
+  it('registers nothing again when the publish fails', async () => {
+    enrollAnswer = { status: 502, body: 'PDS rejected record' };
+    const { client } = await makeClient(new MemoryDeviceKeyStore(await storedKey()));
+    const ws = await login(client);
+    await until(() => enrollCalls.length > 0);
+    await pause();
+    expect(ws.sent.filter((l) => l.startsWith('MSGSIG '))).toHaveLength(1);
+  });
+
+  it('registers nothing on the next connection when the publish is answered after a reconnect', async () => {
+    const uri = 'at://did:plc:alice/at.freeq.deviceKey/3kdevice';
+    enrollAnswer = { status: 200, body: { ok: true, uri, cid: 'bafy' } };
+    let release!: () => void;
+    enrollGate = new Promise<void>((resolve) => (release = resolve));
+    const first = await storedKey();
+    const store = new MemoryDeviceKeyStore(first);
+    const { client } = await makeClient(store);
+    const ws = await login(client);
+    await until(() => enrollCalls.length > 0);
+    // The socket goes before the publish is answered, and another tab's
+    // sign-in replaces the stored key meanwhile.
+    ws.close();
+    await flushAsync();
+    const next = await storedKey();
+    await store.save(next);
+    const ws2 = await login(client);
+    release();
+    await until(() => enrollCalls.length > 1);
+    await pause();
+    const registered = ws2.sent.filter((l) => l.startsWith('MSGSIG '));
+    expect(registered, 'never the key of the connection that ended').not.toContain(
+      `MSGSIG ${await rawPublicB64(first.keyPair)}`,
+    );
+    expect(new Set(registered)).toEqual(new Set([`MSGSIG ${await rawPublicB64(next.keyPair)}`]));
+  });
+
+  it('does not publish a key past its lifetime', async () => {
+    const keyPair = (await crypto.subtle.generateKey('Ed25519', false, ['sign', 'verify'])) as CryptoKeyPair;
+    const store = new MemoryDeviceKeyStore({ keyPair, createdAt: hoursAgo(91 * 24) });
+    const { client } = await makeClient(store);
+    const ws = await login(client);
+    await pause();
+    expect(enrollCalls, 'the server would refuse the record as expired').toEqual([]);
+    expect(ws.sent.filter((l) => l.startsWith('MSGSIG '))).toHaveLength(1);
   });
 
   it("re-checks the client's own account once the key is published", async () => {

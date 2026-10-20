@@ -4769,6 +4769,85 @@ mod retired_key_tests {
         assert_eq!(count(&listings), 1);
     }
 
+    /// Whether the server's copy of the account names `kid`.
+    fn copy_names(state: &Arc<SharedState>, kid: &str) -> bool {
+        state
+            .record_cache
+            .stored_listing(DID, freeq_sdk::identity_records::DEVICE_KEY_TYPE)
+            .is_some_and(|listing| {
+                let values: Vec<serde_json::Value> =
+                    listing.entries.iter().map(|e| e.value.clone()).collect();
+                freeq_sdk::identity_records::device_key_history(DID, &values)
+                    .iter()
+                    .any(|k| k.kid == kid)
+            })
+    }
+
+    /// The device registers its key again once its publish is answered: the
+    /// same path lists the account again, so the copy every reader is served
+    /// holds the new record and the key row takes the record's expiry.
+    #[tokio::test]
+    async fn a_key_registered_again_after_its_publish_refreshes_the_copy() {
+        let records = Arc::new(parking_lot::Mutex::new(vec![record_for(1)]));
+        let (state, listings, _) = state_counting(records.clone()).await;
+        // A login a key registered under here before, so its login lists
+        // nothing and the listing is the registration's.
+        state.device_key_tokens.lock().insert(
+            (DID.to_string(), "an-earlier-key".to_string()),
+            "BT-MSGSIG-AGAIN".to_string(),
+        );
+        let kid = freeq_sdk::sigtag::derive_kid(&signing_key(46).verifying_key());
+
+        let mut client = Client::signed_in(&state, "BT-MSGSIG-AGAIN").await;
+        client.tx(&msgsig_line(&signing_key(46))).await;
+        client
+            .rx(|l| l.contains("MSGSIG OK"))
+            .await
+            .expect("the key is registered");
+        wait_for_count(&listings, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !copy_names(&state, &kid),
+            "the registration's copy predates the publish"
+        );
+        let filed = state
+            .with_db(|db| db.get_signing_key_row(DID, &kid))
+            .flatten()
+            .expect("the key row");
+
+        // The publish lands, and the device registers the same key again.
+        records.lock().push(record_for(46));
+        client.tx(&msgsig_line(&signing_key(46))).await;
+        client
+            .rx(|l| l.contains("MSGSIG OK"))
+            .await
+            .expect("the key is registered again");
+        wait_for_count(&listings, 2).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !copy_names(&state, &kid) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(copy_names(&state, &kid), "the copy holds the published key");
+
+        let row = state
+            .with_db(|db| db.get_signing_key_row(DID, &kid))
+            .flatten()
+            .expect("the key row");
+        assert_eq!(
+            row.registered_at, filed.registered_at,
+            "the same row, first filed at the connect"
+        );
+        let published = chrono::DateTime::parse_from_rfc3339(&made_on()).unwrap()
+            + freeq_sdk::identity_records::KEY_LIFETIME;
+        assert_eq!(
+            row.expires_at,
+            Some(published.timestamp()),
+            "the row takes the record's expiry at the publish"
+        );
+        assert_ne!(row.expires_at, filed.expires_at);
+        assert!(still_answers(&mut client).await);
+    }
+
     #[tokio::test]
     async fn a_key_another_live_key_retired_is_refused_proving_only_what_decides_it() {
         let mut records = fifty_keys(44);
