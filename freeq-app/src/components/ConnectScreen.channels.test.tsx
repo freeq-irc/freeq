@@ -39,6 +39,12 @@ function joined(): unknown {
   return seen.connects[0]![2];
 }
 
+/** Whether that connect asked for those channels, which decides whether the
+ *  first of them to join is the channel the app opens. */
+function requested(): unknown {
+  return seen.connects[0]![4];
+}
+
 describe('the channels a connect screen sign-in joins', () => {
   it('joins the typed channel on a returned sign-in, not the saved set', async () => {
     // What doAtLogin saved before the redirect, and where this browser was.
@@ -56,6 +62,7 @@ describe('the channels a connect screen sign-in joins', () => {
     await showScreen();
     await waitFor(() => expect(seen.connects).toHaveLength(1));
     expect(joined()).toEqual(['#typed']);
+    expect(requested()).toBe(true);
   });
 
   it('joins the typed channel on a guest connect, not the saved set', async () => {
@@ -67,6 +74,7 @@ describe('the channels a connect screen sign-in joins', () => {
     fireEvent.click(screen.getByText('Connect as Guest'));
     await waitFor(() => expect(seen.connects).toHaveLength(1));
     expect(joined()).toEqual(['#typed']);
+    expect(requested()).toBe(true);
   });
 
   it('rejoins the saved set on a restored session, not the typed channel', async () => {
@@ -82,5 +90,8 @@ describe('the channels a connect screen sign-in joins', () => {
     await showScreen();
     await waitFor(() => expect(seen.connects).toHaveLength(1));
     expect(joined()).toEqual(['#old']);
+    // No one asked for them, so the restored session reopens whichever
+    // conversation was last open rather than the first channel to join.
+    expect(requested()).toBeFalsy();
   });
 });

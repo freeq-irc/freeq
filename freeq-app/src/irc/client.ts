@@ -301,6 +301,25 @@ function newKeyLookup(after?: Promise<void>): KeyLookup {
   );
 }
 
+/** The channels the person named on the sign-in screen, lowercased and
+ *  without any channel key, in the order they named them — and where in that
+ *  order the channel now open stands (`Infinity`: none of them is open).
+ *  Only an explicit sign-in fills this; a reconnect leaves it empty. */
+let requestedChannels: string[] = [];
+let openedRequestedRank = Infinity;
+
+/** A channel as the store keys it: the name alone, lowercased. A named
+ *  channel may carry a key ("#secret hunter2"), which `joinChannel` splits
+ *  off the same way before the name reaches the store. */
+function bareChannelName(channel: string): string {
+  return channel.trim().split(/\s+/)[0].toLowerCase();
+}
+
+/** Where `channel` stands among the channels this sign-in named, or -1. */
+function requestedRank(channel: string): number {
+  return requestedChannels.indexOf(bareChannelName(channel));
+}
+
 /** The key lookup the last connect was built with. */
 let connectKeyLookup: KeyLookup | null = null;
 
@@ -713,8 +732,19 @@ export function __setKeyUnpublishedForTests(): void {
  * `freshSignIn`: this connect is made from a returned sign-in, the only one
  * allowed to replace a device key the account has retired. A saved session
  * and every reconnect leave it false.
+ *
+ * `channelsRequested`: `channels` is what the person named on the sign-in
+ * screen, so the first of them to join is the channel the app opens. A
+ * reconnect leaves it false — its channels are where the browser already
+ * was, and it reopens whichever conversation was last open instead.
  */
-export function connect(url: string, desiredNick: string, channels?: string[], freshSignIn = false) {
+export function connect(
+  url: string,
+  desiredNick: string,
+  channels?: string[],
+  freshSignIn = false,
+  channelsRequested = false,
+) {
   if (client) {
     try { client.disconnect(); } catch { /* ignore */ }
     client = null;
@@ -722,6 +752,14 @@ export function connect(url: string, desiredNick: string, channels?: string[], f
 
   const store = useStore.getState();
   store.reset();
+
+  // Asking to join a channel at sign-in is asking to be in it: the named
+  // channels decide what opens, ahead of both rules further down (the first
+  // channel to join, and the restore of the last one open).
+  requestedChannels = channelsRequested
+    ? (channels ?? []).map(bareChannelName).filter(Boolean)
+    : [];
+  openedRequestedRank = Infinity;
 
   // The key this device signs with, and the lookup that checks what others
   // send. A guest signs nothing and publishes nothing, so neither is set up
@@ -1368,6 +1406,9 @@ function wireEvents(c: FreeqClient) {
     const savedActive = localStorage.getItem('freeq-active-channel');
     if (savedActive && savedActive !== 'server') {
       setTimeout(() => {
+        // A channel named at this sign-in is already open; taking it away
+        // half a second in is what made the channel field look dead.
+        if (openedRequestedRank !== Infinity) return;
         const ch = useStore.getState().channels.get(savedActive.toLowerCase());
         if (ch) useStore.getState().setActiveChannel(savedActive);
       }, 500);
@@ -1404,9 +1445,20 @@ function wireEvents(c: FreeqClient) {
   c.on('channelJoined', (channel) => {
     s().addChannel(channel);
     s().clearMembers(channel);
-    const savedActive = localStorage.getItem('freeq-active-channel');
-    if (!savedActive || s().activeChannel === 'server') {
+    // A channel named at sign-in opens over whatever is open, because the
+    // server rejoins the account's saved channels during registration and
+    // those arrive first. Rank only ever improves, so an earlier-named
+    // channel that joins later takes over, and nothing takes over from the
+    // first one named.
+    const rank = requestedRank(channel);
+    if (rank >= 0 && rank < openedRequestedRank) {
+      openedRequestedRank = rank;
       s().setActiveChannel(channel);
+    } else if (openedRequestedRank === Infinity) {
+      const savedActive = localStorage.getItem('freeq-active-channel');
+      if (!savedActive || s().activeChannel === 'server') {
+        s().setActiveChannel(channel);
+      }
     }
     saveJoinedChannels();
 

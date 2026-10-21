@@ -252,8 +252,10 @@ export function ConnectScreen() {
         const loc = window.location;
         const proto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
         const host = loc.host.replace('localhost', '127.0.0.1');
-        // A returned sign-in: the one connect that may replace a retired key.
-        connect(`${proto}//${host}/irc`, finalNick, ch, true);
+        // A returned sign-in: the one connect that may replace a retired key,
+        // and one the person named these channels for, so the first of them
+        // to join is what opens.
+        connect(`${proto}//${host}/irc`, finalNick, ch, true, true);
       }
     } catch { /* ignore parse errors */ }
   }, [brokerOrigin]);
@@ -428,8 +430,9 @@ export function ConnectScreen() {
     // Persist the channel input for next visit (doAtLogin does the same).
     localStorage.setItem(LS_CHANNELS, channels);
     // An explicit sign-in joins what the person typed, not where the browser
-    // last was — that set is for the reconnect on the next load.
-    connect(server, nick.trim(), typedChannels(channels));
+    // last was — that set is for the reconnect on the next load — and opens
+    // the first of the typed channels to join.
+    connect(server, nick.trim(), typedChannels(channels), false, true);
   };
 
   const connecting = connectionState === 'connecting' || connectionState === 'connected';
