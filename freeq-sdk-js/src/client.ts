@@ -397,6 +397,11 @@ const ACT_ANSWER_WINDOW_MS = 5_000;
  */
 const GUEST_NICK_RESUME_DELAYS_MS = [500, 1000, 2000];
 
+/** Where a guest who was given no channels lands. Not #freeq: that channel
+ *  carries a policy on zerosum and the server answers a guest's JOIN with
+ *  477, so the one channel a guest is sent to unasked has to be ungated. */
+const GUEST_DEFAULT_CHANNEL = '#general';
+
 /** CHATHISTORY subcommands, which sit where a target could and are all legal
  *  nicks. */
 const HISTORY_SUBCOMMANDS = new Set([
@@ -3529,8 +3534,8 @@ export class FreeqClient extends EventEmitter {
 
         const toJoin = this.autoJoinChannels.length > 0
           ? this.autoJoinChannels
-          : (this.sasl?.did ? [] : (this._joinedChannels.size > 0 ? [...this._joinedChannels] : ['#freeq']));
-        if (!this.sasl?.did && toJoin.length === 0) toJoin.push('#freeq');
+          : (this.sasl?.did ? [] : (this._joinedChannels.size > 0 ? [...this._joinedChannels] : [GUEST_DEFAULT_CHANNEL]));
+        if (!this.sasl?.did && toJoin.length === 0) toJoin.push(GUEST_DEFAULT_CHANNEL);
         for (const ch of toJoin) {
           if (ch.trim()) this.raw(`JOIN ${ch.trim()}`);
         }

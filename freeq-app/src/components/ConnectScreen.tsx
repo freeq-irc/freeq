@@ -129,9 +129,44 @@ const LS_CHANNELS = 'freeq-channels';
 const LS_BROKER_TOKEN = 'freeq-broker-token';
 const LS_BROKER_BASE = 'freeq-broker-base';
 
+/** Where someone who names no channel ends up. Not #freeq: it carries a
+ *  policy on zerosum, a guest who reaches for it is refused with 477, and
+ *  the panel that would ask them to sign in opens only for an account that
+ *  already is — so the default has to be a channel neither server gates. */
+const DEFAULT_CHANNEL = '#general';
+
+/** The value `freeq-oauth-pending` carries when the person edited the channel
+ *  field before the redirect. Any other value, including the plain `'1'` an
+ *  untouched field writes, leaves the returning connect a plain reconnect. */
+const EDITED_MARKER = 'edited';
+
 /** The channel field's comma-separated text as a list of channels. */
 function typedChannels(raw: string | null): string[] {
-  return (raw || '#freeq').split(',').map((s) => s.trim()).filter(Boolean);
+  return (raw || DEFAULT_CHANNEL).split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+/** The channel field's starting text, and whether it already counts as this
+ *  visit's instruction. Following an `#auto-join=` link is someone naming a
+ *  channel as much as typing one is, so the invited channel goes first — the
+ *  first channel named is the one that opens — and the visit counts as asked
+ *  for without the person touching the field. Saved text is only where the
+ *  browser last was, which is a preference. */
+function initialChannelField(): { text: string; fromInvite: boolean } {
+  // Check for auto-join from invite link (e.g. #auto-join=#channel)
+  const hash = window.location.hash;
+  if (hash.startsWith('#auto-join=')) {
+    const ch = decodeURIComponent(hash.slice('#auto-join='.length));
+    window.location.hash = '';
+    const existing = localStorage.getItem(LS_CHANNELS) || '';
+    const saved = existing.split(',').map(s => s.trim()).filter(Boolean);
+    // A Set keeps first insertion, so the invited channel stays first even
+    // when the saved set already holds it.
+    const text = [...new Set([ch, ...saved])].join(',');
+    // Persist through OAuth redirect
+    localStorage.setItem(LS_CHANNELS, text);
+    return { text, fromInvite: true };
+  }
+  return { text: localStorage.getItem(LS_CHANNELS) || DEFAULT_CHANNEL, fromInvite: false };
 }
 
 export function ConnectScreen() {
@@ -143,22 +178,13 @@ export function ConnectScreen() {
   const [handle, setHandle] = useState(() => localStorage.getItem(LS_HANDLE) || '');
   const [nick, setNick] = useState(() => 'web' + Math.floor(Math.random() * 99999));
   const [atNick, setAtNick] = useState(''); // derived nick for AT login, editable
-  const [channels, setChannels] = useState(() => {
-    // Check for auto-join from invite link (e.g. #auto-join=#channel)
-    const hash = window.location.hash;
-    if (hash.startsWith('#auto-join=')) {
-      const ch = decodeURIComponent(hash.slice('#auto-join='.length));
-      window.location.hash = '';
-      const existing = localStorage.getItem(LS_CHANNELS) || '';
-      const merged = new Set(existing.split(',').map(s => s.trim()).filter(Boolean));
-      merged.add(ch);
-      const result = [...merged].join(',');
-      // Persist through OAuth redirect
-      localStorage.setItem(LS_CHANNELS, result);
-      return result;
-    }
-    return localStorage.getItem(LS_CHANNELS) || '#freeq';
-  });
+  // Read once, before anything can have edited the field.
+  const [initialField] = useState(initialChannelField);
+  const [channels, setChannels] = useState(initialField.text);
+  // Whether this visit's field is an instruction: the person edited it, or an
+  // invite link named a channel in it. Left alone it is a preference — those
+  // channels are still joined, but the conversation last open is reopened.
+  const [channelsEdited, setChannelsEdited] = useState(initialField.fromInvite);
   const isTauri = !!(window as any).__TAURI_INTERNALS__;
   const [server, setServer] = useState(() => {
     if (isTauri) return 'wss://irc.freeq.at/irc';
@@ -223,6 +249,11 @@ export function ConnectScreen() {
 
     const raw = localStorage.getItem('freeq-oauth-result');
     if (!raw) return;
+    // This visit's field is pre-filled and nobody has touched it, so the one
+    // thing it cannot tell us is whether the person edited the field on the
+    // visit that left for the PDS. doAtLogin writes that into the pending
+    // marker it already sets, which nothing else reads the value of.
+    const fieldWasEdited = localStorage.getItem('freeq-oauth-pending') === EDITED_MARKER;
     localStorage.removeItem('freeq-oauth-result');
     localStorage.removeItem('freeq-oauth-pending');
     try {
@@ -252,10 +283,10 @@ export function ConnectScreen() {
         const loc = window.location;
         const proto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
         const host = loc.host.replace('localhost', '127.0.0.1');
-        // A returned sign-in: the one connect that may replace a retired key,
-        // and one the person named these channels for, so the first of them
-        // to join is what opens.
-        connect(`${proto}//${host}/irc`, finalNick, ch, true, true);
+        // A returned sign-in: the one connect that may replace a retired key.
+        // It opens the first of these channels to join only if the person
+        // named them, rather than leaving the saved field alone.
+        connect(`${proto}//${host}/irc`, finalNick, ch, true, fieldWasEdited);
       }
     } catch { /* ignore parse errors */ }
   }, [brokerOrigin]);
@@ -413,15 +444,17 @@ export function ConnectScreen() {
         return;
       }
 
-      // Same-window flow (more reliable than popup in browsers)
-      localStorage.setItem('freeq-oauth-pending', '1');
+      // Same-window flow (more reliable than popup in browsers). The marker
+      // carries whether the field was this visit's instruction across the
+      // redirect, which component state cannot survive.
+      localStorage.setItem('freeq-oauth-pending', channelsEdited ? EDITED_MARKER : '1');
       window.location.href = authUrl;
       return;
     } catch (e) {
       setError(`OAuth error: ${e}`);
       setOauthPending(false);
     }
-  }, [handle, server, channels, atNick, chans]);
+  }, [handle, server, channels, channelsEdited, atNick, chans]);
 
   // Guest login (no AT auth)
   const doGuestLogin = () => {
@@ -429,10 +462,10 @@ export function ConnectScreen() {
     setError('');
     // Persist the channel input for next visit (doAtLogin does the same).
     localStorage.setItem(LS_CHANNELS, channels);
-    // An explicit sign-in joins what the person typed, not where the browser
+    // An explicit sign-in joins what the field says, not where the browser
     // last was — that set is for the reconnect on the next load — and opens
-    // the first of the typed channels to join.
-    connect(server, nick.trim(), typedChannels(channels), false, true);
+    // the first of those channels to join when the person named them.
+    connect(server, nick.trim(), typedChannels(channels), false, channelsEdited);
   };
 
   const connecting = connectionState === 'connecting' || connectionState === 'connected';
@@ -584,8 +617,8 @@ export function ConnectScreen() {
             </label>
             <input
               value={channels}
-              onChange={(e) => setChannels(e.target.value)}
-              placeholder="#freeq"
+              onChange={(e) => { setChannels(e.target.value); setChannelsEdited(true); }}
+              placeholder={DEFAULT_CHANNEL}
               onKeyDown={(e) => e.key === 'Enter' && (mode === 'at-proto' ? doAtLogin() : doGuestLogin())}
               className="w-full bg-bg border border-border rounded-lg px-4 py-3 text-base text-fg outline-none focus:border-accent transition-colors placeholder:text-fg-dim"
             />

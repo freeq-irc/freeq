@@ -195,7 +195,7 @@ test.describe('Multi-tab / nick collision', () => {
     await page2.goto('/');
     await page2.getByRole('button', { name: 'Guest' }).click();
     await page2.getByPlaceholder('your_nick').fill(nick);
-    await page2.getByPlaceholder('#freeq').fill(channel);
+    await page2.getByPlaceholder('#general').fill(channel);
     await page2.getByRole('button', { name: 'Connect as Guest' }).click();
 
     // Wait for connection

@@ -2,11 +2,12 @@
 /**
  * Which channel the app opens on connect (irc/client.ts, hotspot gamma 133).
  *
- * A sign-in where the person named channels opens the first of them. That has
- * to beat two older rules: the server rejoins the account's saved channels
- * during registration, so their JOINs land before the client's own, and half
- * a second after registration the client reopens the conversation that was
- * last open. A reconnect names no channels and keeps both rules.
+ * A sign-in whose channel field the person edited opens the first channel it
+ * names. That has to beat two older rules: the server rejoins the account's
+ * saved channels during registration, so their JOINs land before the client's
+ * own, and half a second after registration the client reopens the
+ * conversation that was last open. An untouched field, a session refresh and
+ * a reconnect all name nothing and keep both rules.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
@@ -64,14 +65,16 @@ const { useStore } = await import('../store');
 
 const s = () => useStore.getState();
 
-/** Connect the way an explicit sign-in does: these channels were asked for. */
-function signedInWith(channels: string[]): MockFreeqClient {
+/** Connect the way a sign-in with an edited channel field does: the person
+ *  asked for these channels. */
+function requesting(channels: string[]): MockFreeqClient {
   bridge.connect('wss://test/irc', 'me', channels, false, true);
   return MockFreeqClient.latest!;
 }
 
-/** Connect the way a session refresh or reconnect does: no one asked. */
-function reconnectedWith(channels: string[]): MockFreeqClient {
+/** Connect the way an untouched field, a session refresh or a reconnect
+ *  does: these channels are joined, but no one asked for them. */
+function notRequesting(channels: string[]): MockFreeqClient {
   bridge.connect('wss://test/irc', 'me', channels);
   return MockFreeqClient.latest!;
 }
@@ -97,7 +100,7 @@ describe('the channel a connect opens', () => {
   it('opens the named channel though a saved one joined first', () => {
     // Where this browser last was, and what the account rejoins on its own.
     localStorage.setItem('freeq-active-channel', '#freeq');
-    const client = signedInWith(['#naptest']);
+    const client = requesting(['#naptest']);
 
     registerAndJoin(client, '#freeq', '#naptest');
     expect(s().activeChannel).toBe('#naptest');
@@ -109,7 +112,7 @@ describe('the channel a connect opens', () => {
 
   it('restores the last open channel when the connect named none', () => {
     localStorage.setItem('freeq-active-channel', '#dev');
-    const client = reconnectedWith(['#freeq', '#dev']);
+    const client = notRequesting(['#freeq', '#dev']);
 
     registerAndJoin(client, '#freeq', '#dev');
     // The first to arrive opens while the restore is still pending.
@@ -120,7 +123,7 @@ describe('the channel a connect opens', () => {
   });
 
   it('opens the first channel named, not the first to join', () => {
-    const client = signedInWith(['#naptest', '#other']);
+    const client = requesting(['#naptest', '#other']);
 
     registerAndJoin(client, '#other', '#naptest');
     expect(s().activeChannel).toBe('#naptest');
@@ -133,16 +136,48 @@ describe('the channel a connect opens', () => {
 
   it('matches a named channel by case, and past its channel key', () => {
     localStorage.setItem('freeq-active-channel', '#freeq');
-    const client = signedInWith(['#NapTest secretkey']);
+    const client = requesting(['#NapTest secretkey']);
 
     registerAndJoin(client, '#freeq', '#naptest');
     vi.advanceTimersByTime(600);
     expect(s().activeChannel).toBe('#naptest');
   });
 
+  it('opens #general on a first-ever visit with nothing stored', () => {
+    // The field showed the default and nobody edited it, so nothing was
+    // asked for — and with no conversation to go back to, the default is
+    // both the channel joined and the channel opened.
+    const client = notRequesting(['#general']);
+
+    registerAndJoin(client, '#general');
+    vi.advanceTimersByTime(600);
+    expect(s().activeChannel).toBe('#general');
+  });
+
+  it('opens the channel an edited field names, over the account rejoins', () => {
+    // The same visit, with the field edited to name a channel instead.
+    localStorage.setItem('freeq-active-channel', '#dev');
+    const client = requesting(['#naptest']);
+
+    registerAndJoin(client, '#freeq', '#dev', '#naptest');
+    vi.advanceTimersByTime(600);
+    expect(s().activeChannel).toBe('#naptest');
+  });
+
+  it('opens an invited channel, not the saved ones joined with it', () => {
+    // An invite link puts its channel first in the field, so arriving by one
+    // lands in that channel even though the browser has its own set.
+    localStorage.setItem('freeq-active-channel', '#dev');
+    const client = requesting(['#party', '#dev']);
+
+    registerAndJoin(client, '#dev', '#party');
+    vi.advanceTimersByTime(600);
+    expect(s().activeChannel).toBe('#party');
+  });
+
   it('falls back to the restore when no named channel ever joins', () => {
     localStorage.setItem('freeq-active-channel', '#dev');
-    const client = signedInWith(['#naptest']);
+    const client = requesting(['#naptest']);
 
     // #naptest is +i and refuses; only the account's own channels join.
     registerAndJoin(client, '#freeq', '#dev');
@@ -151,13 +186,13 @@ describe('the channel a connect opens', () => {
   });
 
   it('forgets the named channels on the next connect', () => {
-    const first = signedInWith(['#naptest']);
+    const first = requesting(['#naptest']);
     registerAndJoin(first, '#naptest');
     expect(s().activeChannel).toBe('#naptest');
 
     // A reconnect of the same page restores what was last open instead.
     localStorage.setItem('freeq-active-channel', '#dev');
-    const again = reconnectedWith(['#naptest', '#dev']);
+    const again = notRequesting(['#naptest', '#dev']);
     registerAndJoin(again, '#naptest', '#dev');
     vi.advanceTimersByTime(600);
     expect(s().activeChannel).toBe('#dev');

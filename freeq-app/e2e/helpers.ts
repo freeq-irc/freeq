@@ -93,7 +93,7 @@ export async function connectGuest(page: Page, nick: string, channel: string) {
   await nickInput.fill(nick);
 
   // Fill channel
-  const channelInput = page.getByPlaceholder('#freeq');
+  const channelInput = page.getByPlaceholder('#general');
   await channelInput.fill(channel);
 
   // Click connect
