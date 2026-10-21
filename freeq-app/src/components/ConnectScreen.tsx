@@ -129,6 +129,11 @@ const LS_CHANNELS = 'freeq-channels';
 const LS_BROKER_TOKEN = 'freeq-broker-token';
 const LS_BROKER_BASE = 'freeq-broker-base';
 
+/** The channel field's comma-separated text as a list of channels. */
+function typedChannels(raw: string | null): string[] {
+  return (raw || '#freeq').split(',').map((s) => s.trim()).filter(Boolean);
+}
+
 export function ConnectScreen() {
   const registered = useStore((s) => s.registered);
   const connectionState = useStore((s) => s.connectionState);
@@ -236,12 +241,11 @@ export function ConnectScreen() {
         oauthConnectInProgress = true;
         setAutoConnecting(true);
         const h = localStorage.getItem(LS_HANDLE) || result.handle || '';
-        // Use saved joined channels if available (reflects actual PART/JOIN state),
-        // otherwise fall back to the saved channels from connect screen input.
-        const savedJoined = localStorage.getItem('freeq-joined-channels');
-        const ch = savedJoined
-          ? JSON.parse(savedJoined)
-          : (localStorage.getItem(LS_CHANNELS) || '#freeq').split(',').map(s => s.trim()).filter(Boolean);
+        // A returned sign-in joins what the person typed on this screen,
+        // which doAtLogin saved before the redirect. The joined set is where
+        // the browser last was, which is what a reconnect wants — preferring
+        // it here made the field dead in any browser that had ever joined.
+        const ch = typedChannels(localStorage.getItem(LS_CHANNELS));
         const finalNick = nickFromHandle(result.handle || h);
         const token = result.web_token || result.token || result.access_jwt || '';
         setSaslCredentials(token, result.did, result.pds_url || '', 'web-token');
@@ -271,12 +275,13 @@ export function ConnectScreen() {
     brokerAutoAttempts++;
     sessionRefreshInFlight = true;
     setAutoConnecting(true);
-    // Use saved joined channels if available (reflects actual PART/JOIN state),
-    // otherwise fall back to the saved channels from connect screen input.
+    // No one asked for this connection, so it is a reconnect: go back to the
+    // channels the browser was last in (reflects actual PART/JOIN state), and
+    // use the typed input only when nothing has been joined yet.
     const savedJoined = localStorage.getItem('freeq-joined-channels');
     const ch = savedJoined
       ? JSON.parse(savedJoined)
-      : (localStorage.getItem(LS_CHANNELS) || '#freeq').split(',').map(s => s.trim()).filter(Boolean);
+      : typedChannels(localStorage.getItem(LS_CHANNELS));
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
@@ -422,13 +427,9 @@ export function ConnectScreen() {
     setError('');
     // Persist the channel input for next visit (doAtLogin does the same).
     localStorage.setItem(LS_CHANNELS, channels);
-    // Use saved joined channels if available (reflects actual PART/JOIN state),
-    // otherwise fall back to what's typed in the connect screen input.
-    const savedJoined = localStorage.getItem('freeq-joined-channels');
-    const ch = savedJoined
-      ? JSON.parse(savedJoined)
-      : (channels || '#freeq').split(',').map(s => s.trim()).filter(Boolean);
-    connect(server, nick.trim(), ch);
+    // An explicit sign-in joins what the person typed, not where the browser
+    // last was — that set is for the reconnect on the next load.
+    connect(server, nick.trim(), typedChannels(channels));
   };
 
   const connecting = connectionState === 'connecting' || connectionState === 'connected';
