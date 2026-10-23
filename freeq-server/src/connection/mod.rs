@@ -7287,6 +7287,48 @@ mod agent_record_tests {
         );
     }
 
+    /// The outage an agent already survived does not count against the
+    /// next connection: admission's own read starts the clock over.
+    #[tokio::test]
+    async fn an_admission_clears_an_earlier_outage() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[76; 32]).unwrap();
+        let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
+        let (state, pds) = gated_with_short_period(&repo).await;
+        let (mut first, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        register(&mut first).await;
+        pds.fail.store(true, Ordering::SeqCst);
+        recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        assert!(state.owner_read_failures.lock().contains_key(OWNER));
+
+        pds.fail.store(false, Ordering::SeqCst);
+        let other_key = PrivateKey::ed25519_from_bytes(&[77; 32]).unwrap();
+        let other_did = format!("did:key:{}", other_key.public_key_multibase());
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&other_did, 24));
+        let (_second, v) = sasl_as_agent(&state, &other_key, "helper2", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        assert!(!state.owner_read_failures.lock().contains_key(OWNER));
+    }
+
+    #[tokio::test]
+    async fn an_owner_with_no_agent_connected_keeps_no_outage() {
+        let repo = owner_repo();
+        let (state, pds) = gated_with_short_period(&repo).await;
+        state.agent_links.lock().insert(
+            (OWNER.to_string(), BOT.to_string()),
+            (std::time::Instant::now(), "at://old".to_string()),
+        );
+        state
+            .owner_read_failures
+            .lock()
+            .insert(OWNER.to_string(), std::time::Instant::now());
+        pds.fail.store(true, Ordering::SeqCst);
+        recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        assert!(state.owner_read_failures.lock().is_empty());
+    }
+
     #[tokio::test]
     async fn a_good_read_starts_the_unreadable_clock_over() {
         let agent_key = PrivateKey::ed25519_from_bytes(&[75; 32]).unwrap();

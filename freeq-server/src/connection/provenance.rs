@@ -508,6 +508,10 @@ pub(crate) async fn recheck_agent_links(
     }
     for (owner_did, bots) in due {
         let delegated = has_delegated_sessions_of(state, &owner_did);
+        // An outage no connected agent is waiting out leaves nothing to keep.
+        if !delegated {
+            state.owner_read_failures.lock().remove(&owner_did);
+        }
         // A lookup that failed says nothing; only an answer of no closes.
         if delegated && state.did_is_allowed_checked(&owner_did, None).await == Some(false) {
             for (bot_did, _) in &bots {
