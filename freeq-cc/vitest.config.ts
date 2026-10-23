@@ -2,8 +2,7 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    // HOME points at a scratch directory before any module reads it: the
-    // kit looks for identities under ~/.freeq, read once at import.
+    // The kit's floor for HOME and fetch, before any module reads either.
     setupFiles: ["./test/setup.ts"],
   },
 });

@@ -3,18 +3,8 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// HOME decides where the runtime looks for ~/.freeq, read when the runtime
-// module is imported, so it points at a scratch directory first.
-const home = await vi.hoisted(async () => {
-  const fs = await import("node:fs");
-  const os = await import("node:os");
-  const path = await import("node:path");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "harness-kit-signed-connect-"));
-  process.env.HOME = dir;
-  return dir;
-});
-
 import { AgentRuntime } from "./runtime.js";
+import { TEST_HOME } from "./test-setup.js";
 import type { BotLike } from "./connection.js";
 import type { Harness, NoticeLevel } from "./harness.js";
 
@@ -24,7 +14,7 @@ const OWNER = "did:plc:owner";
 class FakeBot implements BotLike {
   identity = { did: "did:key:zSelf" };
   delegation = { signature: "c2lnbmVk" };
-  stateDir = join(home, ".freeq", "bots", "pi-test1234-proj");
+  stateDir = join(TEST_HOME, ".freeq", "bots", "pi-test1234-proj");
   provenance = { verified: true, reason: "signature", text: "Provenance verified: Verified against creator key" };
   client = {
     nick: "pi-test1234-proj",

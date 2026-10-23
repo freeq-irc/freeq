@@ -3,18 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// HOME decides where the runtime looks for ~/.freeq, read when the runtime
-// module is imported, so it points at a scratch directory first.
-const home = await vi.hoisted(async () => {
-  const fs = await import("node:fs");
-  const os = await import("node:os");
-  const path = await import("node:path");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "harness-kit-sign-cert-"));
-  process.env.HOME = dir;
-  return dir;
-});
-
 import { AgentRuntime } from "./runtime.js";
+import { TEST_HOME } from "./test-setup.js";
 import type { BotLike } from "./connection.js";
 import type { Harness, NoticeLevel } from "./harness.js";
 
@@ -24,7 +14,7 @@ const OWNER = "did:plc:owner";
 class FakeBot implements BotLike {
   identity = { did: "did:key:zSelf" };
   delegation = { signature: null as string | null };
-  stateDir = join(home, ".freeq", "bots", "pi-test1234-proj");
+  stateDir = join(TEST_HOME, ".freeq", "bots", "pi-test1234-proj");
   provenance = { verified: true, reason: "signature", text: "Provenance verified: Verified against creator key" };
   client = {
     nick: "pi-test1234-proj",
@@ -99,7 +89,7 @@ describe("/freeq authorize --sign-cert", () => {
         "and every server now reads agent records instead. Prefer `/freeq authorize` and add this agent under Settings → Agents.",
     );
     expect(notices[1]!.text).toMatch(/^freeq authorize --sign-cert — sign this installation's delegation\n/);
-    expect(existsSync(join(home, ".freeq", "owner", "did_plc_owner", "creator.key"))).toBe(true);
+    expect(existsSync(join(TEST_HOME, ".freeq", "owner", "did_plc_owner", "creator.key"))).toBe(true);
 
     // The next connect presents the certificate signed.
     bot.delegation = { signature: "c2lnbmVk" };
