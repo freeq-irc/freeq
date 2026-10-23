@@ -239,9 +239,11 @@ fn is_wire_did(s: &str) -> bool {
 
 /// The host a `did:web` names, without port or path.
 fn did_web_host(did: &str) -> Option<String> {
-    let first = did.strip_prefix("did:web:")?.split(':').next()?;
-    let host = first.replace("%3A", ":").replace("%3a", ":");
-    let host = host.split(':').next()?.to_ascii_lowercase();
+    let host = did
+        .strip_prefix("did:web:")?
+        .split(':')
+        .next()?
+        .to_ascii_lowercase();
     (!host.is_empty()).then_some(host)
 }
 
@@ -260,6 +262,12 @@ fn owner_may_be_looked_up(config: &crate::config::ServerConfig, owner: &str) -> 
     }
 }
 
+/// The soonest a delegated agent is refused, however quickly the server knew:
+/// a refusal for an owner who is not allowed would otherwise come back
+/// faster than one that had to read a member's records.
+pub(crate) const DELEGATED_REFUSAL_FLOOR: std::time::Duration =
+    std::time::Duration::from_millis(1500);
+
 /// Handles the case where the allowlist has never heard of an agent's own
 /// `did:key` but the owner it names claims it and is allowed.
 async fn delegated_admit(
@@ -271,6 +279,20 @@ async fn delegated_admit(
     let Some(owner) = owner_did else {
         return Err("no owner named".to_string());
     };
+    let started = tokio::time::Instant::now();
+    let admitted = check_delegation(state, session_id, agent_did, owner).await;
+    if admitted.is_err() {
+        tokio::time::sleep_until(started + DELEGATED_REFUSAL_FLOOR).await;
+    }
+    admitted
+}
+
+async fn check_delegation(
+    state: &Arc<SharedState>,
+    session_id: &str,
+    agent_did: &str,
+    owner: &str,
+) -> Result<(), String> {
     if !is_wire_did(owner) {
         return Err("owner_did is not a DID".to_string());
     }
@@ -1006,6 +1028,27 @@ mod delegated_admit_tests {
         }
     }
 
+    /// Refusing a stranger costs no lookup, so without the floor it would
+    /// come back faster than refusing someone whose records were read.
+    #[tokio::test]
+    async fn a_refusal_comes_no_sooner_than_the_floor() {
+        let state =
+            state_allowing_owner(true, vec![repo_of(STRANGER, &[claim(STRANGER, AGENT, 24)])])
+                .await;
+        let started = std::time::Instant::now();
+        assert!(admit(&state, Some(STRANGER)).await.is_err());
+        assert!(started.elapsed() >= DELEGATED_REFUSAL_FLOOR);
+    }
+
+    #[tokio::test]
+    async fn an_admission_is_not_held_to_the_floor() {
+        let state =
+            state_allowing_owner(true, vec![repo_of(OWNER, &[claim(OWNER, AGENT, 24)])]).await;
+        let started = std::time::Instant::now();
+        assert_eq!(admit(&state, Some(OWNER)).await, Ok(()));
+        assert!(started.elapsed() < DELEGATED_REFUSAL_FLOOR);
+    }
+
     /// A failing PDS must not confirm that its owner is allowed here.
     #[tokio::test]
     async fn a_read_that_fails_is_refused_with_the_shared_text() {
@@ -1040,7 +1083,7 @@ mod delegated_admit_tests {
         );
         assert_eq!(
             did_web_host("did:web:acme.com%3A8443:x").as_deref(),
-            Some("acme.com")
+            Some("acme.com%3a8443")
         );
         assert_eq!(did_web_host("did:plc:abc"), None);
         assert_eq!(did_web_host("did:web:"), None);
@@ -1061,6 +1104,11 @@ mod delegated_admit_tests {
             &cfg,
             "did:web:acme.com.victim.example"
         ));
+        assert!(!owner_may_be_looked_up(
+            &cfg,
+            "did:web:acme.com@victim.example"
+        ));
+        assert!(!owner_may_be_looked_up(&cfg, "did:web:acme.com%3A8443"));
         assert!(owner_may_be_looked_up(&cfg, "did:plc:anyone"));
         let listed = crate::config::ServerConfig {
             allowed_dids: vec!["did:web:solo.example".to_string()],

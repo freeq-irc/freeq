@@ -315,6 +315,7 @@ pub(super) async fn read_owner_links(
         chrono::Utc::now(),
     );
     *last = Some((std::time::Instant::now(), links.clone()));
+    state.owner_read_failures.lock().remove(owner_did);
     Ok(links)
 }
 
@@ -485,9 +486,9 @@ type KeptLink = (std::time::Instant, String);
 /// bot stays in any channel it is in. An entry a connect-time lookup changed
 /// meanwhile is left as it is. A read that fails changes nothing, and the
 /// next run tries again.
-/// Failed re-reads of an owner's records in a row before their connected
-/// agents are closed as unverifiable.
-pub(crate) const OWNER_READ_FAILURES_TO_CLOSE: u32 = 3;
+/// How many re-read periods an owner's records may stay unreadable before
+/// their connected agents are closed as unverifiable.
+pub(crate) const UNREADABLE_PERIODS_TO_CLOSE: u32 = 3;
 
 pub(crate) async fn recheck_agent_links(
     state: &std::sync::Arc<crate::server::SharedState>,
@@ -518,20 +519,18 @@ pub(crate) async fn recheck_agent_links(
             }
         }
         let links = match read_owner_links(state, &owner_did).await {
-            Ok(links) => {
-                state.owner_read_failures.lock().remove(&owner_did);
-                links
-            }
+            Ok(links) => links,
             Err(e) => {
                 tracing::debug!(owner = %owner_did, error = %e, "Could not re-read the owner's agent records");
                 if delegated {
-                    let failures = {
-                        let mut failures = state.owner_read_failures.lock();
-                        let n = failures.entry(owner_did.clone()).or_insert(0);
-                        *n += 1;
-                        *n
-                    };
-                    if failures >= OWNER_READ_FAILURES_TO_CLOSE {
+                    let since = *state
+                        .owner_read_failures
+                        .lock()
+                        .entry(owner_did.clone())
+                        .or_insert_with(std::time::Instant::now);
+                    let window = std::time::Duration::from_secs(state.config.record_cache_secs)
+                        * UNREADABLE_PERIODS_TO_CLOSE;
+                    if since.elapsed() >= window {
                         for (bot_did, _) in &bots {
                             close_delegated_sessions(
                                 state,

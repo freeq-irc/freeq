@@ -7104,11 +7104,7 @@ mod agent_record_tests {
                 .iter()
                 .any(|l| l.starts_with("ERROR :Delegation withdrawn"))
         );
-        b.tx("PING keep").await;
-        assert!(
-            b.rx(|l| l.contains("PONG")).await.is_some(),
-            "the sibling is still served"
-        );
+        assert!(still_served(&mut b).await, "the sibling is still served");
         assert_eq!(state.delegated_sessions.lock().len(), 1);
     }
 
@@ -7131,8 +7127,7 @@ mod agent_record_tests {
 
         repo.lock().add(AGENT_KEY_TYPE, &removal(&agent_did, 1));
         recheck_agent_links(&state, std::time::Duration::ZERO).await;
-        c.tx("PING keep").await;
-        assert!(c.rx(|l| l.contains("PONG")).await.is_some(), "still served");
+        assert!(still_served(&mut c).await, "still served");
     }
 
     #[tokio::test]
@@ -7211,10 +7206,14 @@ mod agent_record_tests {
         (state, pds)
     }
 
-    /// Whether the server still answers `c`.
+    /// Whether the server still answers `c` and has not closed it. A
+    /// closing connection can still answer one last PING, but its ERROR line
+    /// always arrives first.
     async fn still_served(c: &mut Client) -> bool {
         c.tx("PING keep").await;
-        c.rx(|l| l.contains("PONG")).await.is_some()
+        c.rx(|l| l.contains("PONG") || l.starts_with("ERROR "))
+            .await
+            .is_some_and(|l| l.contains("PONG"))
     }
 
     /// A lookup that fails says nothing about the owner, so it closes no one.
@@ -7235,39 +7234,85 @@ mod agent_record_tests {
         assert!(still_served(&mut agent).await);
     }
 
+    /// An instance like `gated_serving` whose re-read period is one second,
+    /// so records unreadable for three seconds close the agent.
+    async fn gated_with_short_period(
+        repo: &Arc<parking_lot::Mutex<StubRepo>>,
+    ) -> (Arc<SharedState>, crate::peer_keys::StubPds) {
+        let pds = crate::peer_keys::stub_pds_repos(vec![repo.clone()]).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig {
+                allowed_dids: vec![OWNER.to_string()],
+                no_guest: true,
+                allow_delegated_agents: true,
+                record_cache_secs: 1,
+                ..Default::default()
+            },
+            pds.resolver.clone(),
+        );
+        reuse_for(&state, 0);
+        (state, pds)
+    }
+
+    /// The re-check retries every minute, so a short outage must not add up
+    /// to a close; only records unreadable for three periods do.
     #[tokio::test]
-    async fn three_failed_reads_in_a_row_close_the_agent_and_a_good_read_resets_the_count() {
+    async fn records_unreadable_for_three_periods_close_the_agent() {
         let agent_key = PrivateKey::ed25519_from_bytes(&[74; 32]).unwrap();
         let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
         let repo = owner_repo();
         repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
-        let (state, pds) = gated_serving(&repo, &[]).await;
+        let (state, pds) = gated_with_short_period(&repo).await;
         let (mut agent, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
         assert!(v.contains(" 903 "), "{v}");
         register(&mut agent).await;
-        let recheck = || recheck_agent_links(&state, std::time::Duration::ZERO);
-        let failing = |on: bool| pds.fail.store(on, Ordering::SeqCst);
 
-        failing(true);
-        recheck().await;
-        recheck().await;
-        failing(false);
-        recheck().await;
-        failing(true);
-        recheck().await;
-        recheck().await;
+        pds.fail.store(true, Ordering::SeqCst);
+        for _ in 0..3 {
+            recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        }
         assert!(
             still_served(&mut agent).await,
-            "two in a row since the good read"
+            "three quick failures are not three periods"
         );
 
-        recheck().await;
+        tokio::time::sleep(std::time::Duration::from_millis(3100)).await;
+        recheck_agent_links(&state, std::time::Duration::ZERO).await;
         let closing = agent.rest().await;
         assert!(
             closing
                 .iter()
                 .any(|l| l.starts_with("ERROR :Delegation unverifiable")),
             "{closing:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_good_read_starts_the_unreadable_clock_over() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[75; 32]).unwrap();
+        let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
+        let (state, pds) = gated_with_short_period(&repo).await;
+        let (mut agent, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        register(&mut agent).await;
+        let recheck = || recheck_agent_links(&state, std::time::Duration::ZERO);
+        let failing = |on: bool| pds.fail.store(on, Ordering::SeqCst);
+        let two_seconds = std::time::Duration::from_secs(2);
+
+        failing(true);
+        recheck().await;
+        tokio::time::sleep(two_seconds).await;
+        failing(false);
+        recheck().await;
+        failing(true);
+        recheck().await;
+        tokio::time::sleep(two_seconds).await;
+        recheck().await;
+        assert!(
+            still_served(&mut agent).await,
+            "four seconds since the first failure, two since the good read"
         );
     }
 

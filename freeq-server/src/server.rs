@@ -906,9 +906,9 @@ pub struct SharedState {
     /// Session → (owner DID, bot DID) of every connection admitted on the
     /// owner's agent record.
     pub delegated_sessions: Mutex<HashMap<String, (String, String)>>,
-    /// Per owner DID, how many re-reads of their records have failed in a
-    /// row while one of their agents is connected on a record.
-    pub(crate) owner_read_failures: Mutex<HashMap<String, u32>>,
+    /// Per owner DID, when reads of their records started failing while one
+    /// of their agents is connected on a record; cleared by any good read.
+    pub(crate) owner_read_failures: Mutex<HashMap<String, std::time::Instant>>,
     /// Per owner DID, the one read of their records at a time and the last
     /// answer, reused while younger than `owner_read_reuse_ms`
     /// (`provenance::read_owner_links`).

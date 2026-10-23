@@ -10,7 +10,7 @@ June 2026.
 
 ### Added
 - SASL payload reassembly: the server joins an `AUTHENTICATE` response split into 400-byte chunks and honours a client-sent `AUTHENTICATE +`, per the IRCv3 base spec, and still accepts a single oversized line.
-- `--allow-delegated-agents`: an allowlisted server admits an agent its allowlist does not know when the owner it names (`owner_did` in the SASL response) is allowed and that owner's `at.freeq.agentKey` records claim it; removing the record, or the owner, closes the connection at the next re-read of the records (`--record-cache-secs`).
+- `--allow-delegated-agents`: an allowlisted server admits an agent its allowlist does not know when the owner it names (`owner_did` in the SASL response) is allowed and that owner's `at.freeq.agentKey` records claim it; removing the record, or the owner, closes the connection at the next re-read of the records (`--record-cache-secs`), and records unreadable for three re-read periods close it too.
 - FTS5 full-text history search: `SEARCH` command plus REST endpoint backed by SQLite FTS5.
 - ATPROTO-CHALLENGE IRCv3 draft specification document.
 - `SECURITY.md` security disclosure policy.
