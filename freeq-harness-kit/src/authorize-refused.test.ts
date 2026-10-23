@@ -99,4 +99,44 @@ describe("/freeq authorize before the server admits the agent", () => {
     await rt.stop();
     vi.unstubAllGlobals();
   });
+
+  it("says why on authorize verify, without waiting for a notice that never comes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-kit-authorize-verify-h-"));
+    const agentDir = join(root, "agent");
+    const cwd = join(root, "proj");
+    mkdirSync(agentDir, { recursive: true });
+    mkdirSync(cwd, { recursive: true });
+    writeFileSync(
+      join(agentDir, "freeq.json"),
+      JSON.stringify({
+        ownerDid: "did:plc:owner",
+        server: "ws://test.invalid/irc",
+        install: "test1234",
+        channels: ["#work"],
+        projects: { proj: { channels: ["#work"] } },
+      }),
+    );
+    const notices: Array<{ text: string; level: NoticeLevel }> = [];
+    const harness: Harness = {
+      agentDir,
+      configDirName: ".pi",
+      projectTrusted: () => false,
+      cwd: () => cwd,
+      modelId: () => "test-model",
+      deliver: () => {},
+      notify: (text, level) => void notices.push({ text, level }),
+      confirm: async () => false,
+      isIdle: () => true,
+      journal: { append: () => {}, read: () => [] },
+    };
+    vi.stubGlobal("fetch", async () => new Response(null, { status: 404 }));
+    const rt = new AgentRuntime(harness, { botFactory: async () => new RefusedBot() });
+    await rt.start();
+    notices.length = 0;
+
+    await rt.runCommand("authorize verify");
+    expect(notices.at(-1)?.text).toContain("do not admit this agent");
+    await rt.stop();
+    vi.unstubAllGlobals();
+  });
 });

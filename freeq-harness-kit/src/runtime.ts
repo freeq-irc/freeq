@@ -1336,6 +1336,11 @@ export class AgentRuntime {
           // undefined from the line above, so read it through a fresh
           // binding.
           const live = (): FreeqConnection | undefined => this.conn as FreeqConnection | undefined;
+          // A connect refused at SASL never sends a provenance notice.
+          if (live()?.state === "error") {
+            this.notify(`freeq: the server refused this installation: ${live()?.lastError}`, "warning");
+            return;
+          }
           // An unverified reply comes first; a verified one follows once
           // the server has read the owner's records.
           const notice = await waitForProvenance(() => live()?.provenanceNotice, {
