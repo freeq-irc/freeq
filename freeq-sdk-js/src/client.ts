@@ -402,26 +402,10 @@ const GUEST_NICK_RESUME_DELAYS_MS = [500, 1000, 2000];
  *  477, so the one channel a guest is sent to unasked has to be ungated. */
 const GUEST_DEFAULT_CHANNEL = '#general';
 
-/** One SASL chunk, per IRCv3; a full chunk tells the server more is coming. */
-const SASL_CHUNK_CHARS = 400;
-
 /** Ceiling on a response, matching `MAX_SASL_RESPONSE_LEN` on the server: a
  *  single line must fit the 8192-byte line limit with `AUTHENTICATE ` and
  *  CRLF. */
 const MAX_SASL_RESPONSE_CHARS = 8177;
-
-/** The AUTHENTICATE lines that carry an encoded response: one line up to a
- *  chunk long, else 400-char chunks with a bare `+` after one that fills the
- *  last. */
-export function saslResponseLines(encoded: string): string[] {
-  if (encoded.length <= SASL_CHUNK_CHARS) return [`AUTHENTICATE ${encoded}`];
-  const lines: string[] = [];
-  for (let i = 0; i < encoded.length; i += SASL_CHUNK_CHARS) {
-    lines.push(`AUTHENTICATE ${encoded.slice(i, i + SASL_CHUNK_CHARS)}`);
-  }
-  if (encoded.length % SASL_CHUNK_CHARS === 0) lines.push('AUTHENTICATE +');
-  return lines;
-}
 
 /** CHATHISTORY subcommands, which sit where a target could and are all legal
  *  nicks. */
@@ -4781,13 +4765,15 @@ export class FreeqClient extends EventEmitter {
 
     if (encoded.length > MAX_SASL_RESPONSE_CHARS) {
       log.error(
-        `[freeq-sdk] SASL response is ${encoded.length} chars, over the ${MAX_SASL_RESPONSE_CHARS} the server will reassemble; aborting`,
+        `[freeq-sdk] SASL response is ${encoded.length} chars, over the ${MAX_SASL_RESPONSE_CHARS} the server accepts; aborting`,
       );
       this.raw('AUTHENTICATE *');
       return;
     }
 
-    for (const line of saslResponseLines(encoded)) this.raw(line);
+    // One line however long: every freeq server takes it, and only newer
+    // ones join chunks.
+    this.raw(`AUTHENTICATE ${encoded}`);
   }
 
   private handleAvSessionState(

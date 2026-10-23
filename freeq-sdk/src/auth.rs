@@ -74,6 +74,7 @@ pub const MAX_SASL_RESPONSE_LEN: usize = 8177;
 /// The `AUTHENTICATE` lines that carry an encoded response under IRCv3
 /// chunking: one line up to a chunk long, else 400-byte chunks with a bare
 /// `+` after one that fills the last.
+#[doc(hidden)]
 pub fn sasl_response_lines(encoded: &str) -> Vec<String> {
     if encoded.len() <= SASL_CHUNK_LEN {
         return vec![format!("AUTHENTICATE {encoded}")];

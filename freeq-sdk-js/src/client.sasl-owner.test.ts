@@ -67,9 +67,9 @@ async function flushAsync() {
   for (let i = 0; i < 5; i++) await Promise.resolve();
 }
 
-/** Drive a crypto-SASL client to its challenge response; the decoded
- *  response payload. */
-async function respondToChallenge(ownerDid?: string): Promise<Record<string, unknown>> {
+/** Drive a crypto-SASL client to its challenge response; the AUTHENTICATE
+ *  lines it sent after naming the mechanism. */
+async function responseLines(ownerDid?: string, signature = 'c2ln'): Promise<string[]> {
   const client = new FreeqClient({
     url: 'wss://test/irc',
     nick: 'helper',
@@ -80,7 +80,7 @@ async function respondToChallenge(ownerDid?: string): Promise<Record<string, unk
     did: 'did:key:z6MkAgent',
     pdsUrl: '',
     method: 'crypto',
-    signer: async () => 'c2ln',
+    signer: async () => signature,
     ownerDid,
   });
   client.connect();
@@ -94,7 +94,12 @@ async function respondToChallenge(ownerDid?: string): Promise<Record<string, unk
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   ws.recv(`AUTHENTICATE ${challenge}`);
   await flushAsync();
-  const line = ws.sent.find(l => l.startsWith('AUTHENTICATE ') && l !== 'AUTHENTICATE ATPROTO-CHALLENGE');
+  return ws.sent.filter(l => l.startsWith('AUTHENTICATE ') && l !== 'AUTHENTICATE ATPROTO-CHALLENGE');
+}
+
+/** The decoded response payload a crypto-SASL client sends. */
+async function respondToChallenge(ownerDid?: string): Promise<Record<string, unknown>> {
+  const [line] = await responseLines(ownerDid);
   expect(line).toBeDefined();
   const encoded = line!.slice('AUTHENTICATE '.length).replace(/-/g, '+').replace(/_/g, '/');
   return JSON.parse(atob(encoded));
@@ -113,29 +118,11 @@ describe('SASL response', () => {
   });
 });
 
-describe('saslResponseLines', () => {
-  it('sends a short response as one line with no terminator', async () => {
-    const { saslResponseLines } = await import('./client.js');
-    expect(saslResponseLines('abc')).toEqual(['AUTHENTICATE abc']);
-  });
-
-  it('sends a response of exactly one chunk as one line, as every server takes it', async () => {
-    const { saslResponseLines } = await import('./client.js');
-    const full = 'x'.repeat(400);
-    expect(saslResponseLines(full)).toEqual([`AUTHENTICATE ${full}`]);
-  });
-
-  it('terminates a longer response that fills its last chunk', async () => {
-    const { saslResponseLines } = await import('./client.js');
-    const lines = saslResponseLines('x'.repeat(800));
-    expect(lines).toHaveLength(3);
-    expect(lines[2]).toBe('AUTHENTICATE +');
-  });
-
-  it('splits a longer response without a terminator', async () => {
-    const { saslResponseLines } = await import('./client.js');
-    const lines = saslResponseLines('y'.repeat(412));
-    expect(lines).toHaveLength(2);
-    expect(lines[1]).toBe(`AUTHENTICATE ${'y'.repeat(12)}`);
+describe('SASL response on the wire', () => {
+  /** A server that predates chunk reassembly reads only the first line. */
+  it('goes out as one line with no terminator, however long', async () => {
+    const lines = await responseLines('did:plc:tmxbvcho3zysvtadtextctxw', 'x'.repeat(500));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.length).toBeGreaterThan('AUTHENTICATE '.length + 400);
   });
 });

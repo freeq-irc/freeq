@@ -543,10 +543,9 @@ intended behavior; this section records reality.
 
 1. **Partial payload chunking.** The reference server reassembles a chunked
    client response, honors a client-sent `AUTHENTICATE +`, and also accepts a
-   single oversized parameter. The TypeScript client sends a response of up
-   to 400 bytes as one line with no terminator and chunks only longer ones;
-   the Rust client (which the iOS and macOS apps reach through FFI) always
-   sends a single parameter, so it can still sign in to servers that predate
+   single oversized parameter. Both reference clients (TypeScript, and Rust,
+   which the iOS and macOS apps reach through FFI) send a single parameter
+   however long, so they can still sign in to servers that predate
    reassembly. Server challenges are not chunked.
 2. **No server-identity binding in the challenge.** The implemented
    challenge contains only `session_id`, `nonce`, and `timestamp`. The
