@@ -2373,7 +2373,10 @@ impl Server {
             );
         }
         let plain_listener = TcpListener::bind(&self.config.listen_addr).await?;
-        tracing::info!("Plain listener on {}", self.config.listen_addr);
+        // The address the kernel gave us, not the one we asked for: with
+        // `--listen-addr 127.0.0.1:0` the configured string names no port, and
+        // this line is where a caller learns which one it got.
+        tracing::info!("Plain listener on {}", plain_listener.local_addr()?);
 
         // Start TLS listener if configured
         if let Some(ref acceptor) = tls_acceptor {
@@ -2805,7 +2808,7 @@ impl Server {
             let web_state = Arc::clone(&state);
             let router = crate::web::router(web_state);
             let listener = tokio::net::TcpListener::bind(addr).await?;
-            tracing::info!("HTTP/WebSocket listener on {addr}");
+            tracing::info!("HTTP/WebSocket listener on {}", listener.local_addr()?);
             tokio::spawn(async move {
                 if let Err(e) = axum::serve(
                     listener,

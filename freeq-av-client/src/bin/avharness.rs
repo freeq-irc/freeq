@@ -475,18 +475,12 @@ impl Server {
     }
 
     async fn start(args: &Args, dids: &[(String, String)]) -> Result<Self> {
-        let irc_port = if args.irc_port == 0 {
-            alloc_port()?
-        } else {
-            args.irc_port
-        };
-        let web_port = if args.web_port == 0 {
-            alloc_port()?
-        } else {
-            args.web_port
-        };
-        let irc = format!("127.0.0.1:{irc_port}");
-        let web = format!("127.0.0.1:{web_port}");
+        // `0` means "let the kernel pick", which it does at `bind` — so the
+        // child is handed `:0` and the harness reads back what it got from the
+        // startup lines the server logs. A port a live socket holds is never
+        // issued to anything else, so no two listeners can be given one.
+        let irc = format!("127.0.0.1:{}", args.irc_port);
+        let web = format!("127.0.0.1:{}", args.web_port);
         let statics = dids
             .iter()
             .map(|(d, k)| format!("{d}={k}"))
@@ -499,15 +493,16 @@ impl Server {
         // is initialized inside the iroh-endpoint branch of `Server::run`, so
         // a server started without it reports `av:false` and has no relay at
         // all. Production always passes it, which is why the coupling has gone
-        // unnoticed. Fixed iroh port so the restart step rebinds the same one.
-        let argv: Vec<String> = vec![
+        // unnoticed. The port it binds is read back and pinned below, so the
+        // restart step rebinds the same one.
+        let mut argv: Vec<String> = vec![
             "--listen-addr".into(),
-            irc.clone(),
+            irc,
             "--web-addr".into(),
-            web.clone(),
+            web,
             "--iroh".into(),
             "--iroh-port".into(),
-            alloc_port()?.to_string(),
+            "0".into(),
             "--data-dir".into(),
             args.data_dir.to_string_lossy().into_owned(),
             "--db-path".into(),
@@ -521,18 +516,23 @@ impl Server {
         ];
 
         let log = args.data_dir.join("server.log");
-        let child = Self::spawn_child(&args.server_bin, &argv, &log, args.require_token)?;
+        let mut child = Self::spawn_child(&args.server_bin, &argv, &log, args.require_token)?;
+        let bound = wait_ready(&mut child, &log).await?;
+        // The addresses it bound go into its own argv, so the restart step
+        // comes back on the same three ports and every agent's cached address
+        // still reaches it.
+        pin_addr(&mut argv, "--listen-addr", &bound.irc.to_string());
+        pin_addr(&mut argv, "--web-addr", &bound.web.to_string());
+        pin_addr(&mut argv, "--iroh-port", &bound.iroh_port.to_string());
         let server = Server {
             bin: args.server_bin.clone(),
             args: argv,
             child,
             log,
             require_token: args.require_token,
-            irc: irc.parse()?,
-            web: web.parse()?,
+            irc: bound.irc,
+            web: bound.web,
         };
-        wait_port(server.irc).await?;
-        wait_port(server.web).await?;
         server.require_av().await?;
         Ok(server)
     }
@@ -565,8 +565,7 @@ impl Server {
     async fn restart(&mut self) -> Result<()> {
         self.kill();
         self.child = Self::spawn_child(&self.bin, &self.args, &self.log, self.require_token)?;
-        wait_port(self.irc).await?;
-        wait_port(self.web).await?;
+        wait_ready(&mut self.child, &self.log).await?;
         self.require_av().await
     }
 }
@@ -577,22 +576,137 @@ impl Drop for Server {
     }
 }
 
-fn alloc_port() -> Result<u16> {
-    Ok(std::net::TcpListener::bind("127.0.0.1:0")?
-        .local_addr()?
-        .port())
+/// What the server bound, from the startup lines it logs.
+struct Bound {
+    irc: std::net::SocketAddr,
+    web: std::net::SocketAddr,
+    /// The iroh endpoint's IPv4 UDP port. Nothing polls it — a UDP socket has
+    /// nothing to accept — so the line's appearance is its readiness.
+    iroh_port: u16,
 }
 
-async fn wait_port(addr: std::net::SocketAddr) -> Result<()> {
+/// Wait until the server has logged all three listeners and both TCP ones
+/// accept.
+///
+/// The same wait as `freeq-server/tests/util/ready.rs`, in its own copy
+/// because this crate does not depend on `freeq-server` and a test module is
+/// not importable across crates either way. The two copies must behave the
+/// same, down to stripping the log's ANSI escapes before parsing it and
+/// reading the `addr` field only out of the iroh line. Both check `try_wait`,
+/// for the same reason: a server that died at `bind` used to be reported as a
+/// server that was slow, thirty seconds later, with the cause in a log nobody
+/// read.
+///
+/// On every failing path the child is killed first: `Child` does not kill on
+/// drop, and `Server` — which does — is built only once this returns, so a
+/// failed wait used to leave a live server behind.
+async fn wait_ready(child: &mut Child, log: &std::path::Path) -> Result<Bound> {
+    let result = wait_ready_inner(child, log).await;
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
+async fn wait_ready_inner(child: &mut Child, log: &std::path::Path) -> Result<Bound> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if std::net::TcpStream::connect(addr).is_ok() {
-            return Ok(());
+        if let Some(status) = child.try_wait()? {
+            bail!(
+                "server exited with {status} before it was serving — its log is at {}",
+                log.display()
+            );
+        }
+        let text = read_log(log);
+        if let Some(irc) = logged_addr(&text, "Plain listener on ")
+            && let Some(web) = logged_addr(&text, "HTTP/WebSocket listener on ")
+            && let Some(iroh_port) = logged_iroh_port(&text)
+            && std::net::TcpStream::connect(irc).is_ok()
+            && std::net::TcpStream::connect(web).is_ok()
+        {
+            return Ok(Bound {
+                irc,
+                web,
+                iroh_port,
+            });
         }
         if Instant::now() >= deadline {
-            bail!("{addr} never came up");
+            bail!(
+                "server never became ready — its log is at {}",
+                log.display()
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The address on the last line that starts with `prefix`. The last, not the
+/// first: a restart appends to the same log.
+fn logged_addr(log: &str, prefix: &str) -> Option<std::net::SocketAddr> {
+    log.lines()
+        .filter_map(|line| line.split_once(prefix))
+        .filter_map(|(_, rest)| rest.split_whitespace().next())
+        .filter_map(|addr| addr.parse().ok())
+        .next_back()
+}
+
+/// The IPv4 port out of the iroh line's `addr=[0.0.0.0:39248, [::]:42420]`
+/// field. The endpoint binds both families and, on port 0, gets a different
+/// port for each; the v4 one is the one this machine dials.
+///
+/// Scoped to the endpoint-ID line, as `ready.rs`'s copy scopes it: only
+/// `iroh.rs` emits a bracketed `addr` field today, so a tree-wide search for
+/// one is a second way the two copies could drift apart.
+fn logged_iroh_port(log: &str) -> Option<u16> {
+    log.lines()
+        .filter_map(|line| line.split_once("Iroh endpoint ID: "))
+        .filter_map(|(_, rest)| rest.split_once("addr=["))
+        .filter_map(|(_, rest)| {
+            rest.trim_end_matches(']')
+                .split(", ")
+                .filter_map(|addr| addr.parse::<std::net::SocketAddr>().ok())
+                .find(std::net::SocketAddr::is_ipv4)
+        })
+        .map(|addr| addr.port())
+        .next_back()
+}
+
+/// The server's captured log, ANSI stripped so the parsing above reads the
+/// plain field text.
+///
+/// Tracing colours its output whether or not it goes to a terminal, and the
+/// escapes land between a field's name and its `=` — so `addr=[` never occurs
+/// in the raw bytes and the iroh parse above found nothing at all.
+/// `freeq-server/tests/util/ready.rs::read_log` strips the same escapes the
+/// same way; the crate boundary stops the two sharing one function, so they
+/// agree by being kept identical.
+fn read_log(path: &std::path::Path) -> String {
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Skip an escape sequence through its final letter.
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Put an address the server bound into the argv it was spawned with, so
+/// starting it again on the same argv rebinds the same port.
+fn pin_addr(args: &mut [String], flag: &str, value: &str) {
+    if let Some(i) = args.iter().position(|a| a == flag)
+        && let Some(slot) = args.get_mut(i + 1)
+    {
+        *slot = value.to_string();
     }
 }
 
