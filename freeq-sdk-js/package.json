@@ -1,6 +1,6 @@
 {
   "name": "@freeq/sdk",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "TypeScript SDK for building freeq IRC clients with AT Protocol identity and E2EE",
   "type": "module",
   "main": "dist/index.js",
