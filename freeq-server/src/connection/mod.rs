@@ -7172,16 +7172,102 @@ mod agent_record_tests {
         assert!(answer.contains("requires authentication"), "{answer}");
     }
 
+    /// harness-kit reads this exact text to point the owner at /freeq
+    /// authorize, so it is pinned to the shared vector.
     #[tokio::test]
-    async fn an_agent_the_owners_records_do_not_name_is_refused_with_the_reason() {
+    async fn an_agent_the_owners_records_do_not_name_is_refused_with_the_shared_text() {
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../../../spec/sasl-refusals.json")).unwrap();
+        let expected = vector["delegated_refusal"]["text"]
+            .as_str()
+            .unwrap()
+            .replace("{owner}", OWNER);
         let agent_key = PrivateKey::ed25519_from_bytes(&[64; 32]).unwrap();
         let repo = owner_repo();
         repo.lock().add(AGENT_KEY_TYPE, &claim(OTHER_BOT, 24));
         let state = gated(&repo).await;
         let (_agent, verdict) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(verdict.contains(" 904 "), "{verdict}");
+        assert!(verdict.ends_with(&format!(":{expected}")), "{verdict}");
+    }
+
+    /// An instance like `gated`, allowing `domains` too, and its stub PDS.
+    async fn gated_serving(
+        repo: &Arc<parking_lot::Mutex<StubRepo>>,
+        domains: &[&str],
+    ) -> (Arc<SharedState>, crate::peer_keys::StubPds) {
+        let pds = crate::peer_keys::stub_pds_repos(vec![repo.clone()]).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig {
+                allowed_dids: vec![OWNER.to_string()],
+                allowed_did_domains: domains.iter().map(|d| d.to_string()).collect(),
+                no_guest: true,
+                allow_delegated_agents: true,
+                ..Default::default()
+            },
+            pds.resolver.clone(),
+        );
+        reuse_for(&state, 0);
+        (state, pds)
+    }
+
+    /// Whether the server still answers `c`.
+    async fn still_served(c: &mut Client) -> bool {
+        c.tx("PING keep").await;
+        c.rx(|l| l.contains("PONG")).await.is_some()
+    }
+
+    /// A lookup that fails says nothing about the owner, so it closes no one.
+    #[tokio::test]
+    async fn a_recheck_whose_owner_lookup_fails_keeps_the_agent() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[73; 32]).unwrap();
+        let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
+        let (state, _pds) = gated_serving(&repo, &["nowhere.example"]).await;
+        let (mut agent, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        register(&mut agent).await;
+
+        // An owner whose DID document cannot be fetched.
+        admitted_under(&state, "did:plc:unresolvable", &agent_did);
+        recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        assert!(still_served(&mut agent).await);
+    }
+
+    #[tokio::test]
+    async fn three_failed_reads_in_a_row_close_the_agent_and_a_good_read_resets_the_count() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[74; 32]).unwrap();
+        let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
+        let (state, pds) = gated_serving(&repo, &[]).await;
+        let (mut agent, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        register(&mut agent).await;
+        let recheck = || recheck_agent_links(&state, std::time::Duration::ZERO);
+        let failing = |on: bool| pds.fail.store(on, Ordering::SeqCst);
+
+        failing(true);
+        recheck().await;
+        recheck().await;
+        failing(false);
+        recheck().await;
+        failing(true);
+        recheck().await;
+        recheck().await;
         assert!(
-            verdict.contains(" 904 ") && verdict.contains("do not admit this agent"),
-            "{verdict}"
+            still_served(&mut agent).await,
+            "two in a row since the good read"
+        );
+
+        recheck().await;
+        let closing = agent.rest().await;
+        assert!(
+            closing
+                .iter()
+                .any(|l| l.starts_with("ERROR :Delegation unverifiable")),
+            "{closing:?}"
         );
     }
 

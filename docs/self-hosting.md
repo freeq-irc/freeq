@@ -178,7 +178,7 @@ freeq-server --config /etc/freeq/server.toml
 | `--allowed-dids` / `FREEQ_ALLOWED_DIDS` | Restrict authentication to these DIDs |
 | `--allowed-did-domains` / `FREEQ_ALLOWED_DID_DOMAINS` | Restrict authentication to DIDs whose handle is under one of the listed domains |
 | `--no-guest` / `FREEQ_NO_GUEST` | Refuse guest connections |
-| `--allow-delegated-agents` / `FREEQ_ALLOW_DELEGATED_AGENTS` | Admit an agent not on the allowlist when it's listed in an allowed owner's `at.freeq.agentKey` record |
+| `--allow-delegated-agents` / `FREEQ_ALLOW_DELEGATED_AGENTS` | Admit a `did:key` agent not on the allowlist when it's listed in an allowed owner's `at.freeq.agentKey` records. Removing the record refuses its next connect and closes a live session at the next re-read (`--record-cache-secs`) |
 
 ### Federation
 

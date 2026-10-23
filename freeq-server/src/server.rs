@@ -906,6 +906,9 @@ pub struct SharedState {
     /// Session → (owner DID, bot DID) of every connection admitted on the
     /// owner's agent record.
     pub delegated_sessions: Mutex<HashMap<String, (String, String)>>,
+    /// Per owner DID, how many re-reads of their records have failed in a
+    /// row while one of their agents is connected on a record.
+    pub(crate) owner_read_failures: Mutex<HashMap<String, u32>>,
     /// Per owner DID, the one read of their records at a time and the last
     /// answer, reused while younger than `owner_read_reuse_ms`
     /// (`provenance::read_owner_links`).
@@ -1194,40 +1197,54 @@ impl SharedState {
     /// Handles the case where the allowlist rejected a DID because the handle
     /// wasn't in an allowed domain. Admits the DID if any claimed handles match.
     pub async fn did_is_allowed_resolved(&self, did: &str, handle: Option<&str>) -> bool {
+        self.did_is_allowed_checked(did, handle).await == Some(true)
+    }
+
+    /// `did_is_allowed_resolved` that tells a refusal apart from a lookup
+    /// that failed: `None` when the answer could not be had.
+    pub async fn did_is_allowed_checked(&self, did: &str, handle: Option<&str>) -> Option<bool> {
         if self.did_is_allowed(did, handle) {
-            return true;
+            return Some(true);
         }
         if self.config.allowed_did_domains.is_empty() {
-            return false;
+            return Some(false);
         }
         let doc = match self.did_resolver.resolve(did).await {
             Ok(doc) => doc,
             Err(e) => {
                 tracing::warn!(%did, "allowlist: DID document resolution failed: {e}");
-                return false;
+                return None;
             }
         };
+        let mut unsure = false;
         for aka in &doc.also_known_as {
             let Some(claimed) = aka.strip_prefix("at://") else {
                 continue;
             };
-            if self.did_is_allowed(did, Some(claimed)) && self.handle_owned_by(claimed, did).await {
-                return true;
+            if !self.did_is_allowed(did, Some(claimed)) {
+                continue;
+            }
+            match self.handle_owned_by(claimed, did).await {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => unsure = true,
             }
         }
-        false
+        if unsure { None } else { Some(false) }
     }
 
-    async fn handle_owned_by(&self, handle: &str, did: &str) -> bool {
+    /// Whether `handle` resolves back to `did`; `None` when the lookup
+    /// itself failed.
+    async fn handle_owned_by(&self, handle: &str, did: &str) -> Option<bool> {
         match self.did_resolver.resolve_handle(handle).await {
-            Ok(resolved) if resolved == did => true,
+            Ok(resolved) if resolved == did => Some(true),
             Ok(resolved) => {
                 tracing::warn!(%did, %handle, %resolved, "allowlist: handle belongs to another DID");
-                false
+                Some(false)
             }
             Err(e) => {
                 tracing::warn!(%did, %handle, "allowlist: handle resolution failed: {e}");
-                false
+                None
             }
         }
     }
@@ -2179,6 +2196,7 @@ impl Server {
             provenance_declarations: Mutex::new(HashMap::new()),
             agent_links: Mutex::new(HashMap::new()),
             delegated_sessions: Mutex::new(HashMap::new()),
+            owner_read_failures: Mutex::new(HashMap::new()),
             owner_reads: Mutex::new(HashMap::new()),
             owner_read_reuse_ms: std::sync::atomic::AtomicU64::new(
                 crate::connection::OWNER_READ_REUSE.as_millis() as u64,
@@ -9509,6 +9527,7 @@ mod s2s_adversarial_tests {
             provenance_declarations: Mutex::new(HashMap::new()),
             agent_links: Mutex::new(HashMap::new()),
             delegated_sessions: Mutex::new(HashMap::new()),
+            owner_read_failures: Mutex::new(HashMap::new()),
             owner_reads: Mutex::new(HashMap::new()),
             owner_read_reuse_ms: std::sync::atomic::AtomicU64::new(
                 crate::connection::OWNER_READ_REUSE.as_millis() as u64,

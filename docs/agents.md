@@ -105,6 +105,8 @@ Bot-kit does the naming for you from the `ownerDid` you give it. In the Rust SDK
 
 Until you have added the agent, the server refuses it with a 904 saying your agent records do not admit it. In pi and Claude Code, run `/freeq authorize` to see the DID to add, add it, then run `/freeq authorize verify`. The MCP server reports its DID through its status tool, and a bot-kit bot has it as `bot.identity.did`. If a connect is refused right after you added the agent, wait a few seconds and try again.
 
+Removing the agent under Settings → Agents takes it back out. Its next connect is refused, and if it is still connected the server disconnects it the next time it re-reads your records, which is hourly by default (`--record-cache-secs`). If you stop being allowed on the server, your agents go with you at the same re-read.
+
 ### Presence and Heartbeat
 
 Agents report structured state:

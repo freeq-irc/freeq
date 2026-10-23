@@ -231,7 +231,33 @@ pub(super) fn handle_cap(
 
 /// A DID as the wire may carry it: `did:` plus printable ASCII.
 fn is_wire_did(s: &str) -> bool {
-    s.starts_with("did:") && s.len() > 4 && s.bytes().all(|b| b.is_ascii_graphic())
+    s.starts_with("did:")
+        && s.len() > 4
+        && s.len() <= 256
+        && s.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// The host a `did:web` names, without port or path.
+fn did_web_host(did: &str) -> Option<String> {
+    let first = did.strip_prefix("did:web:")?.split(':').next()?;
+    let host = first.replace("%3A", ":").replace("%3a", ":");
+    let host = host.split(':').next()?.to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// Whether an owner may be looked up at all. A `did:web` resolves by
+/// fetching the host in its name, so that host must already be an allowed
+/// one.
+fn owner_may_be_looked_up(config: &crate::config::ServerConfig, owner: &str) -> bool {
+    match did_web_host(owner) {
+        Some(host) => crate::server::did_allowed(
+            &config.allowed_dids,
+            &config.allowed_did_domains,
+            owner,
+            Some(&host),
+        ),
+        None => true,
+    }
 }
 
 /// Handles the case where the allowlist has never heard of an agent's own
@@ -248,25 +274,38 @@ async fn delegated_admit(
     if !is_wire_did(owner) {
         return Err("owner_did is not a DID".to_string());
     }
-    if !state.config.allow_delegated_agents {
-        return Err("this server does not admit delegated agents".to_string());
-    }
     if !agent_did.starts_with("did:key:") {
         return Err("only an agent with a did:key can be delegated".to_string());
     }
     if owner.starts_with("did:key:") {
         return Err("an owner must be an account with a repository".to_string());
     }
+    // Everything from here is one refusal on the wire; the log says which.
     let refusal = format!("the agent records of {owner} do not admit this agent");
-    if !state.did_is_allowed_resolved(owner, None).await {
-        tracing::warn!(agent = %agent_did, %owner, "delegated connect refused: the owner is not allowed here");
+    if !state.config.allow_delegated_agents {
+        tracing::warn!(agent = %agent_did, %owner, "delegated connect refused: --allow-delegated-agents is off");
         return Err(refusal);
+    }
+    if !owner_may_be_looked_up(&state.config, owner) {
+        tracing::warn!(agent = %agent_did, %owner, "delegated connect refused: the owner's did:web host is not an allowed domain");
+        return Err(refusal);
+    }
+    match state.did_is_allowed_checked(owner, None).await {
+        Some(true) => {}
+        Some(false) => {
+            tracing::warn!(agent = %agent_did, %owner, "delegated connect refused: the owner is not allowed here");
+            return Err(refusal);
+        }
+        None => {
+            tracing::warn!(agent = %agent_did, %owner, "delegated connect refused: the owner's standing could not be checked");
+            return Err(refusal);
+        }
     }
     let links = super::provenance::read_owner_links(state, owner)
         .await
         .map_err(|e| {
-            tracing::warn!(agent = %agent_did, %owner, error = %e, "delegated connect: could not read the owner's agent records");
-            format!("could not read the agent records of {owner}")
+            tracing::warn!(agent = %agent_did, %owner, error = %e, "delegated connect refused: could not read the owner's agent records");
+            refusal.clone()
         })?;
     let Some(link) = links.into_iter().find(|l| l.link.agent_did == agent_did) else {
         tracing::warn!(agent = %agent_did, %owner, "delegated connect refused: the owner's records do not name the agent");
@@ -954,15 +993,81 @@ mod delegated_admit_tests {
     #[tokio::test]
     async fn an_owner_that_is_not_a_did_is_refused_before_anything_else() {
         let state = state_allowing_owner(true, vec![]).await;
+        let too_long = format!("did:plc:{}", "a".repeat(300));
         for owner in [
             "alice.example",
             "did:",
             "did:plc:bad\r\nQUIT",
             "did:plc:with space",
+            too_long.as_str(),
         ] {
             let refused = admit(&state, Some(owner)).await.unwrap_err();
             assert!(refused.contains("not a DID"), "{owner:?}: {refused}");
         }
+    }
+
+    /// A failing PDS must not confirm that its owner is allowed here.
+    #[tokio::test]
+    async fn a_read_that_fails_is_refused_with_the_shared_text() {
+        let pds =
+            crate::peer_keys::stub_pds_repos(vec![repo_of(OWNER, &[claim(OWNER, AGENT, 24)])])
+                .await;
+        pds.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig {
+                allowed_dids: vec![OWNER.to_string()],
+                allow_delegated_agents: true,
+                ..Default::default()
+            },
+            pds.resolver.clone(),
+        );
+        state
+            .owner_read_reuse_ms
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let refused = admit(&state, Some(OWNER)).await.unwrap_err();
+        assert!(refused.contains("do not admit this agent"), "{refused}");
+    }
+
+    #[test]
+    fn the_host_of_a_did_web_is_read_without_port_or_path() {
+        assert_eq!(
+            did_web_host("did:web:Acme.com").as_deref(),
+            Some("acme.com")
+        );
+        assert_eq!(
+            did_web_host("did:web:acme.com:users:alice").as_deref(),
+            Some("acme.com")
+        );
+        assert_eq!(
+            did_web_host("did:web:acme.com%3A8443:x").as_deref(),
+            Some("acme.com")
+        );
+        assert_eq!(did_web_host("did:plc:abc"), None);
+        assert_eq!(did_web_host("did:web:"), None);
+    }
+
+    /// The server fetches the host in a did:web to resolve it, so a stranger
+    /// must not get to name that host.
+    #[test]
+    fn a_did_web_owner_is_looked_up_only_under_an_allowed_domain() {
+        let cfg = crate::config::ServerConfig {
+            allowed_did_domains: vec!["acme.com".to_string()],
+            ..Default::default()
+        };
+        assert!(owner_may_be_looked_up(&cfg, "did:web:acme.com"));
+        assert!(owner_may_be_looked_up(&cfg, "did:web:bots.acme.com"));
+        assert!(!owner_may_be_looked_up(&cfg, "did:web:victim.example"));
+        assert!(!owner_may_be_looked_up(
+            &cfg,
+            "did:web:acme.com.victim.example"
+        ));
+        assert!(owner_may_be_looked_up(&cfg, "did:plc:anyone"));
+        let listed = crate::config::ServerConfig {
+            allowed_dids: vec!["did:web:solo.example".to_string()],
+            ..Default::default()
+        };
+        assert!(owner_may_be_looked_up(&listed, "did:web:solo.example"));
+        assert!(!owner_may_be_looked_up(&listed, "did:web:other.example"));
     }
 
     #[tokio::test]
@@ -970,7 +1075,7 @@ mod delegated_admit_tests {
         let state =
             state_allowing_owner(false, vec![repo_of(OWNER, &[claim(OWNER, AGENT, 24)])]).await;
         let refused = admit(&state, Some(OWNER)).await.unwrap_err();
-        assert!(refused.contains("does not admit"), "{refused}");
+        assert!(refused.contains("do not admit this agent"), "{refused}");
     }
 
     #[tokio::test]
