@@ -119,10 +119,17 @@ describe('saslResponseLines', () => {
     expect(saslResponseLines('abc')).toEqual(['AUTHENTICATE abc']);
   });
 
-  it('terminates a response that fills its last chunk', async () => {
+  it('sends a response of exactly one chunk as one line, as every server takes it', async () => {
     const { saslResponseLines } = await import('./client.js');
     const full = 'x'.repeat(400);
-    expect(saslResponseLines(full)).toEqual([`AUTHENTICATE ${full}`, 'AUTHENTICATE +']);
+    expect(saslResponseLines(full)).toEqual([`AUTHENTICATE ${full}`]);
+  });
+
+  it('terminates a longer response that fills its last chunk', async () => {
+    const { saslResponseLines } = await import('./client.js');
+    const lines = saslResponseLines('x'.repeat(800));
+    expect(lines).toHaveLength(3);
+    expect(lines[2]).toBe('AUTHENTICATE +');
   });
 
   it('splits a longer response without a terminator', async () => {

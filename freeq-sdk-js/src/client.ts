@@ -405,12 +405,16 @@ const GUEST_DEFAULT_CHANNEL = '#general';
 /** One SASL chunk, per IRCv3; a full chunk tells the server more is coming. */
 const SASL_CHUNK_CHARS = 400;
 
-/** Ceiling on a response, matching `MAX_SASL_RESPONSE_LEN` on the server. */
-const MAX_SASL_RESPONSE_CHARS = 8192;
+/** Ceiling on a response, matching `MAX_SASL_RESPONSE_LEN` on the server: a
+ *  single line must fit the 8192-byte line limit with `AUTHENTICATE ` and
+ *  CRLF. */
+const MAX_SASL_RESPONSE_CHARS = 8177;
 
-/** The AUTHENTICATE lines that carry an encoded response: 400-char chunks,
- *  with a bare `+` after a response that fills its last chunk. */
+/** The AUTHENTICATE lines that carry an encoded response: one line up to a
+ *  chunk long, else 400-char chunks with a bare `+` after one that fills the
+ *  last. */
 export function saslResponseLines(encoded: string): string[] {
+  if (encoded.length <= SASL_CHUNK_CHARS) return [`AUTHENTICATE ${encoded}`];
   const lines: string[] = [];
   for (let i = 0; i < encoded.length; i += SASL_CHUNK_CHARS) {
     lines.push(`AUTHENTICATE ${encoded.slice(i, i + SASL_CHUNK_CHARS)}`);

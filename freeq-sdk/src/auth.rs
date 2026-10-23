@@ -67,12 +67,17 @@ pub fn decode_challenge_bytes(encoded: &str) -> anyhow::Result<Vec<u8>> {
 /// One SASL chunk, per IRCv3; a full chunk tells the server more is coming.
 pub const SASL_CHUNK_LEN: usize = 400;
 
-/// Ceiling on a response, matching what the server will reassemble.
-pub const MAX_SASL_RESPONSE_LEN: usize = 8192;
+/// Ceiling on a response: a single line must fit the server's 8192-byte
+/// line limit with `AUTHENTICATE ` and CRLF.
+pub const MAX_SASL_RESPONSE_LEN: usize = 8177;
 
 /// The `AUTHENTICATE` lines that carry an encoded response under IRCv3
-/// chunking: 400-byte chunks, with a bare `+` after one that fills the last.
+/// chunking: one line up to a chunk long, else 400-byte chunks with a bare
+/// `+` after one that fills the last.
 pub fn sasl_response_lines(encoded: &str) -> Vec<String> {
+    if encoded.len() <= SASL_CHUNK_LEN {
+        return vec![format!("AUTHENTICATE {encoded}")];
+    }
     let mut lines: Vec<String> = encoded
         .as_bytes()
         .chunks(SASL_CHUNK_LEN)
@@ -430,15 +435,14 @@ mod sasl_response_lines_tests {
         assert_eq!(sasl_response_lines("abc"), vec!["AUTHENTICATE abc"]);
     }
 
+    /// Every server takes one line of this length; only newer ones join
+    /// chunks, and an older one would read the terminator as a new attempt.
     #[test]
-    fn a_response_of_exactly_one_chunk_is_terminated() {
+    fn a_response_of_exactly_one_chunk_is_one_line_with_no_terminator() {
         let payload = "x".repeat(SASL_CHUNK_LEN);
         assert_eq!(
             sasl_response_lines(&payload),
-            vec![
-                format!("AUTHENTICATE {payload}"),
-                "AUTHENTICATE +".to_string()
-            ]
+            vec![format!("AUTHENTICATE {payload}")]
         );
     }
 

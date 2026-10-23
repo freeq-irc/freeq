@@ -6778,7 +6778,10 @@ mod sasl_write_tests {
         let err = write_sasl_response(&mut buf, &"w".repeat(MAX_SASL_RESPONSE_LEN + 1))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("over the 8192"));
+        assert!(
+            err.to_string()
+                .contains(&format!("over the {MAX_SASL_RESPONSE_LEN}"))
+        );
         assert!(
             buf.is_empty(),
             "nothing goes out when the response is refused"
