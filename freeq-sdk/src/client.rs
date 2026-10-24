@@ -16248,10 +16248,25 @@ mod verdict_tests {
 
     /// A session whose connected server vouches for SIGNER's key 26 and
     /// serves SIGNER's records from the repository SIGNER's PDS lists, its
-    /// key lookup's ttl one second; SIGNER's key is met through the server
-    /// on a chat line first, before it is published. With the origin, the
-    /// repository, the PDS's listing count and the lookup.
+    /// key lookup's ttl an hour, so that a listing goes past it only where
+    /// the test says so (`KeyLookup::backdate_listing`); SIGNER's key is
+    /// met through the server on a chat line first, before it is published.
+    /// With the origin, the repository, the PDS's listing count and the
+    /// lookup.
     async fn vouched_poster() -> (
+        Session,
+        Arc<Origin>,
+        SharedRepo,
+        Arc<AtomicUsize>,
+        Arc<crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>>,
+    ) {
+        vouched_poster_ttl(3600).await
+    }
+
+    /// [`vouched_poster`], its key lookup's ttl `ttl_secs` seconds.
+    async fn vouched_poster_ttl(
+        ttl_secs: u64,
+    ) -> (
         Session,
         Arc<Origin>,
         SharedRepo,
@@ -16273,7 +16288,7 @@ mod verdict_tests {
             crate::key_lookup::KeyLookup::new(
                 reader,
                 Some(base),
-                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(ttl_secs),
             )
             .with_retry_delays(Vec::new())
             .with_own_host_base(move |_| site_base.clone()),
@@ -16288,7 +16303,10 @@ mod verdict_tests {
         (session, origin, repo, pds_listings, lookup)
     }
 
-    /// Past the one-second ttl of [`vouched_poster`]'s lookup.
+    /// Past a one-second ttl, for the tests whose next step waits on a kept
+    /// opening post's own age (`recheck_due`) and not only on the lookup's
+    /// held listing, which
+    /// [`crate::key_lookup::KeyLookup::backdate_listing`] dates back.
     async fn past_the_ttl() {
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
     }
@@ -16315,7 +16333,7 @@ mod verdict_tests {
         let (mut session, origin, repo, pds_listings, lookup) = vouched_poster().await;
         repo.lock()
             .add(crate::identity_records::DEVICE_KEY_TYPE, &device_record(26));
-        past_the_ttl().await;
+        lookup.backdate_listing(SIGNER);
         let listed = origin.record_reads.load(Ordering::SeqCst);
         let at_pds = pds_listings.load(Ordering::SeqCst);
         let (opener, task) = signers_opener();
@@ -16343,8 +16361,8 @@ mod verdict_tests {
     /// no key, and the ruling is hidden.
     #[tokio::test]
     async fn an_opener_under_a_key_still_unpublished_keeps_the_servers_key() {
-        let (mut session, origin, _repo, pds_listings, _lookup) = vouched_poster().await;
-        past_the_ttl().await;
+        let (mut session, origin, _repo, pds_listings, lookup) = vouched_poster().await;
+        lookup.backdate_listing(SIGNER);
         let listed = origin.record_reads.load(Ordering::SeqCst);
         let at_pds = pds_listings.load(Ordering::SeqCst);
         let (opener, task) = signers_opener();
@@ -16375,7 +16393,7 @@ mod verdict_tests {
     #[tokio::test]
     async fn a_fetched_opener_under_a_vouched_key_is_kept_and_checked_again_after_the_ttl() {
         use crate::verdict::RulingCheck;
-        let (mut session, origin, repo, _pds_listings, _lookup) = vouched_poster().await;
+        let (mut session, origin, repo, _pds_listings, _lookup) = vouched_poster_ttl(1).await;
         let (opener, task) = served(
             26,
             SIGNER,

@@ -2097,6 +2097,17 @@ impl<P: ClientProvider> KeyLookup<P> {
         self.ttl
     }
 
+    /// Test only: date `did`'s held listing, and when it was last listed,
+    /// an hour ago, so the listing is past the ttl without waiting it out.
+    #[cfg(test)]
+    pub(crate) fn backdate_listing(&self, did: &str) {
+        let hour_ago = Utc::now() - chrono::TimeDelta::hours(1);
+        if let Some(entry) = self.records.lock().get_mut(did) {
+            entry.1 = hour_ago;
+        }
+        self.refreshed.lock().insert(did.to_string(), hour_ago);
+    }
+
     /// How many times `refresh_account` has dropped `did`'s answers.
     fn refresh_count(&self, did: &str) -> u64 {
         self.refreshes.lock().get(did).copied().unwrap_or(0)
@@ -4322,11 +4333,7 @@ mod tests {
     /// Date Alice's held listing, and when she was last listed, an hour ago,
     /// so the listing is past the ttl without waiting it out.
     fn backdate_alice(keys: &KeyLookup<freeq_oauth::SharedClient>) {
-        let hour_ago = Utc::now() - chrono::TimeDelta::hours(1);
-        if let Some(entry) = keys.records.lock().get_mut(ALICE) {
-            entry.1 = hour_ago;
-        }
-        keys.refreshed.lock().insert(ALICE.to_string(), hour_ago);
+        keys.backdate_listing(ALICE);
     }
 
     /// Requests to the home server's batch and listing routes together.
