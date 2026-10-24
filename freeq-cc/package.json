@@ -27,7 +27,7 @@
     "@freeq/bot-kit": "file:../freeq-bot-kit-js",
     "@freeq/harness-kit": "file:../freeq-harness-kit",
     "@freeq/sdk": "file:../freeq-sdk-js",
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.32.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
