@@ -472,7 +472,12 @@ export class FreeqConnection {
 
       bot.on("authError", (e: string) => {
         this.#lastError = e;
-        this.#notice(`freeq: authentication failed — ${e}`, "error", "auth");
+        // An allowlisted server names the owner's records; that is the
+        // owner's cue to add this installation as one of their agents.
+        const hint = /agent records of .* do not admit this agent/.test(e)
+          ? ` Run ${this.#names.hint("authorize")} to add this installation as one of your agents.`
+          : "";
+        this.#notice(`freeq: authentication failed — ${e}${hint}`, "error", "auth");
       });
 
       await bot.start();

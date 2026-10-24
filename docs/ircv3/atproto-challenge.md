@@ -541,12 +541,12 @@ draft and from its own in-repo documentation in the following ways. Where
 this draft and the implementation differ, the draft text above states the
 intended behavior; this section records reality.
 
-1. **No payload chunking.** Neither the reference server nor its clients
-   split `AUTHENTICATE` payloads into 400-byte chunks, and the server does
-   not reassemble chunked client responses or recognize a client-sent
-   `AUTHENTICATE +`. Payloads are sent as single oversized parameters
-   (which `pds-oauth` responses routinely are). This draft makes base-spec
-   chunking normative.
+1. **Partial payload chunking.** The reference server reassembles a chunked
+   client response, honors a client-sent `AUTHENTICATE +`, and also accepts a
+   single oversized parameter. Both reference clients (TypeScript, and Rust,
+   which the iOS and macOS apps reach through FFI) send a single parameter
+   however long, so they can still sign in to servers that predate
+   reassembly. Server challenges are not chunked.
 2. **No server-identity binding in the challenge.** The implemented
    challenge contains only `session_id`, `nonce`, and `timestamp`. The
    relay consideration in Security considerations is mitigated there by
@@ -567,11 +567,17 @@ intended behavior; this section records reality.
    or verify the PLC audit log (`/log/audit`). Audit-log verification is
    mentioned in Security considerations as an option for higher-assurance
    deployments, not as implemented behavior.
-7. **Response fields undocumented in protocol notes.** The project's
+7. **An extra response member.** The reference server also reads an
+   `owner_did` member: the DID of the account the authenticating agent acts
+   for. A server with a connect allowlist may admit an agent whose own DID
+   it does not know when that account is allowed and its public agent
+   records (`at.freeq.agentKey`) name the agent. This draft does not define
+   the member; servers that do not implement it ignore it.
+8. **Response fields undocumented in protocol notes.** The project's
    protocol notes omit the `challenge_nonce` and `dpop_proof` response
    fields (both required by the PDS methods of Appendix A) and the
    `web-token` method entirely; the implementation defines all three.
-8. **Key rotation.** Sessions are not revalidated on DID-document key
+9. **Key rotation.** Sessions are not revalidated on DID-document key
    changes; the SHOULD in Security considerations is aspirational and
    noted there as an open consideration.
 

@@ -956,6 +956,7 @@ impl FreeqClient {
             device_label: self.device_label.lock().unwrap().clone(),
             fresh_sign_in: self.take_fresh_sign_in(),
             key_lookup,
+            owner_did: None,
         };
 
         // MUST call connect() inside the runtime — it uses tokio::spawn internally.

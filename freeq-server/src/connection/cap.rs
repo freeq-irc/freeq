@@ -7,7 +7,53 @@ use super::registration::try_complete_registration;
 use crate::irc::{self, Message};
 use crate::sasl;
 use crate::server::SharedState;
+use freeq_sdk::auth::{MAX_SASL_RESPONSE_LEN, SASL_CHUNK_LEN};
 use std::sync::Arc;
+
+/// What a single `AUTHENTICATE` line contributed to the response.
+enum Reassembly {
+    /// A piece landed and the rest is still coming.
+    Partial,
+    /// The whole response, ready to decode.
+    Complete(String),
+    /// More than any real response could need.
+    TooLong,
+}
+
+/// Join the pieces of a SASL response. A short piece, a bare `+`, or a full
+/// chunk that already decodes ends it.
+fn accumulate_response(conn: &mut Connection, param: &str) -> Reassembly {
+    let chunk = if param == "+" { "" } else { param };
+    if conn.sasl_response_buf.len() + chunk.len() > MAX_SASL_RESPONSE_LEN {
+        conn.sasl_response_buf.clear();
+        return Reassembly::TooLong;
+    }
+    conn.sasl_response_buf.push_str(chunk);
+    if chunk.len() == SASL_CHUNK_LEN
+        && sasl::decode_response_explained(&conn.sasl_response_buf).is_err()
+    {
+        return Reassembly::Partial;
+    }
+    Reassembly::Complete(std::mem::take(&mut conn.sasl_response_buf))
+}
+
+/// Close the connection once it has failed SASL three times.
+fn close_after_too_many_failures(
+    conn: &Connection,
+    state: &Arc<SharedState>,
+    session_id: &str,
+    send: &impl Fn(&Arc<SharedState>, &str, String),
+) {
+    if conn.sasl_failures >= 3 {
+        send(
+            state,
+            session_id,
+            "ERROR :Too many SASL failures\r\n".to_string(),
+        );
+        // Drop the send channel to force-close the connection.
+        state.connections.lock().remove(session_id);
+    }
+}
 
 pub(super) fn handle_cap(
     conn: &mut Connection,
@@ -183,6 +229,126 @@ pub(super) fn handle_cap(
     }
 }
 
+/// A DID as the wire may carry it: `did:` plus printable ASCII.
+fn is_wire_did(s: &str) -> bool {
+    s.starts_with("did:")
+        && s.len() > 4
+        && s.len() <= 256
+        && s.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// The host a `did:web` names, without port or path.
+fn did_web_host(did: &str) -> Option<String> {
+    let host = did
+        .strip_prefix("did:web:")?
+        .split(':')
+        .next()?
+        .to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// Whether an owner may be looked up at all. A `did:web` resolves by
+/// fetching the host in its name, so that host must already be an allowed
+/// one.
+fn owner_may_be_looked_up(config: &crate::config::ServerConfig, owner: &str) -> bool {
+    match did_web_host(owner) {
+        Some(host) => crate::server::did_allowed(
+            &config.allowed_dids,
+            &config.allowed_did_domains,
+            owner,
+            Some(&host),
+        ),
+        None => true,
+    }
+}
+
+/// The soonest a delegated agent is refused, however quickly the server knew:
+/// a refusal for an owner who is not allowed would otherwise come back
+/// faster than one that had to read a member's records.
+pub(crate) const DELEGATED_REFUSAL_FLOOR: std::time::Duration =
+    std::time::Duration::from_millis(1500);
+
+/// Handles the case where the allowlist has never heard of an agent's own
+/// `did:key` but the owner it names claims it and is allowed.
+async fn delegated_admit(
+    state: &Arc<SharedState>,
+    session_id: &str,
+    agent_did: &str,
+    owner_did: Option<&str>,
+) -> Result<(), String> {
+    let Some(owner) = owner_did else {
+        return Err("no owner named".to_string());
+    };
+    let started = tokio::time::Instant::now();
+    let admitted = check_delegation(state, session_id, agent_did, owner).await;
+    if admitted.is_err() {
+        tokio::time::sleep_until(started + DELEGATED_REFUSAL_FLOOR).await;
+    }
+    admitted
+}
+
+async fn check_delegation(
+    state: &Arc<SharedState>,
+    session_id: &str,
+    agent_did: &str,
+    owner: &str,
+) -> Result<(), String> {
+    if !is_wire_did(owner) {
+        return Err("owner_did is not a DID".to_string());
+    }
+    if !agent_did.starts_with("did:key:") {
+        return Err("only an agent with a did:key can be delegated".to_string());
+    }
+    if owner.starts_with("did:key:") {
+        return Err("an owner must be an account with a repository".to_string());
+    }
+    // Everything from here is one refusal on the wire; the log says which.
+    let refusal = format!("the agent records of {owner} do not admit this agent");
+    if !state.config.allow_delegated_agents {
+        tracing::warn!(agent = %agent_did, %owner, "delegated connect refused: --allow-delegated-agents is off");
+        return Err(refusal);
+    }
+    if !owner_may_be_looked_up(&state.config, owner) {
+        tracing::warn!(agent = %agent_did, %owner, "delegated connect refused: the owner's did:web host is not an allowed domain");
+        return Err(refusal);
+    }
+    match state.did_is_allowed_checked(owner, None).await {
+        Some(true) => {}
+        Some(false) => {
+            tracing::warn!(agent = %agent_did, %owner, "delegated connect refused: the owner is not allowed here");
+            return Err(refusal);
+        }
+        None => {
+            tracing::warn!(agent = %agent_did, %owner, "delegated connect refused: the owner's standing could not be checked");
+            return Err(refusal);
+        }
+    }
+    let links = super::provenance::read_owner_links(state, owner)
+        .await
+        .map_err(|e| {
+            tracing::warn!(agent = %agent_did, %owner, error = %e, "delegated connect refused: could not read the owner's agent records");
+            refusal.clone()
+        })?;
+    let Some(link) = links.into_iter().find(|l| l.link.agent_did == agent_did) else {
+        tracing::warn!(agent = %agent_did, %owner, "delegated connect refused: the owner's records do not name the agent");
+        return Err(refusal);
+    };
+    let key = (owner.to_string(), agent_did.to_string());
+    state
+        .agent_links
+        .lock()
+        .insert(key.clone(), (std::time::Instant::now(), link.uri.clone()));
+    state
+        .delegated_sessions
+        .lock()
+        .insert(session_id.to_string(), key);
+    tracing::info!(
+        agent = %agent_did, %owner, uri = %link.uri,
+        "admitting an agent on its owner's agent record"
+    );
+    Ok(())
+}
+
 pub(super) async fn handle_authenticate(
     conn: &mut Connection,
     msg: &Message,
@@ -201,6 +367,7 @@ pub(super) async fn handle_authenticate(
     if param == "*" {
         // SASL abort — client is cancelling the authentication attempt
         conn.sasl_in_progress = false;
+        conn.sasl_response_buf.clear();
         let fail = Message::from_server(
             server_name,
             irc::ERR_SASLFAIL,
@@ -210,13 +377,39 @@ pub(super) async fn handle_authenticate(
         return;
     }
 
+    // Handles a stray terminator with nothing to end, after a short chunk or a
+    // re-issued challenge.
+    if param == "+" && conn.sasl_response_buf.is_empty() {
+        return;
+    }
+
     if param.eq_ignore_ascii_case("ATPROTO-CHALLENGE") {
         conn.sasl_in_progress = true;
         conn.dpop_retries = 0; // Reset DPoP retry counter on new SASL attempt
+        conn.sasl_response_buf.clear();
         let encoded = state.challenge_store.create(session_id);
         let reply = Message::new("AUTHENTICATE", vec![&encoded]);
         send(state, session_id, format!("{reply}\r\n"));
     } else if conn.sasl_in_progress {
+        let full = match accumulate_response(conn, param) {
+            Reassembly::Partial => return,
+            Reassembly::TooLong => {
+                conn.sasl_in_progress = false;
+                conn.sasl_failures += 1;
+                crate::server::Metrics::bump(&state.metrics.sasl_failure_total);
+                let fail = Message::from_server(
+                    server_name,
+                    irc::ERR_SASLFAIL,
+                    vec![conn.nick_or_star(), "SASL response too long"],
+                );
+                send(state, session_id, format!("{fail}\r\n"));
+                tracing::warn!(%session_id, "SASL response exceeded the reassembly limit");
+                close_after_too_many_failures(conn, state, session_id, send);
+                return;
+            }
+            Reassembly::Complete(full) => full,
+        };
+        let param = full.as_str();
         let decoded = sasl::decode_response_explained(param);
         if let Ok(response) = decoded {
             // Check for web-token method first (server-side OAuth pre-verified)
@@ -259,6 +452,10 @@ pub(super) async fn handle_authenticate(
                         )
                         .await
                     };
+                    // An agent the allowlist does not know may still come in on
+                    // the owner it names.
+                    let mut refusal = "Not authorized to connect to this server".to_string();
+                    let mut delegated = false;
                     // Connect-time allowlist, if the instance opted in. A web
                     // token brings its handle along; the challenge path doesn't.
                     let allowed = match &verify_result {
@@ -266,6 +463,25 @@ pub(super) async fn handle_authenticate(
                             state
                                 .did_is_allowed_resolved(did, web_handle.as_deref())
                                 .await
+                                || match delegated_admit(
+                                    state,
+                                    session_id,
+                                    did,
+                                    response.owner_did.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        delegated = true;
+                                        true
+                                    }
+                                    Err(reason) => {
+                                        if response.owner_did.is_some() {
+                                            refusal = format!("{refusal}: {reason}");
+                                        }
+                                        false
+                                    }
+                                }
                         }
                         Err(_) => true,
                     };
@@ -277,10 +493,7 @@ pub(super) async fn handle_authenticate(
                             let fail = Message::from_server(
                                 server_name,
                                 irc::ERR_SASLFAIL,
-                                vec![
-                                    conn.nick_or_star(),
-                                    "Not authorized to connect to this server",
-                                ],
+                                vec![conn.nick_or_star(), refusal.as_str()],
                             );
                             send(state, session_id, format!("{fail}\r\n"));
                             tracing::warn!(
@@ -288,6 +501,7 @@ pub(super) async fn handle_authenticate(
                                 method = response.method.as_deref().unwrap_or("crypto"),
                                 "connection denied by connect allowlist"
                             );
+                            close_after_too_many_failures(conn, state, session_id, send);
                         }
                         Ok(did) => {
                             // A sign-in with a one-time web token whose login
@@ -332,6 +546,11 @@ pub(super) async fn handle_authenticate(
                             }
                             conn.authenticated_did = Some(did.clone());
                             conn.sasl_in_progress = false;
+                            // Handles a connection that was let in on an owner's record and
+                            // has since authenticated as a DID the allowlist accepts directly.
+                            if !delegated {
+                                state.delegated_sessions.lock().remove(session_id);
+                            }
                             state
                                 .session_dids
                                 .lock()
@@ -489,15 +708,7 @@ pub(super) async fn handle_authenticate(
                                     ],
                                 );
                                 send(state, session_id, format!("{fail}\r\n"));
-                                if conn.sasl_failures >= 3 {
-                                    send(
-                                        state,
-                                        session_id,
-                                        "ERROR :Too many SASL failures\r\n".to_string(),
-                                    );
-                                    // Drop the send channel to force-close the connection.
-                                    state.connections.lock().remove(session_id);
-                                }
+                                close_after_too_many_failures(conn, state, session_id, send);
                             } else {
                                 // DPoP nonce rotation: PDS requires a fresh nonce.
                                 // Re-issue a challenge so the client can retry with the nonce.
@@ -529,15 +740,7 @@ pub(super) async fn handle_authenticate(
                                 vec![conn.nick_or_star(), "SASL authentication failed"],
                             );
                             send(state, session_id, format!("{fail}\r\n"));
-                            if conn.sasl_failures >= 3 {
-                                send(
-                                    state,
-                                    session_id,
-                                    "ERROR :Too many SASL failures\r\n".to_string(),
-                                );
-                                // Drop the send channel to force-close the connection.
-                                state.connections.lock().remove(session_id);
-                            }
+                            close_after_too_many_failures(conn, state, session_id, send);
                         }
                     }
                 }
@@ -574,5 +777,387 @@ pub(super) async fn handle_authenticate(
             vec![conn.nick_or_star(), "Unsupported SASL mechanism"],
         );
         send(state, session_id, format!("{fail}\r\n"));
+    }
+}
+
+#[cfg(test)]
+mod sasl_reassembly_tests {
+    use super::*;
+
+    fn conn() -> Connection {
+        Connection::new("sess-1".to_string())
+    }
+
+    fn complete(r: Reassembly) -> Option<String> {
+        match r {
+            Reassembly::Complete(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_response_shorter_than_a_chunk_arrives_whole() {
+        let mut c = conn();
+        assert_eq!(
+            complete(accumulate_response(&mut c, "abc")),
+            Some("abc".to_string())
+        );
+        assert!(c.sasl_response_buf.is_empty());
+    }
+
+    #[test]
+    fn a_full_chunk_waits_for_more() {
+        let mut c = conn();
+        let chunk = "x".repeat(SASL_CHUNK_LEN);
+        assert!(matches!(
+            accumulate_response(&mut c, &chunk),
+            Reassembly::Partial
+        ));
+        assert_eq!(c.sasl_response_buf.len(), SASL_CHUNK_LEN);
+    }
+
+    #[test]
+    fn pieces_are_joined_in_order() {
+        let mut c = conn();
+        let first = "a".repeat(SASL_CHUNK_LEN);
+        accumulate_response(&mut c, &first);
+        let joined = complete(accumulate_response(&mut c, "bbb")).unwrap();
+        assert_eq!(joined, format!("{first}bbb"));
+        assert!(c.sasl_response_buf.is_empty());
+    }
+
+    #[test]
+    fn a_bare_plus_ends_a_response_that_fills_its_last_chunk() {
+        let mut c = conn();
+        let chunk = "y".repeat(SASL_CHUNK_LEN);
+        accumulate_response(&mut c, &chunk);
+        assert_eq!(complete(accumulate_response(&mut c, "+")), Some(chunk));
+    }
+
+    #[test]
+    fn an_endless_stream_is_refused_and_dropped() {
+        let mut c = conn();
+        let chunk = "z".repeat(SASL_CHUNK_LEN);
+        let mut refused = false;
+        for _ in 0..(MAX_SASL_RESPONSE_LEN / SASL_CHUNK_LEN + 2) {
+            if matches!(accumulate_response(&mut c, &chunk), Reassembly::TooLong) {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "an unbounded stream of chunks must be refused");
+        assert!(c.sasl_response_buf.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod delegated_admit_tests {
+    use super::*;
+    use freeq_sdk::crypto::PrivateKey;
+    use freeq_sdk::identity_records::{
+        AGENT_KEY_TYPE, DEVICE_KEY_TYPE, build_agent_record, build_agent_retirement,
+        build_device_record,
+    };
+    use freeq_sdk::test_support::StubRepo;
+
+    const AGENT: &str = "did:key:z6MkAgent";
+    const OTHER_AGENT: &str = "did:key:z6MkOther";
+    const OWNER: &str = "did:plc:owner";
+    const STRANGER: &str = "did:plc:stranger";
+
+    fn hours_ago(hours: i64) -> String {
+        static NOW: std::sync::LazyLock<chrono::DateTime<chrono::Utc>> =
+            std::sync::LazyLock::new(chrono::Utc::now);
+        (*NOW - chrono::TimeDelta::hours(hours))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    fn owner_key() -> PrivateKey {
+        PrivateKey::ed25519_from_bytes(&[62; 32]).unwrap()
+    }
+
+    fn value(record: &impl serde::Serialize) -> serde_json::Value {
+        serde_json::to_value(record).unwrap()
+    }
+
+    fn claim(owner: &str, bot: &str, hours: i64) -> serde_json::Value {
+        value(&build_agent_record(&owner_key(), owner, bot, &hours_ago(hours), None).unwrap())
+    }
+
+    fn removal(owner: &str, bot: &str, hours: i64) -> serde_json::Value {
+        value(&build_agent_retirement(&owner_key(), owner, bot, &hours_ago(hours)).unwrap())
+    }
+
+    /// `owner`'s repository, holding their device record and `agents`.
+    fn repo_of(owner: &str, agents: &[serde_json::Value]) -> Arc<parking_lot::Mutex<StubRepo>> {
+        let mut repo = StubRepo::new(owner);
+        repo.add(
+            DEVICE_KEY_TYPE,
+            &value(&build_device_record(&owner_key(), owner, &hours_ago(48), None).unwrap()),
+        );
+        for record in agents {
+            repo.add(AGENT_KEY_TYPE, record);
+        }
+        Arc::new(parking_lot::Mutex::new(repo))
+    }
+
+    /// An instance that allows `allowed` and nobody else, serving `repos`.
+    async fn state_allowing(
+        allow_delegated: bool,
+        allowed: &[&str],
+        repos: Vec<Arc<parking_lot::Mutex<StubRepo>>>,
+    ) -> Arc<SharedState> {
+        let pds = crate::peer_keys::stub_pds_repos(repos).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig {
+                allowed_dids: allowed.iter().map(|d| d.to_string()).collect(),
+                allow_delegated_agents: allow_delegated,
+                ..Default::default()
+            },
+            pds.resolver.clone(),
+        );
+        state
+            .owner_read_reuse_ms
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        state
+    }
+
+    async fn state_allowing_owner(
+        allow_delegated: bool,
+        repos: Vec<Arc<parking_lot::Mutex<StubRepo>>>,
+    ) -> Arc<SharedState> {
+        state_allowing(allow_delegated, &[OWNER], repos).await
+    }
+
+    async fn admit(state: &Arc<SharedState>, owner: Option<&str>) -> Result<(), String> {
+        delegated_admit(state, "sess-1", AGENT, owner).await
+    }
+
+    #[tokio::test]
+    async fn an_agent_its_allowed_owner_claims_is_admitted_and_kept_for_the_recheck() {
+        let repo = repo_of(OWNER, &[claim(OWNER, OTHER_AGENT, 20)]);
+        let own = repo.lock().add(AGENT_KEY_TYPE, &claim(OWNER, AGENT, 24));
+        let state = state_allowing_owner(true, vec![repo]).await;
+        assert_eq!(admit(&state, Some(OWNER)).await, Ok(()));
+        let key = (OWNER.to_string(), AGENT.to_string());
+        assert_eq!(state.delegated_sessions.lock().get("sess-1"), Some(&key));
+        let kept = state
+            .agent_links
+            .lock()
+            .get(&key)
+            .map(|(_, uri)| uri.clone());
+        assert_eq!(kept.as_deref(), Some(own.as_str()));
+    }
+
+    /// The attack this exists to stop: naming an allowed owner who has not
+    /// claimed you.
+    #[tokio::test]
+    async fn an_owner_whose_records_name_other_agents_admits_nobody() {
+        let state =
+            state_allowing_owner(true, vec![repo_of(OWNER, &[claim(OWNER, OTHER_AGENT, 24)])])
+                .await;
+        let refused = admit(&state, Some(OWNER)).await.unwrap_err();
+        assert!(refused.contains("do not admit this agent"), "{refused}");
+        assert!(state.delegated_sessions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_claim_the_owner_withdrew_admits_nobody() {
+        let records = [claim(OWNER, AGENT, 24), removal(OWNER, AGENT, 12)];
+        let state = state_allowing_owner(true, vec![repo_of(OWNER, &records)]).await;
+        let refused = admit(&state, Some(OWNER)).await.unwrap_err();
+        assert!(refused.contains("do not admit this agent"), "{refused}");
+    }
+
+    /// A record lifted into the listing without the repository's proof.
+    #[tokio::test]
+    async fn a_claim_whose_proof_fails_admits_nobody() {
+        let repo = repo_of(OWNER, &[]);
+        repo.lock().add_forged(
+            AGENT_KEY_TYPE,
+            &claim(OWNER, AGENT, 24),
+            &claim(OWNER, OTHER_AGENT, 30),
+        );
+        let state = state_allowing_owner(true, vec![repo]).await;
+        let refused = admit(&state, Some(OWNER)).await.unwrap_err();
+        assert!(refused.contains("do not admit this agent"), "{refused}");
+    }
+
+    /// Delegation carries the owner's standing, so it cannot exceed it.
+    #[tokio::test]
+    async fn a_claim_from_an_owner_who_is_not_allowed_admits_nobody() {
+        let state =
+            state_allowing_owner(true, vec![repo_of(STRANGER, &[claim(STRANGER, AGENT, 24)])])
+                .await;
+        let refused = admit(&state, Some(STRANGER)).await.unwrap_err();
+        assert!(refused.contains("do not admit this agent"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn an_owner_who_is_not_allowed_is_not_read() {
+        let pds = crate::peer_keys::stub_pds_repos(vec![repo_of(
+            STRANGER,
+            &[claim(STRANGER, AGENT, 24)],
+        )])
+        .await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig {
+                allowed_dids: vec![OWNER.to_string()],
+                allow_delegated_agents: true,
+                ..Default::default()
+            },
+            pds.resolver.clone(),
+        );
+        assert!(admit(&state, Some(STRANGER)).await.is_err());
+        assert_eq!(pds.arrivals.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_owner_that_is_not_a_did_is_refused_before_anything_else() {
+        let state = state_allowing_owner(true, vec![]).await;
+        let too_long = format!("did:plc:{}", "a".repeat(300));
+        for owner in [
+            "alice.example",
+            "did:",
+            "did:plc:bad\r\nQUIT",
+            "did:plc:with space",
+            too_long.as_str(),
+        ] {
+            let refused = admit(&state, Some(owner)).await.unwrap_err();
+            assert!(refused.contains("not a DID"), "{owner:?}: {refused}");
+        }
+    }
+
+    /// Refusing a stranger costs no lookup, so without the floor it would
+    /// come back faster than refusing someone whose records were read.
+    #[tokio::test]
+    async fn a_refusal_comes_no_sooner_than_the_floor() {
+        let state =
+            state_allowing_owner(true, vec![repo_of(STRANGER, &[claim(STRANGER, AGENT, 24)])])
+                .await;
+        let started = std::time::Instant::now();
+        assert!(admit(&state, Some(STRANGER)).await.is_err());
+        assert!(started.elapsed() >= DELEGATED_REFUSAL_FLOOR);
+    }
+
+    #[tokio::test]
+    async fn an_admission_is_not_held_to_the_floor() {
+        let state =
+            state_allowing_owner(true, vec![repo_of(OWNER, &[claim(OWNER, AGENT, 24)])]).await;
+        let started = std::time::Instant::now();
+        assert_eq!(admit(&state, Some(OWNER)).await, Ok(()));
+        assert!(started.elapsed() < DELEGATED_REFUSAL_FLOOR);
+    }
+
+    /// A failing PDS must not confirm that its owner is allowed here.
+    #[tokio::test]
+    async fn a_read_that_fails_is_refused_with_the_shared_text() {
+        let pds =
+            crate::peer_keys::stub_pds_repos(vec![repo_of(OWNER, &[claim(OWNER, AGENT, 24)])])
+                .await;
+        pds.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig {
+                allowed_dids: vec![OWNER.to_string()],
+                allow_delegated_agents: true,
+                ..Default::default()
+            },
+            pds.resolver.clone(),
+        );
+        state
+            .owner_read_reuse_ms
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let refused = admit(&state, Some(OWNER)).await.unwrap_err();
+        assert!(refused.contains("do not admit this agent"), "{refused}");
+    }
+
+    #[test]
+    fn the_host_of_a_did_web_is_read_without_port_or_path() {
+        assert_eq!(
+            did_web_host("did:web:Acme.com").as_deref(),
+            Some("acme.com")
+        );
+        assert_eq!(
+            did_web_host("did:web:acme.com:users:alice").as_deref(),
+            Some("acme.com")
+        );
+        assert_eq!(
+            did_web_host("did:web:acme.com%3A8443:x").as_deref(),
+            Some("acme.com%3a8443")
+        );
+        assert_eq!(did_web_host("did:plc:abc"), None);
+        assert_eq!(did_web_host("did:web:"), None);
+    }
+
+    /// The server fetches the host in a did:web to resolve it, so a stranger
+    /// must not get to name that host.
+    #[test]
+    fn a_did_web_owner_is_looked_up_only_under_an_allowed_domain() {
+        let cfg = crate::config::ServerConfig {
+            allowed_did_domains: vec!["acme.com".to_string()],
+            ..Default::default()
+        };
+        assert!(owner_may_be_looked_up(&cfg, "did:web:acme.com"));
+        assert!(owner_may_be_looked_up(&cfg, "did:web:bots.acme.com"));
+        assert!(!owner_may_be_looked_up(&cfg, "did:web:victim.example"));
+        assert!(!owner_may_be_looked_up(
+            &cfg,
+            "did:web:acme.com.victim.example"
+        ));
+        assert!(!owner_may_be_looked_up(
+            &cfg,
+            "did:web:acme.com@victim.example"
+        ));
+        assert!(!owner_may_be_looked_up(&cfg, "did:web:acme.com%3A8443"));
+        assert!(owner_may_be_looked_up(&cfg, "did:plc:anyone"));
+        let listed = crate::config::ServerConfig {
+            allowed_dids: vec!["did:web:solo.example".to_string()],
+            ..Default::default()
+        };
+        assert!(owner_may_be_looked_up(&listed, "did:web:solo.example"));
+        assert!(!owner_may_be_looked_up(&listed, "did:web:other.example"));
+    }
+
+    #[tokio::test]
+    async fn the_instance_must_opt_in() {
+        let state =
+            state_allowing_owner(false, vec![repo_of(OWNER, &[claim(OWNER, AGENT, 24)])]).await;
+        let refused = admit(&state, Some(OWNER)).await.unwrap_err();
+        assert!(refused.contains("do not admit this agent"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_naming_no_owner_admits_nobody() {
+        let state = state_allowing_owner(true, vec![]).await;
+        assert!(admit(&state, None).await.is_err());
+    }
+
+    /// A did:key has no repository to read.
+    #[tokio::test]
+    async fn an_agent_naming_itself_admits_nobody() {
+        let state = state_allowing(true, &[AGENT], vec![]).await;
+        let refused = admit(&state, Some(AGENT)).await.unwrap_err();
+        assert!(refused.contains("account with a repository"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn only_an_agent_with_a_did_key_is_delegated() {
+        let person = "did:plc:someone";
+        let state =
+            state_allowing_owner(true, vec![repo_of(OWNER, &[claim(OWNER, person, 24)])]).await;
+        let refused = delegated_admit(&state, "sess-1", person, Some(OWNER))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("did:key"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_does_not_say_whether_the_named_owner_is_allowed() {
+        let allowed = state_allowing_owner(true, vec![repo_of(OWNER, &[])]).await;
+        let not_allowed = state_allowing(true, &[STRANGER], vec![repo_of(OWNER, &[])]).await;
+        assert_eq!(
+            admit(&allowed, Some(OWNER)).await,
+            admit(&not_allowed, Some(OWNER)).await
+        );
     }
 }

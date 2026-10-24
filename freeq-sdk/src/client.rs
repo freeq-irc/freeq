@@ -83,6 +83,9 @@ pub struct ConnectConfig {
     /// puts a verdict on each. Built without an origin base, it asks the
     /// connected server ([`server_http_origin`]). `None`: no verdicts.
     pub key_lookup: Option<Arc<crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>>>,
+    /// The account this agent acts for, named in the SASL response so its
+    /// agent records can admit the agent.
+    pub owner_did: Option<String>,
 }
 
 impl std::fmt::Debug for ConnectConfig {
@@ -101,6 +104,7 @@ impl std::fmt::Debug for ConnectConfig {
             .field("device_label", &self.device_label)
             .field("fresh_sign_in", &self.fresh_sign_in)
             .field("key_lookup", &self.key_lookup.is_some())
+            .field("owner_did", &self.owner_did)
             .finish()
     }
 }
@@ -121,6 +125,7 @@ impl Default for ConnectConfig {
             device_label: None,
             fresh_sign_in: false,
             key_lookup: None,
+            owner_did: None,
         }
     }
 }
@@ -3205,10 +3210,10 @@ where
                                     use base64::Engine;
                                     let json_bytes = response.to_string();
                                     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json_bytes.as_bytes());
-                                    writer.write_all(format!("AUTHENTICATE {encoded}\r\n").as_bytes()).await?;
+                                    write_sasl_response(&mut writer, &encoded).await?;
                                 }
                             } else if let Some(ref signer) = signer {
-                                handle_authenticate_challenge(&msg, signer.as_ref(), &mut writer).await?;
+                                handle_authenticate_challenge(&msg, signer.as_ref(), config.owner_did.as_deref(), &mut writer).await?;
                             }
                         }
                         // Handle DPOP_NONCE notice during SASL — update signer nonce
@@ -6563,9 +6568,25 @@ fn parse_multiline_cap(caps_str: &str) -> Option<(usize, usize)> {
     Some((max_bytes, max_lines))
 }
 
+/// Write an encoded SASL response as one `AUTHENTICATE` line, however long.
+async fn write_sasl_response<W: AsyncWrite + Unpin>(writer: &mut W, encoded: &str) -> Result<()> {
+    if encoded.len() > auth::MAX_SASL_RESPONSE_LEN {
+        anyhow::bail!(
+            "SASL response is {} bytes, over the {} the server accepts",
+            encoded.len(),
+            auth::MAX_SASL_RESPONSE_LEN
+        );
+    }
+    writer
+        .write_all(format!("AUTHENTICATE {encoded}\r\n").as_bytes())
+        .await?;
+    Ok(())
+}
+
 async fn handle_authenticate_challenge<W: AsyncWrite + Unpin>(
     msg: &Message,
     signer: &dyn ChallengeSigner,
+    owner_did: Option<&str>,
     writer: &mut W,
 ) -> Result<()> {
     let encoded_challenge = msg.params.first().map(|s| s.as_str()).unwrap_or("");
@@ -6576,15 +6597,12 @@ async fn handle_authenticate_challenge<W: AsyncWrite + Unpin>(
     // eprintln!("  Challenge decoded ({} bytes), signing with {}...", challenge_bytes.len(), signer.did());
 
     // Produce the response using the signer
-    let response = signer.respond(&challenge_bytes)?;
+    let mut response = signer.respond(&challenge_bytes)?;
+    response.owner_did = owner_did.map(str::to_string);
     let encoded = auth::encode_response(&response);
     // eprintln!("  Sending AUTHENTICATE response ({} bytes)", encoded.len());
 
-    writer
-        .write_all(format!("AUTHENTICATE {encoded}\r\n").as_bytes())
-        .await?;
-
-    Ok(())
+    write_sasl_response(writer, &encoded).await
 }
 
 // ── Reconnect helper ──
@@ -6724,6 +6742,88 @@ fn rand_jitter(max: u64) -> u64 {
         return 0;
     }
     rand::random::<u64>() % max
+}
+
+#[cfg(test)]
+mod sasl_write_tests {
+    use super::*;
+    use auth::MAX_SASL_RESPONSE_LEN;
+
+    async fn lines(encoded: &str) -> Vec<String> {
+        let mut buf: Vec<u8> = Vec::new();
+        write_sasl_response(&mut buf, encoded).await.unwrap();
+        String::from_utf8(buf)
+            .unwrap()
+            .split("\r\n")
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A server that predates chunk reassembly still takes one long line.
+    #[tokio::test]
+    async fn a_response_of_any_length_goes_out_as_one_line() {
+        for len in [3, 400, 412, 1200] {
+            let payload = "x".repeat(len);
+            assert_eq!(
+                lines(&payload).await,
+                vec![format!("AUTHENTICATE {payload}")]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_response_the_server_will_not_accept_is_refused() {
+        let mut buf: Vec<u8> = Vec::new();
+        let err = write_sasl_response(&mut buf, &"w".repeat(MAX_SASL_RESPONSE_LEN + 1))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("over the {MAX_SASL_RESPONSE_LEN}"))
+        );
+        assert!(
+            buf.is_empty(),
+            "nothing goes out when the response is refused"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sasl_response_tests {
+    use super::*;
+    use base64::Engine;
+
+    async fn response_naming(owner: Option<&str>) -> serde_json::Value {
+        let key = crate::crypto::PrivateKey::generate_ed25519();
+        let signer = auth::KeySigner::new(format!("did:key:{}", key.public_key_multibase()), key);
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"challenge");
+        let msg = Message::new("AUTHENTICATE", vec![&challenge]);
+        let mut out: Vec<u8> = Vec::new();
+        handle_authenticate_challenge(&msg, &signer, owner, &mut out)
+            .await
+            .unwrap();
+        let line = String::from_utf8(out).unwrap();
+        let encoded = line.trim_end().strip_prefix("AUTHENTICATE ").unwrap();
+        serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_response_names_the_owner_it_was_given() {
+        let payload = response_naming(Some("did:plc:owner")).await;
+        assert_eq!(payload["owner_did"], "did:plc:owner");
+    }
+
+    #[tokio::test]
+    async fn the_response_carries_no_owner_field_when_none_was_given() {
+        let payload = response_naming(None).await;
+        assert!(payload.get("owner_did").is_none());
+    }
 }
 
 #[cfg(test)]

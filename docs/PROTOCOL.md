@@ -50,6 +50,11 @@ The client responds with base64url-encoded JSON:
 }
 ```
 
+An agent may add `owner_did`, the DID of the account it acts for. A server
+with a connect allowlist that does not know the agent's own DID may admit it
+when that account is allowed and its `at.freeq.agentKey` records name the
+agent (`--allow-delegated-agents`).
+
 ### Verification Methods
 
 1. **`crypto`** — Client signs the raw challenge bytes with a key listed in

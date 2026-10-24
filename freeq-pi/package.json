@@ -44,7 +44,7 @@
   "dependencies": {
     "@freeq/bot-kit": "^0.2.0",
     "@freeq/harness-kit": "file:../freeq-harness-kit",
-    "@freeq/sdk": "^0.2.0"
+    "@freeq/sdk": "^0.3.0"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.99.1",

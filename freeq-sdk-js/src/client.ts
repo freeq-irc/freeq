@@ -402,6 +402,11 @@ const GUEST_NICK_RESUME_DELAYS_MS = [500, 1000, 2000];
  *  477, so the one channel a guest is sent to unasked has to be ungated. */
 const GUEST_DEFAULT_CHANNEL = '#general';
 
+/** Ceiling on a response, matching `MAX_SASL_RESPONSE_LEN` on the server: a
+ *  single line must fit the 8192-byte line limit with `AUTHENTICATE ` and
+ *  CRLF. */
+const MAX_SASL_RESPONSE_CHARS = 8177;
+
 /** CHATHISTORY subcommands, which sit where a target could and are all legal
  *  nicks. */
 const HISTORY_SUBCOMMANDS = new Set([
@@ -4751,20 +4756,24 @@ export class FreeqClient extends EventEmitter {
       signature,
       pds_url: this.sasl?.pdsUrl,
       challenge_nonce: challengeNonce,
+      owner_did: this.sasl?.ownerDid,
     });
     const encoded = btoa(response)
       .replace(/\+/g, '-')
       .replace(/\//g, '_')
       .replace(/=+$/, '');
 
-    if (encoded.length <= 400) {
-      this.raw(`AUTHENTICATE ${encoded}`);
-    } else {
-      for (let i = 0; i < encoded.length; i += 400) {
-        this.raw(`AUTHENTICATE ${encoded.slice(i, i + 400)}`);
-      }
-      this.raw('AUTHENTICATE +');
+    if (encoded.length > MAX_SASL_RESPONSE_CHARS) {
+      log.error(
+        `[freeq-sdk] SASL response is ${encoded.length} chars, over the ${MAX_SASL_RESPONSE_CHARS} the server accepts; aborting`,
+      );
+      this.raw('AUTHENTICATE *');
+      return;
     }
+
+    // One line however long: every freeq server takes it, and only newer
+    // ones join chunks.
+    this.raw(`AUTHENTICATE ${encoded}`);
   }
 
   private handleAvSessionState(
