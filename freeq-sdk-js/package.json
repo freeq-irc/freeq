@@ -31,7 +31,7 @@
     "lint": "eslint src/"
   },
   "dependencies": {
-    "@atcute/car": "^6.0.2",
+    "@atcute/car": "^6.1.0",
     "@atcute/cbor": "^2.3.7",
     "@atcute/cid": "^2.4.2",
     "@atcute/crypto": "^2.4.4",

@@ -1154,7 +1154,11 @@ interface SignedCommit {
  * fails is treated as missing.
  */
 async function readProof(car: Uint8Array): Promise<{ root: string; store: MemoryBlockStore }> {
-  const reader = fromUint8Array(car);
+  // The reader's own block check throws on the first block that doesn't hash
+  // to its CID, which would fail the whole proof. The contract is that such a
+  // block is missing, not fatal, so this loop does the check itself and keeps
+  // only blocks that pass.
+  const reader = fromUint8Array(car, { verifyBlocks: false });
   const root = reader.roots[0];
   if (reader.roots.length !== 1 || root === undefined) throw new Error('proof names no single root');
   const store = new MemoryBlockStore();
