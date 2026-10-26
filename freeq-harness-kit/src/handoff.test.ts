@@ -197,6 +197,44 @@ describe("the connected server's rulings", () => {
     expect(store.get(id)!.state).toBe("assigned");
   });
 
+  it("an expire the SDK found counts is applied from the task's referee on another server", () => {
+    const id = offer(store);
+    move(store, "accept", id, BOB);
+    const r = store.apply(
+      ev({
+        verb: "expire",
+        did: "did:web:referee.example",
+        from: "referee.example",
+        eventId: "01EXPIRE000000000000000000",
+        taskId: id,
+        fields: { act: "handoff", "act-id": id },
+        ruling: "counts",
+      }),
+      { serverDid: SERVER, signatureValid: false },
+    );
+    expect(r.ok, r.ok ? "" : r.reason).toBe(true);
+    expect(store.get(id)!.state).toBe("expired");
+  });
+
+  it("an expire the SDK could not check, from a server other than the connected one, is refused", () => {
+    const id = offer(store);
+    move(store, "accept", id, BOB);
+    const r = store.apply(
+      ev({
+        verb: "expire",
+        did: "did:web:referee.example",
+        from: "referee.example",
+        eventId: "01EXPIRE000000000000000000",
+        taskId: id,
+        fields: { act: "handoff", "act-id": id },
+        ruling: "cannot-check",
+      }),
+      { serverDid: SERVER, signatureValid: true },
+    );
+    expect(r.ok).toBe(false);
+    expect(store.get(id)!.state).toBe("assigned");
+  });
+
   it("an expire is refused when the server's name is not known", () => {
     const id = offer(store);
     move(store, "accept", id, BOB);

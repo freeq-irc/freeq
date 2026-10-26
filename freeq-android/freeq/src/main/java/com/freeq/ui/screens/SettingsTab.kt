@@ -25,6 +25,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.freeq.model.AppState
 import com.freeq.model.ConnectionState
+import com.freeq.model.JoinPartDisplay
 import com.freeq.model.ServerConfig
 import com.freeq.ui.components.UserAvatar
 import com.freeq.ui.theme.FreeqColors
@@ -38,6 +39,7 @@ fun SettingsTab(appState: AppState) {
     val serverAddress by appState.serverAddress
     val connectionState by appState.connectionState
     val isDarkTheme by appState.isDarkTheme
+    val joinPartDisplay by appState.joinPartDisplay
     val customStatus by appState.customStatus
     val signingKeyUnpublished by appState.signingKeyUnpublished
     val context = LocalContext.current
@@ -241,6 +243,36 @@ fun SettingsTab(appState: AppState) {
                                 checkedThumbColor = FreeqColors.accent,
                                 checkedTrackColor = FreeqColors.accent.copy(alpha = 0.3f)
                             )
+                        )
+                    }
+
+                    // Join/part/quit lines — hidden by default.
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            "Join & leave messages",
+                            fontSize = 15.sp,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
+                        val modes = JoinPartDisplay.entries
+                        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                            modes.forEachIndexed { index, mode ->
+                                SegmentedButton(
+                                    selected = joinPartDisplay == mode,
+                                    onClick = { appState.setJoinPartDisplay(mode) },
+                                    shape = SegmentedButtonDefaults.itemShape(index = index, count = modes.size)
+                                ) {
+                                    Text(when (mode) {
+                                        JoinPartDisplay.HIDDEN -> "Hidden"
+                                        JoinPartDisplay.GROUPED -> "Grouped"
+                                        JoinPartDisplay.ALL -> "All"
+                                    })
+                                }
+                            }
+                        }
+                        Text(
+                            "Grouped folds a run of joins and leaves into one line. Kicks and moderation actions always show.",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }

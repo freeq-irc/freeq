@@ -9,12 +9,14 @@
  * this machine. Until the record exists the server stores the certificate
  * as unverified, and every feature that trusts delegation refuses it.
  *
- * THE OLDER WAY. An installation can instead sign its certificate with a
- * creator key kept here (`creatorKeyPath`), whose public half the owner
- * registers with the server by sending `MSGSIG <pubkey>` from a session
- * signed in as them. That still verifies, and an installation that already
- * has such a key keeps signing with it; `/freeq authorize` no longer makes
- * one. The key functions below stay for that, and for the helper scripts.
+ * THE DEPRECATED WAY. An installation can instead sign its certificate
+ * with a creator key kept here (`creatorKeyPath`), whose public half the
+ * owner registers with the server by sending `MSGSIG <pubkey>` from a
+ * session signed in as them. Every server in use now reads agent records,
+ * and signed certificates will stop counting in a later release, when this way is
+ * removed. Until then an installation that has such a key keeps signing
+ * with it and is warned once per process (`signedCertificateLine`); the key
+ * functions below stay for that, and for the helper scripts.
  */
 
 import { mkdir, readFile, writeFile, chmod, access } from "node:fs/promises";
@@ -75,10 +77,9 @@ export interface AuthorizeInstructions {
 }
 
 /**
- * `/freeq authorize --sign-cert`, the way for a server that does not read
- * agent records yet: make sure the creator key exists, and say what to paste
- * where. Pure and local — no network. Removed once every server in use reads
- * agent records.
+ * `/freeq authorize --sign-cert`, deprecated: make sure the creator key
+ * exists, and say what to paste where. Pure and local — no network. To be
+ * removed in a later release, when signed certificates stop counting.
  */
 export async function authorizeInstructions(opts: {
   ownerDid: string;
@@ -105,6 +106,42 @@ export async function authorizeInstructions(opts: {
   };
 }
 
+/** Whether this process has warned about a signed certificate yet. Once per
+ *  process, like the SDK's deprecation warnings: a reconnect builds a new
+ *  connection, so a per-connection set would warn again. */
+let signedCertificateWarned = false;
+
+/** True the first time it is called in this process, false after. Both the
+ *  connection's warning and `/freeq authorize --sign-cert`'s call it. */
+export function firstSignedCertificateWarning(): boolean {
+  if (signedCertificateWarned) return false;
+  signedCertificateWarned = true;
+  return true;
+}
+
+/**
+ * What to say when this installation's certificate is signed with a creator
+ * key: that signed certificates will stop counting in a later release, how to add
+ * the agent record instead, and what to delete so an unsigned certificate is
+ * made at the next start. Without `certPath` (the signer, which may be
+ * signing a copy) it names the signed certificate on the bot's machine.
+ * bot-kit says the same sentence in its own copy; it cannot import this.
+ */
+export function signedCertificateLine(opts: { botDid: string; certPath?: string; keyPath?: string }): string {
+  const certificate = opts.certPath
+    ? `the certificate at ${opts.certPath}`
+    : "the signed certificate on the bot's machine";
+  const toDelete = opts.keyPath
+    ? `the creator key at ${opts.keyPath} if it exists, and ${certificate}`
+    : certificate;
+  return (
+    "This bot's certificate is signed with a creator key. Signed certificates will stop counting in a later release; " +
+    "every server now reads agent records instead. Add this agent under Settings → Agents in the freeq web app, " +
+    `or with \`freeq-bot-id register --owner <handle> ${opts.botDid}\`, then delete ${toDelete}, ` +
+    "so an unsigned certificate is made at the next start."
+  );
+}
+
 export interface AgentInstructions {
   ownerDid: string;
   botDid: string;
@@ -114,13 +151,18 @@ export interface AgentInstructions {
 
 /**
  * What `/freeq authorize` says: this installation's DID and the two places
- * the owner can add it as one of their agents. Local only: nothing is made
- * or sent.
+ * the owner can add it as one of their agents, and, when its certificate is
+ * signed (`signature`), the deprecation line naming what to delete. Local
+ * only: nothing is made or sent.
  */
 export async function agentInstructions(opts: {
   ownerDid: string;
   botDid: string;
   root: string;
+  /** The loaded certificate's signature; set means it is signed. */
+  signature?: string | null;
+  /** Where bot-kit keeps this installation's state, holding delegation.json. */
+  stateDir?: string;
   names?: HarnessNames;
 }): Promise<AgentInstructions> {
   const names = opts.names ?? PI_NAMES;
@@ -132,20 +174,22 @@ export async function agentInstructions(opts: {
     `  - from a terminal: freeq-bot-id register --owner <your handle> ${opts.botDid}`,
     "",
     `Then run:  ${names.hint("authorize verify")}`,
-    "",
-    `On a server that doesn't read agent records yet, use ${names.hint("authorize --sign-cert")} instead.`,
   ];
-  let legacy = false;
-  try {
-    await access(creatorKeyPath(opts.root, opts.ownerDid));
-    legacy = true;
-  } catch {
-    // No creator key: the record is the only way.
-  }
-  if (legacy) {
+  if (opts.signature) {
+    let keyPath: string | undefined = creatorKeyPath(opts.root, opts.ownerDid);
+    try {
+      await access(keyPath);
+    } catch {
+      // No creator key here (a copied certificate): only the file to delete.
+      keyPath = undefined;
+    }
     steps.push(
       "",
-      "This installation also signs its certificate with an older creator key; that keeps working.",
+      signedCertificateLine({
+        botDid: opts.botDid,
+        certPath: opts.stateDir ? join(opts.stateDir, "delegation.json") : undefined,
+        keyPath,
+      }),
     );
   }
   return { ownerDid: opts.ownerDid, botDid: opts.botDid, steps };
@@ -154,7 +198,7 @@ export async function agentInstructions(opts: {
 /** What an unverified certificate means now: the owner's record is not there yet. */
 function waitingForRecord(names: HarnessNames): string {
   return (
-    `Not verified yet: the server found no agent record naming this installation. Add its DID (shown by ${names.hint("authorize")}) in the freeq web app under Settings → Agents, or with freeq-bot-id register, then run ${names.hint("authorize verify")} again. On a server that doesn't read agent records yet, ${names.hint("authorize --sign-cert")} is the way.`
+    `Not verified yet: the server found no agent record naming this installation. Add its DID (shown by ${names.hint("authorize")}) in the freeq web app under Settings → Agents, or with freeq-bot-id register, then run ${names.hint("authorize verify")} again.`
   );
 }
 

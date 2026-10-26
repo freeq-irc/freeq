@@ -35,6 +35,15 @@ export const AGENT_KEY_TYPE = 'at.freeq.agentKey';
 export const KEY_LIFETIME_MS = 90 * 24 * 60 * 60 * 1000;
 
 /**
+ * Whether a key made at `createdAt` (RFC 3339) is past its lifetime now. A
+ * date that does not parse counts as not past it.
+ */
+export function pastKeyLifetime(createdAt: string): boolean {
+  const made = Date.parse(createdAt);
+  return !Number.isNaN(made) && made + KEY_LIFETIME_MS <= Date.now();
+}
+
+/**
  * An `at.freeq.deviceKey` entry: either a key the account publishes
  * (`publicKeyMultibase`) or a retirement of one (`revokes`), never both.
  */
@@ -273,6 +282,18 @@ export async function deviceKeyHistory(
     retiredAt: k.retiredAt === null ? null : new Date(k.retiredAt),
     record: k.record,
   }));
+}
+
+/**
+ * Whether a device holding `key` must stop using it at `now`: a retirement
+ * before its expiry counts at once, whatever its date, and an expiry once it
+ * is reached. Message verdicts judge by date instead.
+ */
+export function retiredOrExpired(key: DeviceKeyHistory, now: Date): boolean {
+  return (
+    key.retiredAt !== null &&
+    (key.retiredAt.getTime() < key.expiresAt.getTime() || key.retiredAt.getTime() <= now.getTime())
+  );
 }
 
 /**
@@ -635,7 +656,13 @@ export type ResolveDid = (did: string) => Promise<DidDocument>;
  * One HTTP GET. The PDS address comes from a DID document anyone can write,
  * so a caller that must refuse private addresses does it in this function.
  */
-export type Fetch = (url: string) => Promise<Response>;
+export type Fetch = (url: string, init?: FetchInit) => Promise<Response>;
+
+/** The one request option a reader passes on: `redirect: 'error'` makes a
+ *  redirect a failed request rather than one followed elsewhere. */
+export interface FetchInit {
+  redirect?: 'error';
+}
 
 /** One `listRecords` entry: where the record sits, the CID the PDS gives it, and the record. */
 export interface ListedRecord {
@@ -1127,7 +1154,11 @@ interface SignedCommit {
  * fails is treated as missing.
  */
 async function readProof(car: Uint8Array): Promise<{ root: string; store: MemoryBlockStore }> {
-  const reader = fromUint8Array(car);
+  // The reader's own block check throws on the first block that doesn't hash
+  // to its CID, which would fail the whole proof. The contract is that such a
+  // block is missing, not fatal, so this loop does the check itself and keeps
+  // only blocks that pass.
+  const reader = fromUint8Array(car, { verifyBlocks: false });
   const root = reader.roots[0];
   if (reader.roots.length !== 1 || root === undefined) throw new Error('proof names no single root');
   const store = new MemoryBlockStore();

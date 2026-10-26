@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import type { AvParticipant } from '../store';
 import { useStore, uniqueMemberCount } from '../store';
-import { setTopic as sendTopic, startAvSession, getClient } from '../irc/client';
+import { setTopic as sendTopic, startAvSession, getClient, dmPeerDid } from '../irc/client';
 import { SpeakerIcon } from './SessionIndicator';
 import { fetchProfile, type ATProfile } from '../lib/profiles';
 import { isDid, resolveIdentityName } from '../lib/identity';
@@ -34,9 +34,7 @@ export function TopBar({ onToggleSidebar, onToggleMembers, sidebarOpen, membersO
   // For DMs, resolve partner profile. A DID-keyed DM (the thread name IS the
   // peer's DID) is its own partner DID even before we have a member row.
   const partnerWhois = isDM ? whoisCache.get(activeChannel.toLowerCase()) : undefined;
-  const partnerDid = isDM
-    ? (isDid(activeChannel) ? activeChannel : (ch?.members.values().next().value?.did || partnerWhois?.did))
-    : undefined;
+  const partnerDid = isDM ? dmPeerDid(activeChannel, partnerWhois?.did) : undefined;
   const [partnerProfileState, setPartnerProfileState] = useState<{ did: string; profile: ATProfile | null } | null>(null);
   useEffect(() => {
     if (!isDM || !partnerDid) return;
@@ -127,12 +125,6 @@ export function TopBar({ onToggleSidebar, onToggleMembers, sidebarOpen, membersO
         {ch?.isEncrypted && (
           <span className="text-success text-xs shrink-0" title="End-to-end encrypted channel">🔒</span>
         )}
-        {isDM && !ch?.isEncrypted && (() => {
-          const partnerDid = ch?.members.values().next().value?.did;
-          return partnerDid ? (
-            <span className="text-success text-xs shrink-0" title="End-to-end encrypted DM">🔒</span>
-          ) : null;
-        })()}
         {isChannel && <VoiceButton channel={activeChannel} />}
       </div>
 

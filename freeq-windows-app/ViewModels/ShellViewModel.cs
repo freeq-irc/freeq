@@ -782,7 +782,7 @@ public partial class ShellViewModel : ObservableObject, IDisposable
         else
         {
             vm.AddMember(new IrcMember { Nick = nick });
-            AddSystemMessage(vm, $"{nick} joined {channel}");
+            AddPresenceMessage(vm, nick, joined: true, $"{nick} joined {channel}");
         }
     }
 
@@ -804,7 +804,7 @@ public partial class ShellViewModel : ObservableObject, IDisposable
         else
         {
             vm.RemoveMember(nick);
-            AddSystemMessage(vm, $"{nick} left {channel}");
+            AddPresenceMessage(vm, nick, joined: false, $"{nick} left {channel}");
         }
     }
 
@@ -1200,7 +1200,7 @@ public partial class ShellViewModel : ObservableObject, IDisposable
             if (ch.FindMember(nick) != null)
             {
                 ch.RemoveMember(nick);
-                AddSystemMessage(ch, $"{nick} quit: {reason}");
+                AddPresenceMessage(ch, nick, joined: false, $"{nick} quit: {reason}");
             }
         }
     }
@@ -1345,6 +1345,61 @@ public partial class ShellViewModel : ObservableObject, IDisposable
     {
         return Channels.FirstOrDefault(c =>
             string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+    }
+
+    // The join/part events behind a grouped summary line, keyed by that
+    // line's id. Only a channel's newest line is ever extended.
+    private readonly Dictionary<string, List<(string Nick, bool Joined)>> _presenceRuns = new();
+
+    /// A join/part/quit line, shown per the `join_part` setting: hidden
+    /// (default), grouped into one summary per run, or all.
+    private void AddPresenceMessage(ChannelViewModel channel, string nick, bool joined, string text)
+    {
+        var mode = _settings.JoinPart.ToLowerInvariant();
+        if (mode != "grouped" && mode != "all")
+            return;
+
+        if (mode == "grouped"
+            && channel.Messages.Count > 0
+            && _presenceRuns.TryGetValue(channel.Messages[^1].Id, out var run))
+        {
+            run.Add((nick, joined));
+            var last = channel.Messages[^1];
+            last.Text = SummarizePresence(run);
+            last.Timestamp = DateTime.UtcNow;
+            // Replace so the list redraws the row (IrcMessage doesn't notify).
+            channel.Messages[^1] = last;
+            return;
+        }
+
+        AddSystemMessage(channel, text);
+        _presenceRuns[channel.Messages[^1].Id] = [(nick, joined)];
+    }
+
+    /// "nap reconnected 2×" for one person's churn, else
+    /// "alice, bob and 2 more joined · carol left".
+    private static string SummarizePresence(List<(string Nick, bool Joined)> run)
+    {
+        var joins = run.Count(e => e.Joined);
+        var leaves = run.Count - joins;
+        var first = run[0].Nick;
+        if (run.All(e => e.Nick.Equals(first, StringComparison.OrdinalIgnoreCase)))
+        {
+            if (joins > 0 && leaves > 0) return $"{first} reconnected {Math.Min(joins, leaves)}×";
+            return joins > 0 ? $"{first} joined {joins}×" : $"{first} left {leaves}×";
+        }
+
+        static string Names(IEnumerable<string> nicks)
+        {
+            var list = nicks.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            var shown = string.Join(", ", list.Take(3));
+            return list.Count > 3 ? $"{shown} and {list.Count - 3} more" : shown;
+        }
+
+        var said = new List<string>();
+        if (joins > 0) said.Add($"{Names(run.Where(e => e.Joined).Select(e => e.Nick))} joined");
+        if (leaves > 0) said.Add($"{Names(run.Where(e => !e.Joined).Select(e => e.Nick))} left");
+        return string.Join(" · ", said);
     }
 
     private void AddSystemMessage(ChannelViewModel? channel, string text)

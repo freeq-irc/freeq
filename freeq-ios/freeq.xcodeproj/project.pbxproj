@@ -47,6 +47,7 @@
 		4047D67A42E04325ACEFECDA /* DidDisplay.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA678EF1B2762175E6668C55 /* DidDisplay.swift */; };
 		45EE47A41295B02CF2A3A689 /* AudioTestView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09AFFD5DE516371B6CC31172 /* AudioTestView.swift */; };
 		466133069EF5AF5E57B45ABF /* ShortcutsHelpSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 750B92E90FF075DF9E61E91F /* ShortcutsHelpSheet.swift */; };
+		4A7801D5F001F1C838BFCF83 /* PresenceLines.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E8A7FC2E15A5CEC8160244E /* PresenceLines.swift */; };
 		4BC265FF53A0BB0A3BFECD1A /* FreeqCommands.swift in Sources */ = {isa = PBXBuildFile; fileRef = 883DBC919B347571BC792852 /* FreeqCommands.swift */; };
 		4D5006848D66CA9FF16B2680 /* DmHistoryOnOpen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6ED301BD44C5DB63F6430B53 /* DmHistoryOnOpen.swift */; };
 		4D812AA5D08CF45A2F27BF72 /* IntelligenceService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25A01703D21F0BCF9963E1B8 /* IntelligenceService.swift */; };
@@ -188,6 +189,7 @@
 		0ACC23EC3E2A6AC3B1FCBA6E /* OutboundSend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutboundSend.swift; sourceTree = "<group>"; };
 		0CFEA027394A64C46A1780F5 /* WatchConnectivity.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WatchConnectivity.framework; path = System/Library/Frameworks/WatchConnectivity.framework; sourceTree = SDKROOT; };
 		0D130A54164E29335DD58872 /* CallLayoutPolicies.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CallLayoutPolicies.swift; sourceTree = "<group>"; };
+		0E8A7FC2E15A5CEC8160244E /* PresenceLines.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceLines.swift; sourceTree = "<group>"; };
 		0F2B162069D9FEB43A008621 /* JoinChannelSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JoinChannelSheet.swift; sourceTree = "<group>"; };
 		13E68B84D80561E2B74C5B48 /* WatchPayloads.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchPayloads.swift; sourceTree = "<group>"; };
 		1553940F560E15659B1C240D /* Jumbomoji.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Jumbomoji.swift; sourceTree = "<group>"; };
@@ -505,6 +507,7 @@
 				D528FB66B3A58A4A06E4379C /* Notifications.swift */,
 				0ACC23EC3E2A6AC3B1FCBA6E /* OutboundSend.swift */,
 				7A31629FF3AFE028388F95C8 /* PhoneWatchBridge.swift */,
+				0E8A7FC2E15A5CEC8160244E /* PresenceLines.swift */,
 				AC795A5BDF4DC3999132F232 /* RefusedKeyNotice.swift */,
 				74C635E269C7A5993F613F3B /* RowSignatureMark.swift */,
 				B848E491B8944927766305C4 /* SelfPartResolve.swift */,
@@ -706,8 +709,8 @@
 			targets = (
 				715097527A8802437490DEDD /* freeq */,
 				8FB43BFB4C70E7C933CE0D5C /* freeqLiveActivity */,
-				ED9847E14EE3BFB54E018387 /* freeqWatch */,
 				064263DED451CA6A77E552E3 /* freeqTests */,
+				ED9847E14EE3BFB54E018387 /* freeqWatch */,
 			);
 		};
 /* End PBXProject section */
@@ -853,6 +856,7 @@
 				DD3E3EE1D2C986B904CB5D82 /* PhotoPicker.swift in Sources */,
 				014D479059F416C096AC45EF /* PinnedMessagesView.swift in Sources */,
 				F09302BFFFB8EAEBFFECBE57 /* PresenceDot.swift in Sources */,
+				4A7801D5F001F1C838BFCF83 /* PresenceLines.swift in Sources */,
 				DF1C8C4E7B84DAD909DCA71B /* QuickSwitcherSheet.swift in Sources */,
 				4F096EDDDC00CEA18281B088 /* RefusedKeyNotice.swift in Sources */,
 				AE483CC317887C7C9A75B9D5 /* RowSignatureMark.swift in Sources */,

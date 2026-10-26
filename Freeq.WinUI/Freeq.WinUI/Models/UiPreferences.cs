@@ -13,3 +13,11 @@ public enum MessageDensity
     Default,
     Compact,
 }
+
+/// How join/part lines are shown. Kicks and moderation always show.
+public enum JoinPartDisplay
+{
+    Hidden,
+    Grouped,
+    All,
+}

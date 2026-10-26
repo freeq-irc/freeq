@@ -235,7 +235,7 @@ pub(super) fn attach_same_did(
     }
 
     // Find existing sessions for this DID
-    let existing_sessions: Vec<String> = {
+    let mut existing_sessions: Vec<String> = {
         let session_dids = state.session_dids.lock();
         let all: Vec<String> = session_dids
             .iter()
@@ -244,6 +244,15 @@ pub(super) fn attach_same_did(
             .collect();
         siblings_to_probe(&all, session_id, &[])
     };
+
+    // Membership indexes can outlive an uncleanly disconnected socket. A
+    // phantom must not seed channel membership (or privileges) on reconnect,
+    // especially after PART/KICK has removed the durable auto-rejoin entry.
+    // Intentional disconnect ghosts are reclaimed separately above.
+    {
+        let connections = state.connections.lock();
+        existing_sessions.retain(|sid| connections.contains_key(sid));
+    }
 
     if existing_sessions.is_empty() {
         // First session for this DID — normal registration.
@@ -586,9 +595,7 @@ pub(super) fn try_complete_registration(
         ) {
             let reply = Message::from_server(server_name, "FAIL", vec!["MSGSIG", code, detail]);
             send(state, session_id, format!("{reply}\r\n"));
-            if code == "KEY_EXPIRED" {
-                super::close_for_expired_key(state, session_id, conn.broker_token.as_deref());
-            }
+            super::close_for_refused_key(state, session_id, code, conn.broker_token.as_deref());
         } else {
             let reply = Message::from_server(server_name, "MSGSIG", vec!["OK"]);
             send(state, session_id, format!("{reply}\r\n"));

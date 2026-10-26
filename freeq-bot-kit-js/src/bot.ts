@@ -22,8 +22,11 @@
 
 import {
   FreeqClient,
+  KeyLookup,
   MemoryDeviceKeyStore,
   importDidKeyPair,
+  makeDidResolver,
+  log,
   type FreeqEvents,
   type NickCollisionPolicy,
   type TransportState,
@@ -92,11 +95,12 @@ export interface FreeqBotCreateOptions {
   // ── Optional ─────────────────────────────────────────────────────────
   /** Override the parent dir for bot state. Defaults to `~/.freeq/bots`. */
   root?: string;
-  /** The older way to prove ownership. Path to the owner's ed25519 seed
-   *  (32 bytes; the file `freeq-bot-id --creator-key` reads). When set, the
-   *  delegation cert is SIGNED by the owner — the server shows
-   *  `_verified: true` provided the owner has registered this key via
-   *  MSGSIG. Unset → an unsigned cert naming the owner, which the server
+  /** Deprecated; to be removed in a later release, when signed certificates stop
+   *  counting. Path to the owner's ed25519 seed (32 bytes; the file
+   *  `freeq-bot-id --creator-key` reads). When set, the delegation cert is
+   *  SIGNED by the owner — the server shows `_verified: true` provided the
+   *  owner has registered this key via MSGSIG — and the bot warns once at
+   *  start. Unset → an unsigned cert naming the owner, which the server
    *  verifies from the owner's agent record: the owner adds the bot's DID
    *  in the freeq web app under Settings → Agents, or with
    *  `freeq-bot-id register --owner <handle> <bot-did>`, and no key of
@@ -119,6 +123,16 @@ export interface FreeqBotCreateOptions {
   heartbeatTtlS?: number;
   /** Server origin for REST API calls. Defaults to the URL origin. */
   serverOrigin?: string;
+  /** Check the signature on every received line, and whether a ruling on a
+   *  task counts, with this lookup: passed to the SDK client (its own
+   *  `keyLookup`). Unset: a lookup asking the connected server, checking
+   *  rulings only. Either way a ruling found failing never leaves the SDK,
+   *  so no `actEvent` handler sees it. */
+  keyLookup?: KeyLookup;
+  /** False checks only whether a ruling counts and puts no verdict on
+   *  received lines (the SDK client's own `checkLines`). Unset: the SDK's
+   *  default with `keyLookup`, false without. */
+  checkLines?: boolean;
   /** Policy on 433 ERR_NICKNAMEINUSE. Default `"refuse"`. */
   onNickCollision?: NickCollisionPolicy;
   /** Register a per-session message-signing key after SASL (SDK default:
@@ -168,6 +182,28 @@ export interface FreeqBotStopOptions {
   /** How long to wait after PRESENCE=offline/QUIT before disconnecting.
    *  Default 250ms. */
   drainMs?: number;
+}
+
+/** Whether this process has said that a bot started with a signed
+ *  certificate. Once per process, like the SDK's deprecation warnings. */
+let signedCertificateWarned = false;
+
+/** Say once, through the SDK's logger, that this bot's certificate is signed
+ *  with a creator key, and what to delete so an unsigned one replaces it.
+ *  The harness kit's `signedCertificateLine` says the same sentence; it
+ *  depends on bot-kit, so the text cannot be shared from there. */
+function warnSignedCertificate(botDid: string, certPath: string, creatorKeyPath?: string): void {
+  if (signedCertificateWarned) return;
+  signedCertificateWarned = true;
+  const toDelete = creatorKeyPath
+    ? `the key at ${creatorKeyPath}, the certificate at ${certPath}, and the \`creatorKeyPath\` option from this bot's code`
+    : `the certificate at ${certPath}`;
+  log.warn(
+    "This bot's certificate is signed with a creator key. Signed certificates will stop counting in a later release; " +
+      "every server now reads agent records instead. Add this agent under Settings → Agents in the freeq web app, " +
+      `or with \`freeq-bot-id register --owner <handle> ${botDid}\`, then delete ${toDelete}, ` +
+      "so an unsigned certificate is made at the next start.",
+  );
 }
 
 export class FreeqBot {
@@ -254,18 +290,36 @@ export class FreeqBot {
     const identity = await loadOrCreateIdentity({
       seedPath: join(stateDir, "agent.key"),
     });
+    const certPath = join(stateDir, "delegation.json");
     const delegation = await loadOrMintDelegation({
-      certPath: join(stateDir, "delegation.json"),
+      certPath,
       agentDid: identity.did,
       ownerDid: opts.ownerDid,
       creatorKeyPath: opts.creatorKeyPath,
     });
+    if (delegation.signature) {
+      warnSignedCertificate(identity.did, certPath, opts.creatorKeyPath);
+    }
 
     const client = new FreeqClient({
       url: opts.url,
       nick: opts.nick,
       channels: opts.channels,
       serverOrigin: opts.serverOrigin,
+      // Rulings are checked by default, asking the connected server, as the
+      // web does; reading no line's verdict, no other line's key is looked up.
+      keyLookup:
+        opts.keyLookup ??
+        new KeyLookup(
+          { fetch: (target, init) => fetch(target, init), resolveDid: makeDidResolver() },
+          null,
+          60 * 60 * 1000,
+        ),
+      ...(opts.checkLines !== undefined
+        ? { checkLines: opts.checkLines }
+        : opts.keyLookup
+          ? {}
+          : { checkLines: false }),
       onNickCollision: opts.onNickCollision ?? "refuse",
       sasl: {
         did: identity.did,
@@ -273,6 +327,8 @@ export class FreeqBot {
         signer: identity.didKey.signer,
         token: "",
         pdsUrl: "",
+        // Lets an allowlisted server admit the bot on the owner's agent record.
+        ownerDid: opts.ownerDid === identity.did ? undefined : opts.ownerDid,
       },
       // The bot signs its messages and mutations with its did:key itself:
       // held as the client's stored device key, it is what MSGSIG registers

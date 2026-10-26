@@ -2027,6 +2027,104 @@ async fn a_companion_line_beside_a_task_stays_deletable() {
     .await;
 }
 
+// ── the referee an opener names ─────────────────────────────────────────────
+
+/// An opener's `act-home` is the server that referees its task. This server
+/// referees only what is posted at its own door, so it refuses an opener
+/// naming any other, under every spelling the signature reads as that tag.
+#[tokio::test]
+async fn an_opener_naming_another_server_as_its_home_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        for name in ["+freeq.at/act-home", "freeq.at/act-home", "act-home"] {
+            let mut tags = offer_tags();
+            tags.push((name.into(), "did:web:elsewhere.example".into()));
+            a.tx(&signed_line(&tags, "#ops", &fresh_id(), &signing));
+            let fail = a.fail();
+            assert!(fail.contains(" WRONG_HOME "), "{name}: {fail}");
+            assert!(
+                fail.contains(":A task opened here must name this server as its home"),
+                "the reason says what an opener here must name: {fail}"
+            );
+        }
+    })
+    .await;
+}
+
+/// A task tag carried twice under two of its prefixes is refused, whatever
+/// the two say: the document the server files would keep only one.
+#[tokio::test]
+async fn a_task_tag_under_two_prefixes_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        for (name, value) in [
+            ("act-home", "did:web:test-act"),
+            ("freeq.at/act-home", "did:web:test-act"),
+            ("freeq.at/act-title", "review-the-deploy"),
+            ("act-title", "something-else"),
+        ] {
+            let mut tags = offer_tags();
+            if name.ends_with("act-home") {
+                tags.push(("+freeq.at/act-home".into(), "did:web:test-act".into()));
+            }
+            tags.push((name.into(), value.into()));
+            a.tx(&signed_line(&tags, "#ops", &fresh_id(), &signing));
+            let fail = a.fail();
+            assert!(fail.contains(" REPEATED_TAG "), "{name}: {fail}");
+            assert!(
+                fail.contains(":A task message must carry each task tag only once"),
+                "{name}: {fail}"
+            );
+        }
+    })
+    .await;
+}
+
+/// Naming this server, or naming nobody, opens the task as before.
+#[tokio::test]
+async fn an_opener_naming_this_server_or_no_home_is_accepted() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let mut watcher = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        watcher.join("#ops");
+        let home = |name: &str| {
+            let mut tags = offer_tags();
+            tags.push((name.into(), "did:web:test-act".into()));
+            tags
+        };
+        for tags in [offer_tags(), home("+freeq.at/act-home"), home("act-home")] {
+            let id = fresh_id();
+            a.tx(&signed_line(&tags, "#ops", &id, &signing));
+            let seen = watcher.rx(
+                |l| l.contains("TAGMSG") && l.contains(&id),
+                "the opener, delivered",
+            );
+            assert!(seen.contains("+freeq.at/act=handoff"), "{seen}");
+        }
+        assert!(
+            a.maybe(|l| l.contains(" FAIL "), 300).is_none(),
+            "nothing was refused"
+        );
+    })
+    .await;
+}
+
 // ── delivery ────────────────────────────────────────────────────────────────
 
 #[tokio::test]

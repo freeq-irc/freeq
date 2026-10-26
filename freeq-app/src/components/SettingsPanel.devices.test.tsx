@@ -264,6 +264,22 @@ describe('the Devices list', () => {
     expect(screen.queryByText('Old tablet')).toBeNull();
   });
 
+  it('lists a device signed out with a date ahead of the clock as signed out', async () => {
+    // Written by a browser whose clock runs three minutes fast.
+    const phone = await aDevice('Fast phone', GONE_CREATED);
+    const ahead = new Date(Date.now() + 3 * 60 * 1000).toISOString();
+    seam.rows = await client.deviceRowsFrom(
+      DID,
+      [thisDevice.record, phone.record, await buildDeviceRetirement(phone.key, DID, phone.kid, ahead)],
+      { kid: thisDevice.kid, createdAt: THIS_CREATED, published: true },
+    );
+    panel();
+    await waitFor(() => screen.getByText('Fast phone'));
+
+    expect(rowMeta('Fast phone')).toBe(`Signed out · ${day(ahead)}`);
+    expect(screen.queryByRole('button', { name: 'Sign out' })).toBeNull();
+  });
+
   it('lists a device whose key expired as expired, dimmed, for 24 hours after its expiry', async () => {
     // Made 90 days and an hour ago: its key expired an hour ago.
     const expiring = await aDevice('Old laptop', new Date(Date.now() - (90 * 24 + 1) * HOUR_MS).toISOString());

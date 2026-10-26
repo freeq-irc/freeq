@@ -158,6 +158,11 @@ pub enum ConfirmState {
     /// the record is never lost, only the pending flag. Written when the
     /// winner is ruled in, which is when the losers stop being able to win.
     Superseded,
+    /// A receipt filed and not acted on: it claimed the task's home's
+    /// authority over a link that does not give it. Kept as evidence; never
+    /// compared when a later ruling's number is checked. Receipts ignored
+    /// before this state existed carry no mark.
+    Ignored,
 }
 
 impl ConfirmState {
@@ -166,6 +171,7 @@ impl ConfirmState {
             ConfirmState::Confirmed => "confirmed",
             ConfirmState::Unconfirmed => "unconfirmed",
             ConfirmState::Superseded => "superseded",
+            ConfirmState::Ignored => "ignored",
         }
     }
 
@@ -179,6 +185,7 @@ impl ConfirmState {
         match value {
             Some("unconfirmed") => ConfirmState::Unconfirmed,
             Some("superseded") => ConfirmState::Superseded,
+            Some("ignored") => ConfirmState::Ignored,
             _ => ConfirmState::Confirmed,
         }
     }

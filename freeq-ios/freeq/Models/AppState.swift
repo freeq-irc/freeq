@@ -1378,6 +1378,7 @@ class AppState: ObservableObject {
         switch v.layer {
         case .some(.vouched): layer = .vouched
         case .some(.published): layer = .published
+        case .some(.didKey): layer = .didKey
         case .none: layer = nil
         }
         return VerdictInfo(
@@ -3133,9 +3134,8 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                 isAction: ircMsg.isAction,
                 timestamp: Date(timeIntervalSince1970: Double(ircMsg.timestampMs) / 1000.0),
                 replyTo: ircMsg.replyTo,
-                // Covers both signals: a live edit (`edit_of`) and one the
-                // server already collapsed into join replay, which carries no
-                // `+draft/edit` and would otherwise read as the original.
+                // Set by the FFI from `edit_of`, live or replayed: a replayed
+                // edit arrives as its own line carrying `+draft/edit`.
                 isEdited: ircMsg.edited,
                 isSigned: ircMsg.isSigned,
                 isEncrypted: wasEncrypted,
@@ -3539,8 +3539,16 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
         case .awayChanged(let nick, let awayMsg):
             state.updateAwayStatus(nick: nick, awayMsg: awayMsg)
 
-        case .userQuit(let nick, _):
+        case .userQuit(let nick, let reason):
             for ch in state.channels {
+                // Only rooms they were in hear about it (parity with web/macOS).
+                if ch.members.contains(where: { $0.nick.lowercased() == nick.lowercased() }) {
+                    ch.appendIfNew(ChatMessage(
+                        id: UUID().uuidString, from: "",
+                        text: "\(nick) quit\(reason.isEmpty ? "" : " (\(reason))")",
+                        isAction: false, timestamp: Date(), replyTo: nil
+                    ))
+                }
                 ch.members.removeAll { $0.nick.lowercased() == nick.lowercased() }
                 ch.typingUsers.removeValue(forKey: nick)
             }

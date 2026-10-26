@@ -43,7 +43,7 @@ export const COMMANDS: Command[] = [
   {
     name: "authorize",
     description: "freeq: add this installation as one of your agents; 'verify' asks the server for its verdict",
-    args: [{ name: "step", description: "verify, or --sign-cert" }],
+    args: [{ name: "step", description: "verify, or --sign-cert (deprecated)" }],
   },
   {
     name: "join",

@@ -39,6 +39,7 @@ const ulid = (n: number) => `01M0${String(n).padStart(22, '0')}`;
 
 const PUBLISHED: Verdict = { state: 'device', layer: 'published', kid: 'k1' };
 const VOUCHED: Verdict = { state: 'device', layer: 'vouched', kid: 'k1' };
+const DID_KEY: Verdict = { state: 'device', layer: 'did-key', kid: 'k1', keySource: 'DidKey' };
 const INVALID: Verdict = { state: 'invalid', kid: 'k1' };
 const SERVER: Verdict = { state: 'server', kid: 'k1' };
 const PENDING: Verdict = { state: 'pending', kid: 'k1' };
@@ -71,7 +72,7 @@ const isHeader = (i: number) => row(i).querySelector('.msg-full') !== null;
 /** The mark row `i` shows. */
 function shownMark(i: number): 'lock' | 'dim-lock' | 'warning' | 'none' {
   const lock = row(i).querySelector('[data-testid="sig-device-mark"]');
-  if (lock) return lock.getAttribute('data-layer') === 'published' ? 'lock' : 'dim-lock';
+  if (lock) return lock.className.includes('opacity-30') ? 'dim-lock' : 'lock';
   return row(i).querySelector('[data-testid="sig-invalid-mark"]') ? 'warning' : 'none';
 }
 
@@ -81,6 +82,15 @@ describe('the signature mark on a row', () => {
     const mark = screen.getByTestId('sig-device-mark');
     expect(mark.textContent).toBe('🔒');
     expect(mark.className).not.toContain('opacity-');
+  });
+
+  it('is the lock at full strength for a key that is the sender’s did:key, and the proof panel names where it came from', () => {
+    channelWith([DID_KEY]);
+    const mark = screen.getByTestId('sig-device-mark');
+    expect(mark.className).not.toContain('opacity-');
+    expect(mark.getAttribute('title')).toBe('Signed with the sender’s own key. The key is their identity.');
+    fireEvent.click(mark, { clientX: 20, clientY: 30 });
+    expect(screen.getByTestId('verify-key').textContent).toBe('k1 · did-key');
   });
 
   it('is dimmed to 30% for a key only the server vouches for, with the hover text on the mark itself', () => {
@@ -137,6 +147,7 @@ describe('grouping by the row mark', () => {
 
   it.each([
     ['full lock then dim lock', PUBLISHED, VOUCHED, 'lock', 'dim-lock'],
+    ['a did:key lock then dim lock', DID_KEY, VOUCHED, 'lock', 'dim-lock'],
     ['lock then ⚠', PUBLISHED, INVALID, 'lock', 'warning'],
     ['lock then none', PUBLISHED, SERVER, 'lock', 'none'],
   ] as const)('gives %s two headers, each with its own mark', (_, first, second, firstMark, secondMark) => {
@@ -145,6 +156,12 @@ describe('grouping by the row mark', () => {
     expect(shownMark(0)).toBe(firstMark);
     expect(isHeader(1)).toBe(true);
     expect(shownMark(1)).toBe(secondMark);
+  });
+
+  it('groups a did:key row under a published one: both are the full lock', () => {
+    channelWith([PUBLISHED, DID_KEY]);
+    expect(shownMark(0)).toBe('lock');
+    expect(isHeader(1)).toBe(false);
   });
 
   it('groups a second row whose check is pending', () => {

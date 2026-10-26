@@ -52,6 +52,11 @@ public class AppSettings
     [JsonPropertyName("login_mode")]
     public string LoginMode { get; set; } = "guest";
 
+    /// Join/part/quit lines: "hidden" (default), "grouped" or "all".
+    /// Kicks and moderation always show.
+    [JsonPropertyName("join_part")]
+    public string JoinPart { get; set; } = "hidden";
+
     public static AppSettings Load()
     {
         try

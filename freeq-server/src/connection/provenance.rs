@@ -283,7 +283,7 @@ pub(crate) type OwnerReadCell = std::sync::Arc<
 /// ago (10 s) is reused, so a "fresh" read on connect is at most that old.
 /// This is a mitigation for now (nap, 2026-09-28), not a limit per bot or
 /// per connection. A failed read is not kept; the next caller tries again.
-async fn read_owner_links(
+pub(super) async fn read_owner_links(
     state: &crate::server::SharedState,
     owner_did: &str,
 ) -> anyhow::Result<Vec<freeq_sdk::identity_records::ProvenAgentLink>> {
@@ -315,6 +315,7 @@ async fn read_owner_links(
         chrono::Utc::now(),
     );
     *last = Some((std::time::Instant::now(), links.clone()));
+    state.owner_read_failures.lock().remove(owner_did);
     Ok(links)
 }
 
@@ -407,7 +408,7 @@ pub(super) async fn verify_from_records(
 /// at `found`, or none. `before` is the kept result when the lookup
 /// started; `token` names the declaration it was started for.
 pub(super) fn apply_link(
-    state: &crate::server::SharedState,
+    state: &std::sync::Arc<crate::server::SharedState>,
     session_id: &str,
     nick: &str,
     key: &(String, String),
@@ -421,9 +422,16 @@ pub(super) fn apply_link(
         // only if still the entry this lookup started from: a newer lookup
         // or a re-check may have written it meanwhile, and its answer is
         // the newer one.
-        let mut links = state.agent_links.lock();
-        if links.get(key) == before.as_ref() {
-            links.remove(key);
+        let gone = {
+            let mut links = state.agent_links.lock();
+            links.get(key) == before.as_ref() && links.remove(key).is_some()
+        };
+        if gone {
+            close_delegated_sessions(
+                state,
+                key,
+                "Delegation withdrawn: the owner's agent record no longer names this bot",
+            );
         }
         return;
     };
@@ -478,6 +486,10 @@ type KeptLink = (std::time::Instant, String);
 /// bot stays in any channel it is in. An entry a connect-time lookup changed
 /// meanwhile is left as it is. A read that fails changes nothing, and the
 /// next run tries again.
+/// How many re-read periods an owner's records may stay unreadable before
+/// their connected agents are closed as unverifiable.
+pub(crate) const UNREADABLE_PERIODS_TO_CLOSE: u32 = 3;
+
 pub(crate) async fn recheck_agent_links(
     state: &std::sync::Arc<crate::server::SharedState>,
     older_than: std::time::Duration,
@@ -495,10 +507,44 @@ pub(crate) async fn recheck_agent_links(
         }
     }
     for (owner_did, bots) in due {
+        let delegated = has_delegated_sessions_of(state, &owner_did);
+        // An outage no connected agent is waiting out leaves nothing to keep.
+        if !delegated {
+            state.owner_read_failures.lock().remove(&owner_did);
+        }
+        // A lookup that failed says nothing; only an answer of no closes.
+        if delegated && state.did_is_allowed_checked(&owner_did, None).await == Some(false) {
+            for (bot_did, _) in &bots {
+                close_delegated_sessions(
+                    state,
+                    &(owner_did.clone(), bot_did.clone()),
+                    "Delegation withdrawn: the owner is no longer allowed here",
+                );
+            }
+        }
         let links = match read_owner_links(state, &owner_did).await {
             Ok(links) => links,
             Err(e) => {
                 tracing::debug!(owner = %owner_did, error = %e, "Could not re-read the owner's agent records");
+                if delegated {
+                    let since = *state
+                        .owner_read_failures
+                        .lock()
+                        .entry(owner_did.clone())
+                        .or_insert_with(std::time::Instant::now);
+                    let window = std::time::Duration::from_secs(state.config.record_cache_secs)
+                        * UNREADABLE_PERIODS_TO_CLOSE;
+                    if since.elapsed() >= window {
+                        for (bot_did, _) in &bots {
+                            close_delegated_sessions(
+                                state,
+                                &(owner_did.clone(), bot_did.clone()),
+                                "Delegation unverifiable: the owner's agent records could not be read",
+                            );
+                        }
+                        state.owner_read_failures.lock().remove(&owner_did);
+                    }
+                }
                 continue;
             }
         };
@@ -510,7 +556,7 @@ pub(crate) async fn recheck_agent_links(
 
 /// Act on a re-check of one (owner, bot) entry, `before` as it was read.
 fn recheck_one(
-    state: &crate::server::SharedState,
+    state: &std::sync::Arc<crate::server::SharedState>,
     owner_did: &str,
     bot_did: &str,
     before: (std::time::Instant, String),
@@ -535,6 +581,11 @@ fn recheck_one(
         }
         kept.remove(&key);
     }
+    close_delegated_sessions(
+        state,
+        &key,
+        "Delegation withdrawn: the owner's agent record no longer names this bot",
+    );
     let verified_reason = record_outcome(&uri).reason;
     let reason = format!("Owner's agent record {uri} no longer names this bot");
     {
@@ -560,6 +611,35 @@ fn recheck_one(
     }
     tell_sessions_of(state, bot_did, &format!("Provenance unverified: {reason}"));
     tracing::info!(owner = %owner_did, bot = %bot_did, %uri, "Provenance unverified: the owner's agent record is gone");
+}
+
+/// Whether any connection was admitted on one of `owner_did`'s records.
+fn has_delegated_sessions_of(state: &crate::server::SharedState, owner_did: &str) -> bool {
+    state
+        .delegated_sessions
+        .lock()
+        .values()
+        .any(|(owner, _)| owner == owner_did)
+}
+
+/// Close every connection the allowlist admitted on the (owner, bot) link
+/// `key`, telling it `reason`.
+fn close_delegated_sessions(
+    state: &std::sync::Arc<crate::server::SharedState>,
+    key: &(String, String),
+    reason: &str,
+) {
+    let sessions: Vec<String> = state
+        .delegated_sessions
+        .lock()
+        .iter()
+        .filter(|(_, link)| *link == key)
+        .map(|(session_id, _)| session_id.clone())
+        .collect();
+    for session_id in sessions {
+        super::close_session(state, &session_id, reason);
+        tracing::info!(owner = %key.0, bot = %key.1, %session_id, %reason, "Closed a delegated connection");
+    }
 }
 
 /// Send `text` as a NOTICE to every session `did` has connected here, if

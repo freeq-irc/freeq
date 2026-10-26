@@ -26,8 +26,9 @@ pub struct StoredDeviceKey {
     pub created_at: String,
     /// The `at://` URI of the record that publishes the key, once written.
     pub record_uri: Option<String>,
-    /// The server refused the key as expired (`FAIL MSGSIG KEY_EXPIRED`):
-    /// the next fresh sign-in replaces it without reading the account.
+    /// The server refused the key as expired or retired (`FAIL MSGSIG
+    /// KEY_EXPIRED` or `KEY_RETIRED`): the next fresh sign-in replaces it
+    /// without reading the account.
     pub refused: bool,
 }
 
@@ -55,9 +56,9 @@ pub fn past_key_lifetime(created_at: &str) -> bool {
 
 /// `did`'s key in `store`, ready to sign a record: the stored one, or a new
 /// one saved in its place when none is stored, or the stored one is past its
-/// lifetime or was refused as expired. A store that fails is an error, not a
-/// session key, since a record signed by a key nobody keeps cannot be
-/// retired from this device.
+/// lifetime or was refused as expired or retired. A store that fails is an
+/// error, not a session key, since a record signed by a key nobody keeps
+/// cannot be retired from this device.
 pub fn load_or_make(store: &dyn DeviceKeyStore, did: &str) -> Result<StoredDeviceKey> {
     if let Some(stored) = store.load(did)?
         && !stored.refused

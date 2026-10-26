@@ -1,14 +1,15 @@
 /**
  * TaskTimeline — focused view for a single task.
  *
- * The task is fetched from `/api/v1/actions/{id}` and shown as what it is —
+ * The task is read from `/api/v1/actions/{id}` through the SDK, which leaves
+ * out every ruling that fails its referee check, and shown as what it is —
  * the moves made on it, each under the word for the verb it carried.
  */
 import { useEffect, useState } from 'react';
 import { VerifySignaturePanel } from './VerifySignaturePanel';
 import { displayNameForKey } from '../lib/display-name';
 import { actHeadline } from '../lib/act-verbs';
-import { apiFetch } from '../lib/api';
+import { getClient } from '../irc/client';
 import { useStore } from '../store';
 
 export function TaskTimeline(props: { actId: string; onClose: () => void }) {
@@ -37,12 +38,14 @@ function ActionTimeline({ actId, onClose }: { actId: string; onClose: () => void
   const setScrollToMsgId = useStore(s => s.setScrollToMsgId);
 
   useEffect(() => {
-    // Authed: an action in a direct conversation is readable only by the two
-    // people in it, and the server tells them apart by the session bearer. A
-    // bare fetch 403s, and the panel shows a participant "Task not found".
-    apiFetch(`/api/v1/actions/${encodeURIComponent(actId)}`)
-      .then(r => r.ok ? r.json() : null)
-      .then(d => { setData(d); setLoading(false); })
+    // The SDK reads it with the session bearer: an action in a direct
+    // conversation is readable only by the two people in it. Under the page's
+    // own origin, as the panel always read it. No client before the first
+    // connection, and a read that fails, both show "Task not found."
+    const read = getClient()?.taskHistory(actId, { origin: window.location.origin });
+    if (!read) { setLoading(false); return; }
+    read
+      .then(d => { setData(d as { task: any; events: ActionEvent[] }); setLoading(false); })
       .catch(() => setLoading(false));
   }, [actId]);
 
@@ -98,17 +101,21 @@ function ActionTimeline({ actId, onClose }: { actId: string; onClose: () => void
           // A receipt and an expiry send no companion line, so there is
           // nothing for their row to jump to and it does not react.
           const msgId = task?.events.find(e => e.eventId === event.event_id)?.msgId;
+          // Every row is the same four columns, verb, name, time, verify, so
+          // the names start on one line whatever word the verb is; the verb
+          // column is wide enough for "revisions requested" and only grows
+          // for the one longer word a review window closing writes.
           return (
           <div
             key={event.event_id}
-            className={`flex items-center gap-2 text-xs py-1${msgId ? ' rounded px-1 hover:bg-surface/30' : ''}`}
+            className={`grid grid-cols-[minmax(128px,max-content)_minmax(0,1fr)_auto_auto] items-center gap-2 text-xs py-1 px-1 rounded${msgId ? ' hover:bg-surface/30' : ''}`}
             onClick={msgId ? () => { setScrollToMsgId(msgId); onClose(); } : undefined}
           >
             <span className="font-semibold text-fg-muted">{actHeadline(doc['act-verb'] ?? '')}</span>
             <span className="text-fg-dim truncate">
               {event.actor_did ? displayNameForKey(event.actor_did) : ''}
             </span>
-            <span className="ml-auto text-[10px] text-fg-dim/50">
+            <span className="text-[10px] text-fg-dim/50 tabular-nums">
               {new Date(event.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
             </span>
             <button

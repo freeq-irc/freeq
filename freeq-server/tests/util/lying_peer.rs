@@ -41,7 +41,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-pub const READY_TIMEOUT: Duration = Duration::from_secs(15);
+use super::ready::{Listener, wait_ready};
+
 pub const EVENT_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long to keep retrying an assertion while the S2S link settles.
 pub const SETTLE: Duration = Duration::from_secs(20);
@@ -104,13 +105,6 @@ impl Drop for TestServer {
     }
 }
 
-/// Bind an ephemeral port, read it, release it. Small reuse race; startup
-/// failure is retried by the caller if it bites.
-fn alloc_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
 /// Deterministic iroh identity from a seed: the endpoint ID is known before
 /// anything binds, so the server can allowlist the lying peer at boot and the
 /// peer can dial the server without discovery.
@@ -144,23 +138,29 @@ pub async fn spawn_server_with_peer(ids: &[&TestId]) -> (TestServer, LyingPeer) 
     let hex: String = [seed; 32].iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.path().join("iroh-key.secret"), hex).unwrap();
 
-    let irc_port = alloc_port();
-    let iroh_port = alloc_port();
-    let irc_addr = format!("127.0.0.1:{irc_port}");
+    // Nothing here needs a port before the server has one: this server is
+    // given no `--s2s-peers`, so it dials nobody, and the lying peer dials it
+    // only after boot. So the kernel picks both ports and the server's own
+    // startup lines say which it got.
     let db_path = dir.path().join("server.db").to_str().unwrap().to_string();
+    // Nothing asserts on the log; it is how the harness learns those two
+    // ports, and what the readiness wait prints when a boot fails. Nothing
+    // captured it before, so a failed bind landed on the test runner's own
+    // output with nothing naming the test it belonged to.
+    let log_path = dir.path().join("server.log").to_str().unwrap().to_string();
+    let log = std::fs::File::create(&log_path).expect("create server log");
+    let log_err = log.try_clone().expect("clone server log handle");
     let resolver: String = ids
         .iter()
         .map(|i| i.resolver_entry())
         .collect::<Vec<_>>()
         .join(",");
 
-    let child = Command::new(env!("CARGO_BIN_EXE_freeq-server"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_freeq-server"))
         .args([
             "--listen-addr",
-            &irc_addr,
+            "127.0.0.1:0",
             "--iroh",
-            "--iroh-port",
-            &iroh_port.to_string(),
             "--data-dir",
             dir.path().to_str().unwrap(),
             "--db-path",
@@ -172,35 +172,28 @@ pub async fn spawn_server_with_peer(ids: &[&TestId]) -> (TestServer, LyingPeer) 
             "--server-name",
             &format!("test-lying-{seed}"),
         ])
-        .env("RUST_LOG", "freeq_server=warn")
+        // Quiet, plus the boot lines of `server.rs` and `iroh.rs`, which name
+        // the addresses the two listeners bound.
+        .env(
+            "RUST_LOG",
+            "freeq_server=warn,freeq_server::server=info,freeq_server::iroh=info",
+        )
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err))
         .spawn()
         .expect("spawn freeq-server");
 
+    let bound = wait_ready(&mut child, &log_path, &[Listener::Irc, Listener::Iroh]).await;
     let server = TestServer {
         _dir: dir,
         child,
-        irc_addr,
+        irc_addr: bound.irc,
         db_path,
         _serial: serial,
     };
-    wait_port(&server.irc_addr).await;
 
-    let peer = LyingPeer::dial(peer_key, peer_id, &server_id, iroh_port).await;
+    let peer = LyingPeer::dial(peer_key, peer_id, &server_id, bound.iroh_port).await;
     (server, peer)
-}
-
-/// Poll a TCP port until it accepts (server IRC listener up).
-async fn wait_port(addr: &str) {
-    let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
-    loop {
-        if std::net::TcpStream::connect(addr).is_ok() {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("server at {addr} never became ready");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 }
 
 // ── the lying peer ───────────────────────────────────────────────
@@ -238,20 +231,12 @@ impl LyingPeer {
             server_port,
         )));
 
-        // Retry the dial: the server's endpoint binds a moment after its IRC
-        // listener, and that is the readiness signal we have.
-        let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
-        let conn = loop {
-            match endpoint.connect(addr.clone(), S2S_ALPN).await {
-                Ok(c) => break c,
-                Err(e) => {
-                    if tokio::time::Instant::now() >= deadline {
-                        panic!("lying peer could not dial server: {e}");
-                    }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-            }
-        };
+        // No retry: the address came from the line the server logs once its
+        // endpoint is bound, so by the time we are here it is listening.
+        let conn = endpoint
+            .connect(addr, S2S_ALPN)
+            .await
+            .expect("lying peer dials the server");
 
         let (send, recv) = conn.open_bi().await.expect("open_bi to server");
 

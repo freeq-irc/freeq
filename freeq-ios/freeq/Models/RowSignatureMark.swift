@@ -5,7 +5,8 @@ import Foundation
 /// macOS `RowSignatureMark`.
 enum RowSignatureMark: Equatable {
     /// The sender's own device signed: a lock at `opacity`, full when the key
-    /// is published in their account, 30% while only their server vouches.
+    /// is published in their account or is their did:key DID itself, 30%
+    /// while only their server vouches.
     case lock(opacity: Double)
     /// The signature failed, or was made after its key was retired.
     case warning
@@ -19,7 +20,8 @@ enum RowSignatureMark: Equatable {
         guard let verdict else { return nil }
         switch verdict.kind {
         case .device:
-            return .lock(opacity: verdict.layer == .published ? 1 : vouchedOpacity)
+            let full = verdict.layer == .published || verdict.layer == .didKey
+            return .lock(opacity: full ? 1 : vouchedOpacity)
         case .invalid, .retired:
             return .warning
         case .server, .unsigned, .unverifiable, .pending:

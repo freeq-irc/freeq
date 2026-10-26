@@ -383,6 +383,75 @@
         "+freeq.at/from": "did:plc:scholar"
       },
       "target": "#swarm"
+    },
+    {
+      "canonical": "{\"act\":\"handoff\",\"act-home\":\"did:web:irc.example\",\"act-title\":\"Triage the overnight alerts\",\"act-verb\":\"offer\",\"from\":\"did:plc:eliza\",\"id\":\"01JHOMEOFFEREVENTID0000000\",\"target\":\"#ops\"}",
+      "id": "01JHOMEOFFEREVENTID0000000",
+      "kid": "VvrhL3cWRidGo6gCgXynYg",
+      "name": "offer-naming-its-home",
+      "publicKey": "Zs1gi5KLiOUODv6qM_rxxDzv4HKUsLh-n-CrpqPPdjM",
+      "seed": "1313131313131313131313131313131313131313131313131313131313131313",
+      "sigTag": "ed25519:VvrhL3cWRidGo6gCgXynYg:UspLPyOSxpyQDCVWHZhtq8EcAC6vBmvK9FdUT7Yf6cCZ9BSiI4w8mg6MeRPHxDw2p--NkVWeueP_NPoJ_bwGAw",
+      "tags": {
+        "+freeq.at/act": "handoff",
+        "+freeq.at/act-home": "did:web:irc.example",
+        "+freeq.at/act-title": "Triage the overnight alerts",
+        "+freeq.at/act-verb": "offer",
+        "+freeq.at/from": "did:plc:eliza"
+      },
+      "target": "#ops"
+    },
+    {
+      "canonical": "{\"act\":\"handoff\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-seq\":\"1\",\"act-subject\":\"01JACCEPTEVENTID0000000000\",\"act-verb\":\"confirm\",\"from\":\"did:web:irc.example\",\"id\":\"01JCONFIRMSEQEVENTID000000\",\"target\":\"#ops\"}",
+      "id": "01JCONFIRMSEQEVENTID000000",
+      "kid": "dZl3bDCF4_naDRMHHrC0qw",
+      "name": "receipt-numbered",
+      "publicKey": "bnoc3Smwt4_ROvTFWY_v9O8qlxZuPKby5Pv8zYBQW_E",
+      "seed": "0505050505050505050505050505050505050505050505050505050505050505",
+      "sigTag": "ed25519:dZl3bDCF4_naDRMHHrC0qw:O1sqXqAGxrXfLNobqaGq4kYK8HqstuaToTDwYUnYWEIbaVs6MoD_kZl4LErKL1UOFhcZXTjfpyv5GQ0Xdz7mDg",
+      "tags": {
+        "+freeq.at/act": "handoff",
+        "+freeq.at/act-id": "01JABCDEF000000000000000EF",
+        "+freeq.at/act-seq": "1",
+        "+freeq.at/act-subject": "01JACCEPTEVENTID0000000000",
+        "+freeq.at/act-verb": "confirm",
+        "+freeq.at/from": "did:web:irc.example"
+      },
+      "target": "#ops"
+    },
+    {
+      "canonical": "{\"act\":\"handoff\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-seq\":\"2\",\"act-verb\":\"expire\",\"from\":\"did:web:irc.example\",\"id\":\"01JEXPIRESEQEVENTID0000000\",\"target\":\"#ops\"}",
+      "id": "01JEXPIRESEQEVENTID0000000",
+      "kid": "dZl3bDCF4_naDRMHHrC0qw",
+      "name": "expire-numbered",
+      "publicKey": "bnoc3Smwt4_ROvTFWY_v9O8qlxZuPKby5Pv8zYBQW_E",
+      "seed": "0505050505050505050505050505050505050505050505050505050505050505",
+      "sigTag": "ed25519:dZl3bDCF4_naDRMHHrC0qw:poNobWmJbnoPUTJplxMBm7Lw8w-uo27C9qJXY4I5LpyBWFbmwgmcNlKszg8CVBlYRnsjIwxNyvAFc8v5CYfvCg",
+      "tags": {
+        "+freeq.at/act": "handoff",
+        "+freeq.at/act-id": "01JABCDEF000000000000000EF",
+        "+freeq.at/act-seq": "2",
+        "+freeq.at/act-verb": "expire",
+        "+freeq.at/from": "did:web:irc.example"
+      },
+      "target": "#ops"
+    },
+    {
+      "canonical": "{\"act\":\"bounty\",\"act-id\":\"01JBOUNTYEVENTID00000000B\",\"act-seq\":\"3\",\"act-verb\":\"auto-accept\",\"from\":\"did:web:irc.example\",\"id\":\"01JAUTOACCEPTSEQEVENTID000\",\"target\":\"#swarm\"}",
+      "id": "01JAUTOACCEPTSEQEVENTID000",
+      "kid": "dZl3bDCF4_naDRMHHrC0qw",
+      "name": "review-timeout-accept-numbered",
+      "publicKey": "bnoc3Smwt4_ROvTFWY_v9O8qlxZuPKby5Pv8zYBQW_E",
+      "seed": "0505050505050505050505050505050505050505050505050505050505050505",
+      "sigTag": "ed25519:dZl3bDCF4_naDRMHHrC0qw:UzabxpO4TXRyhFqoMfbP5w0XjdDqYY6WFO_UBD3mRNOaXYw5GdhfcJ7yrtuxbgMfpyyh8two1P-nvczMX6mFAw",
+      "tags": {
+        "+freeq.at/act": "bounty",
+        "+freeq.at/act-id": "01JBOUNTYEVENTID00000000B",
+        "+freeq.at/act-seq": "3",
+        "+freeq.at/act-verb": "auto-accept",
+        "+freeq.at/from": "did:web:irc.example"
+      },
+      "target": "#swarm"
     }
   ],
   "venueRule": "target is the normalized venue, never the wire target: a channel lowercased, or `dm:<did_a>,<did_b>` with the two DIDs sorted ascending."
