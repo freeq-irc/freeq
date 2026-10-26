@@ -5,7 +5,9 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MemoryDeviceKeyStore, type StoredDeviceKey } from './device-key.js';
+import 'fake-indexeddb/auto';
+import { IDBFactory } from 'fake-indexeddb';
+import { IndexedDbDeviceKeyStore, MemoryDeviceKeyStore, type DeviceKeyStore, type StoredDeviceKey } from './device-key.js';
 import { decodeMultibaseEd25519, verifyEd25519 } from './did-key.js';
 import { recordSignedBytes } from './identity-records.js';
 import { deriveKid } from './signing.js';
@@ -75,6 +77,9 @@ interface EnrollCall {
 
 let enrollCalls: EnrollCall[];
 let enrollAnswer: { status: number; body: unknown };
+/** Held in front of every `/enroll` answer, for a test that needs one to
+ *  land after the connection it was started on. */
+let enrollGate: Promise<void> | null;
 
 beforeEach(() => {
   MockWebSocket.instances = [];
@@ -82,11 +87,13 @@ beforeEach(() => {
   globalThis.WebSocket = MockWebSocket;
   enrollCalls = [];
   enrollAnswer = { status: 200, body: {} };
+  enrollGate = null;
   vi.stubGlobal(
     'fetch',
     vi.fn(async (url: string, init?: RequestInit) => {
       if (url === `${BROKER}/enroll`) {
         enrollCalls.push(JSON.parse(String(init?.body)));
+        if (enrollGate !== null) await enrollGate;
         return new Response(JSON.stringify(enrollAnswer.body), { status: enrollAnswer.status });
       }
       return new Response('{}', { status: 404 });
@@ -265,6 +272,66 @@ describe('publishing the device key through the broker', () => {
     expect(unpublished()).toBe(0);
   });
 
+  it('registers the key again once the publish is answered', async () => {
+    const uri = 'at://did:plc:alice/at.freeq.deviceKey/3kdevice';
+    enrollAnswer = { status: 200, body: { ok: true, uri, cid: 'bafy' } };
+    const stored = await storedKey();
+    const { client } = await makeClient(new MemoryDeviceKeyStore(stored));
+    const ws = await login(client);
+    await until(() => ws.sent.filter((l) => l.startsWith('MSGSIG ')).length > 1);
+    await pause();
+    const registered = ws.sent.filter((l) => l.startsWith('MSGSIG '));
+    expect(registered, 'one at 001, one after the publish').toHaveLength(2);
+    expect(registered[1]).toBe(`MSGSIG ${await rawPublicB64(stored.keyPair)}`);
+    expect(registered[1], 'the key it presented').toBe(registered[0]);
+  });
+
+  it('registers nothing again when the publish fails', async () => {
+    enrollAnswer = { status: 502, body: 'PDS rejected record' };
+    const { client } = await makeClient(new MemoryDeviceKeyStore(await storedKey()));
+    const ws = await login(client);
+    await until(() => enrollCalls.length > 0);
+    await pause();
+    expect(ws.sent.filter((l) => l.startsWith('MSGSIG '))).toHaveLength(1);
+  });
+
+  it('registers nothing on the next connection when the publish is answered after a reconnect', async () => {
+    const uri = 'at://did:plc:alice/at.freeq.deviceKey/3kdevice';
+    enrollAnswer = { status: 200, body: { ok: true, uri, cid: 'bafy' } };
+    let release!: () => void;
+    enrollGate = new Promise<void>((resolve) => (release = resolve));
+    const first = await storedKey();
+    const store = new MemoryDeviceKeyStore(first);
+    const { client } = await makeClient(store);
+    const ws = await login(client);
+    await until(() => enrollCalls.length > 0);
+    // The socket goes before the publish is answered, and another tab's
+    // sign-in replaces the stored key meanwhile.
+    ws.close();
+    await flushAsync();
+    const next = await storedKey();
+    await store.save(next);
+    const ws2 = await login(client);
+    release();
+    await until(() => enrollCalls.length > 1);
+    await pause();
+    const registered = ws2.sent.filter((l) => l.startsWith('MSGSIG '));
+    expect(registered, 'never the key of the connection that ended').not.toContain(
+      `MSGSIG ${await rawPublicB64(first.keyPair)}`,
+    );
+    expect(new Set(registered)).toEqual(new Set([`MSGSIG ${await rawPublicB64(next.keyPair)}`]));
+  });
+
+  it('does not publish a key past its lifetime', async () => {
+    const keyPair = (await crypto.subtle.generateKey('Ed25519', false, ['sign', 'verify'])) as CryptoKeyPair;
+    const store = new MemoryDeviceKeyStore({ keyPair, createdAt: hoursAgo(91 * 24) });
+    const { client } = await makeClient(store);
+    const ws = await login(client);
+    await pause();
+    expect(enrollCalls, 'the server would refuse the record as expired').toEqual([]);
+    expect(ws.sent.filter((l) => l.startsWith('MSGSIG '))).toHaveLength(1);
+  });
+
   it("re-checks the client's own account once the key is published", async () => {
     const uri = 'at://did:plc:alice/at.freeq.deviceKey/3kdevice';
     enrollAnswer = { status: 200, body: { ok: true, uri, cid: 'bafy' } };
@@ -331,6 +398,7 @@ describe('publishing the device key through the broker', () => {
     const unpublished = await storedKey();
     const second = await lookupHolding(unpublished, true);
     await login((await makeClient(new MemoryDeviceKeyStore(unpublished), true, second.lookup)).client);
+    await until(() => enrollCalls.length > 0);
     await pause();
     expect(first.refresh).not.toHaveBeenCalled();
     expect(second.refresh).not.toHaveBeenCalled();
@@ -395,14 +463,14 @@ describe('a stored key the account has retired', () => {
   const KEY_TYPE = 'at.freeq.deviceKey';
   type StubRepo = Awaited<ReturnType<typeof import('../test/repo-proofs.js')['stubRepo']>>;
 
-  /** `stored`'s own record, and a retirement of it signed by the key itself. */
-  async function recordsOf(stored: StoredDeviceKey): Promise<{ record: unknown; retirement: unknown }> {
+  /** `stored`'s own record, and a retirement of it dated `at`, signed by the key itself. */
+  async function recordsOf(stored: StoredDeviceKey, at = RETIRED): Promise<{ record: unknown; retirement: unknown }> {
     const { buildDeviceRecord, buildDeviceRetirement } = await import('./identity-records.js');
     const { recordKeyOf } = await import('./device-key.js');
     const key = await recordKeyOf(stored.keyPair);
     const record = await buildDeviceRecord(key, DID, stored.createdAt);
     const kid = await deriveKid(decodeMultibaseEd25519(key.publicKeyMultibase));
-    return { record, retirement: await buildDeviceRetirement(key, DID, kid, RETIRED) };
+    return { record, retirement: await buildDeviceRetirement(key, DID, kid, at) };
   }
 
   /** The account's repository holding `records`, each with its proof. */
@@ -415,7 +483,7 @@ describe('a stored key the account has retired', () => {
 
   /** A client whose key lookup reads the account from `repo`, with an empty
    *  proven set; how many listings and proofs it served. */
-  async function clientReading(store: MemoryDeviceKeyStore, repo: StubRepo, freshSignIn?: boolean) {
+  async function clientReading(store: DeviceKeyStore, repo: StubRepo, freshSignIn?: boolean) {
     const { FreeqClient } = await import('./client.js');
     const { KeyLookup } = await import('./key-lookup.js');
     let listings = 0;
@@ -464,6 +532,40 @@ describe('a stored key the account has retired', () => {
     client.disconnect();
   });
 
+  const RETIRED_WORDS = 'This device was signed out from another device. Sign in again to continue.';
+
+  it('marks its stored key refused on KEY_RETIRED, and only a fresh sign-in replaces it, unread', async () => {
+    // A failed publish, so the client does not list its own account after it.
+    enrollAnswer = { status: 502, body: {} };
+    const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+    const { record } = await recordsOf(stored);
+    // The account still lists the key as live: the mark alone replaces it.
+    const repo = await repoHolding(record);
+    const store = new MemoryDeviceKeyStore(stored);
+    const first = await clientReading(store, repo);
+    const heard: (boolean | undefined)[] = [];
+    first.client.on('serverFail', () => heard.push((store as unknown as { key: StoredDeviceKey }).key.refused));
+    const ws = await login(first.client);
+    ws.recv(`:srv FAIL MSGSIG KEY_RETIRED :${RETIRED_WORDS}`);
+    await until(() => heard.length > 0);
+    expect(heard, 'marked before the app hears of it').toEqual([true]);
+    first.client.disconnect();
+
+    MockWebSocket.instances = [];
+    const reconnect = await clientReading(store, repo);
+    const ws2 = await login(reconnect.client);
+    expect(msgsigOf(ws2), 'a reconnect presents it still').toBe(await rawPublicB64(stored.keyPair));
+    reconnect.client.disconnect();
+
+    MockWebSocket.instances = [];
+    const again = await clientReading(store, repo, true);
+    const next = await login(again.client);
+    expect(msgsigOf(next)).not.toBe(await rawPublicB64(stored.keyPair));
+    expect((await store.load())!.keyPair).not.toBe(stored.keyPair);
+    expect(again.listings(), 'the account was not read').toBe(0);
+    again.client.disconnect();
+  });
+
   it('leaves its stored key unmarked when KEY_EXPIRED refuses a session key it fell back to', async () => {
     const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
     const { record } = await recordsOf(stored);
@@ -505,7 +607,207 @@ describe('a stored key the account has retired', () => {
     expect(replaced.keyPair).not.toBe(stored.keyPair);
     expect(replaced.refused).toBeUndefined();
     expect(replaced.recordUri).toBeUndefined();
+    await until(() => enrollCalls.length > 0);
     again.client.disconnect();
+  });
+
+  /** Two browsers that keep their key wrapped: one refuses a locked Ed25519
+   *  key, the other makes one but cannot store it. */
+  const WRAPPED_BROWSERS: [string, () => void][] = [
+    ['refuses a locked key', () => {
+      const generate = crypto.subtle.generateKey.bind(crypto.subtle);
+      vi.spyOn(crypto.subtle, 'generateKey').mockImplementation(((a: any, extractable: boolean, u: KeyUsage[]) => {
+        if (a === 'Ed25519' && !extractable) return Promise.reject(new DOMException('refused', 'NotSupportedError'));
+        return generate(a, extractable, u);
+      }) as any);
+    }],
+    ['cannot store a locked key', () => {
+      const P = (globalThis as any).IDBObjectStore.prototype;
+      const put = P.put;
+      const holdsEd = (v: any): boolean =>
+        v instanceof CryptoKey ? v.algorithm.name === 'Ed25519'
+        : v && typeof v === 'object' && !(v instanceof ArrayBuffer) && !ArrayBuffer.isView(v) ? Object.values(v).some(holdsEd)
+        : false;
+      vi.spyOn(P, 'put').mockImplementation(function (this: any, value: any, key?: any) {
+        if (holdsEd(value)) throw new DOMException('could not clone', 'DataCloneError');
+        return put.call(this, value, key);
+      });
+    }],
+  ];
+  for (const [browser, mock] of WRAPPED_BROWSERS)
+  describe(`on a browser that ${browser}, so keeps its key wrapped`, () => {
+    beforeEach(() => {
+      globalThis.indexedDB = new IDBFactory();
+      mock();
+    });
+
+    /** A wrapped key in IndexedDB, made two days ago, carrying `recordUri`. */
+    async function wrappedStore(recordUri: string): Promise<{ store: IndexedDbDeviceKeyStore; stored: StoredDeviceKey }> {
+      const store = new IndexedDbDeviceKeyStore(DID);
+      const made = (await store.load())!;
+      expect(store.storage).toBe('wrapped');
+      await store.save({ ...made, createdAt: hoursAgo(48), recordUri });
+      return { store, stored: (await new IndexedDbDeviceKeyStore(DID).load())! };
+    }
+
+    /** What a fresh store loads once it holds `uri`, and how it keeps it. */
+    async function publishedAs(uri: string) {
+      for (let i = 0; i < 200; i++) {
+        if ((await new IndexedDbDeviceKeyStore(DID).load())!.recordUri === uri) break;
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      const reader = new IndexedDbDeviceKeyStore(DID);
+      const key = (await reader.load())!;
+      return { key, storage: reader.storage };
+    }
+
+    it('presents a new key at the next fresh sign-in after KEY_EXPIRED, and keeps it wrapped', async () => {
+      const { store, stored } = await wrappedStore('at://did:plc:alice/at.freeq.deviceKey/3k');
+      const { record } = await recordsOf(stored);
+      const repo = await repoHolding(record);
+      const first = await clientReading(store, repo);
+      const ws = await login(first.client);
+      ws.recv(`:srv FAIL MSGSIG KEY_EXPIRED :${EXPIRED_WORDS}`);
+      for (let i = 0; i < 200; i++) {
+        if ((await new IndexedDbDeviceKeyStore(DID).load())!.refused) break;
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      first.client.disconnect();
+
+      const uri = 'at://did:plc:alice/at.freeq.deviceKey/3new';
+      enrollAnswer = { status: 200, body: { uri } };
+      const again = await clientReading(store, repo, true);
+      const next = await login(again.client);
+      expect(msgsigOf(next)).not.toBe(await rawPublicB64(stored.keyPair));
+      const reader = new IndexedDbDeviceKeyStore(DID);
+      const replaced = (await reader.load())!;
+      expect(reader.storage).toBe('wrapped');
+      expect(msgsigOf(next)).toBe(await rawPublicB64(replaced.keyPair));
+      expect(replaced.refused).toBeUndefined();
+      await until(() => enrollCalls.length > 0);
+      expect(enrollCalls).toHaveLength(1);
+      const published = await publishedAs(uri);
+      expect(published.storage).toBe('wrapped');
+      expect(published.key.recordUri).toBe(uri);
+      expect(await rawPublicB64(published.key.keyPair)).toBe(msgsigOf(next));
+      again.client.disconnect();
+    });
+
+    it('is replaced right after a new sign-in when the account retired it, and the new key kept wrapped', async () => {
+      const { store, stored } = await wrappedStore('at://did:plc:alice/at.freeq.deviceKey/3old');
+      const { record, retirement } = await recordsOf(stored);
+      const uri = 'at://did:plc:alice/at.freeq.deviceKey/3r';
+      enrollAnswer = { status: 200, body: { uri } };
+      const { client } = await clientReading(store, await repoHolding(record, retirement), true);
+      const ws = await login(client);
+      expect(msgsigOf(ws)).not.toBe(await rawPublicB64(stored.keyPair));
+      const reader = new IndexedDbDeviceKeyStore(DID);
+      const now = (await reader.load())!;
+      expect(reader.storage).toBe('wrapped');
+      expect(msgsigOf(ws)).toBe(await rawPublicB64(now.keyPair));
+      await until(() => enrollCalls.length > 0);
+      expect(enrollCalls).toHaveLength(1);
+      const published = await publishedAs(uri);
+      expect(published.storage).toBe('wrapped');
+      expect(published.key.recordUri).toBe(uri);
+      expect(await rawPublicB64(published.key.keyPair)).toBe(msgsigOf(ws));
+      client.disconnect();
+    });
+  });
+
+  describe('saving the record URI reads the store back', () => {
+    const URI = 'at://did:plc:alice/at.freeq.deviceKey/3kdevice';
+
+    /** Publish `store`'s key through a broker that runs `meanwhile` while the
+     *  publish is out, then answers 200 with URI; how often the account was
+     *  re-listed, and what was warned. */
+    async function publishWhile(store: MemoryDeviceKeyStore, meanwhile: () => Promise<unknown>) {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string, init?: RequestInit) => {
+          if (url === `${BROKER}/enroll`) {
+            enrollCalls.push(JSON.parse(String(init?.body)));
+            await meanwhile();
+            return new Response(JSON.stringify({ uri: URI }), { status: 200 });
+          }
+          return new Response('{}', { status: 404 });
+        }),
+      );
+      const { KeyLookup } = await import('./key-lookup.js');
+      const lookup = new KeyLookup(
+        { fetch: globalThis.fetch as never, resolveDid: async () => ({ id: DID }) as never },
+        null,
+        3_600_000,
+      );
+      const refresh = vi.spyOn(lookup, 'refreshAccount').mockResolvedValue(undefined);
+      const warn = vi.spyOn(console, 'warn');
+      const { client } = await makeClient(store, true, lookup);
+      await login(client);
+      await until(() => enrollCalls.length > 0);
+      await pause();
+      client.disconnect();
+      return {
+        relisted: refresh.mock.calls.length,
+        warns: warn.mock.calls.map((c) => String(c[0])),
+      };
+    }
+
+    it('gives no URI to a key replaced meanwhile', async () => {
+      const store = new MemoryDeviceKeyStore(await storedKey());
+      const other = await storedKey();
+      const { relisted, warns } = await publishWhile(store, () => store.save(other));
+      const kept = (await store.load())!;
+      expect(kept.keyPair).toBe(other.keyPair);
+      expect(kept.recordUri).toBeUndefined();
+      expect(warns).toEqual(['[freeq-sdk] device key replaced while it was published']);
+      expect(relisted).toBe(1);
+    });
+
+    it('keeps a refused mark set meanwhile', async () => {
+      const stored = await storedKey();
+      const store = new MemoryDeviceKeyStore(stored);
+      const { relisted, warns } = await publishWhile(store, () => store.save({ ...stored, refused: true }));
+      const kept = (await store.load())!;
+      expect(kept.keyPair).toBe(stored.keyPair);
+      expect(kept.recordUri).toBe(URI);
+      expect(kept.refused).toBe(true);
+      expect(warns).toEqual([]);
+      expect(relisted).toBe(1);
+    });
+
+    it('saves nothing when the store reads back empty', async () => {
+      const stored = await storedKey();
+      const store = new MemoryDeviceKeyStore(stored);
+      const save = vi.spyOn(store, 'save');
+      const { relisted, warns } = await publishWhile(store, async () => {
+        vi.spyOn(store, 'load').mockResolvedValueOnce(null);
+      });
+      expect(save).not.toHaveBeenCalled();
+      expect((await store.load())!.recordUri).toBeUndefined();
+      expect(warns).toEqual(['[freeq-sdk] device key replaced while it was published']);
+      expect(relisted).toBe(1);
+    });
+
+    it('saves nothing when the store cannot be read back', async () => {
+      const store = new MemoryDeviceKeyStore(await storedKey());
+      const save = vi.spyOn(store, 'save');
+      const { relisted, warns } = await publishWhile(store, async () => {
+        vi.spyOn(store, 'load').mockRejectedValueOnce(new Error('gone'));
+      });
+      expect(save).not.toHaveBeenCalled();
+      expect(warns).toEqual(['[freeq-sdk] published device key not read back:']);
+      expect(relisted).toBe(1);
+    });
+
+    it('says so when the URI cannot be saved', async () => {
+      const store = new MemoryDeviceKeyStore(await storedKey());
+      const { relisted, warns } = await publishWhile(store, async () => {
+        vi.spyOn(store, 'save').mockRejectedValueOnce(new Error('full'));
+      });
+      expect((await store.load())!.recordUri).toBeUndefined();
+      expect(warns).toEqual(['[freeq-sdk] published device key not saved:']);
+      expect(relisted).toBe(1);
+    });
   });
 
   it('replaces a stored key past its lifetime at a fresh sign-in', async () => {
@@ -518,6 +820,7 @@ describe('a stored key the account has retired', () => {
     const ws = await login(client);
     expect(msgsigOf(ws)).not.toBe(await rawPublicB64(keyPair));
     expect((await store.load())!.keyPair).not.toBe(keyPair);
+    await until(() => enrollCalls.length > 0);
     client.disconnect();
   });
 
@@ -534,6 +837,7 @@ describe('a stored key the account has retired', () => {
     const ws = await login(client);
     expect(msgsigOf(ws)).not.toBe(await rawPublicB64(old.keyPair));
     expect((await store.load())!.keyPair).not.toBe(old.keyPair);
+    await until(() => enrollCalls.length > 0);
   });
 
   it('is replaced right after a new sign-in, and the new key is published', async () => {
@@ -550,6 +854,17 @@ describe('a stored key the account has retired', () => {
     await until(() => enrollCalls.length > 0);
     expect(enrollCalls).toHaveLength(1);
     expect(enrollCalls[0]!.record.publicKeyMultibase).toBeDefined();
+  });
+
+  it('is replaced right after a new sign-in when its retirement is dated ahead of the clock', async () => {
+    const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+    const ahead = new Date(Date.now() + 3_600_000).toISOString();
+    const { record, retirement } = await recordsOf(stored, ahead);
+    const store = new MemoryDeviceKeyStore(stored);
+    const { client } = await clientReading(store, await repoHolding(record, retirement), true);
+    const ws = await login(client);
+    expect(msgsigOf(ws)).not.toBe(await rawPublicB64(stored.keyPair));
+    expect((await store.load())!.keyPair).not.toBe(stored.keyPair);
   });
 
   it('is not replaced when it is still live', async () => {
@@ -587,6 +902,45 @@ describe('a stored key the account has retired', () => {
     const ws2 = await login(second.client);
     expect(msgsigOf(ws2)).not.toBe(await rawPublicB64(genuineKey.keyPair));
     expect((await replaced.load())!.keyPair).not.toBe(genuineKey.keyPair);
+    await until(() => enrollCalls.length > 0);
+  });
+
+  it('keeps the stored key when the check outlasts sixty seconds, and does not replace it after', async () => {
+    const old = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3old');
+    const { record, retirement } = await recordsOf(old);
+    const repo = await repoHolding(record, retirement);
+    // The account's listing is answered only once the test lets it go.
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const respond = repo.respond.bind(repo);
+    repo.respond = async (url: URL) => {
+      if (url.pathname === '/xrpc/com.atproto.repo.listRecords') await held;
+      return respond(url);
+    };
+    // The sixty-second bound, fired by hand; every other timer runs.
+    const bounds: (() => void)[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: () => void, ms?: number) => {
+      if (ms === 60_000) {
+        bounds.push(fn);
+        return 0;
+      }
+      return realSetTimeout(fn, ms);
+    }) as unknown as typeof setTimeout);
+    const store = new MemoryDeviceKeyStore(old);
+    const { client } = await clientReading(store, repo, true);
+
+    const loggedIn = login(client);
+    await until(() => bounds.length > 0);
+    expect(bounds).toHaveLength(1);
+    bounds[0]!();
+    const ws = await loggedIn;
+    expect(msgsigOf(ws), 'the stored key, at the bound').toBe(await rawPublicB64(old.keyPair));
+
+    release();
+    await pause();
+    expect((await store.load())!.keyPair, 'the late answer replaced nothing').toBe(old.keyPair);
+    client.disconnect();
   });
 
   it('is kept on a connect that does not follow a new sign-in', async () => {
@@ -670,6 +1024,7 @@ describe('a stored key the account has retired', () => {
         expect(repo.proofReads(entry)).toBe(1);
       }
       expect(await lookup.provenDeviceRecords(DID)).toHaveLength(51);
+      await until(() => enrollCalls.length > 0);
     });
 
     it('keeps the key when the retirement proof fails', async () => {

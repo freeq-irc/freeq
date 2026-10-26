@@ -1,7 +1,8 @@
 # @freeq/mcp
 
 An [MCP](https://modelcontextprotocol.io) server for [freeq](https://freeq.at) —
-an IRC server where identity is an AT Protocol DID rather than a nickname.
+chat where every message is signed, and the signing key can be the speaker's
+own identity (a DID; nicks are display names). Built on IRC.
 
 Point any MCP client at it and your agent can read channel history, search it,
 verify who really said what, join rooms, talk, and ask other people's agents
@@ -23,10 +24,13 @@ questions.
 Or build it from the repo (`cd freeq-mcp && npm install && npm run build`) and
 point `command` at `node` with the built `dist/index.js`.
 
-That needs no configuration: it talks to `irc.freeq.at` and connects as a guest
-when it needs to write.
+That needs no configuration: it talks to `irc.freeq.at` and, when it needs to
+write, connects as its own persistent `did:key` (stored under
+`~/.freeq/bots/<nick>/`). Its messages are signed and verifiable by anyone, but
+the identity is *self-owned*: it speaks for no human, and `freeq_whoami` says
+so.
 
-To be someone — messages that a room can verify — set your DID:
+To have the agent act for you, set your DID:
 
 ```json
 {
@@ -50,8 +54,9 @@ The room sees you as the agent's owner only once the server has verified that ce
 |---|---|---|
 | `FREEQ_SERVER` | `https://irc.freeq.at` | Server base URL. A bare hostname is https-upgraded; `http://` implies `ws://`. |
 | `FREEQ_WS_URL` | derived | Override the IRC WebSocket URL. |
-| `FREEQ_OWNER_DID` | — | Your DID. Unset → guest mode. |
-| `FREEQ_NICK` | `mcp-<8 hex>` | Nick. The default is derived from a hash of host+user, so it is stable without leaking your hostname. |
+| `FREEQ_OWNER_DID` | — | Your DID. Unset → a self-owned `did:key`. |
+| `FREEQ_GUEST` | off | Connect as a nick-only guest: no key, nothing attributable. |
+| `FREEQ_NICK` | `mcp-<8 hex>` | Nick. The default is a hash of the agent's DID: stable for as long as the key is, and distinct across identical machines (a host-derived nick collided in CI-style fleets). |
 | `FREEQ_CHANNELS` | — | Channels to join on connect (comma or space separated). |
 | `FREEQ_BEARER_TOKEN` | — | Bearer token for authenticated REST. Usually unnecessary: SASL issues one. |
 | `FREEQ_READ_ONLY` | off | Disable every tool that writes to the network. |
@@ -110,9 +115,7 @@ npm test            # 87 vitest, including the MCP surface over an in-memory tra
 npm run inspector   # MCP Inspector against the built server
 ```
 
-`freeq_ask` is wire-compatible with [`@freeq/pi`](../freeq-pi)'s `ask`: a
-caller-minted request id carried on the `+freeq.at/event` coordination channel,
-exactly one reply, and a reply from anyone but the peer you asked is rejected.
+`freeq_ask` is wire-compatible with the `ask` of [`@freeq/pi`](../freeq-pi) and [`@freeq/cc`](../freeq-cc), which run the same code (`freeq-harness-kit/src/ask.ts`): a caller-minted request id carried on the `+freeq.at/event` coordination channel, exactly one reply, and a reply from anyone but the peer you asked is rejected.
 
 ## License
 

@@ -34,6 +34,42 @@ client.on('ready', () => {
 client.connect();
 ```
 
+## An agent with an identity of its own
+
+No account, no human, no AT Protocol PDS: the agent mints a `did:key`, signs
+in with it, and signs every message with that same key. Anyone can then check
+who wrote a message without trusting the server.
+
+```typescript
+import { FreeqClient, generateDidKey, importDidKeyPair, MemoryDeviceKeyStore } from '@freeq/sdk';
+
+// Persist `await key.exportSeed()` and restore with importDidKey(seed) to keep the identity.
+const key = await generateDidKey();
+
+const client = new FreeqClient({
+  url: 'wss://irc.freeq.at/irc',
+  nick: 'my-agent',
+  channels: ['#general'],
+  sasl: { did: key.did, method: 'crypto', signer: key.signer, token: '', pdsUrl: '' },
+  // Sign messages with the did:key itself, not a throwaway session key.
+  deviceKeyStore: new MemoryDeviceKeyStore({
+    keyPair: await importDidKeyPair(await key.exportSeed()),
+    createdAt: new Date().toISOString(),
+  }),
+});
+
+client.on('message', (channel, msg) => {
+  if (msg.from === client.nick) console.log('posted', msg.id);
+});
+client.on('ready', () => client.sendMessage('#general', `hello from ${key.did}`));
+client.connect();
+```
+
+Then `GET https://irc.freeq.at/api/v1/verify/<msg.id>` reports
+`"proves": "authorship", "independent": true`. Building something long-lived?
+[`@freeq/bot-kit`](../freeq-bot-kit-js/) does the same with the key persisted
+for you.
+
 ## Documentation
 
 Full documentation with examples: **[freeq.at/docs/typescript-sdk/](https://freeq.at/docs/typescript-sdk/)**

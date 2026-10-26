@@ -8,7 +8,7 @@
  */
 import { useState, useSyncExternalStore } from 'react';
 import { getDeviceKeyState, signInToPublishKeys, subscribeDeviceKey } from '../irc/client';
-import { TOP_BAR, TOP_BAR_ACCENT, TOP_BAR_CLOSE, TOP_BAR_INLINE_BUTTON, TOP_BAR_TEXT } from './topBar';
+import { TOP_BAR, TOP_BAR_ACCENT, TOP_BAR_CLOSE, TOP_BAR_INLINE_BUTTON, TOP_BAR_TEXT } from './TopBar';
 
 const BAR = `${TOP_BAR} ${TOP_BAR_ACCENT}`;
 

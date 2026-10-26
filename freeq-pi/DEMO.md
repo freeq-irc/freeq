@@ -69,7 +69,10 @@ turn — clearly labelled as coming from someone else's agent:
 
   What is the new signature of AuthProvider.authenticate?
 
-  [Your next reply will be sent back to pi-chad over freeq.]
+  [To answer, use the freeq tool: 'say' in #freeq-dev. If you post nothing
+  there, your closing text is posted to #freeq-dev instead, addressed to
+  pi-chad. Answer concisely and only from what you can verify in this
+  environment. If you cannot answer, say so plainly.]
 
   ● read  src/auth/provider.ts
   Answering: authenticate now takes a Session, not a bare token…

@@ -52,6 +52,44 @@ fun actCardNeighbours(task: ActTask, event: ActTaskEvent): ActNeighbours {
     return ActNeighbours(cards.getOrNull(i - 1)?.msgId, cards.getOrNull(i + 1)?.msgId)
 }
 
+/**
+ * The rows as the list draws them: each "confirmed" line directly under the
+ * card of the step it confirms.
+ *
+ * The stored list stays in time order, and a confirmation is stamped by the
+ * home's clock while its card is stamped by the server's whole second, so by
+ * time the line can land above its card. A line moves only when its card's
+ * row is here and not deleted; otherwise it stays where its time put it. Two
+ * lines under one card keep their order. Nothing else moves.
+ */
+fun actConfirmLinesUnderCards(rows: List<ChatMessage>, cards: Map<String, ActCard>): List<ChatMessage> {
+    // The card row each confirmation belongs under, by the confirmation's id.
+    val cardOf = HashMap<String, String>()
+    for ((rowId, card) in cards) {
+        for (ev in card.task.events) {
+            if (ev.verb == "confirm" && ev.fields["act-subject"] == card.event.eventId) {
+                cardOf[ev.eventId] = rowId
+            }
+        }
+    }
+    if (cardOf.isEmpty()) return rows
+    val drawnCards = rows.filter { it.from.isNotEmpty() && !it.isDeleted }.mapTo(HashSet()) { it.id }
+    val under = HashMap<String, MutableList<ChatMessage>>()
+    for (m in rows) {
+        val card = if (m.from.isEmpty()) cardOf[m.id] else null
+        if (card != null && card in drawnCards) under.getOrPut(card) { mutableListOf() }.add(m)
+    }
+    if (under.isEmpty()) return rows
+    val out = ArrayList<ChatMessage>(rows.size)
+    for (m in rows) {
+        val card = if (m.from.isEmpty()) cardOf[m.id] else null
+        if (card != null && card in under) continue
+        out.add(m)
+        under[m.id]?.let { out.addAll(it) }
+    }
+    return out
+}
+
 /** A task event and the task it belongs to, as one card draws them. */
 data class ActCard(val task: ActTask, val event: ActTaskEvent)
 

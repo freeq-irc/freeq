@@ -178,14 +178,19 @@ pub(crate) fn file_session_signing_key(
         .map_err(|_| ("INVALID_KEY", "Invalid ed25519 public key"))?;
     let kid = freeq_sdk::sigtag::derive_kid(&vk);
 
-    // A key on file past its expiry is refused before anything is written, so
-    // the caller's FAIL is the last word it gets for it.
+    // A key on file that this server retired, or past its expiry, is refused
+    // before anything is written, so the caller's FAIL is the last word it
+    // gets for it. A retirement counts whatever its date.
     let now = chrono::Utc::now().timestamp();
-    let expired = state
+    let row = state
         .with_db(|db| db.get_signing_key_row(did, &kid))
-        .flatten()
-        .is_some_and(|row| row.expired_at(now));
-    if expired {
+        .flatten();
+    if row.as_ref().is_some_and(|row| row.removed_at.is_some()) {
+        tracing::info!(session = %session_id, %did, %kid, "Refused a signing key this server has marked retired");
+        return Err(("KEY_RETIRED", KEY_RETIRED_WORDS));
+    }
+    if row.is_some_and(|row| row.expired_at(now)) {
+        tracing::info!(session = %session_id, %did, %kid, "Refused a signing key whose row has expired");
         return Err(("KEY_EXPIRED", KEY_EXPIRED_WORDS));
     }
 
@@ -232,21 +237,32 @@ pub(crate) fn file_session_signing_key(
 pub(crate) const KEY_EXPIRED_WORDS: &str =
     "This device's signing key has expired. Sign in again to continue.";
 
-/// After the caller has sent `FAIL MSGSIG KEY_EXPIRED` for a key refused at
-/// registration: end the login token this connection came in on and close
-/// it. Spawned, so the FAIL already queued goes out first.
-pub(crate) fn close_for_expired_key(
+/// What a device whose signing key was retired is told.
+pub(crate) const KEY_RETIRED_WORDS: &str =
+    "This device was signed out from another device. Sign in again to continue.";
+
+/// After the caller has sent `FAIL MSGSIG <code>` for a key refused at
+/// registration: for `KEY_EXPIRED` or `KEY_RETIRED`, end the login token this
+/// connection came in on and close it; any other code leaves both. Spawned,
+/// so the FAIL already queued goes out first.
+pub(crate) fn close_for_refused_key(
     state: &Arc<SharedState>,
     session_id: &str,
+    code: &str,
     broker_token: Option<&str>,
 ) {
+    let reason = match code {
+        "KEY_EXPIRED" => "Signing key expired",
+        "KEY_RETIRED" => "Signing key retired",
+        _ => return,
+    };
     let state = Arc::clone(state);
     let (session_id, token) = (session_id.to_string(), broker_token.map(str::to_string));
     tokio::spawn(async move {
         if let Some(token) = token {
             end_login_token(&state, &token).await;
         }
-        close_session(&state, &session_id, "Signing key expired");
+        close_session(&state, &session_id, reason);
     });
 }
 
@@ -283,7 +299,7 @@ async fn refuse_if_retired(
     // The published key's row follows its record (a key published after its
     // last registration keeps the local date until it connects again).
     state.with_db(|db| db.set_signing_key_expiry(did, kid, Some(key.expires_at.timestamp())));
-    let Some(retired_at) = key.retired_at.filter(|at| *at <= now) else {
+    let Some(retired_at) = key.retired_at.filter(|_| key.retired_or_expired(now)) else {
         return;
     };
     if retired_at == key.expires_at {
@@ -307,11 +323,7 @@ async fn refuse_if_retired(
     let reply = irc::Message::from_server(
         &state.server_name,
         "FAIL",
-        vec![
-            "MSGSIG",
-            "KEY_RETIRED",
-            "This device was signed out from another device. Sign in again to continue.",
-        ],
+        vec!["MSGSIG", "KEY_RETIRED", KEY_RETIRED_WORDS],
     );
     if let Some(tx) = state.connections.lock().get(session_id) {
         let _ = tx.try_send(format!("{reply}\r\n"));
@@ -422,6 +434,7 @@ pub struct Connection {
     pub(crate) sasl_in_progress: bool,
     pub(crate) sasl_failures: u8,
     pub(crate) dpop_retries: u8,
+    pub(crate) sasl_response_buf: String,
 }
 
 impl Connection {
@@ -459,6 +472,7 @@ impl Connection {
             sasl_in_progress: false,
             sasl_failures: 0,
             dpop_retries: 0,
+            sasl_response_buf: String::new(),
         }
     }
 
@@ -973,6 +987,36 @@ where
                 conn.nick = Some(rn);
             }
             // Trigger auto-op etc. in channels (already handled by complete_irc_login)
+        }
+
+        // A message line from a session whose registered key has expired, or
+        // whose row this server has marked retired, is refused and the
+        // session closed, instead of being relayed until the once-a-minute
+        // sweep. A `TAGMSG` counts only when it carries the client's
+        // signature, the one kind a reader would mark invalid; an unsigned
+        // one, such as a typing notice, passes. `break`, not `continue`: a
+        // line buffered behind this one would otherwise be read with the key
+        // already dropped.
+        if conn.registered
+            && match msg.command.as_str() {
+                "PRIVMSG" | "NOTICE" | "BATCH" => true,
+                "TAGMSG" => {
+                    msg.tags.contains_key("+freeq.at/sig") || msg.tags.contains_key("freeq.at/sig")
+                }
+                _ => false,
+            }
+            && let Some(did) = conn.authenticated_did.as_deref()
+        {
+            let key = state.session_msg_keys.lock().get(&session_id).copied();
+            if let Some(vk) = key {
+                let kid = freeq_sdk::sigtag::derive_kid(&vk);
+                if crate::key_expiry::refuse_if_retired_or_expired(&state, &session_id, did, &kid)
+                    .await
+                    .is_some()
+                {
+                    break;
+                }
+            }
         }
 
         match msg.command.as_str() {
@@ -1549,13 +1593,12 @@ where
                                 vec!["MSGSIG", code, detail],
                             );
                             send(&state, &session_id, format!("{reply}\r\n"));
-                            if code == "KEY_EXPIRED" {
-                                close_for_expired_key(
-                                    &state,
-                                    &session_id,
-                                    conn.broker_token.as_deref(),
-                                );
-                            }
+                            close_for_refused_key(
+                                &state,
+                                &session_id,
+                                code,
+                                conn.broker_token.as_deref(),
+                            );
                         }
                     }
                 }
@@ -4192,6 +4235,7 @@ fn cleanup_session_state(state: &Arc<SharedState>, session_id: &str) {
     state.session_kill.lock().remove(session_id);
     state.liveness_probes.lock().remove(session_id);
     state.session_dids.lock().remove(session_id);
+    state.delegated_sessions.lock().remove(session_id);
     state.session_handles.lock().remove(session_id);
     state.session_iroh_ids.lock().remove(session_id);
     state.session_away.lock().remove(session_id);
@@ -4367,6 +4411,39 @@ mod retired_key_tests {
                     broker_token.map(str::to_string),
                 ),
             );
+            let mut c = Self::authenticating(state, nick, web_token).await;
+            c.rx(|l| l.split_whitespace().nth(1) == Some("903"))
+                .await
+                .expect("903");
+            if let Some(line) = before_welcome {
+                c.tx(line).await;
+                c.tx("CAP END").await;
+                return c;
+            }
+            c.tx("CAP END").await;
+            c.rx(|l| l.split_whitespace().nth(1) == Some("001"))
+                .await
+                .expect("001");
+            c
+        }
+
+        /// Signed in with `web_token`, which a sign-in route minted, and
+        /// registered.
+        async fn registered_with(state: &Arc<SharedState>, web_token: &str) -> Client {
+            let mut c = Self::authenticating(state, "alice", web_token).await;
+            c.rx(|l| l.split_whitespace().nth(1) == Some("903"))
+                .await
+                .expect("903");
+            c.tx("CAP END").await;
+            c.rx(|l| l.split_whitespace().nth(1) == Some("001"))
+                .await
+                .expect("001");
+            c
+        }
+
+        /// Through `AUTHENTICATE` with the web token `web_token`, not waiting
+        /// for its answer.
+        async fn authenticating(state: &Arc<SharedState>, nick: &str, web_token: &str) -> Client {
             let (client_side, server_side) = tokio::io::duplex(16384);
             let served = state.clone();
             tokio::spawn(async move {
@@ -4395,23 +4472,25 @@ mod retired_key_tests {
             let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .encode(payload.to_string().as_bytes());
             c.tx(&format!("AUTHENTICATE {encoded}")).await;
-            c.rx(|l| l.split_whitespace().nth(1) == Some("903"))
-                .await
-                .expect("903");
-            if let Some(line) = before_welcome {
-                c.tx(line).await;
-                c.tx("CAP END").await;
-                return c;
-            }
-            c.tx("CAP END").await;
-            c.rx(|l| l.split_whitespace().nth(1) == Some("001"))
-                .await
-                .expect("001");
             c
         }
 
+        /// A connection to `state` with nothing sent yet.
+        pub(super) async fn open(state: &Arc<SharedState>) -> Client {
+            let (client_side, server_side) = tokio::io::duplex(16384);
+            let served = state.clone();
+            tokio::spawn(async move {
+                let _ = handle_generic(server_side, served).await;
+            });
+            let (reader, writer) = tokio::io::split(client_side);
+            Client {
+                reader: BufReader::new(reader),
+                writer,
+            }
+        }
+
         /// Every line until the server closes the connection.
-        async fn rest(&mut self) -> Vec<String> {
+        pub(super) async fn rest(&mut self) -> Vec<String> {
             let lines = std::sync::Mutex::new(Vec::new());
             self.rx(|l| {
                 lines.lock().unwrap().push(l.to_string());
@@ -4667,6 +4746,12 @@ mod retired_key_tests {
     async fn a_registration_listing_lands_in_the_record_cache() {
         let (state, listings, _) =
             state_counting(Arc::new(parking_lot::Mutex::new(fifty_keys(45)))).await;
+        // A login a key registered under here before, so its login lists
+        // nothing and the listing is the registration's.
+        state.device_key_tokens.lock().insert(
+            (DID.to_string(), "an-earlier-key".to_string()),
+            "BT-RECORD-CACHE".to_string(),
+        );
 
         let mut client = Client::signed_in(&state, "BT-RECORD-CACHE").await;
         client.tx(&msgsig_line(&signing_key(45))).await;
@@ -4699,6 +4784,85 @@ mod retired_key_tests {
         assert_eq!(kept.entries.len(), 50);
         assert_eq!(kept.repo_key, row.repo_key);
         assert_eq!(count(&listings), 1);
+    }
+
+    /// Whether the server's copy of the account names `kid`.
+    fn copy_names(state: &Arc<SharedState>, kid: &str) -> bool {
+        state
+            .record_cache
+            .stored_listing(DID, freeq_sdk::identity_records::DEVICE_KEY_TYPE)
+            .is_some_and(|listing| {
+                let values: Vec<serde_json::Value> =
+                    listing.entries.iter().map(|e| e.value.clone()).collect();
+                freeq_sdk::identity_records::device_key_history(DID, &values)
+                    .iter()
+                    .any(|k| k.kid == kid)
+            })
+    }
+
+    /// The device registers its key again once its publish is answered: the
+    /// same path lists the account again, so the copy every reader is served
+    /// holds the new record and the key row takes the record's expiry.
+    #[tokio::test]
+    async fn a_key_registered_again_after_its_publish_refreshes_the_copy() {
+        let records = Arc::new(parking_lot::Mutex::new(vec![record_for(1)]));
+        let (state, listings, _) = state_counting(records.clone()).await;
+        // A login a key registered under here before, so its login lists
+        // nothing and the listing is the registration's.
+        state.device_key_tokens.lock().insert(
+            (DID.to_string(), "an-earlier-key".to_string()),
+            "BT-MSGSIG-AGAIN".to_string(),
+        );
+        let kid = freeq_sdk::sigtag::derive_kid(&signing_key(46).verifying_key());
+
+        let mut client = Client::signed_in(&state, "BT-MSGSIG-AGAIN").await;
+        client.tx(&msgsig_line(&signing_key(46))).await;
+        client
+            .rx(|l| l.contains("MSGSIG OK"))
+            .await
+            .expect("the key is registered");
+        wait_for_count(&listings, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !copy_names(&state, &kid),
+            "the registration's copy predates the publish"
+        );
+        let filed = state
+            .with_db(|db| db.get_signing_key_row(DID, &kid))
+            .flatten()
+            .expect("the key row");
+
+        // The publish lands, and the device registers the same key again.
+        records.lock().push(record_for(46));
+        client.tx(&msgsig_line(&signing_key(46))).await;
+        client
+            .rx(|l| l.contains("MSGSIG OK"))
+            .await
+            .expect("the key is registered again");
+        wait_for_count(&listings, 2).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !copy_names(&state, &kid) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(copy_names(&state, &kid), "the copy holds the published key");
+
+        let row = state
+            .with_db(|db| db.get_signing_key_row(DID, &kid))
+            .flatten()
+            .expect("the key row");
+        assert_eq!(
+            row.registered_at, filed.registered_at,
+            "the same row, first filed at the connect"
+        );
+        let published = chrono::DateTime::parse_from_rfc3339(&made_on()).unwrap()
+            + freeq_sdk::identity_records::KEY_LIFETIME;
+        assert_eq!(
+            row.expires_at,
+            Some(published.timestamp()),
+            "the row takes the record's expiry at the publish"
+        );
+        assert_ne!(row.expires_at, filed.expires_at);
+        assert!(still_answers(&mut client).await);
     }
 
     #[tokio::test]
@@ -4800,6 +4964,537 @@ mod retired_key_tests {
             .expect("the key row");
         assert_eq!(row.removed_at, None);
     }
+    #[tokio::test]
+    async fn a_key_retired_with_a_date_ahead_of_the_clock_is_refused() {
+        let key = signing_key(48);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let signer = freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&key.to_bytes()).unwrap();
+        let ahead = at(now() + 3600);
+        let mut records = device_records(&key, false);
+        records.push(
+            serde_json::to_value(
+                freeq_sdk::identity_records::build_device_retirement(&signer, DID, &kid, &ahead)
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        let resolver = crate::peer_keys::stub_pds_resolver(DID, records).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            resolver,
+        );
+
+        let mut client = Client::signed_in(&state, "BT-RETIRED-AHEAD").await;
+        client.tx(&msgsig_line(&key)).await;
+        let lines = client.rest().await;
+        assert!(
+            lines.iter().any(|l| l.contains("FAIL MSGSIG KEY_RETIRED")),
+            "{lines:?}"
+        );
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-RETIRED-AHEAD"))
+        );
+        let row = state
+            .with_db(|db| db.get_signing_key_row(DID, &kid))
+            .flatten()
+            .expect("the key row");
+        let stamped = chrono::DateTime::parse_from_rfc3339(&ahead)
+            .unwrap()
+            .timestamp();
+        assert_eq!(row.removed_at, Some(stamped), "stamped with its own date");
+    }
+
+    #[tokio::test]
+    async fn a_key_this_server_retired_is_refused_at_registration_with_the_pds_unreadable() {
+        let key = signing_key(47);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        // The resolver knows no document, so the records cannot be read.
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            freeq_sdk::did::DidResolver::static_map(std::collections::HashMap::new()),
+        );
+        state.with_db(|db| {
+            db.save_signing_key_from(
+                DID,
+                key.verifying_key().as_bytes(),
+                "local-session",
+                now() - 3600,
+                Some(now() + 24 * 3600),
+            )
+        });
+        // Dated five minutes ahead of the clock, as the records check may
+        // stamp it: a sign-out counts whatever its date.
+        assert_eq!(
+            state.with_db(|db| db.retire_signing_key(DID, &kid, now() + 300)),
+            Some(true)
+        );
+
+        let mut client =
+            Client::offering_at_registration(&state, "BT-RETIRED-HERE", &msgsig_line(&key)).await;
+        let lines = client.rest().await;
+        let fail = lines
+            .iter()
+            .position(|l| l.contains("FAIL MSGSIG KEY_RETIRED"))
+            .unwrap_or_else(|| panic!("no KEY_RETIRED FAIL in {lines:?}"));
+        assert!(
+            lines[fail].ends_with(
+                "This device was signed out from another device. Sign in again to continue."
+            ),
+            "{}",
+            lines[fail]
+        );
+        assert!(!lines.iter().any(|l| l.contains("MSGSIG OK")), "{lines:?}");
+        assert!(lines.last().unwrap().starts_with("ERROR"), "{lines:?}");
+        assert!(state.session_msg_keys.lock().is_empty());
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-RETIRED-HERE"))
+        );
+    }
+
+    // ── a fresh sign-in reads the account's device keys again ────────
+
+    const BROKER_SECRET: &str = "retired-key-test-broker-secret";
+
+    /// The two ways a device signs in here: a separate broker that pushes
+    /// each login to the web-token route, and this server's own OAuth
+    /// callback with its `/session` refresh.
+    #[derive(Clone, Copy, Debug)]
+    enum SignIn {
+        Broker,
+        BuiltIn,
+    }
+
+    impl SignIn {
+        const BOTH: [SignIn; 2] = [SignIn::Broker, SignIn::BuiltIn];
+
+        /// A state signing devices in this way, resolving through `resolver`.
+        fn state(self, resolver: freeq_sdk::did::DidResolver) -> Arc<SharedState> {
+            let config = match self {
+                SignIn::Broker => crate::config::ServerConfig {
+                    broker_shared_secret: Some(BROKER_SECRET.to_string()),
+                    ..Default::default()
+                },
+                SignIn::BuiltIn => crate::config::ServerConfig::default(),
+            };
+            let mut state = crate::server::test_state_with_resolver(config, resolver);
+            if let SignIn::BuiltIn = self {
+                // The store a server with no separate broker files logins in.
+                Arc::get_mut(&mut state)
+                    .expect("a state nothing else holds yet")
+                    .embedded_session_store =
+                    Some(Arc::new(freeq_auth_broker::InMemoryStore::new()));
+            }
+            state
+        }
+
+        /// A new sign-in: its login token, and the web token the app gets.
+        async fn sign_in(self, state: &Arc<SharedState>, base: &str) -> (String, String) {
+            static LOGINS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = LOGINS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self {
+                SignIn::Broker => {
+                    // The broker makes a new login token at each sign-in.
+                    let login = format!("BT-FRESH-{n}");
+                    let web_token = broker_push(base, &login).await;
+                    (login, web_token)
+                }
+                SignIn::BuiltIn => {
+                    let oauth_state = format!("st-fresh-{n}");
+                    let created_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    state.oauth_pending.lock().insert(
+                        oauth_state.clone(),
+                        crate::server::OAuthPending {
+                            handle: "alice.test".to_string(),
+                            did: DID.to_string(),
+                            pds_url: "https://pds.example".to_string(),
+                            code_verifier: "verifier".to_string(),
+                            redirect_uri: format!("{base}/auth/callback"),
+                            client_id: format!("{base}/client-metadata.json"),
+                            token_endpoint: stub_token_endpoint().await,
+                            dpop_key_b64: freeq_sdk::oauth::DpopKey::generate().to_base64url(),
+                            created_at,
+                            // The app's redirect carries both tokens.
+                            mobile: true,
+                            irc_state: None,
+                            purpose: crate::server::OauthPurpose::Login,
+                            requested_scope: "atproto".to_string(),
+                        },
+                    );
+                    let html =
+                        reqwest::get(format!("{base}/auth/callback?state={oauth_state}&code=C"))
+                            .await
+                            .unwrap()
+                            .text()
+                            .await
+                            .unwrap();
+                    let start = html.find("freeq://auth?").expect("the app's redirect");
+                    let rest = &html[start..];
+                    let end = rest.find(['"', '\'']).unwrap_or(rest.len());
+                    let url = url::Url::parse(&rest[..end]).unwrap();
+                    let param = |name: &str| {
+                        url.query_pairs()
+                            .find(|(k, _)| k == name)
+                            .map(|(_, v)| v.into_owned())
+                            .unwrap()
+                    };
+                    (param("broker_token"), param("token"))
+                }
+            }
+        }
+
+        /// A reconnect on the login `login`: the web token the app gets.
+        async fn reconnect(self, base: &str, login: &str) -> String {
+            match self {
+                SignIn::Broker => broker_push(base, login).await,
+                SignIn::BuiltIn => {
+                    let answer: serde_json::Value = reqwest::Client::new()
+                        .post(format!("{base}/session"))
+                        .header("origin", base)
+                        .json(&serde_json::json!({ "broker_token": login }))
+                        .send()
+                        .await
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    answer["token"].as_str().expect("a web token").to_string()
+                }
+            }
+        }
+    }
+
+    /// The separate broker's push for `login`, as it makes at a sign-in and
+    /// at each refresh: the web token the route answers with.
+    async fn broker_push(base: &str, login: &str) -> String {
+        let body = serde_json::json!({ "did": DID, "handle": "alice.test", "broker_token": login });
+        let (sig, ts) = freeq_auth_broker::sign_body(BROKER_SECRET, &body).unwrap();
+        let answer: serde_json::Value = reqwest::Client::new()
+            .post(format!("{base}/auth/broker/web-token"))
+            .header("x-broker-signature", sig)
+            .header("x-broker-timestamp", ts)
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(&body).unwrap())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        answer["token"].as_str().expect("a web token").to_string()
+    }
+
+    /// A PDS token endpoint that answers the code exchange and the refresh.
+    async fn stub_token_endpoint() -> String {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(|body: axum::body::Bytes| async move {
+                let form: std::collections::HashMap<String, String> =
+                    serde_urlencoded::from_bytes(&body).unwrap();
+                match form.get("grant_type").map(String::as_str) {
+                    Some("authorization_code") => axum::Json(serde_json::json!({
+                        "access_token": "ACCESS-1",
+                        "refresh_token": "REFRESH-1",
+                        "scope": "atproto",
+                        "sub": DID,
+                    }))
+                    .into_response(),
+                    Some("refresh_token") => axum::Json(serde_json::json!({
+                        "access_token": "ACCESS-2",
+                        "refresh_token": "REFRESH-2",
+                        "scope": "atproto",
+                    }))
+                    .into_response(),
+                    _ => axum::http::StatusCode::BAD_REQUEST.into_response(),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/token")
+    }
+
+    /// The real web routes for `state` on a loopback port; their base URL.
+    async fn serve_web(state: &Arc<SharedState>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = crate::web::router(state.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// What the records route serves for the account's device keys: how
+    /// many records, and whether the copy is marked stale.
+    async fn served_device_keys(base: &str) -> (usize, bool) {
+        let body: serde_json::Value = reqwest::get(format!(
+            "{base}/api/v1/records/{DID}/{}",
+            freeq_sdk::identity_records::DEVICE_KEY_TYPE
+        ))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        (
+            body["records"].as_array().map_or(0, Vec::len),
+            body["stale"].as_bool().expect("a listing"),
+        )
+    }
+
+    /// The listing the account's device keys had before a sign-out, kept
+    /// as any earlier read of them keeps it.
+    async fn keep_a_listing(state: &Arc<SharedState>) {
+        state
+            .key_lookup
+            .reader()
+            .list_record_entries(DID, freeq_sdk::identity_records::DEVICE_KEY_TYPE, None)
+            .await
+            .unwrap();
+    }
+
+    /// A sign-out lands at the PDS after the server kept a listing; then the
+    /// device signs in afresh. The records route serves the sign-out.
+    async fn a_fresh_sign_in_lists_the_device_keys_again(setup: SignIn) {
+        let records = Arc::new(parking_lot::Mutex::new(vec![record_for(80)]));
+        let (resolver, listings, _) =
+            crate::peer_keys::stub_pds_counting(DID, records.clone()).await;
+        let state = setup.state(resolver);
+        let base = serve_web(&state).await;
+        keep_a_listing(&state).await;
+        records.lock().push(retirement_by(80, 80));
+
+        let (_, web_token) = setup.sign_in(&state, &base).await;
+        let _client = Client::registered_with(&state, &web_token).await;
+
+        assert_eq!(
+            served_device_keys(&base).await,
+            (2, false),
+            "the copy holds the sign-out"
+        );
+        assert_eq!(count(&listings), 2, "listed again at the login");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_sign_in_through_the_broker_lists_the_device_keys_again() {
+        a_fresh_sign_in_lists_the_device_keys_again(SignIn::Broker).await;
+    }
+
+    #[tokio::test]
+    async fn a_fresh_built_in_sign_in_lists_the_device_keys_again() {
+        a_fresh_sign_in_lists_the_device_keys_again(SignIn::BuiltIn).await;
+    }
+
+    /// A web token that names no login, as an older broker's push makes,
+    /// cannot be matched to a key registered here, so its sign-in reads the
+    /// account's device keys again too.
+    #[tokio::test]
+    async fn a_sign_in_that_names_no_login_lists_the_device_keys_again() {
+        let records = Arc::new(parking_lot::Mutex::new(vec![record_for(84)]));
+        let (resolver, listings, _) =
+            crate::peer_keys::stub_pds_counting(DID, records.clone()).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            resolver,
+        );
+        let base = serve_web(&state).await;
+        keep_a_listing(&state).await;
+        records.lock().push(retirement_by(84, 84));
+
+        let _client = Client::signed_in_as(&state, DID, "alice", "WT-NO-LOGIN").await;
+
+        assert_eq!(
+            served_device_keys(&base).await,
+            (2, false),
+            "the copy holds the sign-out"
+        );
+        assert_eq!(count(&listings), 2, "listed again at the login");
+    }
+
+    #[tokio::test]
+    async fn the_login_answers_903_only_once_the_listing_is_in() {
+        let repo = Arc::new(parking_lot::Mutex::new(
+            freeq_sdk::test_support::StubRepo::new(DID),
+        ));
+        repo.lock().add(
+            freeq_sdk::identity_records::DEVICE_KEY_TYPE,
+            &record_for(83),
+        );
+        let pds = crate::peer_keys::stub_pds_repos(vec![repo]).await;
+        let state = SignIn::Broker.state(pds.resolver.clone());
+        let base = serve_web(&state).await;
+        let (_, web_token) = SignIn::Broker.sign_in(&state, &base).await;
+
+        pds.hold.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut client = Client::authenticating(&state, "alice", &web_token).await;
+        wait_for_count(&pds.arrivals, 1).await;
+        assert_eq!(count(&pds.arrivals), 1, "the login lists the account");
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            client.rx(|l| l.split_whitespace().nth(1) == Some("903")),
+        )
+        .await;
+        assert!(early.is_err(), "no 903 while the listing is out: {early:?}");
+        pds.hold.store(false, std::sync::atomic::Ordering::SeqCst);
+        client
+            .rx(|l| l.split_whitespace().nth(1) == Some("903"))
+            .await
+            .expect("903 once the listing is in");
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_of_a_login_that_registered_a_key_here_lists_nothing_at_the_login() {
+        for setup in SignIn::BOTH {
+            let records = Arc::new(parking_lot::Mutex::new(vec![record_for(81)]));
+            let (resolver, listings, _) =
+                crate::peer_keys::stub_pds_counting(DID, records.clone()).await;
+            let state = setup.state(resolver);
+            let base = serve_web(&state).await;
+            let (login, web_token) = setup.sign_in(&state, &base).await;
+            let mut first = Client::registered_with(&state, &web_token).await;
+            first.tx(&msgsig_line(&signing_key(81))).await;
+            first
+                .rx(|l| l.contains("MSGSIG OK"))
+                .await
+                .expect("the key is registered");
+            // The registration's own check lists the account as well.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            first.tx("QUIT").await;
+            assert_eq!(first.rx(|_| false).await, None);
+            records.lock().push(retirement_by(81, 81));
+            let before = count(&listings);
+
+            let web_token = setup.reconnect(&base, &login).await;
+            let _again = Client::registered_with(&state, &web_token).await;
+
+            assert_eq!(
+                count(&listings),
+                before,
+                "{setup:?}: no listing at the login"
+            );
+            assert_eq!(
+                served_device_keys(&base).await,
+                (1, false),
+                "{setup:?}: the copy is the registration's"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_sign_in_with_the_pds_unreadable_signs_in_and_the_kept_copy_is_served() {
+        for setup in SignIn::BOTH {
+            // A port nothing is listening on: bind it, learn the number, drop it.
+            let dead = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let repo_key =
+                freeq_sdk::crypto::PrivateKey::generate_secp256k1().public_key_multibase();
+            let doc = freeq_sdk::did::make_test_did_document_with_pds(
+                DID,
+                &repo_key,
+                Some(&format!("http://127.0.0.1:{dead}")),
+            );
+            let state = setup.state(freeq_sdk::did::DidResolver::static_map(
+                std::collections::HashMap::from([(DID.to_string(), doc)]),
+            ));
+            let base = serve_web(&state).await;
+            state.record_cache.keep_listing(
+                DID,
+                freeq_sdk::identity_records::DEVICE_KEY_TYPE,
+                &repo_key,
+                &[freeq_sdk::identity_records::RecordEntry {
+                    uri: format!("at://{DID}/at.freeq.deviceKey/rk1"),
+                    cid: String::new(),
+                    value: record_for(82),
+                }],
+            );
+
+            let (_, web_token) = setup.sign_in(&state, &base).await;
+            let _client = Client::registered_with(&state, &web_token).await;
+
+            assert_eq!(
+                served_device_keys(&base).await,
+                (1, false),
+                "{setup:?}: the kept copy, not marked stale"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_sign_in_whose_did_document_never_answers_signs_in_within_the_bound() {
+        for setup in SignIn::BOTH {
+            let repo_key =
+                freeq_sdk::crypto::PrivateKey::generate_secp256k1().public_key_multibase();
+            let doc = freeq_sdk::did::make_test_did_document_with_pds(
+                DID,
+                &repo_key,
+                Some("http://127.0.0.1:9"),
+            );
+            // The account's DID document is answered an hour after it is asked for.
+            let (resolver, _) = freeq_sdk::did::DidResolver::static_map_counting_after(
+                std::collections::HashMap::from([(DID.to_string(), doc)]),
+                std::time::Duration::from_secs(3600),
+            );
+            let state = setup.state(resolver);
+            let base = serve_web(&state).await;
+            state.record_cache.keep_listing(
+                DID,
+                freeq_sdk::identity_records::DEVICE_KEY_TYPE,
+                &repo_key,
+                &[freeq_sdk::identity_records::RecordEntry {
+                    uri: format!("at://{DID}/at.freeq.deviceKey/rk1"),
+                    cid: String::new(),
+                    value: record_for(84),
+                }],
+            );
+            let (_, web_token) = setup.sign_in(&state, &base).await;
+
+            let bound = crate::peer_keys::FETCH_TIMEOUT;
+            let started = std::time::Instant::now();
+            let mut client = Client::authenticating(&state, "alice", &web_token).await;
+            // `rx` waits five seconds at most, so start it a second before the bound.
+            tokio::time::sleep(bound - std::time::Duration::from_secs(1)).await;
+            client
+                .rx(|l| l.split_whitespace().nth(1) == Some("903"))
+                .await
+                .expect("903");
+            let waited = started.elapsed();
+            assert!(
+                waited < bound + std::time::Duration::from_secs(2),
+                "{setup:?}: the sign-in waited {waited:?}"
+            );
+            client.tx("CAP END").await;
+            client
+                .rx(|l| l.split_whitespace().nth(1) == Some("001"))
+                .await
+                .expect("001");
+
+            assert_eq!(
+                served_device_keys(&base).await,
+                (1, false),
+                "{setup:?}: the kept copy, not marked stale"
+            );
+        }
+    }
+
     // ── expired keys ─────────────────────────────────────────────────
 
     const EXPIRED_WORDS: &str = "This device's signing key has expired. Sign in again to continue.";
@@ -4832,11 +5527,17 @@ mod retired_key_tests {
 
     /// The FAIL, then the close, and no `MSGSIG OK` among `lines`.
     fn refused_as_expired(lines: &[String]) {
+        refused_as(lines, "KEY_EXPIRED", EXPIRED_WORDS);
+    }
+
+    /// `FAIL MSGSIG <code>` with `words`, then the close, and no `MSGSIG OK`
+    /// among `lines`.
+    fn refused_as(lines: &[String], code: &str, words: &str) {
         let fail = lines
             .iter()
-            .position(|l| l.contains("FAIL MSGSIG KEY_EXPIRED"))
-            .unwrap_or_else(|| panic!("no KEY_EXPIRED FAIL in {lines:?}"));
-        assert!(lines[fail].contains(EXPIRED_WORDS), "{}", lines[fail]);
+            .position(|l| l.contains(&format!("FAIL MSGSIG {code}")))
+            .unwrap_or_else(|| panic!("no {code} FAIL in {lines:?}"));
+        assert!(lines[fail].contains(words), "{}", lines[fail]);
         let error = lines
             .iter()
             .position(|l| l.starts_with("ERROR"))
@@ -5074,6 +5775,374 @@ mod retired_key_tests {
             .unwrap();
         assert_eq!(row.removed_at, None);
     }
+
+    /// A fresh state, and alice signed in with `broker_token` and `key`
+    /// registered.
+    async fn keyed_alice(
+        key: &ed25519_dalek::SigningKey,
+        broker_token: &str,
+    ) -> (Arc<SharedState>, Client) {
+        let resolver = crate::peer_keys::stub_pds_resolver(DID, vec![]).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            resolver,
+        );
+        let mut alice = Client::signed_in(&state, broker_token).await;
+        alice.tx(&msgsig_line(key)).await;
+        alice
+            .rx(|l| l.contains("MSGSIG OK"))
+            .await
+            .expect("the key is registered");
+        (state, alice)
+    }
+
+    /// Alice joins `#guard`, then a watcher does; returns the watcher.
+    async fn watcher_beside(state: &Arc<SharedState>, alice: &mut Client) -> Client {
+        alice.tx("JOIN #guard").await;
+        alice
+            .rx(|l| l.split_whitespace().nth(1) == Some("366"))
+            .await
+            .expect("alice joins");
+        let mut watcher =
+            Client::signed_in_as(state, "did:plc:guardwatcher", "watcher", "WT-GUARD-WATCHER")
+                .await;
+        watcher.tx("JOIN #guard").await;
+        watcher
+            .rx(|l| l.split_whitespace().nth(1) == Some("366"))
+            .await
+            .expect("the watcher joins");
+        watcher
+    }
+
+    /// Every line the watcher received up to the answer to its own PING. A
+    /// line relayed from a session that has already closed was queued to the
+    /// watcher before that answer.
+    async fn watcher_lines(watcher: &mut Client) -> Vec<String> {
+        watcher.tx("PING :guard-marker").await;
+        let lines = std::sync::Mutex::new(Vec::new());
+        watcher
+            .rx(|l| {
+                lines.lock().unwrap().push(l.to_string());
+                l.contains("PONG") && l.contains("guard-marker")
+            })
+            .await
+            .expect("the PING is answered");
+        lines.into_inner().unwrap()
+    }
+
+    /// Whether any of `lines` is a message line from alice.
+    fn relayed_from_alice(lines: &[String]) -> bool {
+        lines.iter().any(|l| {
+            l.contains("alice!")
+                && [" PRIVMSG ", " NOTICE ", " TAGMSG ", " BATCH "]
+                    .iter()
+                    .any(|c| l.contains(c))
+        })
+    }
+
+    #[tokio::test]
+    async fn a_line_after_the_key_expires_is_refused_with_the_line_behind_it() {
+        // A single run catches `continue` in place of `break` about half the
+        // time, so run on twenty fresh states.
+        let mut relayed = 0;
+        for run in 0..20 {
+            let key = signing_key(67);
+            let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+            let (state, mut alice) = keyed_alice(&key, "BT-GUARD-LINE").await;
+            let mut watcher = watcher_beside(&state, &mut alice).await;
+
+            state.with_db(|db| db.set_signing_key_expiry(DID, &kid, Some(now() - 1)));
+            alice.tx("PRIVMSG #guard :one\r\nPRIVMSG #guard :two").await;
+            refused_as_expired(&alice.rest().await);
+            if relayed_from_alice(&watcher_lines(&mut watcher).await) {
+                relayed += 1;
+            }
+            assert!(
+                state
+                    .revoked_token_hashes
+                    .lock()
+                    .contains(&freeq_auth_broker::token_hash("BT-GUARD-LINE")),
+                "run {run}"
+            );
+            let row = state
+                .with_db(|db| db.get_signing_key_row(DID, &kid))
+                .flatten()
+                .unwrap();
+            assert_eq!(row.removed_at, None, "run {run}");
+        }
+        assert_eq!(relayed, 0, "runs that relayed a line: {relayed}/20");
+    }
+
+    #[tokio::test]
+    async fn a_multiline_batch_closed_after_the_key_expires_is_refused() {
+        let key = signing_key(68);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let (state, mut alice) = keyed_alice(&key, "BT-GUARD-BATCH").await;
+        alice.tx("CAP REQ :batch draft/multiline").await;
+        alice
+            .rx(|l| l.contains("ACK"))
+            .await
+            .expect("multiline acked");
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        alice.tx("BATCH +ml draft/multiline #guard").await;
+        alice.tx("@batch=ml PRIVMSG #guard :one").await;
+        alice.tx("@batch=ml PRIVMSG #guard :two").await;
+        alice.tx("PING :taken").await;
+        alice
+            .rx(|l| l.contains("PONG") && l.contains("taken"))
+            .await
+            .expect("the batch lines were taken");
+        state.with_db(|db| db.set_signing_key_expiry(DID, &kid, Some(now() - 1)));
+        alice.tx("BATCH -ml").await;
+        refused_as_expired(&alice.rest().await);
+        let lines = watcher_lines(&mut watcher).await;
+        assert!(!relayed_from_alice(&lines), "{lines:?}");
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-GUARD-BATCH"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tagmsg_after_the_key_expires_is_refused() {
+        let key = signing_key(69);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let (state, mut alice) = keyed_alice(&key, "BT-GUARD-TAGMSG").await;
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        state.with_db(|db| db.set_signing_key_expiry(DID, &kid, Some(now() - 1)));
+        alice
+            .tx("@+typing=active;+freeq.at/sig=ed25519:k:s TAGMSG #guard")
+            .await;
+        refused_as_expired(&alice.rest().await);
+        let lines = watcher_lines(&mut watcher).await;
+        assert!(!relayed_from_alice(&lines), "{lines:?}");
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-GUARD-TAGMSG"))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_tagmsg_after_the_key_expires_is_relayed_and_the_next_line_refused() {
+        let key = signing_key(72);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let (state, mut alice) = keyed_alice(&key, "BT-GUARD-UNSIGNED").await;
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        state.with_db(|db| db.set_signing_key_expiry(DID, &kid, Some(now() - 1)));
+        alice.tx("@+typing=active TAGMSG #guard").await;
+        watcher
+            .rx(|l| l.contains("alice!") && l.contains(" TAGMSG #guard") && l.contains("+typing"))
+            .await
+            .expect("the typing notice is relayed");
+        assert!(still_answers(&mut alice).await);
+
+        alice.tx("PRIVMSG #guard :hello").await;
+        refused_as_expired(&alice.rest().await);
+        let lines = watcher_lines(&mut watcher).await;
+        assert!(!relayed_from_alice(&lines), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn a_tagmsg_signed_under_the_bare_tag_after_the_key_expires_is_refused() {
+        let key = signing_key(73);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let (state, mut alice) = keyed_alice(&key, "BT-GUARD-BARE-SIG").await;
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        state.with_db(|db| db.set_signing_key_expiry(DID, &kid, Some(now() - 1)));
+        alice
+            .tx("@+typing=active;freeq.at/sig=ed25519:k:s TAGMSG #guard")
+            .await;
+        refused_as_expired(&alice.rest().await);
+        let lines = watcher_lines(&mut watcher).await;
+        assert!(!relayed_from_alice(&lines), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn a_notice_after_the_key_expires_is_refused() {
+        let key = signing_key(74);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let (state, mut alice) = keyed_alice(&key, "BT-GUARD-NOTICE").await;
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        state.with_db(|db| db.set_signing_key_expiry(DID, &kid, Some(now() - 1)));
+        alice.tx("NOTICE #guard :hello").await;
+        refused_as_expired(&alice.rest().await);
+        let lines = watcher_lines(&mut watcher).await;
+        assert!(!relayed_from_alice(&lines), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn a_line_under_a_live_key_is_delivered() {
+        let (state, mut alice) = keyed_alice(&signing_key(70), "BT-GUARD-LIVE").await;
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        alice.tx("PRIVMSG #guard :hello").await;
+        watcher
+            .rx(|l| l.contains("PRIVMSG #guard") && l.ends_with("hello"))
+            .await
+            .expect("the line is delivered");
+        assert!(still_answers(&mut alice).await);
+    }
+
+    #[tokio::test]
+    async fn a_session_that_never_registered_a_key_is_not_checked() {
+        let (state, _) = state_holding_an_expired_row(&signing_key(71)).await;
+        let mut alice = Client::signed_in(&state, "BT-GUARD-NO-KEY").await;
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        alice.tx("PRIVMSG #guard :hello").await;
+        watcher
+            .rx(|l| l.contains("PRIVMSG #guard") && l.ends_with("hello"))
+            .await
+            .expect("the line is delivered");
+        assert!(still_answers(&mut alice).await);
+    }
+
+    // ── keys whose row is marked retired while connected ─────────────
+
+    const RETIRED_WORDS: &str =
+        "This device was signed out from another device. Sign in again to continue.";
+
+    /// Mark `key`'s row retired, as the sign-out route or the records check
+    /// of another connection of the same key does. Dated five minutes ahead
+    /// of the clock, as the records check may stamp it: a sign-out counts
+    /// whatever its date.
+    fn mark_retired(state: &Arc<SharedState>, key: &ed25519_dalek::SigningKey) {
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        assert_eq!(
+            state.with_db(|db| db.retire_signing_key(DID, &kid, now() + 300)),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_after_the_key_row_is_marked_retired_is_refused_and_closed() {
+        let key = signing_key(75);
+        let (state, mut alice) = keyed_alice(&key, "BT-GUARD-RETIRED").await;
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        mark_retired(&state, &key);
+        alice.tx("PRIVMSG #guard :one\r\nPRIVMSG #guard :two").await;
+        refused_as(&alice.rest().await, "KEY_RETIRED", RETIRED_WORDS);
+        let lines = watcher_lines(&mut watcher).await;
+        assert!(!relayed_from_alice(&lines), "{lines:?}");
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-GUARD-RETIRED"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sweeper_closes_a_session_whose_key_row_is_marked_retired_once() {
+        let key = signing_key(76);
+        let (state, mut alice) = keyed_alice(&key, "BT-SWEPT-RETIRED").await;
+        assert_eq!(crate::key_expiry::sweep(&state).await, 0, "a live key");
+
+        mark_retired(&state, &key);
+        assert_eq!(crate::key_expiry::sweep(&state).await, 1);
+        assert_eq!(crate::key_expiry::sweep(&state).await, 0, "refused once");
+        refused_as(&alice.rest().await, "KEY_RETIRED", RETIRED_WORDS);
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-SWEPT-RETIRED"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sign_out_route_refuses_a_connected_device_of_the_key_once() {
+        let key = signing_key(78);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let (state, mut alice) = keyed_alice(&key, "BT-ROUTE-SIGNED-OUT").await;
+        let device = state
+            .session_msg_keys
+            .lock()
+            .keys()
+            .next()
+            .cloned()
+            .expect("alice's session");
+        // Another session of the account presses Sign out. Its sign-in sends
+        // alice a liveness probe, which she answers here.
+        let _other = Client::signed_in_as(&state, DID, "alice2", "WT-ROUTE-OTHER").await;
+        assert!(still_answers(&mut alice).await);
+        let bearer = state
+            .session_dids
+            .lock()
+            .keys()
+            .find(|sid| **sid != device)
+            .cloned()
+            .expect("the other session");
+        let base = serve_web(&state).await;
+
+        let answer: serde_json::Value = reqwest::Client::new()
+            .post(format!("{base}/api/v1/devices/sign-out"))
+            .header("authorization", format!("Bearer {bearer}"))
+            .json(&serde_json::json!({ "kid": kid }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            answer,
+            serde_json::json!({ "ok": true, "sessions_closed": 1, "tokens_revoked": 1 })
+        );
+        assert!(
+            !state.session_msg_keys.lock().contains_key(&device),
+            "the device's key is dropped by the time the route answers"
+        );
+        assert_eq!(crate::key_expiry::sweep(&state).await, 0, "refused once");
+        let lines = alice.rest().await;
+        refused_as(&lines, "KEY_RETIRED", RETIRED_WORDS);
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("FAIL MSGSIG")).count(),
+            1,
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("ERROR")).count(),
+            1,
+            "{lines:?}"
+        );
+        assert!(
+            state
+                .revoked_token_hashes
+                .lock()
+                .contains(&freeq_auth_broker::token_hash("BT-ROUTE-SIGNED-OUT"))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_tagmsg_under_a_retired_row_is_relayed_and_the_next_line_refused() {
+        let key = signing_key(77);
+        let (state, mut alice) = keyed_alice(&key, "BT-GUARD-RETIRED-UNSIGNED").await;
+        let mut watcher = watcher_beside(&state, &mut alice).await;
+
+        mark_retired(&state, &key);
+        alice.tx("@+typing=active TAGMSG #guard").await;
+        watcher
+            .rx(|l| l.contains("alice!") && l.contains(" TAGMSG #guard") && l.contains("+typing"))
+            .await
+            .expect("the typing notice is relayed");
+        assert!(still_answers(&mut alice).await);
+
+        alice.tx("PRIVMSG #guard :hello").await;
+        refused_as(&alice.rest().await, "KEY_RETIRED", RETIRED_WORDS);
+        let lines = watcher_lines(&mut watcher).await;
+        assert!(!relayed_from_alice(&lines), "{lines:?}");
+    }
 }
 
 #[cfg(test)]
@@ -5089,9 +6158,10 @@ mod agent_record_tests {
     use freeq_sdk::test_support::StubRepo;
     use std::sync::atomic::Ordering;
 
-    const OWNER: &str = "did:plc:agentowner";
+    const OWNER: &str = "did:plc:agentownerq2w3e4r5t6y7u8";
     const BOT: &str = "did:plc:agentbot";
     const OTHER_BOT: &str = "did:plc:otherbot";
+    const STRANGER: &str = "did:plc:stranger";
 
     /// `hours` before one instant fixed for the test run.
     fn hours_ago(hours: i64) -> String {
@@ -5844,5 +6914,467 @@ mod agent_record_tests {
             .unwrap();
         assert_eq!(stored["type"], "SomethingElse/v1");
         assert_eq!(stored["_verified"], false);
+    }
+
+    /// One ATPROTO-CHALLENGE exchange on an open connection, as `key`,
+    /// naming `owner` if any; the 903 or 904 line.
+    async fn sasl_exchange(
+        c: &mut Client,
+        key: &freeq_sdk::crypto::PrivateKey,
+        owner: Option<&str>,
+    ) -> String {
+        use base64::Engine;
+        let did = format!("did:key:{}", key.public_key_multibase());
+        c.tx("AUTHENTICATE ATPROTO-CHALLENGE").await;
+        let challenge = c
+            .rx(|l| l.starts_with("AUTHENTICATE "))
+            .await
+            .expect("challenge");
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(challenge.trim_start_matches("AUTHENTICATE "))
+            .unwrap();
+        let nonce: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // The fields the SDKs send, so the response is as long as theirs.
+        let mut payload = serde_json::json!({
+            "did": did,
+            "method": "crypto",
+            "signature": key.sign_base64url(&bytes),
+            "pds_url": "",
+            "challenge_nonce": nonce["nonce"],
+        });
+        if let Some(owner) = owner {
+            payload["owner_did"] = serde_json::Value::String(owner.to_string());
+        }
+        let encoded =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        // Split as the SDKs do; a response naming an owner can be greater than a single chunk.
+        for line in freeq_sdk::auth::sasl_response_lines(&encoded) {
+            c.tx(&line).await;
+        }
+        c.rx(|l| matches!(l.split_whitespace().nth(1), Some("903") | Some("904")))
+            .await
+            .expect("a SASL verdict")
+    }
+
+    /// The SASL exchange a did:key agent makes, naming `owner`; the 903 or
+    /// 904 line.
+    async fn sasl_as_agent(
+        state: &Arc<SharedState>,
+        key: &freeq_sdk::crypto::PrivateKey,
+        nick: &str,
+        owner: &str,
+    ) -> (Client, String) {
+        let mut c = Client::open(state).await;
+        c.tx("CAP LS 302").await;
+        c.tx(&format!("NICK {nick}")).await;
+        c.tx(&format!("USER {nick} 0 * :test")).await;
+        c.tx("CAP REQ :sasl").await;
+        c.rx(|l| l.contains("ACK")).await.expect("CAP ACK");
+        let verdict = sasl_exchange(&mut c, key, Some(owner)).await;
+        (c, verdict)
+    }
+
+    /// Finish registration after a 903.
+    async fn register(c: &mut Client) {
+        c.tx("CAP END").await;
+        c.rx(|l| l.split_whitespace().nth(1) == Some("001"))
+            .await
+            .expect("registered");
+    }
+
+    /// An instance that refuses guests and allows OWNER and `also`, with
+    /// delegated agents admitted.
+    async fn gated_with(
+        repo: &Arc<parking_lot::Mutex<StubRepo>>,
+        also: &[&str],
+    ) -> Arc<SharedState> {
+        let pds = crate::peer_keys::stub_pds_repos(vec![repo.clone()]).await;
+        let mut allowed = vec![OWNER.to_string()];
+        allowed.extend(also.iter().map(|d| d.to_string()));
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig {
+                allowed_dids: allowed,
+                no_guest: true,
+                allow_delegated_agents: true,
+                ..Default::default()
+            },
+            pds.resolver.clone(),
+        );
+        reuse_for(&state, 0);
+        state
+    }
+
+    async fn gated(repo: &Arc<parking_lot::Mutex<StubRepo>>) -> Arc<SharedState> {
+        gated_with(repo, &[]).await
+    }
+
+    /// Mark the connection of `agent_did` as admitted on `owner`'s record.
+    fn admitted_under(state: &SharedState, owner: &str, agent_did: &str) {
+        let session = state
+            .did_sessions
+            .lock()
+            .get(agent_did)
+            .and_then(|s| s.iter().next().cloned())
+            .expect("the agent is connected");
+        let key = (owner.to_string(), agent_did.to_string());
+        state.agent_links.lock().insert(
+            key.clone(),
+            (std::time::Instant::now(), "at://old".to_string()),
+        );
+        state.delegated_sessions.lock().insert(session, key);
+    }
+
+    #[tokio::test]
+    async fn an_agent_the_owners_record_names_connects_through_the_allowlist_until_the_record_goes()
+    {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[63; 32]).unwrap();
+        let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
+        let state = gated(&repo).await;
+
+        let (mut agent, verdict) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(
+            verdict.contains(" 903 "),
+            "admitted on the record: {verdict}"
+        );
+        register(&mut agent).await;
+
+        repo.lock().add(AGENT_KEY_TYPE, &removal(&agent_did, 1));
+        recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        let closing = agent.rest().await;
+        assert!(
+            closing
+                .iter()
+                .any(|l| l.starts_with("ERROR :Delegation withdrawn")),
+            "the connection is closed with the reason: {closing:?}"
+        );
+        assert!(state.delegated_sessions.lock().is_empty());
+    }
+
+    /// The record goes and the agent's own PROVENANCE is what reads the
+    /// owner's records next, hours before the re-check would.
+    #[tokio::test]
+    async fn a_delegated_connection_is_closed_when_its_own_provenance_finds_the_record_gone() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[65; 32]).unwrap();
+        let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
+        let state = gated(&repo).await;
+
+        let (mut agent, verdict) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(verdict.contains(" 903 "), "{verdict}");
+        register(&mut agent).await;
+
+        repo.lock().add(AGENT_KEY_TYPE, &removal(&agent_did, 1));
+        agent.tx(&provenance_line(&unsigned_cert(&agent_did))).await;
+        let closing = agent.rest().await;
+        assert!(
+            closing
+                .iter()
+                .any(|l| l.starts_with("ERROR :Delegation withdrawn")),
+            "{closing:?}"
+        );
+    }
+
+    /// Withdrawal is per record: the owner's other agent stays.
+    #[tokio::test]
+    async fn withdrawing_one_agent_leaves_the_owners_other_agent_connected() {
+        let first_key = PrivateKey::ed25519_from_bytes(&[66; 32]).unwrap();
+        let second_key = PrivateKey::ed25519_from_bytes(&[67; 32]).unwrap();
+        let first = format!("did:key:{}", first_key.public_key_multibase());
+        let second = format!("did:key:{}", second_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&first, 24));
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&second, 24));
+        let state = gated(&repo).await;
+
+        let (mut a, v) = sasl_as_agent(&state, &first_key, "one", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        register(&mut a).await;
+        let (mut b, v) = sasl_as_agent(&state, &second_key, "two", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        register(&mut b).await;
+
+        repo.lock().add(AGENT_KEY_TYPE, &removal(&first, 1));
+        recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        assert!(
+            a.rest()
+                .await
+                .iter()
+                .any(|l| l.starts_with("ERROR :Delegation withdrawn"))
+        );
+        assert!(still_served(&mut b).await, "the sibling is still served");
+        assert_eq!(state.delegated_sessions.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_reauthenticates_on_its_own_standing_is_not_withdrawn() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[68; 32]).unwrap();
+        let own_key = PrivateKey::ed25519_from_bytes(&[69; 32]).unwrap();
+        let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
+        let own_did = format!("did:key:{}", own_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
+        let state = gated_with(&repo, &[&own_did]).await;
+
+        let (mut c, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        let v = sasl_exchange(&mut c, &own_key, None).await;
+        assert!(v.contains(" 903 "), "{v}");
+        register(&mut c).await;
+        assert!(state.delegated_sessions.lock().is_empty());
+
+        repo.lock().add(AGENT_KEY_TYPE, &removal(&agent_did, 1));
+        recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        assert!(still_served(&mut c).await, "still served");
+    }
+
+    #[tokio::test]
+    async fn a_delegated_connection_is_closed_when_its_owner_is_no_longer_allowed() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[70; 32]).unwrap();
+        let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
+        let state = gated(&repo).await;
+        let (mut agent, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        register(&mut agent).await;
+
+        admitted_under(&state, STRANGER, &agent_did);
+        recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        let closing = agent.rest().await;
+        assert!(
+            closing
+                .iter()
+                .any(|l| l.starts_with("ERROR :Delegation withdrawn")),
+            "{closing:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_agent_cannot_register_as_a_guest() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[71; 32]).unwrap();
+        let repo = owner_repo();
+        let state = gated(&repo).await;
+        let (mut agent, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(v.contains(" 904 "), "{v}");
+        agent.tx("CAP END").await;
+        let answer = agent
+            .rx(|l| l.starts_with("ERROR :") || l.split_whitespace().nth(1) == Some("001"))
+            .await
+            .expect("an answer to registration");
+        assert!(answer.contains("requires authentication"), "{answer}");
+    }
+
+    /// harness-kit reads this exact text to point the owner at /freeq
+    /// authorize, so it is pinned to the shared vector.
+    #[tokio::test]
+    async fn an_agent_the_owners_records_do_not_name_is_refused_with_the_shared_text() {
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../../../spec/sasl-refusals.json")).unwrap();
+        let expected = vector["delegated_refusal"]["text"]
+            .as_str()
+            .unwrap()
+            .replace("{owner}", OWNER);
+        let agent_key = PrivateKey::ed25519_from_bytes(&[64; 32]).unwrap();
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(OTHER_BOT, 24));
+        let state = gated(&repo).await;
+        let (_agent, verdict) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(verdict.contains(" 904 "), "{verdict}");
+        assert!(verdict.ends_with(&format!(":{expected}")), "{verdict}");
+    }
+
+    /// An instance like `gated`, allowing `domains` too, and its stub PDS.
+    async fn gated_serving(
+        repo: &Arc<parking_lot::Mutex<StubRepo>>,
+        domains: &[&str],
+    ) -> (Arc<SharedState>, crate::peer_keys::StubPds) {
+        let pds = crate::peer_keys::stub_pds_repos(vec![repo.clone()]).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig {
+                allowed_dids: vec![OWNER.to_string()],
+                allowed_did_domains: domains.iter().map(|d| d.to_string()).collect(),
+                no_guest: true,
+                allow_delegated_agents: true,
+                ..Default::default()
+            },
+            pds.resolver.clone(),
+        );
+        reuse_for(&state, 0);
+        (state, pds)
+    }
+
+    /// Whether the server still answers `c` and has not closed it. A
+    /// closing connection can still answer one last PING, but its ERROR line
+    /// always arrives first.
+    async fn still_served(c: &mut Client) -> bool {
+        c.tx("PING keep").await;
+        c.rx(|l| l.contains("PONG") || l.starts_with("ERROR "))
+            .await
+            .is_some_and(|l| l.contains("PONG"))
+    }
+
+    /// A lookup that fails says nothing about the owner, so it closes no one.
+    #[tokio::test]
+    async fn a_recheck_whose_owner_lookup_fails_keeps_the_agent() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[73; 32]).unwrap();
+        let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
+        let (state, _pds) = gated_serving(&repo, &["nowhere.example"]).await;
+        let (mut agent, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        register(&mut agent).await;
+
+        // An owner whose DID document cannot be fetched.
+        admitted_under(&state, "did:plc:unresolvable", &agent_did);
+        recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        assert!(still_served(&mut agent).await);
+    }
+
+    /// An instance like `gated_serving` whose re-read period is one second,
+    /// so records unreadable for three seconds close the agent.
+    async fn gated_with_short_period(
+        repo: &Arc<parking_lot::Mutex<StubRepo>>,
+    ) -> (Arc<SharedState>, crate::peer_keys::StubPds) {
+        let pds = crate::peer_keys::stub_pds_repos(vec![repo.clone()]).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig {
+                allowed_dids: vec![OWNER.to_string()],
+                no_guest: true,
+                allow_delegated_agents: true,
+                record_cache_secs: 1,
+                ..Default::default()
+            },
+            pds.resolver.clone(),
+        );
+        reuse_for(&state, 0);
+        (state, pds)
+    }
+
+    /// The re-check retries every minute, so a short outage must not add up
+    /// to a close; only records unreadable for three periods do.
+    #[tokio::test]
+    async fn records_unreadable_for_three_periods_close_the_agent() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[74; 32]).unwrap();
+        let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
+        let (state, pds) = gated_with_short_period(&repo).await;
+        let (mut agent, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        register(&mut agent).await;
+
+        pds.fail.store(true, Ordering::SeqCst);
+        for _ in 0..3 {
+            recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        }
+        assert!(
+            still_served(&mut agent).await,
+            "three quick failures are not three periods"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(3100)).await;
+        recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        let closing = agent.rest().await;
+        assert!(
+            closing
+                .iter()
+                .any(|l| l.starts_with("ERROR :Delegation unverifiable")),
+            "{closing:?}"
+        );
+    }
+
+    /// The outage an agent already survived does not count against the
+    /// next connection: admission's own read starts the clock over.
+    #[tokio::test]
+    async fn an_admission_clears_an_earlier_outage() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[76; 32]).unwrap();
+        let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
+        let (state, pds) = gated_with_short_period(&repo).await;
+        let (mut first, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        register(&mut first).await;
+        pds.fail.store(true, Ordering::SeqCst);
+        recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        assert!(state.owner_read_failures.lock().contains_key(OWNER));
+
+        pds.fail.store(false, Ordering::SeqCst);
+        let other_key = PrivateKey::ed25519_from_bytes(&[77; 32]).unwrap();
+        let other_did = format!("did:key:{}", other_key.public_key_multibase());
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&other_did, 24));
+        let (_second, v) = sasl_as_agent(&state, &other_key, "helper2", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        assert!(!state.owner_read_failures.lock().contains_key(OWNER));
+    }
+
+    #[tokio::test]
+    async fn an_owner_with_no_agent_connected_keeps_no_outage() {
+        let repo = owner_repo();
+        let (state, pds) = gated_with_short_period(&repo).await;
+        state.agent_links.lock().insert(
+            (OWNER.to_string(), BOT.to_string()),
+            (std::time::Instant::now(), "at://old".to_string()),
+        );
+        state
+            .owner_read_failures
+            .lock()
+            .insert(OWNER.to_string(), std::time::Instant::now());
+        pds.fail.store(true, Ordering::SeqCst);
+        recheck_agent_links(&state, std::time::Duration::ZERO).await;
+        assert!(state.owner_read_failures.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_good_read_starts_the_unreadable_clock_over() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[75; 32]).unwrap();
+        let agent_did = format!("did:key:{}", agent_key.public_key_multibase());
+        let repo = owner_repo();
+        repo.lock().add(AGENT_KEY_TYPE, &claim(&agent_did, 24));
+        let (state, pds) = gated_with_short_period(&repo).await;
+        let (mut agent, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(v.contains(" 903 "), "{v}");
+        register(&mut agent).await;
+        let recheck = || recheck_agent_links(&state, std::time::Duration::ZERO);
+        let failing = |on: bool| pds.fail.store(on, Ordering::SeqCst);
+        let two_seconds = std::time::Duration::from_secs(2);
+
+        failing(true);
+        recheck().await;
+        tokio::time::sleep(two_seconds).await;
+        failing(false);
+        recheck().await;
+        failing(true);
+        recheck().await;
+        tokio::time::sleep(two_seconds).await;
+        recheck().await;
+        assert!(
+            still_served(&mut agent).await,
+            "four seconds since the first failure, two since the good read"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_third_allowlist_refusal_closes_the_connection() {
+        let agent_key = PrivateKey::ed25519_from_bytes(&[72; 32]).unwrap();
+        let repo = owner_repo();
+        let state = gated(&repo).await;
+        let (mut agent, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        assert!(v.contains(" 904 "), "{v}");
+        for _ in 0..2 {
+            let v = sasl_exchange(&mut agent, &agent_key, Some(OWNER)).await;
+            assert!(v.contains(" 904 "), "{v}");
+        }
+        assert!(
+            agent
+                .rx(|l| l.starts_with("ERROR :Too many SASL failures"))
+                .await
+                .is_some(),
+            "the third refusal ends the connection"
+        );
     }
 }

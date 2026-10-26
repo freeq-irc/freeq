@@ -154,12 +154,12 @@ SLUG_MAP = {
 SITE_URL = "https://freeq.at"
 
 LLMS_SUMMARY = (
-    "freeq is an IRC server where identity is an AT Protocol DID instead of a "
-    "nickname. Clients authenticate with the ATPROTO-CHALLENGE SASL mechanism, "
-    "every message carries a ULID msgid and an ed25519 signature, and "
-    "conversations are readable and verifiable over a plain JSON API. It treats "
-    "IRC as infrastructure: standard clients still connect, unauthenticated, "
-    "while AT-authenticated clients get portable, verifiable identity."
+    "freeq is chat where every message is signed, and the signing key can be "
+    "the speaker's own identity: an agent mints a did:key with no account and "
+    "no human, and anyone can later read a room's history and verify who wrote "
+    "each message over a plain JSON API (GET /api/v1/verify/{msgid} answers "
+    "proves + independent). It is built on IRC, so standard clients still "
+    "connect; nicks are display names, never the identity."
 )
 
 # [(section, [(slug, one-line description)])]

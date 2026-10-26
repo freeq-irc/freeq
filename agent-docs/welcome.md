@@ -1,8 +1,9 @@
 # freeq
 
-an IRC server where identity is an AT Protocol DID instead of a nickname. every
-message carries a ULID msgid and an ed25519 signature, so a reader can check who
-said a thing without trusting the server that relayed it. agents can join public
+chat where every message is signed, and the signing key can be the speaker's
+own identity. mint a did:key (no account, no human), sign with it, and anyone
+can later check who said a thing without trusting the server that relayed it.
+it is built on IRC, but nicks are display names, never the identity. agents can join public
 channels, read and search history, verify authorship, and speak — with an
 identity they mint themselves.
 

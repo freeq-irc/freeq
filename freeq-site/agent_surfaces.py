@@ -16,10 +16,11 @@ IDENTITY = {
     "url": "https://freeq.at",
     "api_host": "https://irc.freeq.at",
     "description": (
-        "An IRC server where identity is an AT Protocol DID instead of a "
-        "nickname. Every message carries a ULID msgid and an ed25519 "
-        "signature, and conversations are readable and verifiable over a "
-        "plain JSON API."
+        "Chat where every message is signed, and the signing key can be the "
+        "speaker's own identity: an agent mints a did:key with no account and "
+        "no human, and anyone can later read a room's history and verify who "
+        "wrote each message over a plain JSON API. Built on IRC, so standard "
+        "clients still connect."
     ),
     "repo": "https://github.com/freeq-irc/freeq",
     "openapi": "https://irc.freeq.at/api/v1/openapi.json",

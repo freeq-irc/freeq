@@ -20,9 +20,11 @@ info:
   version: 0.1.0
   summary: AT Protocol-authenticated IRC server with a JSON API for agents.
   description: |
-    freeq is an IRC server where identity is an AT Protocol DID (via the
-    `ATPROTO-CHALLENGE` SASL mechanism) rather than a nickname, plus a REST
-    surface so agents can read and verify conversations without speaking IRC.
+    freeq is chat where every message is signed, and the signing key can be
+    the speaker's own identity: a DID, authenticated with the
+    `ATPROTO-CHALLENGE` SASL mechanism (a `did:key` needs no account). This
+    REST surface lets agents read a room's history and verify who wrote each
+    message (`/api/v1/verify/{msgid}`) without speaking IRC.
 
     **Errors** — every `/api/v1/*` 4xx and 5xx answers with the `Error`
     schema: `error` (reason phrase, safe to branch on), `status`, `message`
@@ -745,6 +747,9 @@ paths:
       description: |
         Re-canonicalizes the stored message, resolves the signing key (client
         session key or server key) and reports whether the signature holds.
+        `verification.proves` says what that means: `authorship` only when the
+        sender's own key signed it. A server-signed message is `valid` but
+        proves `relay`.
       parameters:
         - $ref: "#/components/parameters/MsgId"
       security: [{}]
@@ -2436,16 +2441,57 @@ components:
               expires_at: { type: [integer, "null"] }
     VerifyResult:
       type: object
+      required: [msgid, verification]
       properties:
         msgid: { type: string }
-        verified: { type: boolean }
-        signer: { type: string, description: DID or server name. }
-        signed_by:
-          type: string
-          description: '`client` (session key) or `server` (fallback).'
-        reason:
-          type: string
-          description: Why verification failed, when it did.
+        channel: { type: string }
+        from: { type: string, description: Sender nick at the time. }
+        sender_did: { type: [string, "null"], description: The DID the signed document names. }
+        text: { type: string }
+        timestamp: { type: integer, format: int64 }
+        signature:
+          type: [string, "null"]
+          description: 'The `+freeq.at/sig` tag: `ed25519:<kid>:<base64url sig>`.'
+        canonical_form: { type: [string, "null"], description: JCS of the signed document. }
+        canonical_hex: { type: [string, "null"] }
+        how_to_verify: { type: string }
+        verification:
+          type: object
+          required: [valid, verdict, verified_by, proves, independent, meaning]
+          properties:
+            proves:
+              type: string
+              enum: [authorship, relay, nothing]
+              description: |
+                What a third party may conclude — read this first. `authorship`:
+                the sender's own registered key signed it. `relay`: this server
+                signed it for the sender, so it is *not* attributable to them;
+                register a session key with MSGSIG to author-sign. `nothing`:
+                invalid or uncheckable.
+            independent:
+              type: boolean
+              description: |
+                Whether `proves` holds without trusting this server. True when
+                the signing key is the did:key itself, or one the identity
+                published (DID document, identity record). False for a session
+                key bound to the DID only by this server's MSGSIG record, and
+                for relay.
+            meaning: { type: string, description: The same, as one sentence. }
+            verdict:
+              type: string
+              enum: [valid, invalid, unverifiable]
+              description: |
+                Whether the bytes check out. `valid` is also true of a
+                server-key signature, which proves relay only — see `proves`.
+            valid: { type: boolean, description: '`verdict == "valid"`. Kept for older clients.' }
+            verified_by:
+              type: string
+              description: |
+                Which key checked it: `client-session-key`, `server-key`,
+                `key-retired`, or an `unverifiable-*` reason.
+            key_source: { type: string }
+            server_public_key: { type: string }
+            client_public_key: { type: [string, "null"] }
     Artifact:
       type: object
       properties:

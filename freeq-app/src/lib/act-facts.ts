@@ -5,7 +5,8 @@
  * The labels live in `spec/act-card-copy.json` beside the rest of the card's
  * words; the card body is the title and this one grid, so no value is ever
  * drawn without its key. A field with no label here still draws, under its own
- * key (see `unknownFields`), so nothing signed is ever invisible.
+ * key (see `unknownFields`), except `act-home` and `act-seq`, which name the
+ * task's referee and number its rulings and are not drawn at all.
  */
 import copySpec from './act-card-copy.json';
 
@@ -74,6 +75,7 @@ const KNOWN = new Set([
   'act', 'act-verb', 'act-id', 'act-title', 'act-to', 'act-note', 'act-ctx', 'act-ctx-h',
   'act-deadline', 'act-bid-deadline', 'act-caps', 'act-price', 'act-bid',
   'act-accepts', 'act-subject', 'act-pay-to', 'act-tx', 'act-replaces', 'act-scope',
+  'act-home', 'act-seq',
 ]);
 
 /** Fields the card has no label for, under their raw keys — the unknown-verb

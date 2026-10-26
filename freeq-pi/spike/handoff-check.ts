@@ -24,9 +24,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ActEventPayload } from "@freeq/sdk";
 
-import { FreeqConnection } from "../src/connection.js";
-import { collectSessionMeta } from "../src/presence.js";
-import { HandoffStore, hashBrief, describeHandoff } from "../src/handoff.js";
+import { FreeqConnection } from "@freeq/harness-kit/connection";
+import { collectSessionMeta } from "@freeq/harness-kit/presence";
+import { HandoffStore, hashBrief, describeHandoff } from "@freeq/harness-kit/handoff";
 
 const { values } = parseArgs({
   options: {
@@ -84,7 +84,7 @@ console.error(`[m4] alice online as ${alice.nick} (${alice.did})`);
 // Must match exactly where bot-kit will look when Bob later connects:
 // <root>/<slug>/<botName(slug)>/agent.key
 const { loadOrCreateIdentity } = await import("@freeq/bot-kit");
-const { botName } = await import("../src/identity.js");
+const { botName } = await import("@freeq/harness-kit/identity");
 const bobIdentity = await loadOrCreateIdentity({
   seedPath: join(root, "m4bob1", botName("m4bob1"), "agent.key"),
 });

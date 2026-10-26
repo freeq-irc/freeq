@@ -13,7 +13,7 @@ import { test, expect, type Page, type Locator } from '@playwright/test';
 import net from 'node:net';
 import {
   uniqueNick, uniqueChannel, connectGuest,
-  heldRowCount, newestHeldMsgId, oldestHeldMsgId, jumpToMessage,
+  heldRowCount, heldPresenceRowCount, newestHeldMsgId, oldestHeldMsgId, jumpToMessage,
 } from './helpers';
 
 const IRC_HOST = process.env.FREEQ_IRC_HOST || '127.0.0.1';
@@ -108,6 +108,17 @@ const jumpButton = (page: Page): Locator =>
 
 /** Settle a freshly activated channel: the view is re-pinned to the bottom on
  *  a timer for the first 1.2s, and a scroll inside that window is undone. */
+/** The held rows a page of history accounts for: everything the store holds
+ *  less the presence lines, which it holds whatever the join/part setting
+ *  says and which readers coming and going add on top of a window. */
+async function heldHistoryRows(page: Page, channel: string): Promise<number> {
+  const [held, presence] = await Promise.all([
+    heldRowCount(page, channel),
+    heldPresenceRowCount(page, channel),
+  ]);
+  return held - presence;
+}
+
 async function settled(page: Page, channel: string): Promise<void> {
   await expect.poll(() => heldRowCount(page, channel), { timeout: 20_000 })
     .toBeGreaterThan(10);
@@ -157,7 +168,7 @@ test.describe('a reader moving through a channel', () => {
       await connectGuest(linked, uniqueNick('rl'), channel);
       const linkedList = linked.getByTestId('message-list');
       await settled(linked, channel);
-      expect(await heldRowCount(linked, channel)).toBeLessThanOrEqual(PAGE * 2);
+      expect(await heldHistoryRows(linked, channel)).toBeLessThanOrEqual(PAGE * 2);
       expect(await oldestHeldMsgId(linked, channel)).not.toBe(oldest);
 
       await jumpToMessage(linked, oldest!);
@@ -178,7 +189,7 @@ test.describe('a reader moving through a channel', () => {
       // away is the window arriving at the live end.
       await jumpButton(linked).click();
       await expect(jumpButton(linked)).toHaveCount(0, { timeout: 15_000 });
-      expect(await heldRowCount(linked, channel)).toBeLessThanOrEqual(PAGE * 2);
+      expect(await heldHistoryRows(linked, channel)).toBeLessThanOrEqual(PAGE * 2);
       expect(await oldestHeldMsgId(linked, channel)).not.toBe(oldest);
 
       // ── or to the present by walking there ──

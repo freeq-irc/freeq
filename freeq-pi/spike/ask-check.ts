@@ -19,10 +19,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 
-import { FreeqConnection, type InboundAsk } from "../src/connection.js";
-import { collectSessionMeta } from "../src/presence.js";
-import { decideInbound, frameInbound, reachesModel } from "../src/inbound.js";
-import { tierFor, defaultConfig, type FreeqConfig } from "../src/config.js";
+import { FreeqConnection, type InboundAsk } from "@freeq/harness-kit/connection";
+import { collectSessionMeta } from "@freeq/harness-kit/presence";
+import { decideInbound, frameInbound, reachesModel } from "@freeq/harness-kit/inbound";
+import { tierFor, defaultConfig, type FreeqConfig } from "@freeq/harness-kit/config";
 
 const { values } = parseArgs({
   options: {

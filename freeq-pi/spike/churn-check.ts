@@ -18,8 +18,8 @@ import { parseArgs } from "node:util";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FreeqConnection } from "../src/connection.js";
-import { collectSessionMeta } from "../src/presence.js";
+import { FreeqConnection } from "@freeq/harness-kit/connection";
+import { collectSessionMeta } from "@freeq/harness-kit/presence";
 
 const { values } = parseArgs({
   options: {
