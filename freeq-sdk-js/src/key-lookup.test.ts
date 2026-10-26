@@ -944,6 +944,28 @@ describe('makeDidResolver', () => {
     await expect(resolve('did:key:z6Mkabc')).rejects.toThrow();
   });
 
+  it('gives up on a directory that never answers', async () => {
+    // The fetch here answers nothing: it settles only when the signal it was
+    // handed fires, which is what a hung directory looks like from inside.
+    const signals: (AbortSignal | null | undefined)[] = [];
+    const hang = vi.fn(
+      (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> =>
+        new Promise((_resolve, reject) => {
+          signals.push(init?.signal);
+          init?.signal?.addEventListener('abort', () =>
+            reject(init.signal!.reason ?? new Error('aborted')),
+          );
+        }),
+    );
+
+    const resolve = makeDidResolver({
+      fetch: hang as unknown as typeof globalThis.fetch,
+      timeoutMs: 20,
+    });
+    await expect(resolve(ALICE)).rejects.toThrow();
+    expect(signals[0]?.aborted).toBe(true);
+  });
+
   /** A `fetch` answering the PLC directory for ALICE, counting the calls. */
   async function plcNetwork(): Promise<{ fetch: typeof globalThis.fetch; hits: { plc: number } }> {
     const doc = {

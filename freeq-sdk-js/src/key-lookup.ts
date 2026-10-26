@@ -1366,12 +1366,24 @@ async function fromRecords(
  * already falls through to a fresh one, the same bound the records take.
  */
 export function makeDidResolver(
-  options: { fetch?: typeof globalThis.fetch; plcUrl?: string; ttlMs?: number } = {},
+  options: {
+    fetch?: typeof globalThis.fetch;
+    plcUrl?: string;
+    ttlMs?: number;
+    timeoutMs?: number;
+  } = {},
 ): ResolveDid {
+  // A directory that goes quiet otherwise holds the caller for as long as the
+  // socket stays open — in a browser, with no limit at all. Ten seconds, as
+  // the Rust resolver gives the same fetch.
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  const base = options.fetch ?? globalThis.fetch;
+  const bounded: typeof globalThis.fetch = (target, init) =>
+    base(target, { ...init, signal: init?.signal ?? AbortSignal.timeout(timeoutMs) });
   const resolver = new CompositeDidDocumentResolver({
     methods: {
-      plc: new PlcDidDocumentResolver({ fetch: options.fetch, apiUrl: options.plcUrl }),
-      web: new WebDidDocumentResolver({ fetch: options.fetch }),
+      plc: new PlcDidDocumentResolver({ fetch: bounded, apiUrl: options.plcUrl }),
+      web: new WebDidDocumentResolver({ fetch: bounded }),
     },
   });
   const ttlMs = options.ttlMs ?? 3_600_000;
