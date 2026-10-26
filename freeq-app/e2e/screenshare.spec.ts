@@ -113,7 +113,7 @@ async function connectGuest(
   await page.goto(BASE_URL);
   await page.getByRole('button', { name: 'Guest' }).click();
   await page.getByPlaceholder('your_nick').fill(nick);
-  await page.getByPlaceholder('#freeq').fill(channel);
+  await page.getByPlaceholder('#general').fill(channel);
   await page.getByRole('button', { name: 'Connect as Guest' }).click();
   await expect(page.getByTestId('sidebar')).toBeVisible({ timeout: 15_000 });
   await expect(page.getByTestId('sidebar').getByText(channel)).toBeVisible({ timeout: 10_000 });

@@ -141,7 +141,7 @@ else exists.
 
 ### Demo B — "Agent team, on the record" (accountability layer, ~medium)
 
-The `freeq-bots` factory team (or freeqcc + Claude) ships a small real PR in
+The `freeq-bots` factory team (or freeq-cc + Claude) ships a small real PR in
 a public channel:
 1. Sponsor (human DID) posts a `task_request` with a budget
    (`BUDGET #room :max=5;unit=usd;period=per_task`).
@@ -205,7 +205,7 @@ pattern) generalizes:
 
 - **Decision/vote bots** (Demo A) — commit-reveal is a core primitive; *what
   a vote means* is an app.
-- **Agent team products** (Demo B) — factory/auditor/freeqcc; task semantics,
+- **Agent team products** (Demo B) — factory/auditor/freeq-cc; task semantics,
   LLM brains, tooling are apps. Core only carries the typed event envelope,
   budgets, receipts.
 - **Compliance/export tooling** — SOC2/discovery exporters that consume

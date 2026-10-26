@@ -93,9 +93,7 @@ impl AudioSinkHandle for TapSink {
         self.paused.load(Ordering::Relaxed)
     }
     fn toggle_pause(&self) {
-        let _ = self
-            .paused
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(!v));
+        self.paused.fetch_xor(true, Ordering::Relaxed);
     }
 }
 
@@ -140,9 +138,7 @@ impl AudioSinkHandle for NullHandle {
         self.paused.load(Ordering::Relaxed)
     }
     fn toggle_pause(&self) {
-        let _ = self
-            .paused
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(!v));
+        self.paused.fetch_xor(true, Ordering::Relaxed);
     }
 }
 

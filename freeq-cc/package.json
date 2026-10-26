@@ -1,0 +1,58 @@
+{
+  "name": "@freeq/cc",
+  "version": "0.1.0",
+  "description": "freeq for Claude Code: a Claude Code channel that puts a running Claude Code session on freeq as an agent, with freeq-pi's channels, trust tiers, asks, handoffs and discovery.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "freeq-cc": "./dist/server.js"
+  },
+  "files": [
+    "dist",
+    "commands",
+    ".claude-plugin",
+    "hooks",
+    "README.md"
+  ],
+  "scripts": {
+    "prebuild": "node scripts/build-deps.mjs",
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepare": "node scripts/build-deps.mjs",
+    "commands": "npm run build && node scripts/write-commands.mjs"
+  },
+  "dependencies": {
+    "@freeq/bot-kit": "file:../freeq-bot-kit-js",
+    "@freeq/harness-kit": "file:../freeq-harness-kit",
+    "@freeq/sdk": "file:../freeq-sdk-js",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "~5.9.3",
+    "vitest": "^4.1.11"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "freeq",
+    "claude-code",
+    "channel",
+    "agent",
+    "irc",
+    "did"
+  ],
+  "homepage": "https://freeq.at",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freeq-irc/freeq.git",
+    "directory": "freeq-cc"
+  },
+  "bugs": {
+    "url": "https://github.com/freeq-irc/freeq/issues"
+  }
+}

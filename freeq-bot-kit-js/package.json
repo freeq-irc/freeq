@@ -1,6 +1,6 @@
 {
   "name": "@freeq/bot-kit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "On-disk persistence + announce-sequence orchestration for freeq bots. Sits on top of @freeq/sdk.",
   "type": "module",
   "main": "dist/index.js",
@@ -30,7 +30,7 @@
     "example:fire-task": "tsx examples/fire-task.ts"
   },
   "dependencies": {
-    "@freeq/sdk": "^0.1.0",
+    "@freeq/sdk": "^0.3.0",
     "commander": "^14.0.1"
   },
   "devDependencies": {

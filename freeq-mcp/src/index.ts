@@ -28,7 +28,7 @@ async function main(): Promise<void> {
   const mcp = createFreeqMcpServer({ cfg });
 
   process.stderr.write(
-    `freeq-mcp: server=${cfg.baseUrl} identity=${cfg.ownerDid ? "did:key agent" : "guest"} ` +
+    `freeq-mcp: server=${cfg.baseUrl} identity=${cfg.guest ? "guest" : cfg.ownerDid ? "did:key agent" : "self-owned did:key"} ` +
       `writes=${cfg.allowWrites ? "on" : "off"}\n`,
   );
 

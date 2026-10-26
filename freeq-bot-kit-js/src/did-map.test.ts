@@ -380,6 +380,51 @@ describe("createDidMap: mutation (save provided)", () => {
     expect(fires.length).toBe(1);
     m.close();
   });
+
+  // A save that is still running after it wrote the file leaves a window in
+  // which a poll tick sees the new mtime before set()/delete() records it.
+  // Holding the save open past a poll interval makes that window certain.
+  async function slowSaveMap(path: string): Promise<DidMapMutable<Entry>> {
+    return await createDidMap<Entry>({
+      load: { path, parse: JSON.parse },
+      pollMs: 30,
+      save: async (entries) => {
+        await writeFile(path, JSON.stringify(entries));
+        await bumpMtime(path);
+        await new Promise((r) => setTimeout(r, 80));
+      },
+    });
+  }
+
+  it("file-backed + slow save: a set() fires one onChange even when a poll lands during the save", async () => {
+    const path = join(dir, "list.json");
+    await writeFile(path, JSON.stringify([]));
+    const m = await slowSaveMap(path);
+    const fires: Entry[][] = [];
+    m.onChange((es) => fires.push(es));
+
+    await m.set({ did: "did:plc:a" });
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(fires.length).toBe(1);
+    expect(m.has("did:plc:a")).toBe(true);
+    m.close();
+  });
+
+  it("file-backed + slow save: a delete() fires one onChange even when a poll lands during the save", async () => {
+    const path = join(dir, "list.json");
+    await writeFile(path, JSON.stringify([{ did: "did:plc:a" }]));
+    const m = await slowSaveMap(path);
+    const fires: Entry[][] = [];
+    m.onChange((es) => fires.push(es));
+
+    expect(await m.delete("did:plc:a")).toBe(true);
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(fires.length).toBe(1);
+    expect(m.has("did:plc:a")).toBe(false);
+    m.close();
+  });
 });
 
 // ── read-only (save omitted) ────────────────────────────────────────────

@@ -59,16 +59,19 @@ pub enum KeyLayer {
     Vouched,
     /// The key is published in the sender's identity record.
     Published,
+    /// The key is the sender's `did:key` DID itself.
+    DidKey,
 }
 
 impl KeyLayer {
-    pub const ALL: [KeyLayer; 2] = [KeyLayer::Vouched, KeyLayer::Published];
+    pub const ALL: [KeyLayer; 3] = [KeyLayer::Vouched, KeyLayer::Published, KeyLayer::DidKey];
 
     /// The layer's name in the model file.
     pub fn name(self) -> &'static str {
         match self {
             KeyLayer::Vouched => "vouched",
             KeyLayer::Published => "published",
+            KeyLayer::DidKey => "did-key",
         }
     }
 }
@@ -98,6 +101,38 @@ pub fn sentence(state: VerdictState, layer: Option<KeyLayer>) -> &'static str {
 }
 
 // ─── checking a received line ───────────────────────────────────────────
+
+/// Whether a ruling on a task counts: decided only for a ruling (a receipt,
+/// an expiry, a closed review window) on a task whose opener names its
+/// referee in `act-home`, from what the referee's own site lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RulingCheck {
+    /// Signed by the named referee, with a key its own site lists, before
+    /// that key stopped counting.
+    Counts,
+    /// Signed by anyone else, with a key the referee's site does not list,
+    /// at or after the key stopped counting, or with no signature that can
+    /// be read.
+    Fails,
+    /// The referee's site could not answer, the task's opener names no
+    /// referee, or the check ran out of time with the referee known:
+    /// handled as before. A ruling whose referee the client cannot know
+    /// (its task's opening post missing, uncheckable, or trusted only
+    /// through the server, or a DM pair it would have given unknown) is
+    /// hidden instead, as a failing one is.
+    CannotCheck,
+}
+
+impl RulingCheck {
+    /// The name on the wire to the apps.
+    pub fn name(self) -> &'static str {
+        match self {
+            RulingCheck::Counts => "counts",
+            RulingCheck::Fails => "fails",
+            RulingCheck::CannotCheck => "cannot-check",
+        }
+    }
+}
 
 /// What a received line's signature covers, rebuilt from the wire.
 #[derive(Debug, Clone)]
@@ -355,7 +390,7 @@ mod tests {
         }
         assert_eq!(
             file["states"]["device"]["layers"],
-            serde_json::json!(["vouched", "published"])
+            serde_json::json!(["vouched", "published", "did-key"])
         );
         assert_eq!(mark(), file["mark"].as_str().unwrap());
     }
@@ -380,6 +415,10 @@ mod tests {
             "Signed on the sender’s device. Key published in their identity record."
         );
         assert_eq!(
+            sentence(VerdictState::Device, Some(KeyLayer::DidKey)),
+            "Signed with the sender’s own key. The key is their identity."
+        );
+        assert_eq!(
             sentence(VerdictState::Retired, None),
             "Signed after this key was retired."
         );
@@ -398,7 +437,7 @@ mod tests {
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "4437a4a5a06e8caa2c516e7e177a80d2ffb9a444f231c05bfc3833d1499df4e4"
+            "7a6c7e7e4ad0d4c787fb3ff44b5d67a413f8246801b6b9e6039f124750a8c070"
         );
     }
 }

@@ -251,6 +251,45 @@ describe("freeq_verify", () => {
     expect(relayed.reading).toMatch(/proves the server relayed it/);
     expect(relayed.reading).not.toMatch(/non-repudiable/);
 
+    // A server that sends `proves` is taken at its word, even with a
+    // `verified_by` this tool does not know.
+    h = await harness({
+      routes: {
+        "GET /api/v1/verify/01LIVED": {
+          body: {
+            msgid: "01LIVED",
+            sender_did: "did:key:z6Mkbot",
+            verification: { valid: true, verdict: "valid", verified_by: "some-new-key-kind", proves: "relay" },
+          },
+        },
+      },
+    });
+    const provesRelay = await h.json("freeq_verify", { msgid: "01LIVED" });
+    expect(provesRelay.reading).toMatch(/proves the server relayed it/);
+
+    // A session key the server merely recorded is authorship on its word,
+    // not independent proof; the reading must not over-claim.
+    h = await harness({
+      routes: {
+        "GET /api/v1/verify/01LIVEE": {
+          body: {
+            msgid: "01LIVEE",
+            sender_did: "did:plc:alice",
+            verification: {
+              valid: true,
+              verdict: "valid",
+              verified_by: "client-session-key",
+              proves: "authorship",
+              independent: false,
+            },
+          },
+        },
+      },
+    });
+    const onItsWord = await h.json("freeq_verify", { msgid: "01LIVEE" });
+    expect(onItsWord.reading).toMatch(/rests on the server's record/);
+    expect(onItsWord.reading).not.toMatch(/non-repudiable/);
+
     h = await harness({
       routes: {
         "GET /api/v1/verify/01LIVEC": {

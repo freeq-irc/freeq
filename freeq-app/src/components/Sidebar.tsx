@@ -2,7 +2,7 @@ import { getDeviceKeyState, subscribeDeviceKey } from '../irc/client';
 import { useState, useEffect, useRef, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import { useStore } from '../store';
-import { joinChannel, partChannel, disconnect, startAvSession, endAvSession, leaveAvSession, getNick, getClient } from '../irc/client';
+import { joinChannel, partChannel, disconnect, startAvSession, endAvSession, leaveAvSession, getNick, getClient, dmPeerDid } from '../irc/client';
 import { SpeakerIcon } from './SessionIndicator';
 import { MicIcon, MicOffIcon, CameraOnIcon, CameraOffIcon, PhoneOffIcon } from './CallPanel';
 import { fetchProfile, getCachedProfile } from '../lib/profiles';
@@ -404,7 +404,7 @@ function ChannelButton({ ch, isActive, onSelect, icon, showPreview, label: label
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-1">
           <span className="truncate text-[15px]" title={isDid(ch.name) ? ch.name : undefined}>{label}</span>
-          {(ch.isEncrypted || (!ch.name.startsWith('#') && ch.members.values().next().value?.did)) && (
+          {ch.isEncrypted && (
             <span className="text-[10px] text-success shrink-0" title="End-to-end encrypted">🔒</span>
           )}
           {showPreview && <DmStatusText nick={ch.name} />}
@@ -633,12 +633,11 @@ function SidebarContextMenu({ channel, isFav, isMuted, isChannel, position, onCl
 
 /** DM avatar that resolves nick → DID → profile image. */
 function DmAvatar({ nick }: { nick: string }) {
-  const channels = useStore((s) => s.channels);
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
 
   // The thread key is either the peer's DID already, or a nick we resolve to
-  // one via the channel member lists.
-  const did = isDid(nick) ? nick : (findMemberByKey(channels, nick)?.member.did ?? null);
+  // one the way every DM surface does.
+  const did = dmPeerDid(nick);
 
   useEffect(() => {
     if (!did) { setAvatarUrl(null); return; }

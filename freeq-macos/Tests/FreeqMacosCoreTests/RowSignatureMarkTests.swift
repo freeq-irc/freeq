@@ -13,6 +13,11 @@ final class RowSignatureMarkTests: XCTestCase {
         XCTAssertEqual(RowSignatureMark.of(verdict(.device, .published)), .lock(opacity: 1))
     }
 
+    func testADidKeyDeviceKeyWearsTheLockAtFullStrengthAndGroupsWithAPublishedOne() {
+        XCTAssertEqual(RowSignatureMark.of(verdict(.device, .didKey)), .lock(opacity: 1))
+        XCTAssertFalse(startsHeader(verdict(.device, .published), verdict(.device, .didKey)))
+    }
+
     func testAVouchedDeviceKeyWearsTheLockAt30Percent() {
         XCTAssertEqual(RowSignatureMark.of(verdict(.device, .vouched)), .lock(opacity: 0.3))
     }

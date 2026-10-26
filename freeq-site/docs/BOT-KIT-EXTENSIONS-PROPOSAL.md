@@ -1,5 +1,7 @@
 # `@freeq/bot-kit` extensions — Proposal
 
+> Historical note: `freeqcc` became `freeq-cc`, a Claude Code plugin built on `freeq-harness-kit`, and the freeqcc daemon was removed. This proposal describes the daemon as it was.
+
 Application-level primitives that two real consumers (freeqcc, freeq-swarm)
 have independently reinvented. After the lifecycle migration landed
 (`feat(freeqcc): migrate to @freeq/bot-kit for identity + lifecycle`),

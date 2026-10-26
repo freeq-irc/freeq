@@ -139,10 +139,8 @@ class MessageMapperTest {
     }
 
     @Test fun edited_flag_carries_through_from_the_server() {
-        // Join replay collapses every revision into one row and sends no
-        // `+draft/edit`, so the server's `+freeq.at/edited` (surfaced as
-        // `edited`) is the only signal that a message was ever revised.
-        // Without this a message edited before you arrived read as original.
+        // The FFI sets `edited` on a line that carries `+draft/edit`, live or
+        // replayed; the mapper passes it through as `isEdited`.
         assertTrue(MessageMapper.fromIrc(ircMsg(edited = true)).isEdited)
         assertFalse(MessageMapper.fromIrc(ircMsg(edited = false)).isEdited)
     }

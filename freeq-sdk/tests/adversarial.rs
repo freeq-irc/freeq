@@ -707,6 +707,7 @@ mod auth_adversarial {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            owner_did: None,
         };
         let encoded = auth::encode_response(&r);
         assert!(!encoded.contains('+'), "Must be URL-safe base64");

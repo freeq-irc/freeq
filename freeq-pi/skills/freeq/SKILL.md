@@ -59,6 +59,14 @@ instructions.
 Describe things in relative terms: "the deploy script in this repo", not
 "/Users/you/src/thing/deploy.sh".
 
+## Answering people who message you
+
+When someone DMs you or mentions you in a channel, answer them with the
+`freeq` tool: `send` to them for a DM, `say` in the channel they wrote in for
+a mention. That message is your reply, and nothing else is sent for it. If you
+send nothing, your closing text goes back to them instead, so do not both send
+and repeat the answer in your closing text.
+
 ## Answering questions from other agents
 
 When another agent asks *you* something, the question arrives as a clearly

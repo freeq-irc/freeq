@@ -44,6 +44,10 @@ pub struct ChallengeResponse {
     /// bind the response to the specific challenge that was issued.
     #[serde(default)]
     pub challenge_nonce: Option<String>,
+    /// The owner this agent acts for. An allowlisted server lets the agent in
+    /// if the owner's at.freeq.agentKey records list it.
+    #[serde(default)]
+    pub owner_did: Option<String>,
 }
 
 /// Stored challenge data: the struct for validation + raw bytes for signature verification.
@@ -127,14 +131,40 @@ impl ChallengeStore {
 /// be JSON, and the signature inside still has to verify against the DID
 /// document.
 pub fn decode_response(encoded: &str) -> Option<ChallengeResponse> {
+    decode_response_explained(encoded).ok()
+}
+
+/// [`decode_response`], with the reason it failed: one line, safe to put in
+/// a 904's trailing parameter.
+///
+/// "bad response" alone was the other half of the loop described above: with
+/// the encoding fixed, agents still guessed `"sig"` for `"signature"` (the
+/// shipped docs never named the field, and the message tag is
+/// `+freeq.at/sig`) and spent minutes re-deriving a correct signature before
+/// finding the field name elsewhere (experiments/ax FINDINGS F10). serde
+/// already knows exactly what is missing; the 904 now says it.
+pub fn decode_response_explained(encoded: &str) -> Result<ChallengeResponse, String> {
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE};
     let bytes = URL_SAFE_NO_PAD
         .decode(encoded)
         .or_else(|_| STANDARD.decode(encoded))
         .or_else(|_| URL_SAFE.decode(encoded))
         .or_else(|_| STANDARD_NO_PAD.decode(encoded))
-        .ok()?;
-    serde_json::from_slice(&bytes).ok()
+        .map_err(|_| "response is not base64".to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| "response is not JSON".to_string())?;
+    serde_json::from_value(value.clone()).map_err(|e| {
+        let got: Vec<String> = value
+            .as_object()
+            .map(|o| o.keys().map(|k| format!("\"{k}\"")).collect())
+            .unwrap_or_default();
+        let mut why = e.to_string();
+        if !got.is_empty() {
+            why.push_str(&format!("; got {}", got.join(", ")));
+        }
+        why.push_str("; expected {\"did\", \"signature\", \"method\"?}");
+        why.replace(['\r', '\n'], " ")
+    })
 }
 
 /// Verify a challenge response. Dispatches to crypto or PDS verification.
@@ -501,6 +531,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            owner_did: None,
         };
         let json = serde_json::to_vec(&resp).unwrap();
         assert!(
@@ -532,6 +563,32 @@ mod tests {
         assert!(decode_response(&STANDARD_NO_PAD_ENCODE_HELPER(r#"{"hello":"world"}"#)).is_none());
     }
 
+    /// A 904 that says only "bad response" sent agents back to re-derive a
+    /// signature that was already correct (experiments/ax FINDINGS F6, F10).
+    /// The reason names what failed, and the common misspelling by name.
+    #[test]
+    fn a_bad_response_says_what_is_wrong_with_it() {
+        let why = |s: &str| decode_response_explained(s).unwrap_err();
+        assert!(why("!!!not base64!!!").contains("not base64"));
+        assert!(why(&STANDARD_NO_PAD_ENCODE_HELPER("not json at all")).contains("not JSON"));
+        let missing = why(&STANDARD_NO_PAD_ENCODE_HELPER(
+            r#"{"did":"did:key:z6Mk","sig":"abc"}"#,
+        ));
+        assert!(missing.contains("missing field `signature`"), "{missing}");
+        assert!(
+            missing.contains("\"sig\""),
+            "names the field it did get: {missing}"
+        );
+        // No line breaks: the reason goes into an IRC trailing parameter.
+        assert!(!missing.contains('\n') && !missing.contains('\r'));
+    }
+
+    #[test]
+    fn a_good_response_explains_nothing() {
+        let ok = STANDARD_NO_PAD_ENCODE_HELPER(r#"{"did":"did:key:z6Mk","signature":"abc"}"#);
+        assert_eq!(decode_response_explained(&ok).unwrap().did, "did:key:z6Mk");
+    }
+
     #[allow(non_snake_case)]
     fn STANDARD_NO_PAD_ENCODE_HELPER(s: &str) -> String {
         base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
@@ -546,6 +603,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            owner_did: None,
         };
         let json = serde_json::to_vec(&resp).unwrap();
         let encoded = URL_SAFE_NO_PAD.encode(&json);
@@ -562,6 +620,7 @@ mod tests {
             pds_url: Some("https://pds.example.com".to_string()),
             dpop_proof: None,
             challenge_nonce: Some("test-nonce".to_string()),
+            owner_did: None,
         };
         let json = serde_json::to_vec(&resp).unwrap();
         let encoded = URL_SAFE_NO_PAD.encode(&json);
@@ -597,6 +656,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            owner_did: None,
         };
 
         let result = verify_response(&challenge, &challenge_bytes, &response, &resolver).await;
@@ -631,6 +691,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            owner_did: None,
         };
 
         let result = verify_response(&challenge, &challenge_bytes, &response, &resolver).await;
@@ -663,6 +724,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            owner_did: None,
         };
 
         let result = verify_response(&challenge, &challenge_bytes, &response, &resolver).await;
@@ -695,6 +757,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            owner_did: None,
         };
 
         let result = verify_response(&challenge, &challenge_bytes, &response, &resolver).await;

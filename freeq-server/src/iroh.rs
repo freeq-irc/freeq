@@ -179,7 +179,11 @@ pub async fn start(state: Arc<SharedState>, bind_port: Option<u16>) -> Result<ir
 
     let endpoint = builder.bind().await?;
 
-    tracing::info!("Iroh endpoint ID: {}", endpoint.id());
+    // The bound address is appended as a field rather than folded into the
+    // message, because `scripts/run-s2s-tests.sh` and
+    // `scripts/start-test-servers.sh` read the endpoint ID out of this line
+    // with `grep -oE '[0-9a-f]{64}'`.
+    tracing::info!(addr = ?endpoint.bound_sockets(), "Iroh endpoint ID: {}", endpoint.id());
 
     let _ = state;
     Ok(endpoint)

@@ -7,21 +7,26 @@
  * tool was looking. Without the buffer, "read what people said to me" would
  * only ever return messages that happened to land during the call.
  *
- * Two identity modes, chosen by whether an owner DID is configured:
+ * Two identity modes:
  *
- * - **authenticated** — a `did:key` agent identity persisted by
- *   `@freeq/bot-kit` under `~/.freeq/bots/<name>/`, with a delegation
- *   certificate naming the owner. The room sees the owner only once the
- *   server has verified the certificate: the owner adds this agent's DID
- *   under Settings → Agents in the freeq web app, or with
- *   `freeq-bot-id register`, and the agent reconnects. `freeq_whoami` says
- *   which it is.
- * - **guest** — no SASL, no key, nick only. Zero-config so the server works out
- *   of the box with no `env` block at all, and `freeq_whoami` says plainly that
- *   nothing is proven and how to upgrade.
+ * - **authenticated** (the default) — a `did:key` agent identity persisted by
+ *   `@freeq/bot-kit` under `~/.freeq/bots/<name>/`. With `FREEQ_OWNER_DID` its
+ *   delegation certificate names that owner, and the room sees the owner once
+ *   the server has verified it: the owner adds this agent's DID under
+ *   Settings → Agents in the freeq web app, or with `freeq-bot-id register`,
+ *   and the agent reconnects. Without an owner the certificate names the
+ *   agent itself (`selfOwned`): a real, stable identity that is honest about
+ *   speaking for nobody. `freeq_whoami` says which it is.
+ * - **guest** — no SASL, no key, nick only, and nothing attributable. Only
+ *   when `FREEQ_GUEST=1`. It used to be the zero-config default, and agents
+ *   given the MCP server read "guest" from `freeq_whoami`, dropped the tools
+ *   and hand-rolled SASL instead (experiments/ax FINDINGS F14).
  */
 
 import { createHash, randomUUID } from "node:crypto";
+import { mkdir, unlink } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { FreeqClient } from "@freeq/sdk";
 import type { CoordinationEventPayload, Message } from "@freeq/sdk";
 import type { FreeqMcpConfig } from "./config.js";
@@ -53,6 +58,9 @@ export interface SessionStatus {
   nick?: string;
   did?: string;
   ownerDid?: string;
+  /** Authenticated with no owner configured: the certificate names the
+   *  agent's own DID, so it speaks for no human. */
+  selfOwned?: boolean;
   channels: string[];
   hasBearerToken: boolean;
   server: string;
@@ -92,10 +100,18 @@ export interface SessionClient {
 
 export interface SessionDeps {
   /** Build a client. Injected in tests; defaults to the real SDK/bot-kit. */
-  createClient?(cfg: FreeqMcpConfig, nick: string): Promise<{
+  createClient?(cfg: FreeqMcpConfig, nick: string): Promise<ClientFactoryResult>;
+  /** Called whenever a bearer token becomes available (SASL success). */
+  onBearerToken?(token: string | undefined): void;
+  now?(): number;
+}
+
+export interface ClientFactoryResult {
     client: SessionClient;
     mode: SessionMode;
     did?: string;
+    /** No owner configured: the certificate names the agent itself. */
+    selfOwned?: boolean;
     /** Connects in place of `client.connect()`: bot-kit's start, which
      *  also sends the delegation certificate. */
     connect?: () => void;
@@ -105,10 +121,6 @@ export interface SessionDeps {
      *  bot-kit's stop, which also clears its heartbeat, its NOTICE reader
      *  and its timers. */
     close?: (reason: string) => Promise<void>;
-  }>;
-  /** Called whenever a bearer token becomes available (SASL success). */
-  onBearerToken?(token: string | undefined): void;
-  now?(): number;
 }
 
 interface PendingAsk {
@@ -149,6 +161,7 @@ export class FreeqSession {
   #client?: SessionClient;
   #mode: SessionMode = "offline";
   #did?: string;
+  #selfOwned = false;
   #provenance?: () => ProvenanceVerdict | null;
   #closeClient?: (reason: string) => Promise<void>;
   #connected = false;
@@ -181,6 +194,7 @@ export class FreeqSession {
       nick: this.#client?.nick ?? (this.#connected ? this.#nick : undefined),
       did: this.#did,
       ownerDid: this.#cfg.ownerDid,
+      selfOwned: mode === "authenticated" ? this.#selfOwned : undefined,
       channels: [...this.#channels],
       hasBearerToken: !!this.#client?.apiBearer,
       server: this.#cfg.baseUrl,
@@ -189,7 +203,7 @@ export class FreeqSession {
         mode === "authenticated"
           ? this.#authenticatedNote(verdict)
           : mode === "guest"
-            ? "Connected as a guest: the nick is not proven and nothing you send is attributable. Set FREEQ_OWNER_DID to your DID to connect with a did:key agent identity and a delegation certificate."
+            ? "Connected as a guest (FREEQ_GUEST is set): the nick is not proven and nothing you send is attributable. Unset FREEQ_GUEST to connect with a did:key agent identity; set FREEQ_OWNER_DID to bind it to your DID."
             : "Not connected. Read-only tools work over REST without a connection; joining, sending and asking need one.",
     };
   }
@@ -199,7 +213,9 @@ export class FreeqSession {
     const signed =
       "Messages are signed with a per-session key and verifiable via /api/v1/verify/{msgid}.";
     const owner = this.#cfg.ownerDid;
-    if (!owner) return `Authenticated as ${did}. ${signed}`;
+    if (!owner) {
+      return `Authenticated as ${did}: a self-owned did:key that speaks for no human (set FREEQ_OWNER_DID to bind it to you). ${signed}`;
+    }
     if (verdict?.verified) {
       return `Authenticated as ${did}. The server verified that it acts for ${owner} (${verdict.reason}). ${signed}`;
     }
@@ -232,13 +248,14 @@ export class FreeqSession {
 
   async #doConnect(): Promise<void> {
     const factory = this.#deps.createClient ?? defaultCreateClient;
-    const { client, mode, did, connect, provenance, close } = await factory(
+    const { client, mode, did, selfOwned, connect, provenance, close } = await factory(
       this.#cfg,
       this.#nick,
     );
     this.#client = client;
     this.#mode = mode;
     this.#did = did;
+    this.#selfOwned = selfOwned ?? false;
     this.#provenance = provenance;
     this.#closeClient = close;
     this.#wire(client);
@@ -528,48 +545,117 @@ function parseReply(raw: unknown): { req: string; a?: string; err?: string } | u
  * Hashed rather than embedded because the nick is public, and
  * "chads-macbook" tells a channel more than it needs to know.
  */
+/** `mcp-<8 hex>` from a DID: unique per key, stable for as long as it is. */
+export function didNick(did: string): string {
+  return `mcp-${createHash("sha256").update(did).digest("hex").slice(0, 8)}`;
+}
+
 export function defaultNick(seed?: string): string {
   const material = seed ?? `${process.env.HOSTNAME ?? ""}\0${process.env.USER ?? ""}\0mcp`;
   const slug = createHash("sha256").update(material).digest("hex").slice(0, 8);
   return `mcp-${slug}`;
 }
 
+/** Where bot-kit keeps per-bot state; matches its own default. */
+export function botStateRoot(): string {
+  return join(homedir(), ".freeq", "bots");
+}
+
+/** The slice of `@freeq/bot-kit` the factory needs; typed so tests can inject a fake. */
+export interface BotKitModule {
+  loadOrCreateIdentity(opts: { seedPath: string }): Promise<{ did: string }>;
+  loadDelegation(opts: { certPath: string }): Promise<{ creator_did: string; signature?: string | null } | null>;
+  FreeqBot: {
+    create(opts: {
+      name: string;
+      ownerDid: string;
+      nick: string;
+      url: string;
+      serverOrigin: string;
+      channels: string[];
+      actorClass: "agent";
+      root?: string;
+    }): Promise<{
+      client: unknown;
+      identity: { did: string };
+      provenance: ProvenanceVerdict | null;
+      start(): Promise<void>;
+      stop(opts: { reason: string }): Promise<void>;
+    }>;
+  };
+}
+
 /**
- * Real client factory: bot-kit identity when an owner DID is configured,
- * plain guest `FreeqClient` otherwise.
+ * Real client factory.
+ *
+ * Default: a bot-kit `did:key` identity. With `FREEQ_OWNER_DID` its
+ * delegation names that human; without it the delegation names the agent
+ * itself. Only `FREEQ_GUEST=1` yields a nick-only guest `FreeqClient`.
  */
-async function defaultCreateClient(
+export async function defaultCreateClient(
   cfg: FreeqMcpConfig,
   nick: string,
-): ReturnType<NonNullable<SessionDeps["createClient"]>> {
-  if (cfg.ownerDid) {
-    // Imported lazily so the guest path doesn't pay for bot-kit's disk I/O.
-    const { FreeqBot } = await import("@freeq/bot-kit");
-    const bot = await FreeqBot.create({
-      name: nick,
-      ownerDid: cfg.ownerDid,
-      nick,
-      url: cfg.wsUrl,
-      serverOrigin: cfg.baseUrl,
-      channels: cfg.channels,
-      actorClass: "agent",
-    });
-    // The session drives readiness itself off the client's events, but
-    // connects through FreeqBot.start(): that runs the announce sequence,
-    // whose PROVENANCE sends the delegation certificate, and reads the
-    // server's verdict on it. Its own failures (auth, timeout) reach the
-    // session through the same client events.
-    return {
-      client: bot.client as unknown as SessionClient,
-      mode: "authenticated",
-      did: bot.identity.did,
-      connect: () => {
-        bot.start().catch(() => undefined);
-      },
-      provenance: () => bot.provenance,
-      close: (reason) => bot.stop({ reason }),
-    };
+  deps: { botKit?: () => Promise<BotKitModule>; root?: string } = {},
+): Promise<ClientFactoryResult> {
+  if (cfg.guest) {
+    const client = new FreeqClient({ url: cfg.wsUrl, nick, channels: cfg.channels });
+    return { client: client as unknown as SessionClient, mode: "guest" };
   }
-  const client = new FreeqClient({ url: cfg.wsUrl, nick, channels: cfg.channels });
-  return { client: client as unknown as SessionClient, mode: "guest" };
+
+  // Imported lazily so the guest path doesn't pay for bot-kit's disk I/O.
+  const kit = await (deps.botKit ?? (() => import("@freeq/bot-kit") as unknown as Promise<BotKitModule>))();
+  const root = deps.root ?? botStateRoot();
+  const stateDir = join(root, nick);
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
+
+  // Learn our own DID first: a self-owned certificate has to name it, and
+  // FreeqBot.create mints the certificate from the owner it is given.
+  const identity = await kit.loadOrCreateIdentity({ seedPath: join(stateDir, "agent.key") });
+  const selfOwned = !cfg.ownerDid;
+  const ownerDid = cfg.ownerDid ?? identity.did;
+
+  // A self-owned cert is unsigned and names nobody, so replacing it once an
+  // owner is configured is the upgrade the operator asked for, not data loss.
+  // Any other mismatch (a different owner, or a signed cert) is left to
+  // bot-kit, whose error names the file and the DIDs involved.
+  if (!selfOwned) {
+    const certPath = join(stateDir, "delegation.json");
+    const existing = await kit.loadDelegation({ certPath });
+    if (existing && existing.creator_did === identity.did && !existing.signature) {
+      await unlink(certPath);
+    }
+  }
+
+  // `nick` names the state directory and is derived from the host, so it is
+  // the same in every identical container; on the wire that made concurrent
+  // agents collide and bot-kit refuse to connect (experiments/ax FINDINGS
+  // F19). Unless FREEQ_NICK pins one, the IRC nick comes from the key.
+  const ircNick = cfg.nick ?? didNick(identity.did);
+
+  const bot = await kit.FreeqBot.create({
+    name: nick,
+    ownerDid,
+    nick: ircNick,
+    url: cfg.wsUrl,
+    serverOrigin: cfg.baseUrl,
+    channels: cfg.channels,
+    actorClass: "agent",
+    root,
+  });
+  // The session drives readiness itself off the client's events, but
+  // connects through FreeqBot.start(): that runs the announce sequence,
+  // whose PROVENANCE sends the delegation certificate, and reads the
+  // server's verdict on it. Its own failures (auth, timeout) reach the
+  // session through the same client events.
+  return {
+    client: bot.client as unknown as SessionClient,
+    mode: "authenticated",
+    did: bot.identity.did,
+    selfOwned,
+    connect: () => {
+      bot.start().catch(() => undefined);
+    },
+    provenance: () => bot.provenance,
+    close: (reason) => bot.stop({ reason }),
+  };
 }

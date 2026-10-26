@@ -151,7 +151,8 @@ Settings → Agents, or with `freeq-bot-id register --owner <handle> <bot-did>`.
 The server reads that record when the bot connects and marks the certificate
 verified; nothing of the owner's is kept with the bot. The older way,
 `creatorKeyPath` (a path to an owner key the owner registered with `MSGSIG`),
-signs the certificate instead and keeps working.
+signs the certificate instead; it is deprecated, to be removed in a later release, and
+a bot started with a signed certificate warns once.
 
 After connecting, the bot writes the server's verdict to stderr as one line, `provenance verified: <reason>` or `provenance unverified: <reason>`, waiting up to 5 seconds for a "verified" answer before reporting "unverified". It writes another line whenever the verdict changes later, for example when the owner removes the record. A bot whose record is added after it connected is verified when it next connects, so restart it after adding it. The program running the bot can read the same verdict: `bot.provenance` is the server's latest answer (`verified`, `reason`, and the server's full `text`), and `bot.onProvenance(handler)` calls `handler` with each verdict written to stderr.
 
@@ -629,9 +630,9 @@ Deliberately out of scope:
 - **Persistence layer.** Both `createDidMap` and `createTurnGate` take optional `load` / `save` callbacks. Bot-kit never touches the filesystem; callers wire `write-file-atomic`, a DB, or whatever they need.
 - **Signal handlers (when not using `createDaemonCLI`).** `process.on('SIGINT', ...)` is process-global; if you're using `FreeqBot` directly without the CLI scaffold, the application owns it. The README's quick example shows the snippet.
 - **Reconnect logic.** Already in the SDK transport (`@freeq/sdk`'s `Transport` does exponential-backoff auto-reconnect and re-emits `'ready'` on resume). Bot-kit's announce loop is already bound to every `'ready'` so reconnects re-announce automatically.
-- **did:key rotation.** No `rotate-key` command shipped. Bot-kit *could* generically delete `agent.key` + `delegation.json` and let the next launch mint fresh ones, but in practice rotation always means more than that — freeqcc, for example, also needs to wipe per-DID claude session caches. So we leave it to the bot to add a `rotate-key` subcommand on the `Command` returned by `createDaemonCLI`, with whatever extra cleanup it needs.
+- **did:key rotation.** No `rotate-key` command shipped. Bot-kit *could* generically delete `agent.key` + `delegation.json` and let the next launch mint fresh ones, but in practice rotation always means more than that — a bot that caches state per DID, for example, also needs to wipe those caches. So we leave it to the bot to add a `rotate-key` subcommand on the `Command` returned by `createDaemonCLI`, with whatever extra cleanup it needs.
 - **Manifest building.** The announce sequence includes `AGENT MANIFEST :<toml>` if you pass a `manifest` string to `FreeqBot.create`. Bot-kit doesn't compose the TOML for you — actor_class, capabilities, supported intents, and version strings are all per-bot, so we accept a pre-formatted string and pass it through. Use any TOML library; see [agents.md](../docs/agents.md) for the manifest schema.
 
 ## Status
 
-v0.2 — five primitives in: `FreeqBot`, `createDaemonCLI`, `createDidMap`, `bot.resolveSenderDid`, `bot.checkMention`, `createTurnGate`. Used in production by `freeqcc`; `freeq-swarm` migration planned.
+v0.2 — five primitives in: `FreeqBot`, `createDaemonCLI`, `createDidMap`, `bot.resolveSenderDid`, `bot.checkMention`, `createTurnGate`. freeq-pi and freeq-cc use it through freeq-harness-kit: `FreeqBot` (with `bot.resolveSenderDid` and `bot.checkMention`), `matchMention`, `checkTransition`, `initialState`, `isTerminal`, `refusalDescription`, `verifyActTags`, `loadOrCreateIdentity` and `loadDelegation`; neither uses `createDaemonCLI`, `createDidMap` or `createTurnGate`. `freeq-swarm` migration planned.

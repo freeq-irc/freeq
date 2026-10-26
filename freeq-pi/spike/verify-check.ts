@@ -19,9 +19,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ActEventPayload } from "@freeq/sdk";
 
-import { FreeqConnection } from "../src/connection.js";
-import { collectSessionMeta } from "../src/presence.js";
-import { serverKeyFetcher, verifyActEvent } from "../src/verify.js";
+import { FreeqConnection } from "@freeq/harness-kit/connection";
+import { collectSessionMeta } from "@freeq/harness-kit/presence";
+import { serverKeyFetcher, verifyActEvent } from "@freeq/harness-kit/verify";
 
 const { values } = parseArgs({
   options: {

@@ -34,6 +34,10 @@ struct FreeqApp: App {
     @AppStorage("freeq.appearance") private var appearanceRaw = "system"
     @Environment(\.scenePhase) private var scenePhase
 
+    init() {
+        JoinPartDisplay.migrateLegacySetting()
+    }
+
     /// Menu item projected from the Command registry — same title,
     /// shortcut, availability, and handler the ⌘K palette uses.
     private func commandButton(_ id: String) -> some View {

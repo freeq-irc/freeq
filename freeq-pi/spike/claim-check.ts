@@ -20,9 +20,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ActEventPayload } from "@freeq/sdk";
 
-import { FreeqConnection } from "../src/connection.js";
-import { collectSessionMeta } from "../src/presence.js";
-import { HandoffStore, describeHandoff } from "../src/handoff.js";
+import { FreeqConnection } from "@freeq/harness-kit/connection";
+import { collectSessionMeta } from "@freeq/harness-kit/presence";
+import { HandoffStore, describeHandoff } from "@freeq/harness-kit/handoff";
 
 const { values } = parseArgs({
   options: {

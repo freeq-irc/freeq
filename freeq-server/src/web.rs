@@ -250,8 +250,6 @@ pub fn router(state: Arc<SharedState>) -> Router {
             "/.well-known/http-message-signatures-directory",
             get(crate::agent_surfaces::web_bot_auth_directory),
         )
-        // This server's did:web document: its signing key and key set.
-        .route("/.well-known/did.json", get(did_document))
         // Private media spaces. Returns a 404 if the feature is unconfigured.
         .route(
             "/xrpc/com.atproto.simplespace.checkUserAccess",
@@ -310,12 +308,6 @@ pub fn router(state: Arc<SharedState>) -> Router {
             axum::routing::post(api_device_sign_out),
         )
         .route("/api/v1/signing-key", get(api_signing_key))
-        .route("/api/v1/signing-keys", get(api_signing_keys_batch))
-        .route("/api/v1/signing-keys/{did}", get(api_did_signing_key))
-        .route(
-            "/api/v1/signing-keys/{did}/{kid}",
-            get(api_did_signing_key_by_kid),
-        )
         .route("/api/v1/records", get(api_records_batch))
         .route("/api/v1/records/{did}", get(api_records_account))
         .route(
@@ -391,6 +383,29 @@ pub fn router(state: Arc<SharedState>) -> Router {
                 ])
                 .allow_credentials(true)
         });
+
+    // This server's did:web document, and the key routes it points at. Keys
+    // are public, so any page may read them: the web app checks a ruling on
+    // a task another server referees against that server's own key list
+    // (`/api/v1/signing-keys/{did}`); its general key lookup asks only its own
+    // page's server, so the batch and per-key routes are open only because
+    // public keys need no guard. Any origin and no credentials, as `/mcp`
+    // below; the app's origin list stays on every other route.
+    app = app.merge(
+        Router::new()
+            .route("/.well-known/did.json", get(did_document))
+            .route("/api/v1/signing-keys", get(api_signing_keys_batch))
+            .route("/api/v1/signing-keys/{did}", get(api_did_signing_key))
+            .route(
+                "/api/v1/signing-keys/{did}/{kid}",
+                get(api_did_signing_key_by_kid),
+            )
+            .layer(
+                CorsLayer::new()
+                    .allow_origin(tower_http::cors::Any)
+                    .allow_methods([axum::http::Method::GET, axum::http::Method::OPTIONS]),
+            ),
+    );
 
     // Remote MCP (Streamable HTTP). Zero-install: an agent points its MCP
     // client at the URL instead of cloning the repo to build the stdio server.
@@ -1401,7 +1416,7 @@ async fn api_channel_events(
 
     let events: Vec<serde_json::Value> = state
         .with_db(|db| {
-            Ok(db.query_coordination_events(&channel.to_lowercase(), event_type, ref_id, actor, since, limit)
+            Ok(db.query_coordination_events(&channel.to_lowercase(), event_type, ref_id, actor, since, limit, false)
                 .into_iter()
                 .map(|e| serde_json::json!({
                     "event_id": e.event_id,
@@ -1617,7 +1632,9 @@ async fn api_act_task(
                 // file and waiting on the server that owns the task:
                 // "confirmed", "unconfirmed", or "superseded" — the last being
                 // a move a confirmed one outran. Absent for a receipt, which
-                // is the answer itself and has no state of its own.
+                // is the answer itself and has no state of its own, except
+                // "ignored" for one filed and not acted on, its link not the
+                // task's home's.
                 "confirm_state": e.confirm.map(crate::events::ConfirmState::as_str),
                 "timestamp": e.timestamp,
             })
@@ -1684,7 +1701,15 @@ async fn api_channel_audit(
 
     // 1. Coordination events
     if let Some(events) = state.with_db(|db| {
-        Ok(db.query_coordination_events(&channel.to_lowercase(), None, None, actor, since, limit))
+        Ok(db.query_coordination_events(
+            &channel.to_lowercase(),
+            None,
+            None,
+            actor,
+            since,
+            limit,
+            true,
+        ))
     }) {
         for e in events {
             timeline.push(serde_json::json!({
@@ -1758,6 +1783,7 @@ async fn api_channel_audit(
                             "event_id": e.event_id,
                             "timestamp": e.timestamp,
                             "signature": e.signature,
+                            "canonical": e.canonical,
                         }),
                     );
                 }
@@ -1833,6 +1859,10 @@ async fn api_channel_audit(
                 "actor_did": e.actor_did,
                 "details": details,
                 "signature": e.signature,
+                // The bytes the signature covers, so a reader can check the
+                // step itself; beside the signature, not among the details a
+                // reader draws as the step's facts.
+                "canonical": e.canonical,
                 "event_id": e.event_id,
             }));
         }
@@ -1859,18 +1889,49 @@ async fn api_channel_audit(
         }
     }
 
-    // Sort by timestamp
+    // Sort by timestamp, and keep the newest `limit` rows: each source sent
+    // its newest. The sort is stable, so rows of one second keep the order
+    // their source gave them.
     timeline.sort_by(|a, b| {
         let ta = a.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
         let tb = b.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
         ta.cmp(&tb)
     });
     if timeline.len() > limit {
-        timeline.truncate(limit);
+        timeline.drain(..timeline.len() - limit);
     }
 
+    // A ruling is checked against the referee its task's opener names, so
+    // the opener of every task on the page goes with it, outside the rows,
+    // whoever `actor` asked for: a page filtered to one person rarely holds
+    // the openers of the tasks that person moved.
+    let task_ids: std::collections::BTreeSet<String> = timeline
+        .iter()
+        .filter(|row| row["category"] == "act")
+        .filter_map(|row| row["details"]["act_id"].as_str().map(str::to_string))
+        .collect();
+    let venue = channel.to_lowercase();
+    let openers: Vec<serde_json::Value> = state
+        .with_db(|db| {
+            let mut found = Vec::new();
+            for id in &task_ids {
+                if let Some(e) = db.get_event(id)?
+                    && e.kind == "act"
+                    && e.venue == venue
+                {
+                    found.push(serde_json::json!({
+                        "event_id": e.event_id,
+                        "canonical": e.canonical,
+                        "signature": e.signature,
+                    }));
+                }
+            }
+            Ok(found)
+        })
+        .unwrap_or_default();
+
     Ok(Json(
-        serde_json::json!({ "channel": channel, "timeline": timeline }),
+        serde_json::json!({ "channel": channel, "timeline": timeline, "openers": openers }),
     ))
 }
 
@@ -2437,6 +2498,108 @@ fn classify_message_signature(
     }
 }
 
+/// What a verdict lets a third party conclude, as `(proves, independent,
+/// meaning)`.
+///
+/// `verdict` answers "do the bytes check out", which is true of a server-key
+/// signature too. Agents checking their own work read `valid: true` as "I am
+/// provably the author" and stopped there, when the server had only vouched
+/// for relaying the message (experiments/ax FINDINGS F18). `proves` is the
+/// answer to the question they were actually asking:
+///
+/// - `authorship` — the sender's own key signed it.
+/// - `relay` — this server signed it on the sender's behalf; the sender did
+///   not, and could deny it.
+/// - `nothing` — no conclusion either way (`invalid` or `unverifiable`).
+///
+/// `independent` says whether that conclusion needs anyone's word. A key the
+/// identity published itself (its DID document or identity record), or a
+/// did:key signing with the very key it names, needs none. A session key
+/// registered with MSGSIG is tied to the DID only by this server's record of
+/// which authenticated connection sent it, and the DID never signs that
+/// binding, so a skeptic has to take this server's word for whose key it is.
+fn what_it_proves(
+    verdict: &str,
+    verified_by: &str,
+    sender_did: Option<&str>,
+    client_public_key: Option<&str>,
+    key_source: Option<&str>,
+) -> (&'static str, bool, String) {
+    let who = sender_did.unwrap_or("the sender");
+    match (verdict, verified_by) {
+        ("valid", "client-session-key") => {
+            if signs_with_its_own_did_key(sender_did, client_public_key) {
+                (
+                    "authorship",
+                    true,
+                    format!(
+                        "Signed by {who}'s own key (the did:key is the key): attributable to \
+                         that identity, checkable without trusting this server."
+                    ),
+                )
+            } else if matches!(key_source, Some("identity-record" | "did-document")) {
+                (
+                    "authorship",
+                    true,
+                    format!(
+                        "Signed by a key {who} published in its {}: attributable to that \
+                         identity, checkable without trusting this server.",
+                        key_source.unwrap_or_default().replace('-', " ")
+                    ),
+                )
+            } else {
+                (
+                    "authorship",
+                    false,
+                    format!(
+                        "Signed by the author's own client key, which this server records as \
+                         {who}'s ({}). The signature shows the client signed it; that the key \
+                         belongs to {who} rests on this server's record.",
+                        key_source.unwrap_or("unknown source")
+                    ),
+                )
+            }
+        }
+        ("valid", "server-key") => (
+            "relay",
+            false,
+            "This server vouches that it relayed this message; the sender did not sign \
+             it, so it is not attributable to them. To author-sign, register a session \
+             key with MSGSIG and sign each message (see /signing.md)."
+                .to_string(),
+        ),
+        ("invalid", _) => (
+            "nothing",
+            false,
+            "The signature does not match this message under the key it names.".to_string(),
+        ),
+        _ => (
+            "nothing",
+            false,
+            "This signature cannot be checked here, so it supports no conclusion either way."
+                .to_string(),
+        ),
+    }
+}
+
+/// Whether `client_public_key` (base64url) is the ed25519 key `sender_did`
+/// itself encodes, i.e. a did:key that signed with its own key.
+fn signs_with_its_own_did_key(sender_did: Option<&str>, client_public_key: Option<&str>) -> bool {
+    use base64::Engine;
+    let (Some(did), Some(client)) = (sender_did, client_public_key) else {
+        return false;
+    };
+    let Some(multibase) = did.strip_prefix("did:key:") else {
+        return false;
+    };
+    match freeq_sdk::crypto::PublicKey::from_multibase(multibase) {
+        Ok(freeq_sdk::crypto::PublicKey::Ed25519(vk)) => {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.as_bytes()) == client
+        }
+        _ => false,
+    }
+}
+
 pub(crate) async fn api_verify_message(
     State(state): State<Arc<SharedState>>,
     axum::extract::Path(msgid): axum::extract::Path<String>,
@@ -2544,10 +2707,20 @@ pub(crate) async fn api_verify_message(
                         .map(|b| format!("{b:02x}"))
                         .collect::<String>()
                 });
+                let (proves, independent, meaning) = what_it_proves(
+                    verdict,
+                    verified_by,
+                    ev.actor_did.as_deref(),
+                    client_public_key.as_deref(),
+                    key_source.as_deref(),
+                );
                 let mut verification = serde_json::json!({
                     "valid": verdict == "valid",
                     "verdict": verdict,
                     "verified_by": verified_by,
+                    "proves": proves,
+                    "independent": independent,
+                    "meaning": meaning,
                     "server_public_key": server_pubkey,
                     "client_public_key": client_public_key,
                 });
@@ -2632,11 +2805,22 @@ pub(crate) async fn api_verify_message(
         use base64::Engine;
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(server_vk.as_bytes())
     };
+    let (proves, independent, meaning) = what_it_proves(
+        verdict,
+        verified_by,
+        sender_did.as_deref(),
+        client_public_key.as_deref(),
+        key_source.as_deref(),
+    );
     let mut verification = serde_json::json!({
-        // `valid` stays for older clients; `verdict` is the honest three-way.
+        // `valid` stays for older clients; `verdict` is the honest three-way;
+        // `proves` is what a third party may conclude from it.
         "valid": verdict == "valid",
         "verdict": verdict,
         "verified_by": verified_by,
+        "proves": proves,
+        "independent": independent,
+        "meaning": meaning,
         "server_public_key": server_pubkey,
         "client_public_key": client_public_key,
     });
@@ -2800,7 +2984,8 @@ struct DeviceSignOutRequest {
 ///
 /// The account's own retirement record is the durable statement that the key
 /// is stood down; this is the eviction that follows it. Three things end: the
-/// key row is retired, every connection signing with that key is closed, and
+/// key row is retired, every connection signing with that key is closed with
+/// `FAIL MSGSIG KEY_RETIRED` (`key_expiry::refuse_if_retired_or_expired`), and
 /// the login token behind it stops working — refused here from now on, and
 /// its session deleted where it lives: the embedded session store, or the
 /// standalone broker, which is asked over a signed call and retried until it
@@ -2850,34 +3035,27 @@ async fn api_device_sign_out(
             .map(|(sid, _)| sid.clone())
             .collect()
     };
+    // Each is refused as the read loop and the sweep refuse a retired key:
+    // `FAIL MSGSIG KEY_RETIRED`, its key dropped, the login token behind it
+    // ended, then the close.
     let mut sessions_closed = 0usize;
+    let mut tokens_revoked = 0usize;
     for sid in &doomed {
-        if crate::connection::close_session(&state, sid, "Signed out from another device") {
+        if let Some(ended) =
+            crate::key_expiry::refuse_if_retired_or_expired(&state, sid, &did, &req.kid).await
+        {
             sessions_closed += 1;
+            tokens_revoked += ended;
         }
     }
 
-    // The login token behind that key: filed as signed out, then its session
-    // ended where it lives — the embedded store, or the standalone broker.
-    let tokens: Vec<String> = {
-        let mut linked = state.device_key_tokens.lock();
-        let mut found = Vec::new();
-        linked.retain(|(d, k), token| {
-            if d == &did && k == &req.kid {
-                found.push(token.clone());
-                false
-            } else {
-                true
-            }
-        });
-        found
-    };
-    for token in &tokens {
-        crate::connection::end_login_token(&state, token).await;
-    }
+    // The login token of a device with no connection here: filed as signed
+    // out, then its session ended where it lives — the embedded store, or the
+    // standalone broker.
+    tokens_revoked += crate::key_expiry::end_login_tokens_of_key(&state, &did, &req.kid).await;
 
     tracing::info!(
-        %did, kid = %req.kid, sessions_closed, tokens_revoked = tokens.len(),
+        %did, kid = %req.kid, sessions_closed, tokens_revoked,
         "device signed out"
     );
     (
@@ -2885,7 +3063,7 @@ async fn api_device_sign_out(
         Json(serde_json::json!({
             "ok": true,
             "sessions_closed": sessions_closed,
-            "tokens_revoked": tokens.len(),
+            "tokens_revoked": tokens_revoked,
         })),
     )
 }
@@ -8207,6 +8385,150 @@ mod signature_verdict_tests {
         assert_eq!(out.0["sender_did"], did);
     }
 
+    /// Store `text` from `did` in `#proves` with the given signature tag, and
+    /// return what the verify endpoint says about it.
+    async fn verify_stored(
+        state: &std::sync::Arc<crate::server::SharedState>,
+        did: &str,
+        msgid: &str,
+        text: &str,
+        sig: Option<String>,
+    ) -> serde_json::Value {
+        let mut tags = std::collections::HashMap::new();
+        if let Some(sig) = sig {
+            tags.insert(freeq_sdk::sigtag::SIG_TAG.to_string(), sig);
+        }
+        state
+            .with_db(|db| {
+                db.insert_message("#proves", "n!u@h", text, 0, &tags, Some(msgid), Some(did))
+            })
+            .expect("test state has a database");
+        api_verify_message(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(msgid.to_string()),
+        )
+        .await
+        .expect("the message is on file")
+        .0
+    }
+
+    /// A server-key signature is `valid` — the bytes check out — but it proves
+    /// only that this server relayed the message. Agents checking their own
+    /// work read `valid: true` as authorship and stopped there (experiments/ax
+    /// FINDINGS F18), so the response says what it proves, and how to get the
+    /// stronger answer.
+    #[tokio::test]
+    async fn a_server_signed_message_proves_relay_not_authorship() {
+        let state = test_state_with_db();
+        let did = "did:key:z6MkserverSignedOnly";
+        let msgid = "01KYVT5Z8Q0000000000RELAY1";
+        let sig = ChatDoc::message(
+            did,
+            msgid,
+            &freeq_sdk::chatsig::channel_venue("#proves"),
+            "hi",
+        )
+        .sign(&state.msg_signing_key);
+        let out = verify_stored(&state, did, msgid, "hi", Some(sig)).await;
+        let v = &out["verification"];
+        assert_eq!(v["verdict"], "valid", "the bytes still check out");
+        assert_eq!(v["verified_by"], "server-key");
+        assert_eq!(v["proves"], "relay");
+        assert_eq!(v["independent"], false);
+        let meaning = v["meaning"]
+            .as_str()
+            .expect("a sentence saying what it proves");
+        assert!(meaning.contains("did not sign"), "{meaning}");
+        assert!(
+            meaning.contains("MSGSIG"),
+            "names the way to author-sign: {meaning}"
+        );
+    }
+
+    /// A session key registered over MSGSIG is tied to the DID only by this
+    /// server's record of which authenticated session sent it: the DID never
+    /// signs that binding. So the message is authored by that client, but a
+    /// skeptic still has to take this server's word for whose key it is, and
+    /// the response must not claim otherwise.
+    #[tokio::test]
+    async fn a_session_key_proves_authorship_on_this_servers_word() {
+        let state = test_state_with_db();
+        let did = "did:plc:sessionkeyuser";
+        let msgid = "01KYVT5Z8Q0000000000AUTHR1";
+        let key = SigningKey::from_bytes(&[5u8; 32]);
+        state
+            .with_db(|db| db.save_signing_key(did, key.verifying_key().as_bytes()))
+            .expect("test state has a database");
+        let sig = ChatDoc::message(
+            did,
+            msgid,
+            &freeq_sdk::chatsig::channel_venue("#proves"),
+            "hi",
+        )
+        .sign(&key);
+        let out = verify_stored(&state, did, msgid, "hi", Some(sig)).await;
+        let v = &out["verification"];
+        assert_eq!(v["proves"], "authorship");
+        assert_eq!(v["independent"], false);
+        let meaning = v["meaning"].as_str().unwrap();
+        assert!(
+            meaning.contains(did),
+            "names who it is attributable to: {meaning}"
+        );
+        assert!(
+            meaning.contains("this server"),
+            "says whose word the key binding rests on: {meaning}"
+        );
+        assert!(!meaning.contains("without trusting"), "{meaning}");
+    }
+
+    /// A did:key that signs with its own key needs nobody's word: the key is
+    /// the identity.
+    #[tokio::test]
+    async fn a_did_key_signing_with_its_own_key_is_independently_checkable() {
+        let state = test_state_with_db();
+        let key = SigningKey::from_bytes(&[6u8; 32]);
+        let did = format!(
+            "did:key:{}",
+            freeq_sdk::crypto::PublicKey::Ed25519(key.verifying_key()).to_multibase()
+        );
+        let msgid = "01KYVT5Z8Q0000000000AUTHR2";
+        state
+            .with_db(|db| db.save_signing_key(&did, key.verifying_key().as_bytes()))
+            .expect("test state has a database");
+        let sig = ChatDoc::message(
+            &did,
+            msgid,
+            &freeq_sdk::chatsig::channel_venue("#proves"),
+            "hi",
+        )
+        .sign(&key);
+        let out = verify_stored(&state, &did, msgid, "hi", Some(sig)).await;
+        let v = &out["verification"];
+        assert_eq!(v["proves"], "authorship");
+        assert_eq!(v["independent"], true);
+        assert!(
+            v["meaning"]
+                .as_str()
+                .unwrap()
+                .contains("without trusting this server")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_message_proves_nothing() {
+        let state = test_state_with_db();
+        let out = verify_stored(
+            &state,
+            "did:key:z6Mkunsigned",
+            "01KYVT5Z8Q0000000000UNSIG1",
+            "hi",
+            None,
+        )
+        .await;
+        assert_eq!(out["verification"]["proves"], "nothing");
+    }
+
     /// The classifier resolves the key the signature's `kid` names, never the
     /// identity's newest. The third of the three chat paths that must agree
     /// on this (the other two are pinned in `server.rs`): a reader coming back
@@ -8881,5 +9203,105 @@ mod verify_catchall_tests {
             .unwrap();
         assert_eq!(resp.status(), 503);
         assert!(!resp.text().await.unwrap().contains("<script"));
+    }
+}
+
+#[cfg(test)]
+mod key_endpoint_cors_tests {
+    use crate::server::test_state_with_db;
+
+    /// Serve the real router on loopback and send one GET with `origin`.
+    async fn get_from(
+        state: std::sync::Arc<crate::server::SharedState>,
+        origin: &str,
+        paths: &[&str],
+    ) -> Vec<reqwest::header::HeaderMap> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = super::router(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+        let client = reqwest::Client::new();
+        let mut headers = Vec::new();
+        for path in paths {
+            let response = client
+                .get(format!("http://{addr}{path}"))
+                .header("Origin", origin)
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_success(),
+                "{path}: {}",
+                response.status()
+            );
+            headers.push(response.headers().clone());
+        }
+        headers
+    }
+
+    /// A server's keys are public, so a page on any origin may read them: the
+    /// web app checks another server's ruling with that server's own keys.
+    #[tokio::test]
+    async fn the_key_endpoints_answer_any_origin_without_credentials() {
+        let state = test_state_with_db();
+        let key = [7u8; 32];
+        state.with_db(|db| {
+            db.save_signing_key_from("did:plc:cors", &key, "local-session", 10, None)
+        });
+        let kid = freeq_sdk::act::derive_kid_bytes(&key);
+        let by_kid = format!("/api/v1/signing-keys/did:plc:cors/{kid}");
+        let batch = format!("/api/v1/signing-keys?keys=did:plc:cors/{kid}");
+        let paths = [
+            "/.well-known/did.json",
+            "/api/v1/signing-keys/did:plc:cors",
+            &by_kid,
+            &batch,
+        ];
+        for (path, headers) in paths
+            .iter()
+            .zip(get_from(state, "https://elsewhere.example", &paths).await)
+        {
+            assert_eq!(
+                headers
+                    .get("access-control-allow-origin")
+                    .and_then(|v| v.to_str().ok()),
+                Some("*"),
+                "{path}"
+            );
+            assert!(
+                headers.get("access-control-allow-credentials").is_none(),
+                "{path}: no credentials"
+            );
+        }
+    }
+
+    /// Every other route keeps the origin list it had.
+    #[tokio::test]
+    async fn other_routes_keep_the_origin_list() {
+        let stranger = get_from(
+            test_state_with_db(),
+            "https://elsewhere.example",
+            &["/api/v1/signing-key"],
+        )
+        .await;
+        assert!(stranger[0].get("access-control-allow-origin").is_none());
+        let ours = get_from(
+            test_state_with_db(),
+            "https://irc.freeq.at",
+            &["/api/v1/signing-key"],
+        )
+        .await;
+        assert_eq!(
+            ours[0]
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://irc.freeq.at")
+        );
     }
 }

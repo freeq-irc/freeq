@@ -21,6 +21,7 @@ import type { FreeqClient } from './client.js';
 import type { Message } from './types.js';
 import * as signing from './signing.js';
 import * as e2ee from './e2ee.js';
+import { waitFor } from '../test/wait-for.js';
 
 // ── WebSocket mock ────────────────────────────────────────────────
 
@@ -91,11 +92,16 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+/**
+ * Give a test that asserts nothing arrived time in which something could
+ * have. Signing (Ed25519) and ENC1 (HKDF + AES-GCM) go through Web Crypto,
+ * which resolves off the macrotask queue, so draining microtasks alone would
+ * not let a stray frame through. Spending time is all such a test can do; a
+ * test that asserts on something that DOES arrive waits for it with
+ * `waitFor`, which is what the budget here used to be asked for and failed
+ * at under a slow CI runner.
+ */
 async function flushAsync(): Promise<void> {
-  // Microtask-only flushing isn't enough here — signing (Ed25519) and
-  // ENC1 (PBKDF2 + AES-GCM) go through Web Crypto, which resolves via
-  // the macrotask queue. Mix setTimeout in so the event loop actually
-  // ticks. ~50ms total upper bound across operations.
   for (let i = 0; i < 10; i++) {
     await new Promise((r) => setTimeout(r, 5));
   }
@@ -113,19 +119,25 @@ async function makeMultilineClient(nick: string): Promise<{
     skipInitialBrokerRefresh: true,
   });
   client.connect();
-  await flushAsync();
   const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+  await waitFor('the registration lines on the wire', () =>
+    ws.sent.some((l) => l.startsWith('USER ')),
+  );
   ws.recv(
     ':srv CAP * LS :message-tags server-time batch echo-message freeq.at/msgsig ' +
       'draft/multiline=max-bytes=40000,max-lines=100',
   );
-  await flushAsync();
+  await waitFor('the CAP REQ the client answers with', () =>
+    ws.sent.some((l) => l.startsWith('CAP REQ')),
+  );
   ws.recv(
     ':srv CAP * ACK :message-tags server-time batch draft/multiline freeq.at/msgsig',
   );
-  await flushAsync();
+  await waitFor('the CAP END the client answers with', () =>
+    ws.sent.some((l) => l.startsWith('CAP END')),
+  );
   ws.recv(`:srv 001 ${nick} :Welcome`);
-  await flushAsync();
+  await waitFor('the client to finish registering', () => client.registered);
   ws.sent.length = 0;
   return { client, ws };
 }
@@ -190,8 +202,9 @@ describe('comprehensive: sig on BATCH opener', () => {
     const verifyKey = await provisionSigningKey(client, did);
     const text = 'first\nsecond\nthird';
     client.sendMessage('#room', text);
-    await flushAsync();
-    const opener = findOpener(ws.sent);
+    const opener = await waitFor('the BATCH opener on the wire', () =>
+      findOpener(ws.sent),
+    );
     expect(opener).toBeDefined();
     // The opener carries the signature AND the event id it covers.
     const sigMatch = opener!.match(/\+freeq\.at\/sig=([^;\s]+)/);
@@ -231,7 +244,9 @@ describe('comprehensive: sig on BATCH opener', () => {
     const { client, ws } = await makeMultilineClient('alice');
     await provisionSigningKey(client, 'did:plc:test-signer');
     client.sendMessage('#room', 'a\nb\nc');
-    await flushAsync();
+    await waitFor('the BATCH closer, the last frame of the batch', () =>
+      findCloser(ws.sent),
+    );
     for (const chunk of findChunks(ws.sent)) {
       expect(chunk).not.toContain('+freeq.at/sig');
     }
@@ -252,9 +267,11 @@ describe('comprehensive: sig on BATCH opener', () => {
       const text = 'first\nsecond\nthird';
       if (tagged === 'reply') client.sendReply('#room', '01ROOTMSGID', text);
       else client.sendEdit('#room', '01ROOTMSGID', text);
-      await flushAsync();
 
-      const opener = findOpener(ws.sent);
+      const opener = await waitFor(
+        `the BATCH opener for a multiline ${tagged}`,
+        () => findOpener(ws.sent),
+      );
       expect(opener, `no opener for a multiline ${tagged}`).toBeDefined();
       const sigTag = opener!.match(/\+freeq\.at\/sig=([^;\s]+)/)?.[1];
       const eventId = opener!.match(/\+freeq\.at\/eventid=([^;\s]+)/)?.[1];
@@ -290,7 +307,9 @@ describe('comprehensive: ENC1 ciphertext-chunked multiline round-trip', () => {
     const text = Array.from({ length: 6 }, (_, i) => `line${i + 1}: ${paragraph}`).join('\n');
     expect(text.length).toBeGreaterThan(6000);
     client.sendMessage(channel, text);
-    await flushAsync();
+    await waitFor('the encrypted BATCH closer on the wire', () =>
+      findCloser(ws.sent),
+    );
     const opener = findOpener(ws.sent);
     const closer = findCloser(ws.sent);
     const chunks = findChunks(ws.sent);
@@ -322,7 +341,9 @@ describe('comprehensive: ENC1 ciphertext-chunked multiline round-trip', () => {
     const text = Array.from({ length: 6 }, (_, i) => `rt${i}: ${paragraph}`).join('\n');
     expect(text.length).toBeGreaterThan(6000);
     senderC.client.sendMessage(channel, text);
-    await flushAsync();
+    await waitFor('the encrypted BATCH closer on the sender wire', () =>
+      findCloser(senderC.ws.sent),
+    );
     // Re-broadcast sender's wire frames as if they arrived at receiver
     // from the server (rewrite by prepending a server-stamped prefix).
     const senderFrames = senderC.ws.sent.filter((l) =>
@@ -348,7 +369,7 @@ describe('comprehensive: ENC1 ciphertext-chunked multiline round-trip', () => {
       }
       receiverC.ws.recv(line);
     }
-    await flushAsync();
+    await waitFor('the reassembled message at the receiver', () => seen.length > 0);
     expect(seen).toHaveLength(1);
     expect(seen[0].text).toBe(text);
     expect(seen[0].encrypted).toBe(true);
@@ -371,7 +392,7 @@ describe('comprehensive: opener tag passthrough', () => {
     ws.recv('@batch=tg1 :bob!u@h PRIVMSG #room :line a');
     ws.recv('@batch=tg1 :bob!u@h PRIVMSG #room :line b');
     ws.recv(':srv BATCH -tg1');
-    await flushAsync();
+    await waitFor('the assembled message', () => seen.length > 0);
     expect(seen).toHaveLength(1);
     expect(seen[0].id).toBe('01OPENID');
     expect(seen[0].timestamp.toISOString()).toBe('2026-05-30T12:00:00.000Z');
@@ -389,7 +410,7 @@ describe('comprehensive: opener tag passthrough', () => {
     ws.recv('@batch=tg2 :bob!u@h PRIVMSG #room :reply line 1');
     ws.recv('@batch=tg2 :bob!u@h PRIVMSG #room :reply line 2');
     ws.recv(':srv BATCH -tg2');
-    await flushAsync();
+    await waitFor('the assembled message', () => seen.length > 0);
     expect(seen).toHaveLength(1);
     expect(seen[0].replyTo).toBe('01ORIG');
   });
@@ -405,7 +426,7 @@ describe('comprehensive: opener tag passthrough', () => {
     ws.recv('@batch=tg3 :bob!u@h PRIVMSG #room :partial chunk one');
     ws.recv('@batch=tg3 :bob!u@h PRIVMSG #room :partial chunk two');
     ws.recv(':srv BATCH -tg3');
-    await flushAsync();
+    await waitFor('the assembled message', () => seen.length > 0);
     expect(seen).toHaveLength(1);
     expect(seen[0].isStreaming).toBe(true);
   });
@@ -423,7 +444,7 @@ describe('comprehensive: opener tag passthrough', () => {
     ws.recv('@batch=tg4 :bob!u@h PRIVMSG #room :revealed line 1');
     ws.recv('@batch=tg4 :bob!u@h PRIVMSG #room :revealed line 2');
     ws.recv(':srv BATCH -tg4');
-    await flushAsync();
+    await waitFor('the assembled message', () => seen.length > 0);
     // A message carrying event tags is a rendering of its event, not the
     // event — the TAGMSG fires `coordinationEvent`, a batch never does.
     expect(events).toHaveLength(0);
@@ -461,7 +482,7 @@ describe('comprehensive: nested multiline inside CHATHISTORY', () => {
       '@batch=ch1;msgid=01PLAIN :bob!u@h PRIVMSG #room :a regular history line',
     );
     ws.recv(':srv BATCH -ch1');
-    await flushAsync();
+    await waitFor('the chathistory batch', () => historyBatches.length > 0);
     expect(topLevelMessages).toHaveLength(0); // none fired at top level
     expect(historyBatches).toHaveLength(1);
     expect(historyBatches[0].target).toBe('#room');
@@ -503,7 +524,7 @@ describe('comprehensive: a replayed multi-line edit folds into its original', ()
     ws.recv('@batch=e1 :bob!u@h PRIVMSG #room :second 2');
     ws.recv(':srv BATCH -e1');
     ws.recv(':srv BATCH -h1');
-    await flushAsync();
+    await waitFor('the chathistory batch', () => history.length > 0);
     expect(edits).toHaveLength(0);
     expect(history).toHaveLength(1);
     expect(history[0]).toHaveLength(1);
@@ -530,7 +551,7 @@ describe('comprehensive: a replayed multi-line edit folds into its original', ()
     ws.recv('@batch=e2 :bob!u@h PRIVMSG #room :lines');
     ws.recv(':srv BATCH -e2');
     ws.recv(':srv BATCH -h2');
-    await flushAsync();
+    await waitFor('the chathistory batch', () => history.length > 0);
     expect(edits).toHaveLength(0);
     expect(history[0]).toHaveLength(1);
     expect(history[0][0].id).toBe('01ONE');
@@ -550,7 +571,7 @@ describe('comprehensive: a replayed multi-line edit folds into its original', ()
     ws.recv('@batch=e3 :bob!u@h PRIVMSG #room :orphan 2');
     ws.recv(':srv BATCH -e3');
     ws.recv(':srv BATCH -h3');
-    await flushAsync();
+    await waitFor('the chathistory batch', () => history.length > 0);
     expect(history[0]).toHaveLength(1);
     expect(history[0][0].id).toBe('01GONE');
     expect(history[0][0].text).toBe('orphan 1\norphan 2');
@@ -567,7 +588,7 @@ describe('comprehensive: a replayed multi-line edit folds into its original', ()
     ws.recv('@batch=e4 :bob!u@h PRIVMSG #room :live 1');
     ws.recv('@batch=e4 :bob!u@h PRIVMSG #room :live 2');
     ws.recv(':srv BATCH -e4');
-    await flushAsync();
+    await waitFor('the live edit', () => edits.length > 0);
     expect(history).toHaveLength(0);
     expect(edits).toHaveLength(1);
     expect((edits[0] as unknown[])[1]).toBe('01ORIG');
@@ -587,7 +608,7 @@ describe('comprehensive: edge cases', () => {
     ws.recv('@msgid=01SC :bob!u@h BATCH +sc1 draft/multiline #room');
     ws.recv('@batch=sc1 :bob!u@h PRIVMSG #room :only one chunk');
     ws.recv(':srv BATCH -sc1');
-    await flushAsync();
+    await waitFor('the assembled message', () => seen.length > 0);
     expect(seen).toHaveLength(1);
     expect(seen[0].text).toBe('only one chunk');
   });
@@ -598,7 +619,7 @@ describe('comprehensive: edge cases', () => {
     client.on('message', (_ch, m) => seen.push(m));
     ws.recv('@msgid=01EM :bob!u@h BATCH +em1 draft/multiline #room');
     ws.recv(':srv BATCH -em1');
-    await flushAsync();
+    await waitFor('the assembled message', () => seen.length > 0);
     expect(seen).toHaveLength(1);
     expect(seen[0].text).toBe('');
   });
@@ -627,7 +648,7 @@ describe('comprehensive: edge cases', () => {
     ws.recv('@batch=chx;msgid=01A :bob!u@h PRIVMSG #room :hello');
     ws.recv('@batch=chx;msgid=01B :bob!u@h PRIVMSG #room :world');
     ws.recv(':srv BATCH -chx');
-    await flushAsync();
+    await waitFor('the chathistory batch', () => history.length > 0);
     expect(topLevel).toHaveLength(0);
     expect(history).toHaveLength(1);
     expect(history[0].messages).toHaveLength(2);
@@ -645,7 +666,7 @@ describe('comprehensive: edge cases', () => {
       ws.recv(`@batch=uc1 :bob!u@h PRIVMSG #room :${line}`);
     }
     ws.recv(':srv BATCH -uc1');
-    await flushAsync();
+    await waitFor('the assembled message', () => seen.length > 0);
     expect(seen).toHaveLength(1);
     expect(seen[0].text).toBe(text);
   });
@@ -661,7 +682,7 @@ describe('comprehensive: edge cases', () => {
     ws.recv('@batch=cm1 :bob!u@h PRIVMSG #room :delta');
     ws.recv('@batch=cm1;draft/multiline-concat= :bob!u@h PRIVMSG #room :epsilon');
     ws.recv(':srv BATCH -cm1');
-    await flushAsync();
+    await waitFor('the assembled message', () => seen.length > 0);
     expect(seen).toHaveLength(1);
     expect(seen[0].text).toBe('alphabetagamma\ndeltaepsilon');
   });
@@ -669,7 +690,9 @@ describe('comprehensive: edge cases', () => {
   it('outbound: text with no \\n sends one PRIVMSG (no BATCH)', async () => {
     const { client, ws } = await makeMultilineClient('alice');
     client.sendMessage('#room', 'just one logical line');
-    await flushAsync();
+    await waitFor('the single PRIVMSG on the wire', () =>
+      ws.sent.find((l) => l.includes('PRIVMSG #room :just one logical line')),
+    );
     expect(findOpener(ws.sent)).toBeUndefined();
     expect(ws.sent.find((l) => l.includes('PRIVMSG #room :just one logical line')))
       .toBeDefined();
@@ -681,7 +704,9 @@ describe('comprehensive: edge cases', () => {
     // Must split into >1 batch, never fall back to a legacy oversized line.
     const text = Array.from({ length: 101 }, (_, i) => `line${i + 1}`).join('\n');
     client.sendMessage('#room', text);
-    await flushAsync();
+    await waitFor('the 101st line on the wire', () =>
+      ws.sent.some((l) => l.endsWith('line101')),
+    );
     const openers = ws.sent.filter(
       (l) => l.includes('BATCH +') && l.includes('draft/multiline'),
     );
@@ -697,7 +722,7 @@ describe('comprehensive: edge cases', () => {
     // Exceed max-bytes=40000 while staying under max-lines: 90 × 600 chars.
     const text = Array.from({ length: 90 }, () => 'x'.repeat(600)).join('\n');
     client.sendMessage('#room', text);
-    await flushAsync();
+    await waitFor('all 90 lines on the wire', () => findChunks(ws.sent).length >= 90);
     const openers = ws.sent.filter(
       (l) => l.includes('BATCH +') && l.includes('draft/multiline'),
     );
@@ -713,7 +738,7 @@ describe('comprehensive: edge cases', () => {
     const seen: Message[] = [];
     client.on('message', (_ch, m) => seen.push(m));
     ws.recv('@+freeq.at/multiline= :bob!u@h PRIVMSG #room :日本語\\n🎉\\n한국어');
-    await flushAsync();
+    await waitFor('the decoded legacy message', () => seen.length > 0);
     expect(seen).toHaveLength(1);
     expect(seen[0].text).toBe('日本語\n🎉\n한국어');
   });
@@ -735,7 +760,9 @@ describe('comprehensive: oversize multi-line paste splits into batches', () => {
     const lines = Array.from({ length: 250 }, (_, i) => `line-${i}`);
     const text = lines.join('\n');
     client.sendMessage('#room', text);
-    await flushAsync();
+    await waitFor('the last of the 250 lines on the wire', () =>
+      ws.sent.some((l) => l.endsWith('line-249')),
+    );
 
     const openers = ws.sent.filter(
       (l) => l.includes('BATCH +') && l.includes('draft/multiline'),

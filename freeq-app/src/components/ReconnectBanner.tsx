@@ -1,7 +1,7 @@
 import { useStore } from '../store';
 import { disconnect, reconnect } from '../irc/client';
 import { useState, useEffect } from 'react';
-import { TOP_BAR, TOP_BAR_BUTTON, TOP_BAR_QUIET_BUTTON, TOP_BAR_TEXT } from './topBar';
+import { TOP_BAR, TOP_BAR_BUTTON, TOP_BAR_QUIET_BUTTON, TOP_BAR_TEXT } from './TopBar';
 
 export function ReconnectBanner() {
   const connectionState = useStore((s) => s.connectionState);

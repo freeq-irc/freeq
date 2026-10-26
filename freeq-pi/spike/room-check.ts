@@ -18,10 +18,10 @@ import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-ag
 import { FreeqClient } from "@freeq/sdk";
 import { loadOrCreateIdentity } from "@freeq/bot-kit";
 
-import { FreeqConnection } from "../src/connection.js";
-import { collectSessionMeta } from "../src/presence.js";
-import { decideInbound, frameInbound, reachesModel } from "../src/inbound.js";
-import { tierFor, modeFor, defaultConfig, type FreeqConfig } from "../src/config.js";
+import { FreeqConnection } from "@freeq/harness-kit/connection";
+import { collectSessionMeta } from "@freeq/harness-kit/presence";
+import { decideInbound, frameInbound, reachesModel } from "@freeq/harness-kit/inbound";
+import { tierFor, modeFor, defaultConfig, type FreeqConfig } from "@freeq/harness-kit/config";
 
 const { values } = parseArgs({
   options: {

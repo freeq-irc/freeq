@@ -36,8 +36,8 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
   const setTheme = useStore((s) => s.setTheme);
   const density = useStore((s) => s.messageDensity);
   const setDensity = useStore((s) => s.setMessageDensity);
-  const showJoinPart = useStore((s) => s.showJoinPart);
-  const setShowJoinPart = useStore((s) => s.setShowJoinPart);
+  const joinPartDisplay = useStore((s) => s.joinPartDisplay);
+  const setJoinPartDisplay = useStore((s) => s.setJoinPartDisplay);
   const loadMedia = useStore((s) => s.loadExternalMedia);
   const setLoadMedia = useStore((s) => s.setLoadExternalMedia);
   const blockedDids = useStore((s) => s.blockedDids);
@@ -114,13 +114,22 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                 ))}
               </div>
             </div>
-            <Toggle
-              label="Show join/part messages"
-              checked={showJoinPart}
-              onChange={setShowJoinPart}
-            />
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-fg-muted">Join & leave messages</span>
+              <div className="flex gap-1 bg-bg rounded-lg p-0.5">
+                {(['hidden', 'grouped', 'all'] as const).map((d) => (
+                  <button
+                    key={d}
+                    onClick={() => setJoinPartDisplay(d)}
+                    className={`px-2 py-1 text-xs rounded-md capitalize ${joinPartDisplay === d ? 'bg-surface text-fg' : 'text-fg-dim'}`}
+                  >
+                    {d}
+                  </button>
+                ))}
+              </div>
+            </div>
             <p className="text-[11px] text-fg-dim leading-relaxed mt-1">
-              Show when users join and leave channels. Kicks and moderation actions are always shown.
+              When people join and leave channels: hidden, folded into one line per run, or every one. Kicks and moderation actions are always shown.
             </p>
           </Section>
 

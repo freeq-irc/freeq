@@ -117,7 +117,7 @@ export function createDaemonCLI<O extends DaemonOpts = DaemonOpts>(
   opts: CreateDaemonCLIOptions<O>,
 ): Command {
   const program = new Command();
-  program.name(opts.name).version("0.1.0");
+  program.name(opts.name).version("0.2.0");
 
   registerLaunch(program, opts);
   registerStop(program, opts);
@@ -503,7 +503,7 @@ async function safeReadAgentDid(seedPath: string): Promise<string | null> {
   return id?.did ?? null;
 }
 
-/** Turn "freeqcc" → "FREEQCC_", "swarm-coordinator" → "SWARM_COORDINATOR_". */
+/** Turn "my-bot" → "MY_BOT_", "swarm-coordinator" → "SWARM_COORDINATOR_". */
 function envPrefix(name: string): string {
   return name.replace(/[^a-zA-Z0-9]/g, "_").toUpperCase() + "_";
 }

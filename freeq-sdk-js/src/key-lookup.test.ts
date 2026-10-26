@@ -16,7 +16,16 @@ import {
   buildDeviceRetirement,
   clearHostPauses,
 } from './identity-records.js';
-import { KeyLookup, MemoryKeyLookupStore, makeDidResolver } from './key-lookup.js';
+import {
+  KeyLookup,
+  type KeyLookupSnapshot,
+  MemoryKeyLookupStore,
+  type OwnHostAnswer,
+  type RefereeKeys,
+  boundReferees,
+  READ_FOR_HELD,
+  makeDidResolver,
+} from './key-lookup.js';
 import { deriveKid } from './signing.js';
 
 const ALICE = 'did:plc:k2n3e2vsihf3farequ44t5j7';
@@ -275,6 +284,19 @@ describe('KeyLookup', () => {
     vi.setSystemTime(clock(61));
     expect((await lookup.keyFor(ALICE, await kidOf(2)))?.source).toBe('OriginServer');
     expect(hits.origin).toBe(2);
+  });
+
+  it('lists for a vouched key again after the ttl, and asks the origin no more', async () => {
+    const { fetch, hits } = await network([], { [`${ALICE} ${await kidOf(2)}`]: await raw(2) });
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, 1_000, NO_RETRIES);
+    expect((await lookup.keyFor(ALICE, await kidOf(2)))?.source).toBe('OriginServer');
+    const asked = { ...hits };
+
+    await new Promise((res) => setTimeout(res, 1_100));
+    expect((await lookup.keyFor(ALICE, await kidOf(2)))?.source).toBe('OriginServer');
+    expect(hits, 'one listing, and the origin not asked again').toEqual({ ...asked, pds: asked.pds + 1 });
+    expect((await lookup.keyFor(ALICE, await kidOf(2)))?.source).toBe('OriginServer');
+    expect(hits, 'none again inside the ttl').toEqual({ ...asked, pds: asked.pds + 1 });
   });
 
   it('lists the account again and finds a record published since, on refreshAccount', async () => {
@@ -1112,6 +1134,24 @@ describe('KeyLookup through the home server', () => {
     expect(hits.origin).toBe(1);
   });
 
+  it("reads a did:key signer's own key from its DID with no request and keeps nothing, and asks for any other kid as before", async () => {
+    const BOT = `did:key:${(await key(7)).publicKeyMultibase}`;
+    const { home, pds, hits, fetch, resolveDid } = await homeNetwork({
+      [`${BOT} ${await kidOf(7)}`]: await raw(7),
+      [`${BOT} ${await kidOf(8)}`]: await raw(8),
+    });
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    const own = await lookup.keyForAt(BOT, await kidOf(7), new Date());
+    expect(own?.source).toBe('DidKey');
+    expect(own?.publicKey).toEqual(await raw(7));
+    expect(hits.origin, 'no request').toBe(0);
+    expect((lookup as unknown as { cache: Map<string, unknown> }).cache.size, 'nothing kept').toBe(0);
+    expect((await lookup.keyForAt(BOT, await kidOf(8), new Date()))?.source).toBe('OriginServer');
+    expect(hits.origin, 'asked as before').toBe(1);
+    expect(home.hits, 'no record request').toEqual(noHome);
+    expect(pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+  });
+
   it('asks nothing for a batch of did:key signers alone', async () => {
     const { home, fetch, resolveDid } = await homeNetwork();
     const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
@@ -1221,6 +1261,241 @@ describe('KeyLookup through the home server', () => {
     expect(fetch.mock.calls.length).toBe(requests);
   });
 
+  /**
+   * Alice's device `seed` as a reader meets it once its record is published
+   * and the device has registered the key again: the home server's copy,
+   * frozen since the registration, holds the record. The server vouches for
+   * the key from the registration, so `homeNetwork` is given it.
+   */
+  async function alicePublishes(net: Awaited<ReturnType<typeof homeNetwork>>, seed: number): Promise<void> {
+    await net.alice.add('at.freeq.deviceKey', await buildDeviceRecord(await key(seed), ALICE, T0));
+    net.home.frozen = false;
+  }
+
+  it('reads a key published since the held listing from the records, with one listing and its proof', async () => {
+    const net = await homeNetwork({ [`${ALICE} ${await kidOf(4)}`]: await raw(4) });
+    const lookup = new KeyLookup({ fetch: net.fetch, resolveDid: net.resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    net.home.frozen = true;
+    await lookup.prefetch([ALICE]);
+    expect((await lookup.keyFor(ALICE, await kidOf(1)))?.source).toBe('IdentityRecord');
+    const before = { ...net.home.hits };
+
+    await alicePublishes(net, 4);
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
+    expect(net.home.hits, 'one listing and the new record’s proof').toEqual({
+      ...before,
+      listing: before.listing + 1,
+      proof: before.proof + 1,
+    });
+    expect(net.pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+
+    const asked = { ...net.home.hits };
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
+    expect(net.home.hits, 'the lines after it ask nothing').toEqual(asked);
+  });
+
+  it('reads twenty lines of two keys published since from the records, with one listing', async () => {
+    const net = await homeNetwork({
+      [`${ALICE} ${await kidOf(4)}`]: await raw(4),
+      [`${ALICE} ${await kidOf(5)}`]: await raw(5),
+    });
+    // A listing takes a moment to come back, as one over a network does,
+    // so the second key's lookup finds the first key's listing in flight.
+    const slow = async (input: string): Promise<Response> => {
+      if (new URL(input).pathname.startsWith('/api/v1/records/')) await new Promise((r) => setTimeout(r, 20));
+      return net.fetch(input);
+    };
+    const lookup = new KeyLookup({ fetch: slow, resolveDid: net.resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    net.home.frozen = true;
+    await lookup.prefetch([ALICE]);
+    await alicePublishes(net, 4);
+    await alicePublishes(net, 5);
+
+    const listed = net.home.hits.batch + net.home.hits.listing;
+    const kids = [await kidOf(4), await kidOf(5)];
+    const lines = await Promise.all(Array.from({ length: 20 }, (_, i) => lookup.keyFor(ALICE, kids[i % 2]!)));
+    expect(lines.filter((f) => f?.source === 'IdentityRecord')).toHaveLength(20);
+    expect(net.home.hits.batch + net.home.hits.listing - listed, 'one listing for the lot').toBe(1);
+  });
+
+  it('reads a history batch of keys published since from the records, in one records request', async () => {
+    const net = await homeNetwork({
+      [`${ALICE} ${await kidOf(4)}`]: await raw(4),
+      [`${ALICE} ${await kidOf(5)}`]: await raw(5),
+    });
+    const reader = { fetch: net.fetch, resolveDid: net.resolveDid };
+    const store = new MemoryKeyLookupStore();
+    const first = new KeyLookup(reader, ORIGIN, HOUR, NO_RETRIES, store);
+    net.home.frozen = true;
+    await first.prefetch([ALICE]);
+    await first.flush();
+    await alicePublishes(net, 4);
+    await alicePublishes(net, 5);
+
+    const again = new KeyLookup(reader, ORIGIN, HOUR, NO_RETRIES, store);
+    await again.prefetch([ALICE]);
+    const listed = net.home.hits.batch + net.home.hits.listing;
+    await again.prefetchKeys([[ALICE, await kidOf(4)], [ALICE, await kidOf(5)]]);
+    for (const seed of [4, 4, 4, 5, 5]) {
+      expect((await again.keyFor(ALICE, await kidOf(seed)))?.source, `the history line of key ${seed}`).toBe(
+        'IdentityRecord',
+      );
+    }
+    expect(net.home.hits.batch + net.home.hits.listing - listed, 'one records request for the batch').toBe(1);
+  });
+
+  // The twin of Rust's
+  // `a_history_batch_lists_an_account_again_after_the_listing_it_waited_on`,
+  // which stands an answered listing in the map where this one holds a real
+  // one back, the Rust home stub having no way to answer late.
+  it('lists an account again after the listing a history batch waited on', async () => {
+    const net = await homeNetwork({ [`${ALICE} ${await kidOf(4)}`]: await raw(4) });
+    // Alice's listing is answered before she publishes key 4 and handed back
+    // while the history batch is running, so the batch finds it in flight and
+    // what it brings cannot name the key.
+    const late = async (url: string): Promise<Response> => {
+      if (new URL(url).pathname !== '/api/v1/records') return net.fetch(url);
+      const answer = await net.fetch(url);
+      await new Promise((r) => setTimeout(r, 100));
+      return answer;
+    };
+    const lookup = new KeyLookup({ fetch: late, resolveDid: net.resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    const live = lookup.keyFor(ALICE, await kidOf(1));
+    await new Promise((r) => setTimeout(r, 20));
+    await alicePublishes(net, 4);
+    await lookup.prefetchKeys([[ALICE, await kidOf(4)]]);
+
+    expect(
+      (await lookup.keyFor(ALICE, await kidOf(4)))?.source,
+      'the key published since the listing waited on',
+    ).toBe('IdentityRecord');
+    expect((await live)?.source).toBe('IdentityRecord');
+    expect(net.home.hits, "one listing of its own, and the new record's proof").toEqual({
+      ...noHome,
+      batch: 1,
+      listing: 1,
+      proof: 1,
+    });
+    expect(net.pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+  });
+
+  it('asks nothing for a key already settled when the lookup is rebuilt on the store', async () => {
+    const net = await homeNetwork({ [`${ALICE} ${await kidOf(4)}`]: await raw(4) });
+    const reader = { fetch: net.fetch, resolveDid: net.resolveDid };
+    const store = new MemoryKeyLookupStore();
+    const lookup = new KeyLookup(reader, ORIGIN, HOUR, NO_RETRIES, store);
+    net.home.frozen = true;
+    await lookup.prefetch([ALICE]);
+    await alicePublishes(net, 4);
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
+    await lookup.flush();
+
+    const asked = { ...net.home.hits };
+    const again = new KeyLookup(reader, ORIGIN, HOUR, NO_RETRIES, store);
+    expect((await again.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
+    expect(net.home.hits, 'nothing asked after the reload').toEqual(asked);
+  });
+
+  it('lists once for an unpublished key, however many lines it signs', async () => {
+    const net = await homeNetwork({ [`${ALICE} ${await kidOf(4)}`]: await raw(4) });
+    const lookup = new KeyLookup({ fetch: net.fetch, resolveDid: net.resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    await lookup.prefetch([ALICE]);
+
+    const listed = net.home.hits.batch + net.home.hits.listing;
+    for (let i = 0; i < 20; i++) {
+      expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('OriginServer');
+    }
+    expect(net.home.hits.batch + net.home.hits.listing - listed, 'one listing in all').toBe(1);
+    expect(net.pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+  });
+
+  it("keeps the origin's answer when the first-sight listing fails, and asks nothing again inside the ttl", async () => {
+    const { fetch: working } = await network([], { [`${ALICE} ${await kidOf(2)}`]: await raw(2) });
+    let listings = 0;
+    const fetch = vi.fn(async (input: string): Promise<Response> => {
+      if (new URL(input).origin !== PDS) return working(input);
+      listings++;
+      return new Response('down', { status: 500 });
+    });
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
+    expect((await lookup.keyFor(ALICE, await kidOf(2)))?.source).toBe('OriginServer');
+
+    // The account was listed since the lookup began, so the first-sight read
+    // takes what is held of it, nothing, and tries no listing of its own.
+    expect(listings, "the ask's listing, and no second attempt").toBe(1);
+    const asked = [listings, fetch.mock.calls.length];
+    for (let i = 0; i < 5; i++) {
+      expect((await lookup.keyFor(ALICE, await kidOf(2)))?.source).toBe('OriginServer');
+    }
+    expect([listings, fetch.mock.calls.length], 'nothing asked again inside the ttl').toEqual(asked);
+  });
+
+  it('lists nothing for a server of its own in a history batch', async () => {
+    const PEER = 'did:web:peer.example';
+    const net = await homeNetwork({ [`${PEER} ${await kidOf(7)}`]: await raw(7) });
+    const lookup = new KeyLookup({ fetch: net.fetch, resolveDid: net.resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    await lookup.prefetchKeys([[PEER, await kidOf(7), true]]);
+    expect(net.home.hits, 'no records asked for').toEqual(noHome);
+    expect(net.pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+    expect((await lookup.keyForAt(PEER, await kidOf(7), new Date(), { server: true }))?.source).toBe('OriginServer');
+  });
+
+  // The twin of Rust's `asks_for_no_device_records_of_a_server`: the live
+  // path, with nothing kept for the key beforehand, so the ask itself
+  // reaches the first-sight re-list and must leave a server's DID out of it.
+  it('lists nothing for a server of its own on a live line', async () => {
+    const PEER = 'did:web:peer.example';
+    const net = await homeNetwork({ [`${PEER} ${await kidOf(7)}`]: await raw(7) });
+    const lookup = new KeyLookup({ fetch: net.fetch, resolveDid: net.resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    expect((await lookup.keyForAt(PEER, await kidOf(7), new Date(), { server: true }))?.source).toBe('OriginServer');
+    expect(net.home.hits, 'no records asked for').toEqual(noHome);
+    expect(net.home.batches, 'no account named in a batch').toEqual([]);
+    expect(net.pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+  });
+
+  // The twin of Rust's `a_vouched_key_of_a_server_is_not_listed_for_after_the_ttl`.
+  it('lists nothing for a vouched key of a server of its own after the ttl', async () => {
+    const PEER = 'did:web:peer.example';
+    const net = await homeNetwork({ [`${PEER} ${await kidOf(7)}`]: await raw(7) });
+    const lookup = new KeyLookup({ fetch: net.fetch, resolveDid: net.resolveDid }, ORIGIN, 400, NO_RETRIES);
+    const ask = { server: true };
+    expect((await lookup.keyForAt(PEER, await kidOf(7), new Date(), ask))?.source).toBe('OriginServer');
+    const asked = { ...net.hits };
+
+    await new Promise((res) => setTimeout(res, 600));
+    expect((await lookup.keyForAt(PEER, await kidOf(7), new Date(), ask))?.source).toBe('OriginServer');
+    expect(net.home.hits, 'no records asked for').toEqual(noHome);
+    expect(net.hits, 'and the origin not asked again').toEqual(asked);
+    expect(net.pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+  });
+
+  it('lists nothing for another kid of a did:key account, live or in a history batch', async () => {
+    const BOT = 'did:key:z6MkExampleBotSigner';
+    const net = await homeNetwork({
+      [`${BOT} ${await kidOf(7)}`]: await raw(7),
+      [`${BOT} ${await kidOf(8)}`]: await raw(8),
+    });
+    const lookup = new KeyLookup({ fetch: net.fetch, resolveDid: net.resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    await lookup.prefetchKeys([[BOT, await kidOf(8)]]);
+    expect((await lookup.keyFor(BOT, await kidOf(7)))?.source).toBe('OriginServer');
+    expect(net.home.hits, 'no records asked for').toEqual(noHome);
+    expect(net.pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+  });
+
+  it('reads a line that came before the publish from the records at the re-check past the ttl', async () => {
+    const net = await homeNetwork({ [`${ALICE} ${await kidOf(4)}`]: await raw(4) });
+    const lookup = new KeyLookup({ fetch: net.fetch, resolveDid: net.resolveDid }, ORIGIN, 1_000, NO_RETRIES);
+    await lookup.prefetch([ALICE]);
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('OriginServer');
+
+    await alicePublishes(net, 4);
+    await new Promise((res) => setTimeout(res, 1_100));
+    const listed = net.home.hits.batch + net.home.hits.listing;
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
+    expect(net.home.hits.batch + net.home.hits.listing - listed, 'one listing at the re-check').toBe(1);
+    expect(net.pds, 'the PDS was not asked').toEqual({ listings: 0, proofs: 0 });
+  });
+
   it('lists the PDS on refreshAccount while the home server serves an older copy', async () => {
     const { alice, home, pds, hits, fetch, resolveDid } = await homeNetwork();
     const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
@@ -1234,6 +1509,37 @@ describe('KeyLookup through the home server', () => {
     expect(pds).toEqual({ listings: 1, proofs: 1 });
     expect(hits.origin).toBe(0);
     expect(home.hits.batch).toBe(1);
+  });
+
+  it('takes the records of a vouched key again through the home server past the ttl, not the PDS, and finds it published since', async () => {
+    const { alice, home, pds, fetch, resolveDid } = await homeNetwork({ [`${ALICE} ${await kidOf(4)}`]: await raw(4) });
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, 1_000, NO_RETRIES);
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('OriginServer');
+    await alice.add('at.freeq.deviceKey', await buildDeviceRecord(await key(4), ALICE, T0));
+    await new Promise((res) => setTimeout(res, 1_100));
+    const listed = home.hits.batch + home.hits.listing;
+    await lookup.relistVouched(ALICE, await kidOf(4));
+    expect(home.hits.batch + home.hits.listing - listed, 'one listing').toBe(1);
+    expect(pds.listings, 'the PDS was not asked').toBe(0);
+    expect(await lookup.holdsOriginAnswer(ALICE, await kidOf(4))).toBe(false);
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('IdentityRecord');
+  });
+
+  it("keeps the origin's answer for a vouched key still unpublished, and takes the records again at most once per ttl", async () => {
+    const { home, pds, hits, fetch, resolveDid } = await homeNetwork({ [`${ALICE} ${await kidOf(4)}`]: await raw(4) });
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, 1_000, NO_RETRIES);
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('OriginServer');
+    await new Promise((res) => setTimeout(res, 1_100));
+    const listed = home.hits.batch + home.hits.listing;
+    await lookup.relistVouched(ALICE, await kidOf(4));
+    expect(home.hits.batch + home.hits.listing - listed, 'one listing').toBe(1);
+    expect(await lookup.holdsOriginAnswer(ALICE, await kidOf(4))).toBe(true);
+    await lookup.relistVouched(ALICE, await kidOf(4));
+    expect(home.hits.batch + home.hits.listing - listed, 'none again inside the ttl').toBe(1);
+    const asked = hits.origin;
+    expect((await lookup.keyFor(ALICE, await kidOf(4)))?.source).toBe('OriginServer');
+    expect(hits.origin, 'no key request').toBe(asked);
+    expect(pds.listings, 'the PDS was not asked').toBe(0);
   });
 
   it('replaces an origin answer for a key published since, in memory and in the store', async () => {
@@ -1377,5 +1683,280 @@ describe('KeyLookup through the home server', () => {
     expect((await lookup.keyFor(ALICE, await kidOf(1)))?.source).toBe('IdentityRecord');
     expect(home.hits).toEqual(noHome);
     expect(pds).toEqual({ listings: 1, proofs: 1 });
+  });
+});
+
+describe('KeyLookup.ownHostAnswer', () => {
+  // A ruling's key counts only when its referee's own site lists it. The list
+  // is read whole, kept, and read again only for a kid not on it.
+  const REFEREE = 'did:web:referee.example';
+  const LIST = `https://referee.example/api/v1/signing-keys/${REFEREE}`;
+
+  /** The referee's site: its key list as `body`, or `status` when set,
+   *  answered once `gate` (when set) resolves. */
+  function site() {
+    const state: {
+      body: unknown;
+      status?: number;
+      gate?: Promise<void>;
+    } = { body: { keys: [] } };
+    const fetch = vi.fn(async (input: string): Promise<Response> => {
+      expect(input).toBe(LIST);
+      if (state.gate) await state.gate;
+      if (state.status !== undefined) return new Response('no', { status: state.status });
+      return new Response(JSON.stringify(state.body), { status: 200 });
+    });
+    /** List these keys, each `[seed, removed_at, expires_at]`. */
+    const list = async (keys: [number, number | null, number | null][]) => {
+      state.body = {
+        did: REFEREE,
+        public_key: null,
+        keys: await Promise.all(
+          keys.map(async ([seed, removed_at, expires_at]) => ({
+            kid: await kidOf(seed),
+            public_key: b64url(await raw(seed)),
+            removed_at,
+            expires_at,
+          })),
+        ),
+      };
+    };
+    return { state, fetch, list };
+  }
+
+  function lookupOn(fetch: (input: string) => Promise<Response>, ttlMs = HOUR): KeyLookup {
+    const resolveDid = vi.fn(async () => {
+      throw new Error('the document is not read');
+    });
+    return new KeyLookup({ fetch, resolveDid }, null, ttlMs, NO_RETRIES);
+  }
+
+  const listed = async (seed: number, retiredAt: number | null = null): Promise<OwnHostAnswer> => ({
+    state: 'listed',
+    publicKey: await raw(seed),
+    retiredAt,
+  });
+
+  it('keeps a listed key and never asks for it again', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(NOW);
+    const { fetch, list } = site();
+    await list([[70, null, null]]);
+    // The general cache's ttl has no say over a referee's keys.
+    const lookup = lookupOn(fetch, 1);
+    expect(await lookup.ownHostAnswer(REFEREE, await kidOf(70))).toEqual(await listed(70));
+    vi.setSystemTime(NOW + 1000 * HOUR);
+    expect(await lookup.ownHostAnswer(REFEREE, await kidOf(70))).toEqual(await listed(70));
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads the whole list once for a kid not on file, retired keys with it', async () => {
+    const { fetch, list } = site();
+    await list([
+      [71, null, null],
+      [72, 1_700_000_000, null],
+      [73, 1_700_000_000, 1_650_000_000],
+    ]);
+    const lookup = lookupOn(fetch);
+    expect(await lookup.ownHostAnswer(REFEREE, await kidOf(71))).toEqual(await listed(71));
+    expect(await lookup.ownHostAnswer(REFEREE, await kidOf(72))).toEqual(await listed(72, 1_700_000_000));
+    expect(await lookup.ownHostAnswer(REFEREE, await kidOf(73))).toEqual(await listed(73, 1_650_000_000));
+    expect(fetch, 'one read of the whole list').toHaveBeenCalledTimes(1);
+  });
+
+  it('answers not listed for a kid still missing after its read, and asks no more for it', async () => {
+    const { fetch, list } = site();
+    await list([[71, null, null]]);
+    const lookup = lookupOn(fetch);
+    expect(await lookup.ownHostAnswer(REFEREE, await kidOf(74))).toEqual({ state: 'not-listed' });
+    expect(await lookup.ownHostAnswer(REFEREE, await kidOf(74))).toEqual({ state: 'not-listed' });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    // Another kid not on file reads the list once more.
+    expect(await lookup.ownHostAnswer(REFEREE, await kidOf(75))).toEqual({ state: 'not-listed' });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the kids read for and not found bounded, oldest out', async () => {
+    const { fetch, list } = site();
+    await list([[71, null, null]]);
+    const lookup = lookupOn(fetch);
+    for (let i = 0; i <= READ_FOR_HELD; i++) {
+      expect(await lookup.ownHostAnswer(REFEREE, `missing-${i}`)).toEqual({ state: 'not-listed' });
+    }
+    expect(fetch).toHaveBeenCalledTimes(READ_FOR_HELD + 1);
+    expect(await lookup.ownHostAnswer(REFEREE, `missing-${READ_FOR_HELD}`)).toEqual({ state: 'not-listed' });
+    expect(fetch, 'the newest is held').toHaveBeenCalledTimes(READ_FOR_HELD + 1);
+    expect(await lookup.ownHostAnswer(REFEREE, 'missing-0')).toEqual({ state: 'not-listed' });
+    expect(fetch, 'the oldest went, and is read for again').toHaveBeenCalledTimes(READ_FOR_HELD + 2);
+    expect(await lookup.ownHostAnswer(REFEREE, await kidOf(71))).toEqual(await listed(71));
+    expect(fetch, 'a found key is not among them').toHaveBeenCalledTimes(READ_FOR_HELD + 2);
+  });
+
+  it("learns a held key's retirement at the read for a new kid", async () => {
+    const { fetch, list } = site();
+    await list([[71, null, null]]);
+    const lookup = lookupOn(fetch);
+    expect(await lookup.ownHostAnswer(REFEREE, await kidOf(71))).toEqual(await listed(71));
+    await list([
+      [71, 1_700_000_000, null],
+      [76, null, null],
+    ]);
+    expect(await lookup.ownHostAnswer(REFEREE, await kidOf(76))).toEqual(await listed(76));
+    expect(await lookup.ownHostAnswer(REFEREE, await kidOf(71))).toEqual(await listed(71, 1_700_000_000));
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps a referee list in the snapshot, and loads one written before lists were kept', async () => {
+    const { fetch, list } = site();
+    await list([[71, 1_700_000_000, null]]);
+    const store = new MemoryKeyLookupStore();
+    const resolveDid = vi.fn(async () => {
+      throw new Error('the document is not read');
+    });
+    const first = new KeyLookup({ fetch, resolveDid }, null, HOUR, NO_RETRIES, store);
+    expect(await first.ownHostAnswer(REFEREE, await kidOf(71))).toEqual(await listed(71, 1_700_000_000));
+    expect(await first.ownHostAnswer(REFEREE, await kidOf(74))).toEqual({ state: 'not-listed' });
+    await first.flush();
+    expect(fetch).toHaveBeenCalledTimes(2);
+
+    const second = new KeyLookup({ fetch, resolveDid }, null, HOUR, NO_RETRIES, store);
+    expect(await second.ownHostAnswer(REFEREE, await kidOf(71))).toEqual(await listed(71, 1_700_000_000));
+    expect(await second.ownHostAnswer(REFEREE, await kidOf(74))).toEqual({ state: 'not-listed' });
+    expect(fetch, 'answered from the snapshot, with no read').toHaveBeenCalledTimes(2);
+
+    // Written before lists were kept: no `referees` field.
+    const { referees: _gone, ...old } = (await store.load()) as KeyLookupSnapshot & { referees?: unknown };
+    const older = new MemoryKeyLookupStore();
+    await older.save(old as KeyLookupSnapshot);
+    const third = new KeyLookup({ fetch, resolveDid }, null, HOUR, NO_RETRIES, older);
+    expect(await third.ownHostAnswer(REFEREE, await kidOf(71))).toEqual(await listed(71, 1_700_000_000));
+    expect(fetch, 'read again, the old snapshot loading').toHaveBeenCalledTimes(3);
+  });
+
+  it('cannot answer after a failed read, and reads again at the next ask', async () => {
+    const { state, fetch, list } = site();
+    const lookup = lookupOn(fetch);
+    for (const [status, body] of [
+      [503, {}],
+      [404, {}],
+      [undefined, { error: 'not a key list' }],
+    ] as const) {
+      state.status = status;
+      state.body = body;
+      expect(await lookup.ownHostAnswer(REFEREE, await kidOf(71)), String(status)).toEqual({
+        state: 'cannot-answer',
+      });
+    }
+    state.status = undefined;
+    await list([[71, null, null]]);
+    expect(await lookup.ownHostAnswer(REFEREE, await kidOf(71))).toEqual(await listed(71));
+    expect(fetch, 'each ask after a failure read again').toHaveBeenCalledTimes(4);
+  });
+
+  it('makes one read for ten concurrent asks, and shares a failed one', async () => {
+    const { state, fetch, list } = site();
+    await list([[71, null, null]]);
+    const lookup = lookupOn(fetch);
+    for (const [seed, answer] of [
+      [71, await listed(71)],
+      [77, { state: 'not-listed' }],
+    ] as const) {
+      const before = fetch.mock.calls.length;
+      const kid = await kidOf(seed);
+      const answers = await Promise.all(Array.from({ length: 10 }, () => lookup.ownHostAnswer(REFEREE, kid)));
+      for (const got of answers) expect(got).toEqual(answer);
+      expect(fetch.mock.calls.length).toBe(before + 1);
+    }
+    state.status = 503;
+    const kid = await kidOf(78);
+    const answers = await Promise.all(Array.from({ length: 10 }, () => lookup.ownHostAnswer(REFEREE, kid)));
+    for (const got of answers) expect(got).toEqual({ state: 'cannot-answer' });
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("lists the single key an old server's answer carries", async () => {
+    const { state, fetch } = site();
+    state.body = {
+      did: REFEREE,
+      algorithm: 'ed25519',
+      public_key: b64url(await raw(78)),
+      encoding: 'base64url',
+      source: 'key-store',
+    };
+    expect(await lookupOn(fetch).ownHostAnswer(REFEREE, await kidOf(78))).toEqual(await listed(78));
+  });
+
+  it('waits for a slow site, with no time limit of its own', async () => {
+    vi.useFakeTimers();
+    const { state, fetch, list } = site();
+    await list([[71, null, null]]);
+    // Longer than any limit a read had: a ruling's check bounds the wait.
+    state.gate = new Promise((resolve) => setTimeout(resolve, 60_000));
+    const lookup = lookupOn(fetch);
+    const asked = lookup.ownHostAnswer(REFEREE, await kidOf(71));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(await asked).toEqual(await listed(71));
+  });
+
+  it("takes nothing from where the referee's site redirects", async () => {
+    // A real fetch rejects a redirect under `redirect: 'error'`, and otherwise
+    // follows it and marks the response it ends on as redirected.
+    const followed: string[] = [];
+    const fetch = vi.fn(async (input: string, init?: { redirect?: 'error' }): Promise<Response> => {
+      expect(input).toBe(LIST);
+      if (init?.redirect === 'error') throw new TypeError('fetch failed: redirect');
+      followed.push('https://elsewhere.example/list');
+      const res = new Response(
+        JSON.stringify({
+          did: REFEREE,
+          keys: [{ kid: await kidOf(71), public_key: b64url(await raw(71)), removed_at: null }],
+        }),
+        { status: 200 },
+      );
+      Object.defineProperty(res, 'redirected', { value: true });
+      return res;
+    });
+    expect(await lookupOn(fetch).ownHostAnswer(REFEREE, await kidOf(71))).toEqual({ state: 'cannot-answer' });
+    expect(followed, 'the redirect is not followed').toEqual([]);
+    // A reader that drops the option still takes nothing from the target.
+    const dropping = vi.fn((input: string) => fetch(input));
+    expect(await lookupOn(dropping).ownHostAnswer(REFEREE, await kidOf(71))).toEqual({ state: 'cannot-answer' });
+  });
+
+  it('asks nothing for a name that is not a plain public host', async () => {
+    const { fetch } = site();
+    const lookup = lookupOn(fetch);
+    for (const did of [
+      'did:web:referee.example%3A8443',
+      'did:web:referee.example:people:bot',
+      'did:web:',
+      ALICE,
+      'did:web:localhost',
+      'did:web:app.localhost',
+      'did:web:127.0.0.1',
+      'did:web:10.0.0.1',
+      'did:web:127.1',
+      'did:web:0x7f.1',
+      'did:web:router',
+    ]) {
+      expect(await lookup.ownHostAnswer(did, await kidOf(71)), did).toEqual({ state: 'cannot-answer' });
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('keeps at most its bound of referees, the least recently asked out, never one being read', () => {
+    const held = new Map<string, RefereeKeys>();
+    for (let n = 0; n < 10; n++) {
+      held.set(`did:web:r${n}.example`, { keys: new Map(), readFor: new Set(), reading: null });
+    }
+    held.get('did:web:r0.example')!.reading = new Promise(() => {});
+    boundReferees(held, 5);
+    expect([...held.keys()]).toEqual([
+      'did:web:r0.example',
+      'did:web:r6.example',
+      'did:web:r7.example',
+      'did:web:r8.example',
+      'did:web:r9.example',
+    ]);
   });
 });

@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 /**
- * THE OLDER WAY. An agent's ownership is now proven by an agent record in
- * the owner's account: add the agent's DID in the freeq web app under
+ * DEPRECATED; to be removed in a later release, when signed certificates stop
+ * counting. An agent's ownership is now proven by an agent record in the
+ * owner's account: add the agent's DID in the freeq web app under
  * Settings → Agents, or run `freeq-bot-id register --owner <handle> <did>`.
- * No cert needs signing and no key needs pasting. This script keeps working
- * for servers from before agent records.
+ * No cert needs signing and no key needs pasting; every server in use reads
+ * agent records. Each run says so first on stderr.
  *
  * Sign a delegation cert with the OWNER's creator key — on the owner's
  * machine, never on the machine being provisioned.
@@ -31,8 +32,8 @@ import { readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 
 const { signDelegation } = await import("@freeq/bot-kit");
-const { creatorKeyPath, loadOrCreateCreatorSeed, creatorPublicKeyB64 } = await import(
-  "../dist/owner-key.js"
+const { creatorKeyPath, loadOrCreateCreatorSeed, creatorPublicKeyB64, signedCertificateLine } = await import(
+  "@freeq/harness-kit/owner-key"
 );
 
 function arg(name, fallback) {
@@ -61,6 +62,8 @@ if (cert.creator_did !== ownerDid) {
 }
 
 const keyPath = arg("key", creatorKeyPath(`${homedir()}/.freeq`, ownerDid));
+// No certificate path: under boxd-migrate.sh this signs a temporary copy.
+console.error(signedCertificateLine({ botDid: cert.bot_did, keyPath }));
 const seed = await loadOrCreateCreatorSeed(keyPath);
 const pub = creatorPublicKeyB64(seed);
 

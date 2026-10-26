@@ -429,6 +429,7 @@ class AppState {
         switch v.layer {
         case .some(.vouched): layer = .vouched
         case .some(.published): layer = .published
+        case .some(.didKey): layer = .didKey
         case .none: layer = nil
         }
         return VerdictInfo(
@@ -2116,9 +2117,8 @@ extension AppState {
                 isAction: msg.isAction,
                 timestamp: Date(timeIntervalSince1970: Double(msg.timestampMs) / 1000.0),
                 replyTo: msg.replyTo,
-                // `edited` covers both signals: a live edit (`edit_of`) and one
-                // the server already collapsed into join replay, which carries
-                // no `+draft/edit` and would otherwise read as the original.
+                // `edited` is set by the FFI from `edit_of`, live or replayed: a
+                // replayed edit arrives as its own line carrying `+draft/edit`.
                 isEdited: msg.edited,
                 isSigned: msg.isSigned,
                 isEncrypted: wasEncrypted,

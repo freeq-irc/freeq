@@ -11,7 +11,7 @@ A single five-minute video shot on one iPhone (with a second device joining mid-
 1. Cold launch → channels and DMs render from cache instantly, then reconnect goes green.
 2. Sign in with Bluesky (already done) → signed-message lock badge appears on every send. Step-up flow for an image upload that requires elevated scope.
 3. Start a video call in `#freeq` from the iPhone. A second device — web or another iPhone — joins via the in-channel "call in progress" speaker glyph. Both sides see actual camera frames (not placeholders).
-4. While the call is live, post a coordination card from `freeqcc` (the Claude Code bot) showing a streaming reply. The card renders as a rich card on iOS, not a wall of text.
+4. While the call is live, post a coordination card from `freeq-cc` (the Claude Code agent), such as a task it posts; freeq-cc does not stream its replies, so a streaming reply needs another sender. The card renders as a rich card on iOS, not a wall of text.
 5. Drop into a 1:1 DM with `yokota` (an agent), ask "/diagnose why I couldn't join #foo" and get a structured diagnostic reply rendered as a card.
 6. Show federation — the same call/messages mirrored on a second freeq server via S2S.
 
@@ -148,7 +148,7 @@ The Agent manifest viewer is unusually high-leverage for the demo because the ac
 ## 6. Phase 5 — Demo prep (do last, time-box to a day)
 
 - Seed two iOS devices and one web client with consistent test data.
-- Pre-create the channels and the freeqcc bot in `#freeq`.
+- Pre-create the channels and the freeq-cc agent in `#freeq`.
 - Record a fallback video for §3 in case live AV fails on demo day.
 - Add a hidden `?demo=true` query / debug toggle that auto-mutes notifications and forces light/dark theme to the recorded look.
 
@@ -178,6 +178,6 @@ Roughly two weeks if Phase 2.1 lands cleanly; three weeks if the AV FFI gets ugl
 ## 9. Open questions for Chad
 
 - AV: are we committing to video for v1 of the demo, or is audio-only acceptable as a fallback if the FFI work blows out?
-- Coordination cards: which event types are highest-priority for the demo? `task.created` from freeqcc is the obvious one — anything else?
+- Coordination cards: which event types are highest-priority for the demo? `task.created` from freeq-cc is the obvious one — anything else?
 - Federation demo (§6): do we have a second peer server stood up, or should I plan to stand one up?
 - Agent manifest viewer (§4): should it surface the unverified delegation state plainly (the yokota case) or hide it until we've fixed the verifier?
