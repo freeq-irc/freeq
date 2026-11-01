@@ -679,8 +679,7 @@ export class FreeqClient extends EventEmitter {
     // start them, and a line left pending is persisted pending by a client
     // that caches the settled verdict.
     this.endOpenBatches();
-    this.transport?.disconnect();
-    this.transport = null;
+    this.stopTransport();
     this._nick = '';
     this._authDid = null;
     this._apiBearer = null;
@@ -733,8 +732,7 @@ export class FreeqClient extends EventEmitter {
   /** Force an immediate reconnect. */
   reconnect(): void {
     if (!this.opts.url || !this.opts.nick) return;
-    this.transport?.disconnect();
-    this.transport = null;
+    this.stopTransport();
     const channels = [...this._joinedChannels];
     this.autoJoinChannels = channels;
     this._nick = this.opts.nick;
@@ -1479,10 +1477,11 @@ export class FreeqClient extends EventEmitter {
    * in place (verified badge next to a Guest nick), and let PRIVMSGs leak under
    * the guest identity.
    *
-   * Mirror the 904 teardown: drop the dead credentials, mark `_saslFailed` so
-   * any in-flight 001 is suppressed and outgoing PRIVMSGs are blocked, notify
-   * the app (so its store clears `authDid` and surfaces "session expired"), and
-   * tear the socket down so the next user action is an explicit re-auth.
+   * The same teardown as a 904, which ends here too: drop the dead
+   * credentials, mark `_saslFailed` so any in-flight 001 is suppressed and
+   * outgoing PRIVMSGs are blocked, notify the app (so its store clears
+   * `authDid` and surfaces "session expired"), and tear the socket down so
+   * the next user action is an explicit re-auth.
    */
   private failReconnectAuth(reason: string): void {
     this.sasl = null;
@@ -1491,10 +1490,15 @@ export class FreeqClient extends EventEmitter {
     this._saslFailed = true;
     this.emit('authError', reason);
     this.emit('authenticated', '', reason);
+    this.stopTransport();
+  }
+
+  /** End this connection on purpose. `Transport.disconnect()` sends QUIT,
+   *  closes without reconnecting and reports the drop through
+   *  `onTransportStateChange`; that is the only report, so callers add none. */
+  private stopTransport(): void {
     this.transport?.disconnect();
     this.transport = null;
-    this._connectionState = 'disconnected';
-    this.emit('connectionStateChanged', 'disconnected');
   }
 
   private onTransportStateChange(state: TransportState): void {
@@ -3564,24 +3568,21 @@ export class FreeqClient extends EventEmitter {
         // token, and reading only the token sent it on to register as a
         // guest after its access had been withdrawn.
         const hadSaslAttempt = this.hasSaslCredentials;
-        this.sasl = null;
-        this._authDid = null;
-        this._apiBearer = null;
-        this.emit('authError', reason);
-        // Mirror the wire identity to the app: did is now empty.
-        this.emit('authenticated', '', reason);
         if (hadSaslAttempt) {
           // Refuse to register as a guest on a connection where SASL
-          // was requested. Mark _saslFailed so any in-flight 001 from
-          // the server is suppressed (the WS may still deliver buffered
-          // lines for a moment after close), and tear down the socket
-          // so the next user action is an explicit re-auth.
-          this._saslFailed = true;
-          this.transport?.disconnect();
-          this.transport = null;
-          this._connectionState = 'disconnected';
-          this.emit('connectionStateChanged', 'disconnected');
+          // was requested. _saslFailed is marked before the app hears,
+          // so any in-flight 001 from the server (the WS may still
+          // deliver buffered lines for a moment after close) and
+          // anything a listener sends are dropped; then the socket is
+          // torn down so the next user action is an explicit re-auth.
+          this.failReconnectAuth(reason);
         } else {
+          this.sasl = null;
+          this._authDid = null;
+          this._apiBearer = null;
+          this.emit('authError', reason);
+          // Mirror the wire identity to the app: did is now empty.
+          this.emit('authenticated', '', reason);
           this.raw('CAP END');
         }
         break;
@@ -3683,18 +3684,12 @@ export class FreeqClient extends EventEmitter {
         const policy = this.opts.onNickCollision ?? 'auto-suffix';
         if (policy === 'refuse') {
           this.emit('authError', `nick '${this._nick}' is already taken`);
-          this.transport?.disconnect();
-          this.transport = null;
-          this._connectionState = 'disconnected';
-          this.emit('connectionStateChanged', 'disconnected');
+          this.stopTransport();
         } else if (policy === 'random-suffix') {
           const MAX_RETRIES = 3;
           if (this._nickCollisionRetries >= MAX_RETRIES) {
             this.emit('authError', `exhausted ${MAX_RETRIES} nick collision retries for '${this.opts.nick}'`);
-            this.transport?.disconnect();
-            this.transport = null;
-            this._connectionState = 'disconnected';
-            this.emit('connectionStateChanged', 'disconnected');
+            this.stopTransport();
             break;
           }
           this._nickCollisionRetries++;

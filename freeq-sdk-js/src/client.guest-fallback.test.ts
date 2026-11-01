@@ -352,6 +352,36 @@ describe('silent guest fallback after stale SASL (regression)', () => {
     const internalSasl = (client as unknown as { sasl: unknown }).sasl;
     expect(internalSasl).toBeNull();
   });
+
+  it('reports the drop once, and writes nothing an authError listener sends', async () => {
+    const { FreeqClient } = await import('./client.js');
+    const client = new FreeqClient({
+      url: 'wss://test/irc',
+      nick: 'chad',
+      skipInitialBrokerRefresh: true,
+    });
+    client.setSaslCredentials({
+      token: 'stale-token',
+      did: 'did:plc:chad',
+      pdsUrl: 'https://pds.example',
+      method: 'pds-session',
+    });
+    const states: string[] = [];
+    const drops: string[] = [];
+    client.on('connectionStateChanged', (s) => states.push(s));
+    client.on('disconnected', (r) => drops.push(r));
+    // The socket is still open while the listeners run; the refusal has
+    // already been recorded, so nothing they send reaches the server.
+    client.on('authError', () => client.raw('PRIVMSG #general :from the listener'));
+
+    client.connect();
+    const ws = MockWebSocket.instances[0];
+    await runStaleSaslScenario(ws);
+
+    expect(ws.sent).not.toContain('PRIVMSG #general :from the listener');
+    expect(states.filter((s) => s === 'disconnected')).toHaveLength(1);
+    expect(drops).toHaveLength(1);
+  });
 });
 
 // ── Silent guest fallback via broker-refresh failure (no 904) ─────
@@ -408,6 +438,22 @@ describe('silent guest fallback via broker-refresh failure (no 904)', () => {
     expect(client.authDid, 'authDid must be cleared').toBeNull();
     expect(registeredAs.find((n) => /^Guest\d+$/.test(n)), 'must not register as a guest').toBeUndefined();
     expect((client as unknown as { sasl: unknown }).sasl, 'stale creds dropped').toBeNull();
+  });
+
+  it('a failed broker refresh reports the drop once', async () => {
+    vi.useFakeTimers();
+    globalThis.fetch = vi.fn(() => Promise.reject(new Error('network down'))) as any;
+
+    const client = await connectAuthedWithBroker();
+    const states: string[] = [];
+    client.on('connectionStateChanged', (s) => states.push(s));
+
+    client.connect();
+    await vi.advanceTimersByTimeAsync(5000);
+    vi.useRealTimers();
+
+    expect(states.filter((s) => s === 'disconnected')).toHaveLength(1);
+    expect(client.connectionState).toBe('disconnected');
   });
 
   it('a guest-degraded socket must not let sendMessage leak a PRIVMSG', async () => {
@@ -503,7 +549,8 @@ describe('a refusal on a signer-authenticated connection', () => {
     expect(errors).toHaveLength(1);
     // It did not go on to register: no CAP END after the 904.
     expect(ws.sent).not.toContain('CAP END');
-    expect(states).toContain('disconnected');
+    // The drop is reported once.
+    expect(states.filter((s) => s === 'disconnected')).toHaveLength(1);
     // The welcome that follows a guest registration must not be taken.
     expect(client.registered).toBe(false);
     // And nothing reconnects: the teardown is deliberate.
