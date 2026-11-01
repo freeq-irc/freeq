@@ -233,6 +233,19 @@ pub(crate) fn file_session_signing_key(
     Ok(())
 }
 
+/// Send a line to a specific session.
+pub(crate) fn send_to(state: &Arc<SharedState>, session_id: &str, line: String) {
+    if let Some(tx) = state.connections.lock().get(session_id) {
+        let _ = tx.try_send(line);
+    }
+}
+
+/// How long a connection that is closing waits for its last lines to reach
+/// the client and for the client to finish: here, the writer's queue and the
+/// client's input read to its end; in the WebSocket bridge, the closing
+/// handshake (`web.rs`); in the iroh bridge, the send stream (`iroh.rs`).
+pub(crate) const CLOSE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// What a device whose signing key has expired is told.
 pub(crate) const KEY_EXPIRED_WORDS: &str =
     "This device's signing key has expired. Sign in again to continue.";
@@ -765,7 +778,8 @@ where
 
     let server_name = state.server_name.clone();
 
-    // Spawn writer task
+    // Spawn writer task. It hands its half back when its queue ends, so the
+    // close below can shut it rather than drop it.
     let write_session_id = session_id.clone();
     let mut write_half = writer;
     let write_handle = tokio::spawn(async move {
@@ -781,7 +795,7 @@ where
             while let Ok(queued) = rx.try_recv() {
                 if let Err(e) = write_half.write_all(queued.as_bytes()).await {
                     tracing::warn!(session_id = %write_session_id, "Write error: {e}");
-                    return;
+                    return write_half;
                 }
                 batch_count += 1;
                 if batch_count >= 64 {
@@ -794,6 +808,7 @@ where
                 break;
             }
         }
+        write_half
     });
 
     // Track whether our own send channel is healthy
@@ -4097,13 +4112,31 @@ where
     );
 
     // Cleanup removed this session's only Sender, so the writer ends once it
-    // has written what was queued (a FAIL and ERROR before a close); abort
-    // as before if it stalls.
+    // has written what was queued (a FAIL and ERROR before a close). Its half
+    // is then shut: FIN on TCP, close_notify on TLS, end of stream into a
+    // WebSocket or iroh bridge. What the client still sends is read and
+    // dropped until it closes too, because a socket dropped with input
+    // unread is reset, and the reset can take the lines just written. That
+    // read runs while the writer drains, not after it: the WebSocket bridge
+    // carries both directions in one task, and with its input unread it
+    // would stop sending the writer's lines. All within CLOSE_DRAIN; on the
+    // bound the writer is aborted, as before.
     let mut write_handle = write_handle;
-    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut write_handle)
-        .await
-        .is_err()
-    {
+    let drained = tokio::time::timeout(CLOSE_DRAIN, async {
+        tokio::join!(
+            async {
+                if let Ok(mut write_half) = (&mut write_handle).await {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = write_half.shutdown().await;
+                }
+            },
+            async {
+                let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+            },
+        )
+    })
+    .await;
+    if drained.is_err() {
         write_handle.abort();
     }
     Ok(())
@@ -4363,10 +4396,11 @@ mod retired_key_tests {
     const DID: &str = "did:plc:retiredkeytest";
 
     /// A connection to `state` over an in-memory stream, signed in with a web
-    /// token carrying `broker_token`.
+    /// token carrying `broker_token`; or over a socket a test connected
+    /// itself ([`Client::over`]).
     pub(super) struct Client {
-        reader: BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
-        writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        reader: BufReader<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
+        writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
     }
 
     impl Client {
@@ -4419,6 +4453,24 @@ mod retired_key_tests {
             broker_token: Option<&str>,
             before_welcome: Option<&str>,
         ) -> Client {
+            Self::open(state)
+                .await
+                .sign_in(state, did, nick, web_token, broker_token, before_welcome)
+                .await
+        }
+
+        /// Signed in on this connection as `did` under `nick`, with the web
+        /// token `web_token` carrying `broker_token`; `before_welcome` as in
+        /// [`Client::offering_at_registration`].
+        async fn sign_in(
+            self,
+            state: &Arc<SharedState>,
+            did: &str,
+            nick: &str,
+            web_token: &str,
+            broker_token: Option<&str>,
+            before_welcome: Option<&str>,
+        ) -> Client {
             state.web_auth_tokens.lock().insert(
                 web_token.to_string(),
                 (
@@ -4428,7 +4480,7 @@ mod retired_key_tests {
                     broker_token.map(str::to_string),
                 ),
             );
-            let mut c = Self::authenticating(state, nick, web_token).await;
+            let mut c = self.authenticate(nick, web_token).await;
             c.rx(|l| l.split_whitespace().nth(1) == Some("903"))
                 .await
                 .expect("903");
@@ -4461,16 +4513,13 @@ mod retired_key_tests {
         /// Through `AUTHENTICATE` with the web token `web_token`, not waiting
         /// for its answer.
         async fn authenticating(state: &Arc<SharedState>, nick: &str, web_token: &str) -> Client {
-            let (client_side, server_side) = tokio::io::duplex(16384);
-            let served = state.clone();
-            tokio::spawn(async move {
-                let _ = handle_generic(server_side, served).await;
-            });
-            let (reader, writer) = tokio::io::split(client_side);
-            let mut c = Client {
-                reader: BufReader::new(reader),
-                writer,
-            };
+            Self::open(state).await.authenticate(nick, web_token).await
+        }
+
+        /// This connection through `AUTHENTICATE` with the web token
+        /// `web_token`, not waiting for its answer.
+        async fn authenticate(self, nick: &str, web_token: &str) -> Client {
+            let mut c = self;
             c.tx("CAP LS 302").await;
             c.tx(&format!("NICK {nick}")).await;
             c.tx(&format!("USER {nick} 0 * :test")).await;
@@ -4499,11 +4548,75 @@ mod retired_key_tests {
             tokio::spawn(async move {
                 let _ = handle_generic(server_side, served).await;
             });
-            let (reader, writer) = tokio::io::split(client_side);
+            Self::over(client_side)
+        }
+
+        /// A client on `stream`, which the caller has connected to a server.
+        fn over(
+            stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        ) -> Client {
+            let (reader, writer) = tokio::io::split(stream);
             Client {
-                reader: BufReader::new(reader),
-                writer,
+                reader: BufReader::new(Box::new(reader)),
+                writer: Box::new(writer),
             }
+        }
+
+        /// Every line until the stream ends, while a second task writes as
+        /// fast as the socket takes them (PONG lines, which the server answers
+        /// with nothing), as a busy client does. Also how the stream ended
+        /// (`None` at its end, or the read error), and the first write that
+        /// failed before then: a reset shows there even when the read sees a
+        /// plain end, because whichever call meets a reset's error first takes
+        /// it. Reading starts only after 100 ms, as a client busy elsewhere
+        /// would, so what the server sent is still waiting in the socket when
+        /// the server closes.
+        async fn read_to_end_while_writing(
+            self,
+        ) -> (
+            Vec<String>,
+            Option<std::io::ErrorKind>,
+            Option<std::io::ErrorKind>,
+        ) {
+            let Client {
+                mut reader,
+                mut writer,
+            } = self;
+            let stop = Arc::new(tokio::sync::Notify::new());
+            let stopped = stop.clone();
+            let writing = tokio::spawn(async move {
+                let mut failed = None;
+                loop {
+                    tokio::select! {
+                        _ = stopped.notified() => break,
+                        written = writer.write_all(b"PONG :busy\r\n") => {
+                            if let Err(e) = written {
+                                failed = Some(e.kind());
+                                break;
+                            }
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                (writer, failed)
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let mut lines = Vec::new();
+            let end = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let mut buf = String::new();
+                    match reader.read_line(&mut buf).await {
+                        Ok(0) => return None,
+                        Ok(_) => lines.push(buf.trim_end().to_string()),
+                        Err(e) => return Some(e.kind()),
+                    }
+                }
+            })
+            .await
+            .expect("the stream ends within 10s");
+            stop.notify_one();
+            let (_writer, write_failed) = writing.await.unwrap();
+            (lines, end, write_failed)
         }
 
         /// Every line until the server closes the connection.
@@ -5651,6 +5764,97 @@ mod retired_key_tests {
                 .lock()
                 .contains(&freeq_auth_broker::token_hash("BT-EXPIRED-EARLY"))
         );
+    }
+
+    /// A refused key over TCP, with the client still writing: the client
+    /// reads the FAIL, the ERROR and then the end of the stream, never a
+    /// reset. The server shuts its side and reads what the client sends until
+    /// it closes, so it never drops the socket with input unread. Repeated,
+    /// because the reset was a race.
+    #[tokio::test]
+    async fn a_refused_tcp_client_still_writing_reads_the_refusal_then_the_end() {
+        let key = signing_key(63);
+        let (state, _) = state_holding_an_expired_row(&key).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = state.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let state = served.clone();
+                tokio::spawn(async move {
+                    let _ = handle(stream, state).await;
+                });
+            }
+        });
+
+        for n in 0..50 {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut client = Client::over(stream)
+                .sign_in(
+                    &state,
+                    DID,
+                    &format!("tcp{n}"),
+                    &format!("WT-TCP-CLOSE-{n}"),
+                    Some(&format!("BT-TCP-CLOSE-{n}")),
+                    None,
+                )
+                .await;
+            client.tx(&msgsig_line(&key)).await;
+            let (lines, end, write_failed) = client.read_to_end_while_writing().await;
+            assert!(
+                lines.iter().any(|l| l.contains("FAIL MSGSIG KEY_EXPIRED")),
+                "repetition {n}, no FAIL: {lines:?}, ended {end:?}"
+            );
+            assert!(
+                lines.iter().any(|l| l.starts_with("ERROR ")),
+                "repetition {n}, no ERROR: {lines:?}, ended {end:?}"
+            );
+            assert_eq!(end, None, "repetition {n} ended in an error: {lines:?}");
+            assert_eq!(
+                write_failed, None,
+                "repetition {n}: a write failed before the end of the stream (a reset): {lines:?}"
+            );
+        }
+    }
+
+    /// Over an in-memory stream: after the refusal the client reads the end of
+    /// the stream, but the server's side is shut, not gone, so the client can
+    /// still write until it closes; the handler then ends at once.
+    #[tokio::test]
+    async fn a_refused_connection_ends_the_stream_and_reads_on_until_the_client_closes() {
+        let key = signing_key(64);
+        let (state, _) = state_holding_an_expired_row(&key).await;
+        let (client_side, server_side) = tokio::io::duplex(16384);
+        let served = state.clone();
+        let handler = tokio::spawn(async move { handle_generic(server_side, served).await });
+        let mut client = Client::over(client_side)
+            .sign_in(
+                &state,
+                DID,
+                "dora",
+                "WT-DUPLEX-CLOSE",
+                Some("BT-DUPLEX-CLOSE"),
+                None,
+            )
+            .await;
+        client.tx(&msgsig_line(&key)).await;
+        refused_as_expired(&client.rest().await);
+
+        client
+            .writer
+            .write_all(b"PING :after the end\r\n")
+            .await
+            .expect("the server's side still reads after its end of stream, not a broken pipe");
+        assert!(
+            !handler.is_finished(),
+            "the handler waits for the client to close"
+        );
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(1), handler)
+            .await
+            .expect("the handler ends once the client closes")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

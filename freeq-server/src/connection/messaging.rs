@@ -1,8 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 //! Message handling: PRIVMSG, NOTICE, TAGMSG, CHATHISTORY.
 
-use super::Connection;
 use super::helpers::{normalize_channel, s2s_broadcast, s2s_next_event_id};
+use super::{Connection, send_to};
 use crate::irc::{self, Message};
 use crate::server::SharedState;
 use std::collections::HashMap;
@@ -4375,13 +4375,6 @@ fn sender_sibling_sessions(state: &Arc<SharedState>, conn: &Connection) -> Vec<S
 }
 
 // ── AV session control ─────────────────────────────────────────────
-
-/// Send a line to a specific session.
-fn send_to(state: &Arc<SharedState>, session_id: &str, line: String) {
-    if let Some(tx) = state.connections.lock().get(session_id) {
-        let _ = tx.try_send(line);
-    }
-}
 
 /// Handle TAGMSG with +freeq.at/av-* tags (session lifecycle control).
 fn handle_av_tagmsg(

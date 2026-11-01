@@ -116,7 +116,7 @@ pub async fn handle_connection(conn: Connection, state: Arc<SharedState>) {
     // Let the send side deliver what the handler queued last (a FAIL and
     // ERROR before a server-side close); abort as before if it stalls.
     let mut tx_handle = tx_handle;
-    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut tx_handle)
+    if tokio::time::timeout(crate::connection::CLOSE_DRAIN, &mut tx_handle)
         .await
         .is_err()
     {

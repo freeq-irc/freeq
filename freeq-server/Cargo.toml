@@ -36,6 +36,7 @@ clap = { workspace = true }
 reqwest = { workspace = true }
 rusqlite = { workspace = true }
 axum = { workspace = true }
+futures-util = { version = "0.3", features = ["sink"] }
 tower-http = { workspace = true }
 iroh = { workspace = true }
 sha2 = { workspace = true }
