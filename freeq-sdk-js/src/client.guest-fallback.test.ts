@@ -464,3 +464,68 @@ describe('Guest rename detection', () => {
     expect(/^Guest\d+$/.test('chad')).toBe(false);
   });
 });
+
+// ── A bot signs with a signer and no token ────────────────────────
+
+describe('a refusal on a signer-authenticated connection', () => {
+  it('tears the socket down instead of registering as a guest', async () => {
+    vi.useFakeTimers();
+    const { FreeqClient } = await import('./client.js');
+    const client = new FreeqClient({
+      url: 'wss://test/irc',
+      nick: 'helper',
+      skipInitialBrokerRefresh: true,
+    });
+    // How a bot authenticates: its own key signs the challenge, and there
+    // is no web token. Before, the 904 handler read only the token, so a
+    // bot whose access had been withdrawn carried on into registration.
+    client.setSaslCredentials({
+      did: 'did:key:zHelper',
+      method: 'crypto',
+      token: '',
+      pdsUrl: '',
+      signer: async () => 'c2ln',
+    });
+    const errors: string[] = [];
+    const states: string[] = [];
+    client.on('authError', (e) => errors.push(e));
+    client.on('connectionStateChanged', (s) => states.push(s));
+
+    client.connect();
+    await flushAsync();
+    const ws = MockWebSocket.instances[0]!;
+    await runSignerRefusal(ws);
+    // Past the transport's first reconnect (1 s), so that a socket it
+    // opened would be counted below.
+    await vi.advanceTimersByTimeAsync(5000);
+    vi.useRealTimers();
+
+    expect(errors).toHaveLength(1);
+    // It did not go on to register: no CAP END after the 904.
+    expect(ws.sent).not.toContain('CAP END');
+    expect(states).toContain('disconnected');
+    // The welcome that follows a guest registration must not be taken.
+    expect(client.registered).toBe(false);
+    // And nothing reconnects: the teardown is deliberate.
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+});
+
+/** Drive a signer-authenticated connection to a 904, then have the server
+ *  carry on with a guest welcome as it really does. */
+async function runSignerRefusal(ws: MockWebSocket) {
+  ws.recv(':srv CAP * LS :message-tags server-time batch sasl echo-message');
+  await flushAsync();
+  ws.recv(':srv CAP helper ACK :message-tags server-time batch sasl echo-message');
+  await flushAsync();
+  const challenge = btoa(JSON.stringify({ session_id: 's', nonce: 'n', timestamp: Date.now() }))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+  ws.recv(`AUTHENTICATE ${challenge}`);
+  await flushAsync();
+  ws.recv(':srv 904 helper :SASL authentication failed');
+  await flushAsync();
+  ws.recv(':srv 001 helper :Welcome to freeq, helper (guest)');
+  await flushAsync();
+}

@@ -631,6 +631,13 @@ export class FreeqClient extends EventEmitter {
     }
   }
 
+  /** Whether this client holds a way to answer a SASL challenge: a
+   *  pre-issued token or a signer. One test for every place that asks,
+   *  so that none of them can disagree about whether a connection signs in. */
+  private get hasSaslCredentials(): boolean {
+    return !!(this.sasl?.token || this.sasl?.signer);
+  }
+
   // ── Connection ──
 
   /** Connect to the IRC server. */
@@ -1566,7 +1573,7 @@ export class FreeqClient extends EventEmitter {
       // Skip broker refresh when we have token-based credentials (the
       // broker would re-mint them anyway) OR when we have a signer
       // (did:key auth: no broker needed, no token to refresh).
-      if (this.skipBrokerRefresh && (this.sasl?.token || this.sasl?.signer)) {
+      if (this.skipBrokerRefresh && this.hasSaslCredentials) {
         this.skipBrokerRefresh = false;
         clearTimeout(safetyTimer);
         sendRegistration();
@@ -3552,7 +3559,11 @@ export class FreeqClient extends EventEmitter {
         // app can re-auth (or explicitly choose guest mode) instead of
         // racing the next reconnect with the same dead token.
         const reason = msg.params[msg.params.length - 1] || 'SASL failed';
-        const hadSaslAttempt = !!this.sasl?.token;
+        // Whether this connection asked to authenticate at all, the same
+        // test the cap negotiation uses: a bot signs with a signer and no
+        // token, and reading only the token sent it on to register as a
+        // guest after its access had been withdrawn.
+        const hadSaslAttempt = this.hasSaslCredentials;
         this.sasl = null;
         this._authDid = null;
         this._apiBearer = null;
@@ -4781,7 +4792,7 @@ export class FreeqClient extends EventEmitter {
       // either a pre-issued token (pds-session/pds-oauth) OR a signer
       // callback (crypto / did:key). Previously only the token branch
       // qualified, so JS bots using did:key never reached SASL.
-      const wantsSasl = (this.sasl?.token || this.sasl?.signer) && available.includes('sasl');
+      const wantsSasl = this.hasSaslCredentials && available.includes('sasl');
       if (wantsSasl) {
         wantedCaps.push('sasl');
       }
@@ -4793,7 +4804,7 @@ export class FreeqClient extends EventEmitter {
     } else if (sub === 'ACK') {
       const caps = msg.params.slice(2).join(' ');
       for (const c of caps.split(' ')) this.ackedCaps.add(c);
-      const canSasl = this.ackedCaps.has('sasl') && (this.sasl?.token || this.sasl?.signer);
+      const canSasl = this.ackedCaps.has('sasl') && this.hasSaslCredentials;
       if (canSasl) {
         this.raw('AUTHENTICATE ATPROTO-CHALLENGE');
       } else {
