@@ -395,6 +395,125 @@ default = ["post_message"]
   });
 });
 
+describe("FreeqBot refusals", () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "freeq-bot-kit-bot-"));
+  });
+  afterEach(async () => {
+    vi.useRealTimers();
+    await rm(root, { recursive: true, force: true });
+  });
+  const WORDS = "the agent records of did:plc:owner do not admit this agent";
+
+  async function aBot() {
+    const { FreeqBot } = await import("./bot.js");
+    return await FreeqBot.create({ name: "test-bot", ownerDid: "did:plc:owner", nick: "test-bot", url: "wss://test/irc", root });
+  }
+
+  it("rejects start() with SignInRefusedError on a final refusal before ready, and stops", async () => {
+    const { SignInRefusedError } = await import("./bot.js");
+    const bot = await aBot();
+    const startPromise = bot.start({ timeoutMs: 2000 });
+    await flushAsync();
+    const ws = MockWebSocket.instances[0]!;
+    await flushAsync();
+    ws.recv(`:srv FAIL AUTHENTICATE NOT_ALLOWED :${WORDS}`);
+    ws.recv(":srv 904 test-bot :SASL authentication failed");
+    const err = await startPromise.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SignInRefusedError);
+    expect((err as InstanceType<typeof SignInRefusedError>).reason).toBe(WORDS);
+    expect((err as Error).message).toBe(`SASL auth failed: ${WORDS}`);
+    await expect(bot.stopped).resolves.toBe(WORDS);
+  });
+
+  it("rejects start() with a plain error, not a refusal, on a nick taken before 900", async () => {
+    const { SignInRefusedError } = await import("./bot.js");
+    const bot = await aBot();
+    const startPromise = bot.start({ timeoutMs: 2000 });
+    await flushAsync();
+    const ws = MockWebSocket.instances[0]!;
+    await flushAsync();
+    ws.recv(":srv 433 * test-bot :Nickname is already in use");
+    const err = await startPromise.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(SignInRefusedError);
+    expect((err as Error).message).toMatch(/SASL auth failed: nick 'test-bot' is already taken/);
+  });
+
+  it("resolves start() 'deferred' on a try-again, and announces at the ready that follows", async () => {
+    vi.useFakeTimers();
+    const bot = await aBot();
+    const startPromise = bot.start({ timeoutMs: 60_000 });
+    await flushAsync();
+    const first = MockWebSocket.instances[0]!;
+    await flushAsync();
+    first.recv(":srv FAIL AUTHENTICATE TEMPORARILY_UNAVAILABLE :Your identity could not be checked just now. Try again shortly.");
+    await expect(startPromise).resolves.toBe("deferred");
+    await vi.advanceTimersByTimeAsync(1000);
+    await flushAsync();
+    const second = MockWebSocket.instances[1]!;
+    expect(second).toBeDefined();
+    await driveToReady(second, "test-bot");
+    expect(second.sent.some((l) => l.startsWith("AGENT REGISTER "))).toBe(true);
+    expect(second.sent.some((l) => l.startsWith("PRESENCE "))).toBe(true);
+    await bot.stop();
+  });
+
+  it("disconnects when stopped while deferred, and opens no further socket", async () => {
+    vi.useFakeTimers();
+    const bot = await aBot();
+    const startPromise = bot.start({ timeoutMs: 60_000 });
+    await flushAsync();
+    MockWebSocket.instances[0]!.recv(":srv FAIL AUTHENTICATE TEMPORARILY_UNAVAILABLE :later");
+    await expect(startPromise).resolves.toBe("deferred");
+    const stopping = bot.stop("bye");
+    await vi.advanceTimersByTimeAsync(5000);
+    await stopping;
+    await expect(bot.stopped).resolves.toBe("bye");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it("stops itself, with the server's words, when its key is refused after ready", async () => {
+    const bot = await aBot();
+    const startPromise = bot.start();
+    await flushAsync();
+    const ws = MockWebSocket.instances[0]!;
+    await driveToReady(ws, "test-bot");
+    await expect(startPromise).resolves.toBe("ready");
+    ws.recv(":srv FAIL MSGSIG KEY_RETIRED :This device was signed out from another device.");
+    await expect(bot.stopped).resolves.toBe("This device was signed out from another device.");
+  });
+
+  it("stops itself, with the server's words, when its session is ended after ready", async () => {
+    const bot = await aBot();
+    const startPromise = bot.start();
+    await flushAsync();
+    const ws = MockWebSocket.instances[0]!;
+    await driveToReady(ws, "test-bot");
+    await startPromise;
+    ws.recv(`:srv FAIL * NOT_ALLOWED :${WORDS}`);
+    await expect(bot.stopped).resolves.toBe(WORDS);
+  });
+
+  it("leaves no listener of start()'s wait behind once it settled", async () => {
+    const bot = await aBot();
+    const counts = () => {
+      const l = (bot.client as unknown as { listeners: Map<string, Set<unknown>> }).listeners;
+      return ["ready", "authError", "authErrorRetry", "error", "connectionStateChanged"].map((e) => l.get(e)?.size ?? 0);
+    };
+    const before = counts();
+    const startPromise = bot.start();
+    await flushAsync();
+    await driveToReady(MockWebSocket.instances[0]!, "test-bot");
+    await startPromise;
+    // What stays is start()'s lasting handlers: one on ready, one on authError.
+    expect(counts()).toEqual([before[0]! + 1, before[1]! + 1, before[2]!, before[3]!, before[4]!]);
+    await bot.stop();
+  });
+});
+
 describe("FreeqBot.resolveSenderDid", () => {
   let root: string;
   beforeEach(async () => {

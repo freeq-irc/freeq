@@ -816,7 +816,11 @@ export const useStore = create<Store>((set, get) => ({
   setNick: (nick) => set({ nick }),
   setRegistered: (v) => set({ registered: v }),
   setWasRegistered: (v) => set({ wasRegistered: v }),
-  setAuth: (did, message) => set({ authDid: did, authMessage: message, authError: null }),
+  // A sign-in clears the last refusal's words. The empty identity a refusal
+  // reports right after its authError keeps them, so they are shown.
+  setAuth: (did, message) => set(did
+    ? { authDid: did, authMessage: message, authError: null }
+    : { authDid: did, authMessage: message }),
   appendMotd: (line) => set((s) => ({ motd: [...s.motd, line] })),
   dismissMotd: () => set({ motdDismissed: true }),
   setConnectedServer: (url) => set({ connectedServer: url }),

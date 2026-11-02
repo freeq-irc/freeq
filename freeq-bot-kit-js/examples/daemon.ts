@@ -90,9 +90,16 @@ const program = createDaemonCLI<DaemonOpts>({
       bot.client.sendMessage(channel, `echo: ${msg.text}`);
     });
 
-    await bot.start();
-    console.log(`[daemon-example] up as ${bot.client.nick} (${bot.identity.did})`);
-    return { stop: (reason) => bot.stop(reason) };
+    // 'deferred': the server could not check the bot just now, and the SDK
+    // keeps trying. A refusal rejects start(), or later stops the bot; the
+    // scaffold then exits 0 through `stopped`.
+    const how = await bot.start();
+    console.log(
+      how === "ready"
+        ? `[daemon-example] up as ${bot.client.nick} (${bot.identity.did})`
+        : `[daemon-example] started as ${bot.identity.did}; the server will check it shortly`,
+    );
+    return { stop: (reason) => bot.stop(reason), stopped: bot.stopped };
   },
   // Enables the built-in provenance check in `status` + `doctor`, asked of
   // the server the bot connects to.

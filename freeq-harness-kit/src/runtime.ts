@@ -1492,8 +1492,9 @@ export class AgentRuntime {
         }
         // A connect for this owner and server is still running: wait for it
         // rather than stop it and start again. The session start and wake()
-        // tell a result that is not online themselves, so the login tells
-        // only an online one, and the outcome is told once.
+        // tell a result that is not online themselves, and the connection
+        // tells a refusal in its own notice, so the login tells only an
+        // online one, and the outcome is told once.
         if (same && this.#connecting) {
           this.notify(`freeq: a connect for ${did} on ${cfg.server} is already under way; waiting for it`, "info");
           const message = await this.#connecting;
@@ -1516,7 +1517,7 @@ export class AgentRuntime {
         const replacedRunning = this.#connecting !== undefined;
         const message = await this.connect(moved ? "server changed" : "login");
         const online = this.conn?.state === "online";
-        if (online || !replacedRunning) this.notify(message, online ? "info" : "warning");
+        if (online || !replacedRunning) this.#tellConnect(message, online ? "info" : "warning");
         this.stateChanged();
         return;
       }
@@ -1534,11 +1535,10 @@ export class AgentRuntime {
           // connect() stops the held connection, and waits for it, before
           // the fresh one; a connect still running is replaced through it.
           await this.connect("re-presenting delegation");
-          // A connect refused at SASL never sends a provenance notice.
-          if (this.conn?.state === "error") {
-            this.notify(`freeq: the server refused this installation: ${this.conn.lastError}`, "warning");
-            return;
-          }
+          // A connect refused at SASL never sends a provenance notice, and
+          // the connection has told the refusal in its own notice, as
+          // #tellConnect leaves it on every other connect path.
+          if (this.conn?.state === "error") return;
           // An unverified reply comes first; a verified one follows once
           // the server has read the owner's records.
           const notice = await waitForProvenance(() => this.conn?.provenanceNotice, {
@@ -1668,7 +1668,7 @@ export class AgentRuntime {
         // connect() stops the held connection, and waits for it, before the
         // fresh one; a connect still running is replaced through it.
         const message = await this.connect("takeover");
-        this.notify(message, this.conn ? "info" : "warning");
+        this.#tellConnect(message, this.conn ? "info" : "warning");
         return;
       }
 
@@ -1723,7 +1723,7 @@ export class AgentRuntime {
           this.conn = undefined;
           this.notify("freeq: disabled", "info");
         } else {
-          this.notify(await this.connect(), "info");
+          this.#tellConnect(await this.connect(), "info");
         }
         return;
       }
@@ -2409,9 +2409,26 @@ export class AgentRuntime {
     const cfg = await this.ensureConfig();
     if (!cfg.enabled || !isDid(cfg.ownerDid)) return;
     this.notify("freeq: first use in this project — minting its identity", "info");
-    const msg = await this.connect();
-    if (this.conn?.state !== "online") this.notify(msg, "warning");
+    this.#tellUnlessOnline(await this.connect());
     this.stateChanged();
+  }
+
+  /** What the session start and wake() say after their connect: nothing
+   *  when it is online, else as #tellConnect. */
+  #tellUnlessOnline(message: string): void {
+    if (this.conn?.state === "online") return;
+    this.#tellConnect(message, "warning");
+  }
+
+  /**
+   * Tell a connect's result, except a refusal or a try-again: a connection
+   * in `error`, or one the server could not check and not yet in, has
+   * already told the server's sentence in its own notice, and the result's
+   * line would say it a second time.
+   */
+  #tellConnect(message: string, level: NoticeLevel): void {
+    if (this.conn?.state === "error" || this.conn?.deferred) return;
+    this.notify(message, level);
   }
 
   /**
@@ -2745,8 +2762,7 @@ export class AgentRuntime {
       this.stateChanged();
       return;
     }
-    const msg = await this.connect();
-    if (this.conn?.state !== "online") this.notify(msg, "warning");
+    this.#tellUnlessOnline(await this.connect());
 
     // Surface work that arrived while this installation was offline. The
     // server replays channel history on join, so offers made overnight land

@@ -83,7 +83,7 @@ Building a bot? See **[`@freeq/bot-kit`](../freeq-bot-kit-js/)** for higher-leve
 - **AT Protocol auth** — SASL ATPROTO-CHALLENGE (PDS session, OAuth, or pure `did:key`) with broker token refresh
 - **E2EE** — Double Ratchet for DMs, AES-256-GCM for channels
 - **IRCv3** — message-tags, echo-message, CHATHISTORY, batch, away-notify
-- **Auto-reconnect** — exponential backoff with automatic channel rejoin
+- **Auto-reconnect** — exponential backoff with automatic channel rejoin, until the server refuses the key or the sign-in
 - **Message signing** — Ed25519 per-session signing for non-repudiation; edits, deletes, and reactions are signed, and servers refuse unsigned changes from logged-in senders
 - **Profiles** — AT Protocol profile fetching with TTL cache
 

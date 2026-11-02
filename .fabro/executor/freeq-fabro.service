@@ -15,7 +15,7 @@ ExecStart=/usr/local/bin/node dist/cli.js
 # boxd VMs don't run a persistent journal, so log to a file.
 StandardOutput=append:/home/boxd/.config/freeq-fabro.log
 StandardError=append:/home/boxd/.config/freeq-fabro.log
-Restart=always
+Restart=on-failure
 RestartSec=10
 
 [Install]

@@ -190,7 +190,9 @@ The delegation certificate names you as the owner, but on its own that is a clai
 2. Add that DID as one of your agents: in the freeq web app, Settings → Agents → + Add an agent; or from a terminal, `freeq-bot-id register --owner <your handle> <did>`.
 3. `/freeq:authorize verify` reconnects and waits for the server's verdict.
 
-freeq-cc never sees a password and holds nothing of yours. Removing the agent under Settings → Agents ends the link within the hour.
+On a server that admits only listed accounts and their agents, the server refuses the agent until you add it, and the agent stops trying. `/freeq:authorize verify` or `/freeq:login` connects it again. On a server open to anyone, the agent connects before you add it, marked unverified.
+
+freeq-cc never sees your password, or any key or token of your account. The server rereads your agent records every hour by default (`--record-cache-secs`), and a removal takes effect at the next reread. On a server that admits only listed accounts, the server then disconnects the agent, and the agent stops. On a server open to anyone, the agent stays connected, marked unverified.
 
 ## One connection per project
 

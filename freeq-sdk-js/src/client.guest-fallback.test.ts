@@ -327,30 +327,39 @@ describe('silent guest fallback after stale SASL (regression)', () => {
     ).toBeUndefined();
   });
 
-  it('clears the stale SASL credentials after 904 (no replay on next reconnect)', async () => {
-    // If we don't clear the stale token, the Transport's next auto-reconnect
-    // will send the same dead token again and we'll re-enter this loop forever.
-    const { FreeqClient } = await import('./client.js');
-    const client = new FreeqClient({
-      url: 'wss://test/irc',
-      nick: 'chad',
-      skipInitialBrokerRefresh: true,
-    });
-    client.setSaslCredentials({
-      token: 'stale-token',
-      did: 'did:plc:chad',
-      pdsUrl: 'https://pds.example',
-      method: 'pds-session',
-    });
+  it('does not reconnect after a 904, and a later connect() asks for SASL again, never as a guest', async () => {
+    // The refused credentials are not replayed by an automatic reconnect,
+    // because there is none; an app that connects again signs in again.
+    vi.useFakeTimers();
+    try {
+      const { FreeqClient } = await import('./client.js');
+      const client = new FreeqClient({
+        url: 'wss://test/irc',
+        nick: 'chad',
+        skipInitialBrokerRefresh: true,
+      });
+      client.setSaslCredentials({
+        token: 'stale-token',
+        did: 'did:plc:chad',
+        pdsUrl: 'https://pds.example',
+        method: 'pds-session',
+      });
 
-    client.connect();
-    const ws = MockWebSocket.instances[0];
-    await runStaleSaslScenario(ws);
+      client.connect();
+      const ws = MockWebSocket.instances[0];
+      await runStaleSaslScenario(ws);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(MockWebSocket.instances).toHaveLength(1);
 
-    // Internal state: sasl should be cleared so the next reconnect
-    // doesn't replay the dead token. Use the (private) backing field.
-    const internalSasl = (client as unknown as { sasl: unknown }).sasl;
-    expect(internalSasl).toBeNull();
+      client.connect();
+      const again = MockWebSocket.instances[1]!;
+      await flushAsync();
+      again.recv(':srv CAP * LS :message-tags sasl');
+      await flushAsync();
+      expect(again.sent.find((l) => l.startsWith('CAP REQ'))).toContain('sasl');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('reports the drop once, and writes nothing an authError listener sends', async () => {
@@ -431,13 +440,17 @@ describe('silent guest fallback via broker-refresh failure (no 904)', () => {
     client.connect();
     // Drive the rejected fetch + its retry backoffs (500ms, 1000ms) to exhaustion.
     await vi.advanceTimersByTimeAsync(5000);
+    // No second socket once every timer has run.
+    await vi.advanceTimersByTimeAsync(60_000);
     vi.useRealTimers();
 
     expect(authErrors.length, 'should surface an auth error').toBeGreaterThan(0);
     expect(authEvents.some((d) => !d), 'must emit authenticated("") so the store clears authDid').toBe(true);
     expect(client.authDid, 'authDid must be cleared').toBeNull();
     expect(registeredAs.find((n) => /^Guest\d+$/.test(n)), 'must not register as a guest').toBeUndefined();
-    expect((client as unknown as { sasl: unknown }).sasl, 'stale creds dropped').toBeNull();
+    expect(MockWebSocket.instances).toHaveLength(1);
+    // Kept, so an app that connects this client again signs in again.
+    expect((client as unknown as { sasl: { did: string } | null }).sasl?.did).toBe('did:plc:chad');
   });
 
   it('a failed broker refresh reports the drop once', async () => {

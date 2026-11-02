@@ -762,11 +762,15 @@ export function connect(
   channels?: string[],
   freshSignIn = false,
   channelsRequested = false,
+  asPlainGuest = false,
 ) {
   if (client) {
     try { client.disconnect(); } catch { /* ignore */ }
     client = null;
   }
+  // A guest asked for connects as a guest: a sign-in still saved (one the
+  // server is trying again, say) would otherwise be handed to the new client.
+  if (asPlainGuest) forgetSignIn();
 
   const store = useStore.getState();
   store.reset();
@@ -852,16 +856,21 @@ export function disconnect() {
   client = null;
   roomGuest = null;
   dmSendGate = null;
+  forgetSignIn();
+  useStore.getState().fullReset();
+}
+
+/** Forget the saved sign-in: its credentials, and the persistent-login
+ *  material, so ConnectScreen doesn't immediately re-auth the user via
+ *  broker session refresh after a deliberate logout. */
+function forgetSignIn() {
   saslState = { token: '', did: '', pdsUrl: '', method: '', skipBrokerRefresh: false };
   hadSignedInSession = false;
-  // Clear persistent-login material so ConnectScreen doesn't immediately
-  // re-auth the user via broker session refresh after a deliberate logout.
   try {
     localStorage.removeItem('freeq-broker-token');
     localStorage.removeItem('freeq-oauth-result');
     localStorage.removeItem('freeq-oauth-pending');
   } catch { /* ignore */ }
-  useStore.getState().fullReset();
 }
 
 export function reconnect() {
@@ -975,16 +984,10 @@ async function noteRoomLink(channel: string, text: string, senderDid: string | u
  *  connection that loses the account is a reconnect refused its token. */
 let hadSignedInSession = false;
 
-/** What the connect screen says when a signed-in session has ended. */
+/** What the connect screen says when the page loads with a session the
+ *  broker no longer honours (the load-time /session 401). */
 export const SESSION_EXPIRED_LINE =
   'Your session expired. Sign in with AT Protocol again, or connect as guest.';
-
-/** A signed-in session's token was refused on reconnect: sign out as the
- *  load-time /session 401 does, rather than continue as a guest. */
-function endExpiredSession(): void {
-  disconnect();
-  useStore.getState().setAuthError(SESSION_EXPIRED_LINE);
-}
 
 export function setSaslCredentials(token: string, did: string, pdsUrl: string, method: string) {
   saslState = { token, did, pdsUrl, method, skipBrokerRefresh: !!token };
@@ -1458,6 +1461,8 @@ export function __wireEventsForTests(c: FreeqClient): void {
 
 function wireEvents(c: FreeqClient) {
   const s = () => useStore.getState();
+  /** The try-again line is up: said once until this session is in. */
+  let retrySaid = false;
 
   c.on('connectionStateChanged', (state) => {
     s().setConnectionState(state);
@@ -1500,15 +1505,8 @@ function wireEvents(c: FreeqClient) {
 
   c.on('registered', (nick) => {
     if (c !== client) return;
-    // Registered without the account it was signed in as: a guest nick.
-    if (saslState.did && !c.authDid) {
-      if (hadSignedInSession) {
-        endExpiredSession();
-        return;
-      }
-    } else if (saslState.did) {
-      hadSignedInSession = true;
-    }
+    retrySaid = false;
+    if (saslState.did && c.authDid) hadSignedInSession = true;
     s().setNick(nick);
     s().setRegistered(true);
     s().setConnectedServer(c['opts'].url);
@@ -1546,11 +1544,37 @@ function wireEvents(c: FreeqClient) {
   c.on('authError', (error) => {
     if (c !== client) return;
     // Refused credentials clear the SDK's DID; a nick collision leaves it.
-    if (hadSignedInSession && saslState.did && !c.authDid) {
-      endExpiredSession();
-      return;
-    }
+    // A signed-in session the server refuses is over, and the SDK has
+    // stopped: sign out as the load-time /session 401 does. So is a sign-in
+    // the SDK refused for good, whose saved credentials would be refused
+    // again ("Connect as guest" and every page load would sign in with
+    // them), and a registered guest the server ends for good (a revoke):
+    // each goes back to the connect screen the same way. The server's words
+    // are set after, since the teardown clears the auth error.
+    const over = (hadSignedInSession && saslState.did && !c.authDid)
+      || (c.saslFailed && (saslState.did !== '' || useStore.getState().registered));
+    if (over) disconnect();
     s().setAuthError(error);
+  });
+
+  // The server could not check this account just now; the SDK keeps trying,
+  // on a growing wait. Said once until the session is in, not at every try.
+  c.on('authErrorRetry', (reason) => {
+    if (c !== client || retrySaid) return;
+    retrySaid = true;
+    // Before the session is first in, the connect screen is what shows: the
+    // reason goes there, as iOS, Android and macOS show it on theirs.
+    const st = useStore.getState();
+    if (!st.registered && !st.wasRegistered) st.setAuthError(reason);
+    else s().addSystemMessage(st.activeChannel || 'server', reason);
+  });
+
+  // The server refused this device's key; the SDK has marked it and stopped.
+  // Sign out here too, then say why, since the teardown clears the auth error.
+  c.on('signingKeyRefused', (reason) => {
+    if (c !== client) return;
+    disconnect();
+    s().setAuthError(reason);
   });
 
   c.on('channelJoined', (channel) => {
@@ -1805,20 +1829,6 @@ function wireEvents(c: FreeqClient) {
   });
 
   c.on('serverFail', (text) => {
-    // The server refused this device's key: the account signed it out. Sign
-    // out here too, then say why, since the teardown clears the auth error.
-    if (/^MSGSIG KEY_RETIRED\b/.test(text)) {
-      disconnect();
-      s().setAuthError('This device was signed out from another device. Sign in again to continue.');
-      return;
-    }
-    // The server refused this device's key as expired; the SDK has marked it,
-    // so the sign-in that follows makes a new one.
-    if (/^MSGSIG KEY_EXPIRED\b/.test(text)) {
-      disconnect();
-      s().setAuthError("This device's signing key has expired. Sign in again to continue.");
-      return;
-    }
     // A refusal is an answer. Resolving it here rather than waiting out the
     // timer is what turns an old server's ACCOUNT_REQUIRED, or an anchor it
     // does not know, into the button at once instead of ten seconds of

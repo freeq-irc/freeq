@@ -207,6 +207,17 @@ function warnSignedCertificate(botDid: string, certPath: string, creatorKeyPath?
   );
 }
 
+/** The server refused this bot's sign-in before it was let in (a final
+ *  refusal, not a nick collision). `reason` is the server's sentence. */
+export class SignInRefusedError extends Error {
+  readonly reason: string;
+  constructor(reason: string) {
+    super(`SASL auth failed: ${reason}`);
+    this.name = "SignInRefusedError";
+    this.reason = reason;
+  }
+}
+
 export class FreeqBot {
   /** Underlying SDK client — `bot.on(...)` proxies handlers here. For typed
    *  methods not surfaced on FreeqBot, call `bot.client.foo(...)`. */
@@ -230,6 +241,17 @@ export class FreeqBot {
   #heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   #readyHandler: (() => void) | null = null;
   #rawHandler: FreeqEvents["raw"] | null = null;
+  /** Stops the bot when the server refuses its key or its sign-in, or ends
+   *  the session for good, or the nick was taken under a `refuse` policy. */
+  #refusalHandler: ((reason: string) => void) | null = null;
+  #resolveStopped!: (reason: string) => void;
+  /** Settles with the reason once the bot has stopped, whether its owner
+   *  called stop() or the bot stopped itself because the server refused
+   *  its key or its sign-in, or ended the session for good, or the nick was
+   *  taken under a `refuse` policy. */
+  readonly stopped: Promise<string> = new Promise((resolve) => {
+    this.#resolveStopped = resolve;
+  });
   /** The server's latest answer to this connection's PROVENANCE. */
   #provenanceLatest: ProvenanceResult | null = null;
   /** The last result written to stderr, across reconnects. */
@@ -523,9 +545,19 @@ export class FreeqBot {
 
   // ── Lifecycle ──────────────────────────────────────────────────────────
 
-  /** Connect, await `'ready'`, run the announce sequence + heartbeat loop.
-   *  Rejects on SASL failure, pre-ready disconnect, or timeout. */
-  async start(opts: FreeqBotStartOptions = {}): Promise<void> {
+  /** Connect, and settle once the server has answered the sign-in:
+   *  - `'ready'` when it let the bot in; the announce sequence and the
+   *    heartbeat run on this and on every later `'ready'`;
+   *  - `'deferred'` when it could not check the bot just now
+   *    (`authErrorRetry`): the SDK keeps trying, and the announce runs at
+   *    the `'ready'` that comes later;
+   *  - rejects with `SignInRefusedError` when it refused the sign-in, and
+   *    with a plain error for a nick collision, a drop before an answer, or
+   *    no answer within `timeoutMs`.
+   *  Whenever the server refuses the bot's key or its sign-in, before or
+   *  after it was let in, the bot stops itself, and `stopped` settles with
+   *  the server's sentence. */
+  async start(opts: FreeqBotStartOptions = {}): Promise<"ready" | "deferred"> {
     if (this.#started) {
       throw new Error("FreeqBot.start() called more than once");
     }
@@ -542,10 +574,16 @@ export class FreeqBot {
       if (result) this.#onProvenance(result);
     };
     this.client.on("raw", this.#rawHandler);
+    // The SDK has stopped for good on either: so does the bot.
+    this.#refusalHandler = (reason: string): void => void this.stop(reason);
+    this.client.on("authError", this.#refusalHandler);
+    this.client.on("signingKeyRefused", this.#refusalHandler);
 
     this.client.connect();
 
-    await new Promise<void>((resolve, reject) => {
+    // This call's wait. Its listeners are removed when it settles, the ones
+    // that did not fire included.
+    return await new Promise<"ready" | "deferred">((resolve, reject) => {
       const timer = setTimeout(() => {
         cleanup();
         reject(new Error(`timeout waiting for ready (${timeoutMs}ms)`));
@@ -553,11 +591,17 @@ export class FreeqBot {
 
       const onReady = (): void => {
         cleanup();
-        resolve();
+        resolve("ready");
+      };
+      const onRetry = (): void => {
+        cleanup();
+        resolve("deferred");
       };
       const onAuthError = (msg: string): void => {
         cleanup();
-        reject(new Error(`SASL auth failed: ${msg}`));
+        // A refused sign-in marks the client before it emits; a nick
+        // collision does not.
+        reject(this.client.saslFailed ? new SignInRefusedError(msg) : new Error(`SASL auth failed: ${msg}`));
       };
       const onState = (state: TransportState): void => {
         if (state === "disconnected") {
@@ -572,15 +616,17 @@ export class FreeqBot {
       const cleanup = (): void => {
         clearTimeout(timer);
         this.client.off("ready", onReady);
+        this.client.off("authErrorRetry", onRetry);
         this.client.off("authError", onAuthError);
         this.client.off("connectionStateChanged", onState);
         this.client.off("error", onError);
       };
 
-      this.client.once("ready", onReady);
-      this.client.once("authError", onAuthError);
+      this.client.on("ready", onReady);
+      this.client.on("authErrorRetry", onRetry);
+      this.client.on("authError", onAuthError);
       this.client.on("connectionStateChanged", onState);
-      this.client.once("error", onError);
+      this.client.on("error", onError);
     });
   }
 
@@ -612,6 +658,11 @@ export class FreeqBot {
       this.client.off("raw", this.#rawHandler);
       this.#rawHandler = null;
     }
+    if (this.#refusalHandler) {
+      this.client.off("authError", this.#refusalHandler);
+      this.client.off("signingKeyRefused", this.#refusalHandler);
+      this.#refusalHandler = null;
+    }
     if (this.#provenanceWait) {
       clearTimeout(this.#provenanceWait);
       this.#provenanceWait = null;
@@ -629,6 +680,7 @@ export class FreeqBot {
     await this.client.flush(drainMs);
     this.client.disconnect();
     this.#didResolver.close();
+    this.#resolveStopped(reason);
   }
 
   // ── Internal ───────────────────────────────────────────────────────────

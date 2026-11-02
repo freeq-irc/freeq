@@ -170,12 +170,13 @@ export interface ClientFactoryResult {
   did?: string;
   selfOwned?: boolean;
   /**
-   * Connect and resolve on `ready` (reject on auth failure). When absent the
-   * session calls `client.connect()` and waits for `ready` itself. bot-kit's
+   * Connect and resolve on `ready` (reject on auth failure), or on a
+   * try-again (bot-kit's `'deferred'`). When absent the session calls
+   * `client.connect()`; it waits for `ready` itself either way. bot-kit's
    * `FreeqBot.start()` goes here so the announce sequence (PROVENANCE, then
    * the configured JOINs) actually runs.
    */
-  start?(): Promise<void>;
+  start?(): Promise<unknown>;
   /** Graceful shutdown; defaults to QUIT + disconnect on the client. */
   stop?(reason: string): Promise<void>;
   /** Fire-and-forget connect in place of `client.connect()`; the session
@@ -358,7 +359,7 @@ export class FreeqSession {
     // still being connected, and retried, by the SDK: wait for it rather
     // than start another one with the same identity beside it. A refused
     // bot is not held: the refusal closes and clears it.
-    let start: (() => Promise<void>) | undefined;
+    let start: (() => Promise<unknown>) | undefined;
     if (!this.#client) {
       const factory = this.#deps.createClient ?? defaultCreateClient;
       const made = await factory(this.#cfg, this.#nick);
@@ -393,6 +394,11 @@ export class FreeqSession {
         cleanup();
         reject(new Error(`SASL authentication failed: ${err}`));
       };
+      // Not refused: the bot stays, and the SDK keeps trying.
+      const onRetry = (reason: string): void => {
+        cleanup();
+        reject(new Error(`the server could not check this identity just now: ${reason}`));
+      };
       const timer = setTimeout(() => {
         cleanup();
         reject(new Error(`timed out connecting to ${this.#cfg.wsUrl} after 30s`));
@@ -402,9 +408,11 @@ export class FreeqSession {
         clearTimeout(timer);
         client.off("ready", onReady as never);
         client.off("authError", onAuthError as never);
+        client.off("authErrorRetry", onRetry as never);
       };
       client.on("ready", onReady as never);
       client.on("authError", onAuthError as never);
+      client.on("authErrorRetry", onRetry as never);
       // A start that rejects ends this wait with its error.
       start?.().catch((err: unknown) => {
         cleanup();
@@ -476,14 +484,17 @@ export class FreeqSession {
       this.#refusal = undefined;
     }) as never);
 
-    // A refused sign-in ends this bot, before or after it was admitted: the
-    // asks in flight get the server's sentence, and close() drops the bot,
-    // so the next connect builds a new one instead of waiting on this one.
-    client.on("authError", ((reason: string) => {
+    // A refused sign-in or key ends this bot, before or after it was
+    // admitted: the asks in flight get the server's sentence, and close()
+    // drops the bot, so the next connect builds a new one instead of
+    // waiting on this one.
+    const refused = (reason: string): void => {
       this.#failAllAsks(reason);
       this.#refusal = reason;
       void this.close(reason);
-    }) as never);
+    };
+    client.on("authError", refused as never);
+    client.on("signingKeyRefused", refused as never);
 
     client.on("message", ((target: string, msg: Message) => {
       this.#record(target, msg);
@@ -498,6 +509,9 @@ export class FreeqSession {
     }) as never);
 
     client.on("authenticated", ((did: string) => {
+      // A refusal reports the identity cleared ("") and drops the bot; that
+      // is no authenticated session, and the client may be gone already.
+      if (!did || client !== this.#client) return;
       this.#did = did;
       this.#mode = "authenticated";
       // API-BEARER arrives as a NOTICE immediately after SASL success and the
@@ -1152,7 +1166,7 @@ export interface BotKitModule {
       identity: { did: string };
       rooms: SessionRooms;
       provenance: ProvenanceVerdict | null;
-      start(): Promise<void>;
+      start(): Promise<unknown>;
       stop(opts: { reason: string }): Promise<void>;
     }>;
   };

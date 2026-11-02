@@ -272,8 +272,12 @@ const program = createDaemonCLI<DaemonOpts>({
       }
     });
 
-    await bot.start();
-    console.log(`[gated-bot] up as ${bot.client.nick} (${bot.identity.did})`);
+    const how = await bot.start();
+    console.log(
+      how === "ready"
+        ? `[gated-bot] up as ${bot.client.nick} (${bot.identity.did})`
+        : `[gated-bot] started as ${bot.identity.did}; the server will check it shortly`,
+    );
     console.log(`  owner:     ${opts.ownerDid}`);
     console.log(`  allowlist: ${allowlist.list().length} extra DID(s)`);
 
@@ -283,6 +287,7 @@ const program = createDaemonCLI<DaemonOpts>({
         allowlist.close();
         await bot.stop(reason);
       },
+      stopped: bot.stopped,
     };
   },
   actorStatusUrl: async (did) => {

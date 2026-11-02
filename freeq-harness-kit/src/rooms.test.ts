@@ -27,7 +27,7 @@ import {
   type RoomsLike,
 } from "./rooms.js";
 import { frameRoomRead } from "./inbound.js";
-import { RoomManager } from "@freeq/bot-kit";
+import { RoomManager, SignInRefusedError } from "@freeq/bot-kit";
 import { buildHello, PI_HELLO, PI_HELLO_ACK } from "./discovery.js";
 
 const OWNER = "did:plc:owner";
@@ -266,11 +266,32 @@ describe("connecting with rooms", () => {
       start: async (b) => {
         b.emit("connectionStateChanged", "connected");
         b.emit("authError", "Delegation withdrawn");
-        throw new Error("SASL auth failed: Delegation withdrawn");
+        throw new SignInRefusedError("Delegation withdrawn");
       },
     });
     expect(rooms.calls).toEqual([]);
     await rt.stop();
+  });
+
+  it("enters held rooms once, at the welcome that follows a start the server deferred", async () => {
+    const { rt, bot, rooms } = await started({
+      held: [ROOM],
+      start: async (b) => {
+        // bot-kit's order: the socket, the SDK's verdict, then start() resolves.
+        b.emit("connectionStateChanged", "connected");
+        b.emit("authErrorRetry", "Your identity could not be checked just now.");
+        return "deferred";
+      },
+    });
+    expect(rooms.calls).toEqual([]);
+    // The SDK tries again on a new socket.
+    bot.emit("connectionStateChanged", "disconnected");
+    bot.emit("connectionStateChanged", "connected");
+    await rt.settled();
+    expect(rooms.calls).toEqual([]);
+    bot.emit("ready");
+    await rt.settled();
+    expect(rooms.calls).toEqual(["prekey", `steward ${ROOM}`]);
   });
 
   it("never parts a room as 'not this project's channel', and never says hello into one", async () => {

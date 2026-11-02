@@ -10,7 +10,7 @@
 //! same credentials may get in later. Every other code is final, and so is a
 //! `904` that no `FAIL` came before. The server reads the codes from here;
 //! `spec/sasl-refusals.json` lists each with its command and kind, and this
-//! module's tests hold the codes to it.
+//! module's tests and the JavaScript SDK's hold the codes to it.
 //!
 //! A browser sign-in through `LOGIN` that the server refuses carries `FAIL
 //! LOGIN NOT_ALLOWED` before its `904`. [`classify`] does not count it as a

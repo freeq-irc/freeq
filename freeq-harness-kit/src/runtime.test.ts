@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentRuntime, httpOriginFor, type RuntimeOptions } from "./runtime.js";
+import { SignInRefusedError } from "@freeq/bot-kit";
 import type { BotLike } from "./connection.js";
 import type { Delivery, Harness, NoticeLevel } from "./harness.js";
 import type { TaskNote } from "./journal.js";
@@ -586,14 +587,20 @@ describe("AgentRuntime: /freeq commands", () => {
   });
 });
 
-/** A bot the server refuses at sign-in: its start() rejects. */
+/** A bot the server refuses at sign-in, as bot-kit reports it: authError,
+ *  then start() rejects with SignInRefusedError. */
 function refusedBot(): FakeBot {
   const bot = new FakeBot();
   bot.start = async () => {
-    throw new Error("SASL auth failed: not allowed");
+    bot.emit("authError", "not allowed");
+    throw new SignInRefusedError("not allowed");
   };
   return bot;
 }
+
+/** The one line a refusal is told in: the connection's own notice. */
+const refusalLines = (notices: Array<{ text: string; level: NoticeLevel }>) =>
+  notices.filter((n) => /not allowed/.test(n.text));
 
 /** A factory that hands out `next()`'s bots and records what it was asked for. */
 function countingFactory(next: () => FakeBot = () => new FakeBot()) {
@@ -730,9 +737,61 @@ describe("AgentRuntime: login and connect replace a connection that is not onlin
     expect(made).toHaveLength(1);
     expect(rt.dormant).toBe(false);
     expect(changes).toBeGreaterThan(0);
-    expect(h.notices.filter((n) => /could not connect/.test(n.text))).toHaveLength(1);
+    expect(refusalLines(h.notices)).toHaveLength(1);
     expect(stuck(h.notices)).toEqual([]);
     await rt.stop();
+  });
+});
+
+describe("AgentRuntime: a try-again is told once, until the agent is in", () => {
+  const WORDS = "Your identity could not be checked just now.";
+  /** A bot the server cannot check just now, as bot-kit reports it:
+   *  authErrorRetry, then start() resolves 'deferred'. */
+  function deferredBot(): FakeBot {
+    const bot = new FakeBot();
+    bot.start = async () => {
+      bot.emit("authErrorRetry", WORDS);
+      return "deferred";
+    };
+    return bot;
+  }
+  const told = (notices: Array<{ text: string }>) => notices.filter((n) => n.text.includes(WORDS));
+  const one = [{ text: `freeq: the server could not check this agent just now — ${WORDS}`, level: "warning" }];
+
+  it("at the session start", async () => {
+    const h = fakeHarness();
+    writeConfig(h.agentDir);
+    const rt = new AgentRuntime(h.harness, { botFactory: async () => deferredBot() });
+    await rt.start();
+    expect(rt.conn?.state).toBe("connecting");
+    expect(told(h.notices)).toEqual(one);
+    await rt.stop();
+  });
+
+  it("when a command wakes a dormant project", async () => {
+    const h = fakeHarness();
+    writeConfig(h.agentDir, { projects: undefined });
+    const rt = new AgentRuntime(h.harness, { botFactory: async () => deferredBot() });
+    await rt.start();
+    await rt.runCommand("mute");
+    expect(told(h.notices)).toEqual(one);
+    await rt.stop();
+  });
+
+  it("from /freeq on, a login and takeover", async () => {
+    for (const command of ["on", "login did:plc:other", "takeover"]) {
+      // Online first; every later connect is the deferred one.
+      const h = fakeHarness({ confirm: async () => true });
+      writeConfig(h.agentDir);
+      let n = 0;
+      const rt = new AgentRuntime(h.harness, { botFactory: async () => (n++ === 0 ? new FakeBot() : deferredBot()) });
+      await rt.start();
+      if (command === "on") await rt.runCommand("off");
+      h.notices.length = 0;
+      await rt.runCommand(command);
+      expect(told(h.notices), command).toEqual(one);
+      await rt.stop();
+    }
   });
 });
 
@@ -883,8 +942,11 @@ describe("AgentRuntime: a login while the session start's connect is running", (
       log.push("start");
       return new Promise((resolve, reject) => {
         rejectStart = reject;
-        settle = (outcome) =>
-          outcome === "online" ? resolve(first) : reject(new Error("SASL auth failed: not allowed"));
+        settle = (outcome) => {
+          if (outcome === "online") return resolve(first);
+          first.emit("authError", "not allowed");
+          reject(new SignInRefusedError("not allowed"));
+        };
       });
     };
     first.stop = async (reason?: string) => {
@@ -927,19 +989,19 @@ describe("AgentRuntime: a login while the session start's connect is running", (
     await s.rt.stop();
   });
 
-  it("a login for the same owner and server waits for it, and the refusal is told once, as a warning", async () => {
+  it("a login for the same owner and server waits for it, and the refusal is told once, in the connection's notice", async () => {
     const s = await startingUp();
     const login = s.rt.runCommand(`login ${OWNER}`);
     await tick();
     s.settle("refused");
     await Promise.all([s.starting, login]);
-    // The one stop is the connection's own discard of its refused bot.
-    expect(s.log).toEqual(["start", "stop discarded"]);
+    // Nothing stopped it but bot-kit: the refused bot is kept.
+    expect(s.log).toEqual(["start"]);
     expect(s.made).toHaveLength(1);
+    expect(s.rt.conn?.state).toBe("error");
     expect(waiting(s.h.notices)).toHaveLength(1);
-    expect(outcomes(s.h.notices)).toEqual([
-      { text: expect.stringMatching(/^freeq: error: .* — last error: SASL auth failed: not allowed$/), level: "warning" },
-    ]);
+    expect(outcomes(s.h.notices)).toEqual([]);
+    expect(refusalLines(s.h.notices)).toEqual([{ text: "freeq: authentication failed — not allowed", level: "error" }]);
     expect(stuck(s.h.notices)).toEqual([]);
     await s.rt.stop();
   });
@@ -965,9 +1027,8 @@ describe("AgentRuntime: a login while the session start's connect is running", (
     expect(s.log).toEqual(["start", "stop login"]);
     expect(s.made.map((m) => m.ownerDid)).toEqual([OWNER, "did:plc:other"]);
     expect(s.h.notices.filter((n) => /freeq: offline/.test(n.text))).toEqual([]);
-    expect(outcomes(s.h.notices)).toEqual([
-      { text: expect.stringMatching(/^freeq: error: .* — last error: SASL auth failed: not allowed$/), level: "warning" },
-    ]);
+    expect(outcomes(s.h.notices)).toEqual([]);
+    expect(refusalLines(s.h.notices)).toEqual([{ text: "freeq: authentication failed — not allowed", level: "error" }]);
     expect(stuck(s.h.notices)).toEqual([]);
     await s.rt.stop();
   });

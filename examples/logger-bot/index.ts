@@ -113,6 +113,8 @@ const ALL_EVENTS: (keyof FreeqEvents)[] = [
   'nickChanged',
   'authenticated',
   'authError',
+  'authErrorRetry',
+  'signingKeyRefused',
   // Channel events
   'channelJoined',
   'channelLeft',

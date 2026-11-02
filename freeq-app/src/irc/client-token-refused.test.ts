@@ -20,6 +20,7 @@ class MockFreeqClient {
   joinedChannels = new Set<string>(['#room']);
   nickToDid: unknown = null;
   authDid: string | null = null;
+  saslFailed = false;
   sasl: { token: string; did: string } | null = null;
   constructor(public opts: { url: string; nick: string; brokerToken?: string }) {
     MockFreeqClient.built.push(this);
@@ -56,7 +57,6 @@ const bridge = await import('./client');
 const { useStore } = await import('../store');
 
 const DID = 'did:plc:signedin';
-const EXPIRED = 'Your session expired. Sign in with AT Protocol again, or connect as guest.';
 
 beforeEach(() => {
   globalThis.indexedDB = new IDBFactory();
@@ -87,18 +87,18 @@ function signedIn(): MockFreeqClient {
   return c;
 }
 
-/** Back on the connect screen with the line, signed out, and no guest. */
-function expectSignedOutWithLine(): void {
+/** Back on the connect screen with `line`, signed out, and no guest. */
+function expectSignedOutWith(line: string): void {
   const s = useStore.getState();
   expect(s.registered).toBe(false);
   expect(s.wasRegistered).toBe(false);
   expect(s.authDid).toBeNull();
-  expect(s.authError).toBe(EXPIRED);
+  expect(s.authError).toBe(line);
   expect(localStorage.getItem('freeq-broker-token')).toBeNull();
 }
 
 describe('a reconnect refused its token', () => {
-  it('ends on the connect screen with the session-expired line when the SDK reports the refusal', () => {
+  it('ends on the connect screen with the server\'s words when the SDK reports the refusal', () => {
     const c = signedIn();
 
     // The SDK's own reconnect offers the spent token and the server answers 904.
@@ -107,24 +107,8 @@ describe('a reconnect refused its token', () => {
     c.emit('authenticated', '', 'Invalid web auth token');
     c.emit('connectionStateChanged', 'disconnected');
 
-    expectSignedOutWithLine();
+    expectSignedOutWith('Invalid web auth token');
     expect(MockFreeqClient.built).toHaveLength(1);
-  });
-
-  it('ends on the connect screen when the reconnect registers as a guest', () => {
-    signedIn();
-    bridge.reconnect();
-    const next = MockFreeqClient.built.at(-1)!;
-    expect(MockFreeqClient.built).toHaveLength(2);
-    // The reconnect still names the account, so the SDK refreshes the session
-    // rather than registering without one.
-    expect(next.sasl?.did).toBe(DID);
-
-    next.emit('connectionStateChanged', 'connected');
-    next.emit('registered', 'Guest12345');
-
-    expectSignedOutWithLine();
-    expect(MockFreeqClient.built).toHaveLength(2);
   });
 
   it('keeps the session when a signed-in connection reports a nick collision', () => {
@@ -132,6 +116,32 @@ describe('a reconnect refused its token', () => {
     c.emit('authError', "nick 'me' is already taken");
     expect(useStore.getState().registered).toBe(true);
     expect(localStorage.getItem('freeq-broker-token')).toBe('BT');
+  });
+
+  it('keeps the session, and says why, when the server cannot check it just now', () => {
+    const c = signedIn();
+    const lines: string[] = [];
+    const addSystemMessage = useStore.getState().addSystemMessage;
+    useStore.setState({
+      addSystemMessage: (channel: string, text: string) => {
+        lines.push(text);
+        addSystemMessage(channel, text);
+      },
+    });
+    const words = 'Your identity could not be checked just now. Try again shortly.';
+    // The SDK tries again on its growing wait: the line is said once.
+    for (let i = 0; i < 3; i++) {
+      c.emit('authErrorRetry', words);
+      c.emit('connectionStateChanged', 'disconnected');
+      c.emit('connectionStateChanged', 'connected');
+    }
+    expect(lines).toEqual([words]);
+    expect(useStore.getState().authError).toBeNull();
+    expect(localStorage.getItem('freeq-broker-token')).toBe('BT');
+    // Once the session is in, a later outage is said again.
+    c.emit('registered', 'me');
+    c.emit('authErrorRetry', words);
+    expect(lines).toEqual([words, words]);
   });
 });
 
@@ -153,5 +163,106 @@ describe("a guest's reconnect", () => {
     expect(s.registered).toBe(true);
     expect(s.nick).toBe('web123');
     expect(s.authError).toBeNull();
+  });
+});
+
+describe('a refusal for good', () => {
+  it("on a first sign-in shows the server's words and drops the saved sign-in", () => {
+    localStorage.setItem('freeq-broker-token', 'BT');
+    bridge.setSaslCredentials('web-token', DID, '', 'web-token');
+    bridge.connect('wss://test/irc', 'me', ['#room']);
+    const c = MockFreeqClient.built.at(-1)!;
+    c.emit('connectionStateChanged', 'connected');
+    // The SDK's final refusal: authError, the empty identity, the drop.
+    const words = 'Not authorized to connect to this server';
+    c.saslFailed = true;
+    c.emit('authError', words);
+    c.emit('authenticated', '', words);
+    c.emit('connectionStateChanged', 'disconnected');
+
+    const s = useStore.getState();
+    expect(s.registered).toBe(false);
+    expect(s.authDid).toBeNull();
+    expect(s.authError).toBe(words);
+    expect(MockFreeqClient.built).toHaveLength(1);
+    // A page load finds no broker token, so it does not sign in again.
+    expect(localStorage.getItem('freeq-broker-token')).toBeNull();
+    // "Connect as guest" connects as a guest, not with the refused token.
+    bridge.connect('wss://test/irc', 'web123', ['#room']);
+    expect(MockFreeqClient.built).toHaveLength(2);
+    expect(MockFreeqClient.built.at(-1)!.sasl).toBeNull();
+  });
+
+  it('a try-again at sign-in shows its reason on the connect screen, once', () => {
+    bridge.setSaslCredentials('web-token', DID, '', 'web-token');
+    bridge.connect('wss://test/irc', 'me', ['#room']);
+    const c = MockFreeqClient.built.at(-1)!;
+    const lines: string[] = [];
+    const addSystemMessage = useStore.getState().addSystemMessage;
+    useStore.setState({
+      addSystemMessage: (channel: string, text: string) => {
+        lines.push(text);
+        addSystemMessage(channel, text);
+      },
+    });
+    const words = 'Your identity could not be checked just now. Try again shortly.';
+    // The SDK tries again on its growing wait.
+    for (let i = 0; i < 3; i++) {
+      c.emit('connectionStateChanged', 'connected');
+      c.emit('authErrorRetry', words);
+      c.emit('connectionStateChanged', 'disconnected');
+    }
+    const s = useStore.getState();
+    expect(s.registered).toBe(false);
+    expect(s.authError).toBe(words);
+    expect(lines).toEqual([]);
+    // The sign-in still holds its credentials: the SDK keeps trying.
+    expect(MockFreeqClient.built).toHaveLength(1);
+    // Once the account is in, the reason goes.
+    c.authDid = DID;
+    c.emit('authenticated', DID, 'ok');
+    expect(useStore.getState().authError).toBeNull();
+  });
+
+  it('"Connect as guest" during a try-again at sign-in connects as a guest', () => {
+    localStorage.setItem('freeq-broker-token', 'BT');
+    bridge.setSaslCredentials('web-token', DID, '', 'web-token');
+    bridge.connect('wss://test/irc', 'me', ['#room']);
+    const c = MockFreeqClient.built.at(-1)!;
+    c.emit('connectionStateChanged', 'connected');
+    c.emit('authErrorRetry', 'Your identity could not be checked just now. Try again shortly.');
+    c.emit('connectionStateChanged', 'disconnected');
+    // The try-again alone keeps the sign-in: the SDK is still trying it.
+    expect(localStorage.getItem('freeq-broker-token')).toBe('BT');
+
+    // The connect screen's guest button: connect(..., asPlainGuest).
+    bridge.connect('wss://test/irc', 'web123', ['#room'], false, false, true);
+    const guest = MockFreeqClient.built.at(-1)!;
+    expect(MockFreeqClient.built).toHaveLength(2);
+    expect(guest.sasl).toBeNull();
+    expect(guest.opts.brokerToken).toBeUndefined();
+    expect(localStorage.getItem('freeq-broker-token')).toBeNull();
+  });
+
+  it("of a registered guest ends on the connect screen with the server's words", () => {
+    bridge.connect('wss://test/irc', 'web123', ['#room']);
+    const c = MockFreeqClient.built.at(-1)!;
+    c.emit('connectionStateChanged', 'connected');
+    c.emit('registered', 'web123');
+    useStore.getState().setWasRegistered(true);
+
+    // An op's revoke: FAIL * AGENT_REVOKED, which the SDK reports as a final
+    // refusal, then the drop. Nothing reconnects.
+    const words = 'Revoked by opper: bye';
+    c.saslFailed = true;
+    c.emit('authError', words);
+    c.emit('authenticated', '', words);
+    c.emit('connectionStateChanged', 'disconnected');
+
+    const s = useStore.getState();
+    expect(s.registered).toBe(false);
+    expect(s.wasRegistered).toBe(false);
+    expect(s.authError).toBe(words);
+    expect(MockFreeqClient.built).toHaveLength(1);
   });
 });

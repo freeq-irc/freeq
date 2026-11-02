@@ -366,8 +366,14 @@ const cli = createDaemonCLI({
   runDaemon: async (opts) => {
     const bot = await FreeqBot.create({ ...opts, url: 'wss://irc.freeq.at/irc' });
     bot.on('message', (ch, msg) => bot.client.sendMessage(ch, `echo: ${msg.text}`));
+    // 'ready', or 'deferred' when the server could not check the bot just now
+    // (the SDK keeps trying, and the announce runs at the 'ready' after it).
+    // A refused sign-in rejects with SignInRefusedError.
     await bot.start();
-    return { stop: (reason) => bot.stop(reason) };
+    // `stopped` settles when the bot stops by itself because the server refused
+    // its key or its sign-in, or the nick was taken under a `refuse` policy;
+    // the scaffold then exits 0.
+    return { stop: (reason) => bot.stop(reason), stopped: bot.stopped };
   },
   // Extra `launch` flags. Caller reads via parsed.<flag> inside preflight.
   launchOptions: [
@@ -396,6 +402,8 @@ await cli.parseAsync(process.argv);
 **Built-in `doctor` checks:** identity file (32-byte ed25519 seed → did:key), delegation cert (parses + `bot_did === agent.did`), server actor record (if `actorStatusUrl` provided, queries `online` + `provenance._verified`). Each `doctorChecks` entry runs after, in registration order, with `{ ok: true, detail? } | { ok: 'warn', reason } | { ok: false, reason }`. Doctor exits 1 if any check fails (warnings don't fail).
 
 **Two-callback launch model:** `preflight` runs in foreground (prompts ok) and re-runs idempotently in the detached child after fork. `runDaemon` only runs in the daemon process and receives `preflight`'s return value. Signal handlers (SIGINT/SIGTERM) are wired by the scaffold; the returned handle's `stop(reason)` is invoked on shutdown.
+
+**Refusals end the daemon cleanly:** when the server refuses the bot's key or its sign-in, the bot stops itself and `bot.stopped` settles with the server's sentence. Hand it to the scaffold as the handle's `stopped`, and it prints `[refused] shutting down...` with the sentence, removes the pid file and exits 0, as on a signal, so a supervisor that restarts on failure (`Restart=on-failure`) leaves it down. A `runDaemon` that rejects with `SignInRefusedError` (a refusal at start) ends the same way; any other rejection removes the pid file and exits 1. Once the bot is in, a nick taken under a `refuse` policy, the default, stops it too: `bot.stopped` settles with the SDK's words, and the daemon prints `[refused] shutting down... nick '<nick>' is already taken` and exits 0. A nick already taken at start makes `start()` reject with a plain `Error`, one of those other rejections, so the daemon exits 1.
 
 ## DID maps (allowlists, banlists, roles, tiers)
 
@@ -629,7 +637,7 @@ Deliberately out of scope:
 - **Policy decisions.** `createDidMap` is a hot-reloadable DID-keyed map; `createTurnGate` runs rate-limit + cycle detection. Bot-kit takes no position on what membership means (allow / ban / role) or who counts as "owner" — those are caller wiring, not framework behavior.
 - **Persistence layer.** Both `createDidMap` and `createTurnGate` take optional `load` / `save` callbacks. Bot-kit never touches the filesystem; callers wire `write-file-atomic`, a DB, or whatever they need.
 - **Signal handlers (when not using `createDaemonCLI`).** `process.on('SIGINT', ...)` is process-global; if you're using `FreeqBot` directly without the CLI scaffold, the application owns it. The README's quick example shows the snippet.
-- **Reconnect logic.** Already in the SDK transport (`@freeq/sdk`'s `Transport` does exponential-backoff auto-reconnect and re-emits `'ready'` on resume). Bot-kit's announce loop is already bound to every `'ready'` so reconnects re-announce automatically.
+- **Reconnect logic.** Already in the SDK transport (`@freeq/sdk`'s `Transport` does exponential-backoff auto-reconnect and re-emits `'ready'` on resume). Bot-kit's announce loop is already bound to every `'ready'` so reconnects re-announce automatically. The transport's reconnecting ends after a refusal of the key or the sign-in, when the bot stops.
 - **did:key rotation.** No `rotate-key` command shipped. Bot-kit *could* generically delete `agent.key` + `delegation.json` and let the next launch mint fresh ones, but in practice rotation always means more than that — a bot that caches state per DID, for example, also needs to wipe those caches. So we leave it to the bot to add a `rotate-key` subcommand on the `Command` returned by `createDaemonCLI`, with whatever extra cleanup it needs.
 - **Manifest building.** The announce sequence includes `AGENT MANIFEST :<toml>` if you pass a `manifest` string to `FreeqBot.create`. Bot-kit doesn't compose the TOML for you — actor_class, capabilities, supported intents, and version strings are all per-bot, so we accept a pre-formatted string and pass it through. Use any TOML library; see [agents.md](../docs/agents.md) for the manifest schema.
 

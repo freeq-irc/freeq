@@ -95,7 +95,7 @@ describe('a signing key the server refuses', () => {
     c.emit('registered', 'me');
     expect(useStore.getState().registered).toBe(true);
 
-    c.emit('serverFail', `MSGSIG KEY_RETIRED ${SIGNED_OUT}`);
+    c.emit('signingKeyRefused', SIGNED_OUT);
     c.emit('connectionStateChanged', 'disconnected');
 
     const state = useStore.getState();
@@ -117,7 +117,7 @@ describe('a signing key the server refuses', () => {
     c.emit('connectionStateChanged', 'connected');
     c.emit('registered', 'me');
 
-    c.emit('serverFail', `MSGSIG KEY_EXPIRED ${EXPIRED}`);
+    c.emit('signingKeyRefused', EXPIRED);
     c.emit('connectionStateChanged', 'disconnected');
 
     expect(c.disconnects).toBe(1);

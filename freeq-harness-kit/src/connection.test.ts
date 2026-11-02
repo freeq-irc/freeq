@@ -14,6 +14,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FreeqBot } from "@freeq/bot-kit";
+import { SignInRefusedError } from "@freeq/bot-kit";
 import { FreeqConnection, type BotLike, type ConnectionOptions } from "./connection.js";
 import { PI_HELLO, PI_HELLO_ACK, buildHello, helloTags } from "./discovery.js";
 import { PI_ASK, PI_ASK_REPLY, encodePayload } from "./ask.js";
@@ -70,7 +71,9 @@ class FakeBot implements BotLike {
     if (this.authError) {
       for (const h of this.handlers.get("authError") ?? []) (h as (e: string) => void)(this.authError);
     }
-    if (this.failStart) throw new Error(this.authError ?? "boom");
+    // bot-kit rejects a refused sign-in with SignInRefusedError, anything
+    // else (an unreachable server, a timeout) with a plain error.
+    if (this.failStart) throw this.authError ? new SignInRefusedError(this.authError) : new Error("boom");
     return this;
   }
   async stop(reason?: string): Promise<unknown> {
@@ -135,27 +138,50 @@ describe("connect lifecycle", () => {
     const { conn, bot, notices } = mk();
     bot.failStart = true;
     await expect(conn.start()).resolves.toBeUndefined();
-    expect(conn.state).toBe("error");
+    // Not a verdict: still trying, as a real bot's drop leaves it.
+    expect(conn.state).toBe("connecting");
     expect(conn.lastError).toMatch(/boom/);
     expect(notices.some((n) => /could not connect/.test(n.text))).toBe(true);
   });
 
+  /** A refusal is kept: `error`, the sentence, the bot held, never retried. */
+  async function expectKeptRefusal(conn: FreeqConnection, bot: FakeBot, sentence: string): Promise<void> {
+    expect(conn.state).toBe("error");
+    expect(conn.lastError).toBe(sentence);
+    expect(bot.stopped).toEqual([]);
+    expect(conn.bot).toBe(bot);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(bot.startCalls).toBe(1);
+  }
+
   it("points a refused delegated agent at /freeq authorize", async () => {
-    const { conn, bot, notices } = mk();
-    bot.failStart = true;
-    bot.authError = delegatedRefusal();
-    await conn.start();
-    const auth = notices.find((n) => /authentication failed/.test(n.text))?.text ?? "";
-    expect(auth).toContain("Run /freeq authorize to add this installation as one of your agents.");
+    vi.useFakeTimers();
+    try {
+      const { conn, bot, notices } = mk();
+      bot.failStart = true;
+      bot.authError = delegatedRefusal();
+      await conn.start();
+      const auth = notices.find((n) => /authentication failed/.test(n.text))?.text ?? "";
+      expect(auth).toContain("Run /freeq authorize to add this installation as one of your agents.");
+      await expectKeptRefusal(conn, bot, delegatedRefusal());
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not hint at authorize for an unrelated refusal", async () => {
-    const { conn, bot, notices } = mk();
-    bot.failStart = true;
-    bot.authError = "SASL authentication failed (bad response: response is not JSON)";
-    await conn.start();
-    const auth = notices.find((n) => /authentication failed/.test(n.text))?.text ?? "";
-    expect(auth).not.toContain("/freeq authorize");
+    vi.useFakeTimers();
+    try {
+      const { conn, bot, notices } = mk();
+      bot.failStart = true;
+      bot.authError = "SASL authentication failed (bad response: response is not JSON)";
+      await conn.start();
+      const auth = notices.find((n) => /authentication failed/.test(n.text))?.text ?? "";
+      expect(auth).not.toContain("/freeq authorize");
+      await expectKeptRefusal(conn, bot, "SASL authentication failed (bad response: response is not JSON)");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("discards a half-built bot on failure so a retry cannot double up", async () => {
@@ -399,6 +425,94 @@ describe("transport state handling (the churn regression)", () => {
     await expect(conn.start()).resolves.toBeUndefined();
     expect(conn.state).toBe("online");
     expect(notices.some((n) => /online handler error/.test(n.text))).toBe(true);
+  });
+});
+
+describe("the server's verdicts", () => {
+  const reconnecting = (notices: Array<{ text: string }>) =>
+    notices.filter((n) => /the transport is reconnecting/.test(n.text));
+
+  it("after ready, a refused sign-in and its drop leave error and say nothing is reconnecting", async () => {
+    const { conn, bot, notices } = mk();
+    await conn.start();
+    bot.emit("authError", "Delegation withdrawn");
+    bot.emit("connectionStateChanged", "disconnected");
+    expect(conn.state).toBe("error");
+    expect(conn.lastError).toBe("Delegation withdrawn");
+    expect(reconnecting(notices)).toEqual([]);
+    expect(notices.filter((n) => /authentication failed — Delegation withdrawn/.test(n.text))).toHaveLength(1);
+  });
+
+  it("after ready, a refused key and its drop leave error and say nothing is reconnecting", async () => {
+    const { conn, bot, notices } = mk();
+    await conn.start();
+    bot.emit("signingKeyRefused", "This device was signed out from another device.");
+    bot.emit("connectionStateChanged", "disconnected");
+    expect(conn.state).toBe("error");
+    expect(conn.lastError).toBe("This device was signed out from another device.");
+    expect(reconnecting(notices)).toEqual([]);
+  });
+
+  it("a try-again and its drop: still connecting, one notice saying why, then online at ready", async () => {
+    const online: number[] = [];
+    const { conn, bot, notices } = mk({ onOnline: () => online.push(1) });
+    await conn.start();
+    expect(online).toHaveLength(1);
+    bot.emit("connectionStateChanged", "disconnected");
+    bot.emit("connectionStateChanged", "connected");
+    bot.emit("authErrorRetry", "Your identity could not be checked just now.");
+    bot.emit("connectionStateChanged", "disconnected");
+    bot.emit("connectionStateChanged", "connected");
+    bot.emit("authErrorRetry", "Your identity could not be checked just now.");
+    bot.emit("connectionStateChanged", "disconnected");
+    expect(conn.state).toBe("connecting");
+    expect(notices.filter((n) => /could not check this agent just now/.test(n.text))).toHaveLength(1);
+    // The drop before the try-again was told; none after it.
+    expect(notices.filter((n) => /connection dropped/.test(n.text))).toHaveLength(1);
+
+    bot.emit("connectionStateChanged", "connected");
+    bot.emit("ready");
+    expect(conn.state).toBe("online");
+    expect(online).toHaveLength(2);
+    bot.emit("connectionStateChanged", "disconnected");
+    expect(notices.filter((n) => /connection dropped/.test(n.text))).toHaveLength(2);
+  });
+
+  it("comes online at the ready that follows a start the server deferred, with one notice and no drop line", async () => {
+    const online: number[] = [];
+    const { conn, bot, notices } = mk({ onOnline: () => online.push(1) });
+    bot.start = async () => {
+      bot.startCalls++;
+      // bot-kit's order: the SDK's verdict, then start() resolves.
+      bot.emit("authErrorRetry", "Your identity could not be checked just now.");
+      return "deferred";
+    };
+    await conn.start();
+    bot.emit("connectionStateChanged", "disconnected");
+    expect(conn.state).toBe("connecting");
+    expect(online).toEqual([]);
+    expect(notices.map((n) => n.text)).toEqual([
+      "freeq: the server could not check this agent just now — Your identity could not be checked just now.",
+    ]);
+    bot.emit("connectionStateChanged", "connected");
+    bot.emit("ready");
+    expect(conn.state).toBe("online");
+    expect(online).toHaveLength(1);
+  });
+
+  it("a stopped connection hears no ready, refusal or try-again", async () => {
+    const online: number[] = [];
+    const { conn, bot, notices } = mk({ onOnline: () => online.push(1) });
+    await conn.start();
+    await conn.stop("bye");
+    const before = notices.length;
+    bot.emit("ready");
+    bot.emit("authError", "refused");
+    bot.emit("signingKeyRefused", "refused");
+    bot.emit("authErrorRetry", "later");
+    expect(online).toHaveLength(1);
+    expect(notices.slice(before)).toEqual([]);
+    expect(conn.state).toBe("offline");
   });
 });
 

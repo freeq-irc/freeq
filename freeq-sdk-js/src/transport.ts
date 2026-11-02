@@ -104,7 +104,15 @@ export class Transport {
     }
   }
 
+  /** Close and stop reconnecting, and report the drop. */
   disconnect() {
+    this.detach();
+    this.opts.onStateChange('disconnected');
+  }
+
+  /** What disconnect() does but its report: the caller reports the drop
+   *  itself, once its listeners have heard why. */
+  detach() {
     this.intentionalClose = true;
     this.stopHeartbeat();
     if (this.reconnectTimer) {
@@ -116,13 +124,12 @@ export class Transport {
       // call `flush()` first. We still emit a defensive QUIT here for callers
       // that haven't sent one, but it may be lost if the buffer is non-empty.
       try { this.send('QUIT :Leaving'); } catch { /* ignore */ }
-      // Unhooked first: the drop is reported below, and the socket's own
-      // close can arrive after a later connect() is up.
+      // Unhooked first: the drop is reported by disconnect() or the caller,
+      // and the socket's own close can arrive after a later connect() is up.
       Transport.unhook(this.ws);
       this.ws.close();
       this.ws = null;
     }
-    this.opts.onStateChange('disconnected');
   }
 
   private static unhook(ws: WebSocket) {

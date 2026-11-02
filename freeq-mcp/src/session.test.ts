@@ -292,6 +292,86 @@ describe("a refused sign-in", () => {
   });
 });
 
+describe("the server's other verdicts", () => {
+  const SENTENCE = "This device was signed out from another device.";
+
+  it("a refused key: the asks in flight get the sentence, and the session is offline with it", async () => {
+    const clients: FakeClient[] = [];
+    const closed: string[] = [];
+    const session = new FreeqSession(loadConfig({}), {
+      createClient: async () => {
+        const client = new FakeClient();
+        clients.push(client);
+        return {
+          client,
+          mode: "authenticated" as SessionMode,
+          did: `did:key:z${clients.length}`,
+          close: async (reason: string) => {
+            closed.push(reason);
+            client.disconnect();
+          },
+        };
+      },
+    });
+    await session.connect();
+    const pending = session.ask("peer", "q", 60_000);
+    // The SDK's order for a refused key: the verdict, then the drop.
+    clients[0]!.emit("signingKeyRefused", SENTENCE);
+    clients[0]!.emit("connectionStateChanged", "disconnected");
+    await expect(pending).resolves.toMatchObject({ ok: false, error: SENTENCE });
+    await Promise.resolve();
+    expect(closed).toEqual([SENTENCE]);
+    expect(session.status().mode).toBe("offline");
+    expect(session.status().note).toContain(`the server refused the last connection: ${SENTENCE}`);
+    expect(() => session.say("#x", "hi")).toThrow(SENTENCE);
+    await session.connect();
+    expect(clients).toHaveLength(2);
+  });
+
+  it("a try-again: the call fails at once with the sentence, and the bot is kept for the next call", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new FakeClient();
+      client.connect = () => {
+        client.connected = true;
+        setTimeout(() => client.emit("authErrorRetry", "Your identity could not be checked just now."), 0);
+      };
+      const factory = vi.fn(async () => ({ client, mode: "authenticated" as SessionMode, did: "did:key:z1" }));
+      const session = new FreeqSession(loadConfig({}), { createClient: factory });
+      const first = expect(session.connect()).rejects.toThrow(
+        "the server could not check this identity just now: Your identity could not be checked just now.",
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      await first;
+      const second = session.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      client.emit("ready");
+      await second;
+      expect(factory).toHaveBeenCalledTimes(1);
+      expect(session.connected).toBe(true);
+      expect(client.handlers.get("authErrorRetry") ?? []).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a client with no close of its own, refused: offline, and its DID is not cleared to nothing", async () => {
+    const client = new FakeClient();
+    const session = new FreeqSession(loadConfig({}), {
+      createClient: async () => ({ client, mode: "guest" as SessionMode, did: "did:key:zGuest" }),
+    });
+    await session.connect();
+    // The SDK's order: the verdict, the identity cleared, then the drop.
+    client.emit("authError", "This server requires an account.");
+    client.emit("authenticated", "", "This server requires an account.");
+    client.emit("connectionStateChanged", "disconnected");
+    const s = session.status();
+    expect(s.mode).toBe("offline");
+    expect(s.did).toBe("did:key:zGuest");
+    expect(s.note).toContain("This server requires an account.");
+  });
+});
+
 describe("write guards", () => {
   it("refuses to send before connecting, and says what to do", () => {
     const { session } = makeSession();
