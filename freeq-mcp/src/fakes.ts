@@ -42,8 +42,7 @@ export class FakeClient implements SessionClient {
 
   off(event: string, handler: (...args: never[]) => void): this {
     const list = this.handlers.get(event) ?? [];
-    const i = list.indexOf(handler);
-    if (i >= 0) list.splice(i, 1);
+    this.handlers.set(event, list.filter((h) => h !== handler));
     return this;
   }
 
