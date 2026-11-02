@@ -314,7 +314,7 @@ Channel operators control agents with IRC commands:
 ```
 AGENT PAUSE myagent          — stop the agent immediately
 AGENT RESUME myagent         — let it continue
-AGENT REVOKE myagent         — revoke all capabilities, force disconnect
+AGENT REVOKE myagent         — revoke all capabilities and disconnect it; it stops until restarted (revoking bans nothing)
 ```
 
 The server delivers these as TAGMSG with a governance tag:
@@ -1126,7 +1126,7 @@ From any IRC client:
 ```
 /quote AGENT PAUSE newsroom          — stop it mid-task
 /quote AGENT RESUME newsroom         — let it continue
-/quote AGENT REVOKE newsroom         — disconnect it permanently
+/quote AGENT REVOKE newsroom         — disconnect it; it stays off until restarted
 ```
 
 From the web client, these are buttons in the agent's identity card popover.

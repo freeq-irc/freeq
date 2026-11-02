@@ -1,9 +1,9 @@
 //! The refusals a freeq server sends, and how a client reads them.
 //!
 //! A sign-in the server refuses carries `FAIL AUTHENTICATE <code> :<sentence>`
-//! just before its `904`. A refused signing key carries `FAIL MSGSIG
-//! KEY_EXPIRED` or `KEY_RETIRED`. [`classify`] reads a `FAIL *` with one of
-//! these codes as it reads a `FAIL AUTHENTICATE`.
+//! just before its `904`. A session the server ends for a reason of the
+//! client's own carries `FAIL * <code> :<sentence>` before its `ERROR`. A
+//! refused signing key carries `FAIL MSGSIG KEY_EXPIRED` or `KEY_RETIRED`.
 //!
 //! Only [`TEMPORARILY_UNAVAILABLE`] says the answer may change by itself: the
 //! server could not get an answer it needs, or the challenge expired, so the
@@ -103,8 +103,8 @@ mod tests {
         words.iter().map(|w| w.to_string()).collect()
     }
 
-    /// Every code the shared vector lists under AUTHENTICATE or `*`
-    /// classifies as the kind it gives.
+    /// Every code the server can send under AUTHENTICATE or `*`, as the shared
+    /// vector lists it, classifies as the kind it gives.
     #[test]
     fn every_code_in_the_shared_vector_classifies_as_its_kind() {
         let vector: serde_json::Value =

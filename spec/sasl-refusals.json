@@ -1,5 +1,5 @@
 {
-  "_comment": "The refusals a freeq server sends. delegated_refusal is the 904 a server sends a delegated agent it does not admit; harness-kit matches it to point the owner at /freeq authorize, and the server's and harness-kit's tests read it. codes is every code the server sends in FAIL AUTHENTICATE before a 904 or in FAIL MSGSIG for a refused signing key, with its kind: try_again (the same credentials may get in later), final, or signing_key; the * rows are codes a client reads in a FAIL * as it reads them in a FAIL AUTHENTICATE. Any AUTHENTICATE or * code not listed is final too. freeq_sdk::refusal's tests read codes.",
+  "_comment": "The refusals a freeq server sends. delegated_refusal is the 904 a server sends a delegated agent it does not admit; harness-kit matches it to point the owner at /freeq authorize, and the server's and harness-kit's tests read it. codes is every code the server sends in FAIL AUTHENTICATE before a 904, in FAIL * before an ERROR, or in FAIL MSGSIG for a refused signing key, with its kind: try_again (the same credentials may get in later), final, or signing_key. Any AUTHENTICATE or * code not listed is final too. freeq_sdk::refusal's tests read codes.",
   "delegated_refusal": {
     "owner": "did:plc:owner",
     "text": "Not authorized to connect to this server: the agent records of {owner} do not admit this agent"
