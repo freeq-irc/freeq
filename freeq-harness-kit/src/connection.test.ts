@@ -198,11 +198,12 @@ describe("transport state handling (the churn regression)", () => {
     expect(conn.state).toBe("connecting"); // recovering, not dead
   });
 
-  it("recovers to online when the transport reconnects", async () => {
+  it("recovers to online when the transport reconnects and the server lets it in", async () => {
     const { conn, bot } = mk();
     await conn.start();
     bot.emit("connectionStateChanged", "disconnected");
     bot.emit("connectionStateChanged", "connected");
+    bot.emit("ready");
     expect(conn.state).toBe("online");
   });
 
@@ -225,6 +226,7 @@ describe("transport state handling (the churn regression)", () => {
 
       const before = bot.sent.filter((s) => s.kind === "join").length;
       bot.emit("connectionStateChanged", "connected");
+      bot.emit("ready");
       await vi.advanceTimersByTimeAsync(4_000);
       const joins = bot.sent.filter((s) => s.kind === "join" && s.target === "#work");
       expect(joins.length).toBe(before + 1);
@@ -240,6 +242,7 @@ describe("transport state handling (the churn regression)", () => {
       await conn.start();
       bot.emit("connectionStateChanged", "disconnected");
       bot.emit("connectionStateChanged", "connected");
+      bot.emit("ready");
       // The server's own auto-rejoin lands inside the grace window.
       bot.emit("channelJoined", "#work");
       await vi.advanceTimersByTimeAsync(20_000);
@@ -259,6 +262,7 @@ describe("transport state handling (the churn regression)", () => {
       bot.emit("joinRejected", "#work", "477", "policy");
       bot.emit("connectionStateChanged", "disconnected");
       bot.emit("connectionStateChanged", "connected");
+      bot.emit("ready");
       await vi.advanceTimersByTimeAsync(20_000);
       expect(bot.sent.filter((s) => s.kind === "join" && s.target === "#work")).toEqual([]);
     } finally {
@@ -273,6 +277,7 @@ describe("transport state handling (the churn regression)", () => {
       await conn.start();
       bot.emit("connectionStateChanged", "disconnected");
       bot.emit("connectionStateChanged", "connected");
+      bot.emit("ready");
       await conn.stop("done");
       await vi.advanceTimersByTimeAsync(20_000);
       expect(bot.sent.filter((s) => s.kind === "join")).toEqual([]);
@@ -293,6 +298,7 @@ describe("transport state handling (the churn regression)", () => {
     await conn.start();
     bot.emit("connectionStateChanged", "disconnected");
     bot.emit("connectionStateChanged", "connected");
+    bot.emit("ready");
     bot.emit("connectionStateChanged", "disconnected");
     expect(notices.filter((n) => /dropped/.test(n.text)).length).toBe(2);
   });
@@ -307,18 +313,81 @@ describe("transport state handling (the churn regression)", () => {
 
   it("reports coming online once per gap, not once per event", async () => {
     // The host resumes assigned work here. bot.start() returning and the
-    // transport's own 'connected' both mean online, and a resume that ran
-    // twice for one connect would re-enter every task twice.
+    // bot's 'ready' both mean online, and a resume that ran twice for one
+    // connect would re-enter every task twice.
     const online: number[] = [];
     const { conn, bot } = mk({ onOnline: () => online.push(1) });
     await conn.start();
-    bot.emit("connectionStateChanged", "connected");
-    bot.emit("connectionStateChanged", "connected");
+    bot.emit("ready");
+    bot.emit("ready");
     expect(online).toHaveLength(1);
 
     bot.emit("connectionStateChanged", "disconnected");
     bot.emit("connectionStateChanged", "connected");
+    expect(online).toHaveLength(1); // a socket is not yet a session
+    bot.emit("ready");
     expect(online).toHaveLength(2); // a real gap closed — resume again
+  });
+
+  it("is not online while sockets open and close before the server lets it in", async () => {
+    // A server that accepts the socket and then refuses the agent before its
+    // welcome: the agent never got in, so the host must not resume work, and
+    // the drop is told once for the whole gap.
+    const online: number[] = [];
+    const { conn, bot, notices } = mk({ onOnline: () => online.push(1) });
+    await conn.start();
+    expect(online).toHaveLength(1);
+    for (let i = 0; i < 3; i++) {
+      bot.emit("connectionStateChanged", "connected");
+      bot.emit("connectionStateChanged", "disconnected");
+    }
+    expect(online).toHaveLength(1);
+    expect(conn.state).toBe("connecting");
+    expect(notices.filter((n) => /connection dropped/.test(n.text))).toHaveLength(1);
+  });
+
+  it("does not come online on a welcome that lands after stop()", async () => {
+    // bot.stop() waits for its send buffer before it disconnects, and a 001
+    // can arrive in that wait.
+    const online: number[] = [];
+    const { conn, bot } = mk({ onOnline: () => online.push(1) });
+    await conn.start();
+    // Stopped while reconnecting, so that a welcome would otherwise be a new
+    // online; it lands inside bot.stop(), while the bot is still held.
+    bot.emit("connectionStateChanged", "disconnected");
+    bot.stop = async (reason?: string) => {
+      bot.stopped.push(reason ?? "");
+      bot.emit("ready");
+      return bot;
+    };
+    await conn.stop("bye");
+    expect(bot.stopped).toEqual(["bye"]);
+    expect(online).toHaveLength(1);
+    expect(conn.state).toBe("offline");
+  });
+
+  it("does not come online on a welcome that lands while a failed start is torn down", async () => {
+    // A failed start discards its bot before stopping it, and bot.stop()
+    // waits for its send buffer before it disconnects: a 001 can arrive in
+    // that wait, from a bot the connection no longer holds.
+    const online: number[] = [];
+    const { conn, bot, notices } = mk({ onOnline: () => online.push(1) });
+    bot.failStart = true;
+    bot.stop = async (reason?: string) => {
+      bot.stopped.push(reason ?? "");
+      bot.emit("ready");
+      bot.emit("connectionStateChanged", "disconnected");
+      return bot;
+    };
+    await conn.start();
+    expect(bot.stopped).toEqual(["discarded"]);
+    expect(online).toHaveLength(0);
+    expect(conn.bot).toBeUndefined();
+    expect(conn.state).not.toBe("online");
+    expect(notices.map((n) => n.text)).toEqual([
+      "freeq: could not connect (boom) — pi continues normally",
+    ]);
+    await conn.stop("done");
   });
 
   it("survives a throwing online handler", async () => {

@@ -168,7 +168,15 @@ function msg(from: string, text: string, over: Partial<Message> = {}, account?: 
   };
 }
 
-async function started(opts: { held?: string[]; rooms?: boolean; trust?: Record<string, string> } = {}) {
+async function started(
+  opts: {
+    held?: string[];
+    rooms?: boolean;
+    trust?: Record<string, string>;
+    /** In place of the bot's start(), which by default emits nothing. */
+    start?: (bot: FakeBot) => Promise<unknown>;
+  } = {},
+) {
   const root = mkdtempSync(join(tmpdir(), "harness-kit-rooms-"));
   const agentDir = join(root, "agent");
   const cwd = join(root, "proj");
@@ -201,6 +209,7 @@ async function started(opts: { held?: string[]; rooms?: boolean; trust?: Record<
     roomLine: () => {},
   };
   const bot = new FakeBot();
+  if (opts.start) bot.start = () => opts.start!(bot);
   const rooms = new FakeRooms(bot);
   for (const h of opts.held ?? []) rooms.keys.add(h);
   const factory: RoomsFactory = () => rooms;
@@ -222,6 +231,46 @@ describe("connecting with rooms", () => {
     expect(notices.map((n) => n.text)).toContain(
       `freeq: ${ROOM}: not sealing the room key to did:key:zBad — bundle signing_key is not the did:key's key`,
     );
+  });
+
+  it("enters held rooms once on a first start, whose socket and welcome land inside bot.start()", async () => {
+    const { bot, rooms } = await started({
+      held: [ROOM],
+      start: async (b) => {
+        b.emit("connectionStateChanged", "connected");
+        b.emit("ready");
+        return b;
+      },
+    });
+    expect(bot.of("join").map((j) => j.target)).toEqual([ROOM]);
+    expect(rooms.calls).toEqual(["prekey", `steward ${ROOM}`]);
+  });
+
+  it("enters held rooms again at the welcome of a reconnect, not at its socket", async () => {
+    const { rt, bot, rooms } = await started({ held: [ROOM] });
+    rooms.calls.length = 0;
+    bot.emit("connectionStateChanged", "disconnected");
+    bot.emit("connectionStateChanged", "connected");
+    await rt.settled();
+    expect(rooms.calls).toEqual([]);
+    bot.emit("ready");
+    await rt.settled();
+    expect(rooms.calls).toEqual(["prekey", `steward ${ROOM}`]);
+    // The rejoin sweep owns a reconnect's JOINs.
+    expect(bot.of("join").map((j) => j.target)).toEqual([ROOM]);
+  });
+
+  it("starts no room setup on a connection the server refuses", async () => {
+    const { rt, rooms } = await started({
+      held: [ROOM],
+      start: async (b) => {
+        b.emit("connectionStateChanged", "connected");
+        b.emit("authError", "Delegation withdrawn");
+        throw new Error("SASL auth failed: Delegation withdrawn");
+      },
+    });
+    expect(rooms.calls).toEqual([]);
+    await rt.stop();
   });
 
   it("never parts a room as 'not this project's channel', and never says hello into one", async () => {

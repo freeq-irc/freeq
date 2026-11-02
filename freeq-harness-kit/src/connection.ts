@@ -467,6 +467,24 @@ export class FreeqConnection {
         this.#opts.onJoinRefused?.(channel, numeric === "477" ? "policy" : reason);
       });
 
+      // Online only once the server has let the agent in (001, which the SDK
+      // reports as 'ready'), not when a socket opens: a socket the server
+      // refuses before then is not online, and it does not re-arm the
+      // 'connection dropped' notice, which so prints once per gap. Nothing
+      // more happens once the connection is stopped, or once this bot is no
+      // longer the one held (a failed start discards it before it stops it):
+      // bot.stop() waits for its send buffer before it disconnects, and a
+      // welcome can arrive in that wait.
+      bot.on("ready", () => {
+        if (this.#stopped || this.#bot !== bot) return;
+        this.#goOnline();
+        this.#noticed.delete("offline");
+        // Rooms rejoin with the rest (they are wanted); stewarding is a
+        // REST pass, owed to anyone who arrived while we were away. A start
+        // still running enters them itself once bot.start() returns.
+        if (!this.#starting) this.#enterRooms(false);
+      });
+
       // Transport state is only 'connected' | 'connecting' | 'disconnected'.
       //
       // IMPORTANT: the SDK transport auto-reconnects, and bot-kit re-runs its
@@ -478,8 +496,6 @@ export class FreeqConnection {
       // ghost-mode churn and re-registration, and peers saw a hello storm.
       bot.on("connectionStateChanged", (s: string) => {
         if (s === "connected") {
-          this.#goOnline();
-          this.#noticed.delete("offline");
           // Membership does not survive a socket. Whatever the server ends up
           // restoring will re-announce itself through channelJoined; until
           // then we are in nothing, and saying otherwise is how the footer
@@ -487,9 +503,6 @@ export class FreeqConnection {
           this.#joined.clear();
           this.#channelsChanged();
           this.#scheduleRejoin();
-          // Rooms rejoin with the rest (they are wanted); stewarding is a
-          // REST pass, owed to anyone who arrived while we were away.
-          this.#enterRooms(false);
         } else if (s === "connecting") {
           if (this.#state === "online") this.#state = "connecting";
         } else if (s === "disconnected" && !this.#stopped) {
@@ -541,10 +554,10 @@ export class FreeqConnection {
   /**
    * Become online, telling the host once per gap.
    *
-   * Both `bot.start()` returning and the transport's own 'connected' event
-   * land here, and a reconnect fires the second one again — so the transition
-   * is what is reported, not the event. A handler that resumes work would
-   * otherwise run twice for one connect.
+   * Both `bot.start()` returning and the bot's 'ready' event land here, and a
+   * reconnect fires the second one again — so the transition is what is
+   * reported, not the event. A handler that resumes work would otherwise run
+   * twice for one connect.
    */
   #goOnline(): void {
     const wasOnline = this.#state === "online";
