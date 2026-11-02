@@ -3607,6 +3607,9 @@ export class FreeqClient extends EventEmitter {
         // from the server. We've already torn the socket down; do not
         // let the app think we registered as the assigned Guest nick.
         if (this._saslFailed) break;
+        // The server has let this connection in, so the wait between
+        // reconnects starts again from 1 s.
+        this.transport?.resetBackoff();
         this.guestFallbackCount = 0;
         this._nick = serverNick;
         this._registered = true;
