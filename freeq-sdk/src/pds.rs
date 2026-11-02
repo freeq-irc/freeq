@@ -135,10 +135,34 @@ pub async fn refresh_session(pds_url: &str, refresh_jwt: &str) -> Result<PdsSess
     Ok(session)
 }
 
+/// A PDS that answered getSession with something other than success. Its
+/// status says whether the token was refused (4xx) or the PDS could not
+/// answer (5xx, 429).
+#[derive(Debug)]
+pub struct SessionRefused {
+    /// The HTTP status the PDS answered.
+    pub status: u16,
+    status_line: String,
+    body: String,
+}
+
+impl std::fmt::Display for SessionRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PDS session verification failed ({}): {}",
+            self.status_line, self.body
+        )
+    }
+}
+
+impl std::error::Error for SessionRefused {}
+
 /// Verify a PDS session by calling getSession.
 ///
 /// Used by the server to verify a client's PDS session token.
-/// Returns the session info (DID, handle) if valid.
+/// Returns the session info (DID, handle) if valid. A PDS that answers with
+/// another status gives a [`SessionRefused`].
 pub async fn verify_session(pds_url: &str, access_jwt: &str) -> Result<SessionInfo> {
     let client = reqwest::Client::new();
     let url = format!("{pds_url}/xrpc/com.atproto.server.getSession");
@@ -152,8 +176,13 @@ pub async fn verify_session(pds_url: &str, access_jwt: &str) -> Result<SessionIn
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        bail!("PDS session verification failed ({status}): {text}");
+        let body = resp.text().await.unwrap_or_default();
+        return Err(SessionRefused {
+            status: status.as_u16(),
+            status_line: status.to_string(),
+            body,
+        }
+        .into());
     }
 
     let info: SessionInfo = resp

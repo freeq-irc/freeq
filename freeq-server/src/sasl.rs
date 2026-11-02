@@ -16,6 +16,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
 use freeq_sdk::did::DidResolver;
 use freeq_sdk::pds;
+use freeq_sdk::refusal::{
+    BAD_RESPONSE, IDENTITY_INVALID, SIGNATURE_INVALID, TEMPORARILY_UNAVAILABLE, TOKEN_INVALID,
+};
 use parking_lot::Mutex;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -54,6 +57,46 @@ pub struct ChallengeResponse {
 struct StoredChallenge {
     challenge: Challenge,
     raw_bytes: Vec<u8>,
+}
+
+/// Why a response found no challenge to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoChallenge {
+    /// The challenge outlived its lifetime: a new connection gets a new one,
+    /// so the same credentials may still get in.
+    Expired,
+    /// None was issued, or it was already answered: a second response to one
+    /// challenge would be refused again.
+    Unknown,
+}
+
+/// Why a SASL response did not authenticate.
+#[derive(Debug)]
+pub enum VerifyError {
+    /// The PDS asks again with this DPoP nonce: re-challenge, not a refusal.
+    DpopNonce(String),
+    /// A refusal: the `FAIL AUTHENTICATE` code it earns, and the reason for
+    /// the log.
+    Refused { code: &'static str, reason: String },
+}
+
+impl VerifyError {
+    fn refused(code: &'static str, reason: impl Into<String>) -> Self {
+        VerifyError::Refused {
+            code,
+            reason: reason.into(),
+        }
+    }
+}
+
+/// The code a PDS's non-success answer earns: one that could not answer just
+/// now (5xx, 429) is worth trying again; any other refused the token.
+fn pds_status_code(status: u16) -> &'static str {
+    if status == 429 || status >= 500 {
+        TEMPORARILY_UNAVAILABLE
+    } else {
+        TOKEN_INVALID
+    }
 }
 
 /// Tracks outstanding SASL challenges. Each challenge is single-use.
@@ -96,18 +139,22 @@ impl ChallengeStore {
         encoded
     }
 
-    /// Consume a challenge for verification. Returns None if the challenge
-    /// doesn't exist, has already been used, or has expired.
-    pub fn take(&self, session_id: &str) -> Option<(Challenge, Vec<u8>)> {
-        let stored = self.pending.lock().remove(session_id)?;
+    /// Consume a challenge for verification, or say why there is none: it
+    /// expired, or it does not exist or was already used.
+    pub fn take(&self, session_id: &str) -> Result<(Challenge, Vec<u8>), NoChallenge> {
+        let stored = self
+            .pending
+            .lock()
+            .remove(session_id)
+            .ok_or(NoChallenge::Unknown)?;
 
         let now = Utc::now().timestamp();
         if (now - stored.challenge.timestamp).unsigned_abs() > self.timeout_secs {
             tracing::warn!(session_id, "Challenge expired");
-            return None;
+            return Err(NoChallenge::Expired);
         }
 
-        Some((stored.challenge, stored.raw_bytes))
+        Ok((stored.challenge, stored.raw_bytes))
     }
 }
 
@@ -173,16 +220,19 @@ pub async fn verify_response(
     challenge_bytes: &[u8],
     response: &ChallengeResponse,
     resolver: &DidResolver,
-) -> Result<String, String> {
+) -> Result<String, VerifyError> {
     if !response.did.starts_with("did:") {
-        return Err("Invalid DID format".to_string());
+        return Err(VerifyError::refused(BAD_RESPONSE, "Invalid DID format"));
     }
 
     match response.method.as_deref() {
         Some("pds-session") => verify_pds_session(challenge, response, resolver).await,
         Some("pds-oauth") => verify_pds_oauth(challenge, response, resolver).await,
         None | Some("crypto") => verify_crypto(challenge_bytes, response, resolver).await,
-        Some(other) => Err(format!("Unsupported verification method: {other}")),
+        Some(other) => Err(VerifyError::refused(
+            BAD_RESPONSE,
+            format!("Unsupported verification method: {other}"),
+        )),
     }
 }
 
@@ -196,7 +246,7 @@ pub async fn verify_response(
 fn verify_challenge_nonce(
     challenge: &Challenge,
     response: &ChallengeResponse,
-) -> Result<(), String> {
+) -> Result<(), VerifyError> {
     match response.challenge_nonce.as_deref() {
         Some(nonce) => {
             if nonce != challenge.nonce {
@@ -204,7 +254,10 @@ fn verify_challenge_nonce(
                     did = %response.did,
                     "Challenge nonce mismatch in PDS verification"
                 );
-                return Err("Challenge nonce mismatch".to_string());
+                return Err(VerifyError::refused(
+                    BAD_RESPONSE,
+                    "Challenge nonce mismatch",
+                ));
             }
             Ok(())
         }
@@ -213,7 +266,10 @@ fn verify_challenge_nonce(
                 did = %response.did,
                 "PDS auth response missing challenge_nonce — rejecting"
             );
-            Err("PDS verification requires challenge_nonce field".to_string())
+            Err(VerifyError::refused(
+                BAD_RESPONSE,
+                "PDS verification requires challenge_nonce field",
+            ))
         }
     }
 }
@@ -223,28 +279,21 @@ async fn verify_crypto(
     challenge_bytes: &[u8],
     response: &ChallengeResponse,
     resolver: &DidResolver,
-) -> Result<String, String> {
+) -> Result<String, VerifyError> {
     tracing::info!(did = %response.did, "Verifying SASL response (crypto)");
 
-    let sig_bytes = URL_SAFE_NO_PAD
-        .decode(&response.signature)
-        .map_err(|e| format!("Invalid signature encoding: {e}"))?;
+    let sig_bytes = URL_SAFE_NO_PAD.decode(&response.signature).map_err(|e| {
+        VerifyError::refused(BAD_RESPONSE, format!("Invalid signature encoding: {e}"))
+    })?;
 
-    let did_doc = resolver
-        .resolve(&response.did)
-        .await
-        .map_err(|e| format!("Failed to resolve DID document: {e}"))?;
-
-    if did_doc.id != response.did {
-        return Err(format!(
-            "DID document ID mismatch: expected {}, got {}",
-            response.did, did_doc.id
-        ));
-    }
+    let did_doc = resolve_document(resolver, &response.did).await?;
 
     let auth_keys = did_doc.authentication_keys();
     if auth_keys.is_empty() {
-        return Err("No authentication keys found in DID document".to_string());
+        return Err(VerifyError::refused(
+            IDENTITY_INVALID,
+            "No authentication keys found in DID document",
+        ));
     }
 
     for (key_id, public_key) in &auth_keys {
@@ -264,10 +313,57 @@ async fn verify_crypto(
         }
     }
 
-    Err(format!(
-        "Signature did not verify against any of {} authentication key(s)",
-        auth_keys.len()
+    Err(VerifyError::refused(
+        SIGNATURE_INVALID,
+        format!(
+            "Signature did not verify against any of {} authentication key(s)",
+            auth_keys.len()
+        ),
     ))
+}
+
+/// The DID document `did` names, if it can be resolved and is its own: a
+/// document that cannot be had is worth trying again (the directory may
+/// answer later); one that names another DID cannot be used.
+async fn resolve_document(
+    resolver: &DidResolver,
+    did: &str,
+) -> Result<freeq_sdk::did::DidDocument, VerifyError> {
+    let did_doc = resolver.resolve(did).await.map_err(|e| {
+        VerifyError::refused(
+            TEMPORARILY_UNAVAILABLE,
+            format!("Failed to resolve DID document: {e}"),
+        )
+    })?;
+    if did_doc.id != did {
+        return Err(VerifyError::refused(
+            IDENTITY_INVALID,
+            format!(
+                "DID document ID mismatch: expected {}, got {}",
+                did, did_doc.id
+            ),
+        ));
+    }
+    Ok(did_doc)
+}
+
+/// The PDS endpoint `did_doc` names, if it is the one the client claimed.
+fn claimed_pds_matches(
+    did_doc: &freeq_sdk::did::DidDocument,
+    claimed_pds: &str,
+) -> Result<(), VerifyError> {
+    let doc_pds = pds::pds_endpoint(did_doc).ok_or_else(|| {
+        VerifyError::refused(IDENTITY_INVALID, "No PDS service endpoint in DID document")
+    })?;
+    // Normalize URLs for comparison (strip trailing slash)
+    let normalize = |s: &str| s.trim_end_matches('/').to_string();
+    if normalize(claimed_pds) != normalize(&doc_pds) {
+        return Err(VerifyError::refused(
+            IDENTITY_INVALID,
+            format!("PDS URL mismatch: claimed {claimed_pds}, document says {doc_pds}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Verify via PDS session token.
@@ -281,7 +377,7 @@ async fn verify_pds_session(
     challenge: &Challenge,
     response: &ChallengeResponse,
     resolver: &DidResolver,
-) -> Result<String, String> {
+) -> Result<String, VerifyError> {
     tracing::info!(did = %response.did, "Verifying SASL response (pds-session)");
 
     // Verify the client echoed back the challenge nonce, binding this
@@ -291,42 +387,32 @@ async fn verify_pds_session(
     let claimed_pds = response
         .pds_url
         .as_deref()
-        .ok_or("pds-session method requires pds_url")?;
+        .ok_or_else(|| VerifyError::refused(BAD_RESPONSE, "pds-session method requires pds_url"))?;
 
-    // Resolve DID document
-    let did_doc = resolver
-        .resolve(&response.did)
-        .await
-        .map_err(|e| format!("Failed to resolve DID document: {e}"))?;
+    // Resolve DID document, and verify the PDS URL matches it
+    let did_doc = resolve_document(resolver, &response.did).await?;
+    claimed_pds_matches(&did_doc, claimed_pds)?;
 
-    if did_doc.id != response.did {
-        return Err(format!(
-            "DID document ID mismatch: expected {}, got {}",
-            response.did, did_doc.id
-        ));
-    }
-
-    // Verify PDS URL matches DID document
-    let doc_pds = pds::pds_endpoint(&did_doc).ok_or("No PDS service endpoint in DID document")?;
-
-    // Normalize URLs for comparison (strip trailing slash)
-    let normalize = |s: &str| s.trim_end_matches('/').to_string();
-    if normalize(claimed_pds) != normalize(&doc_pds) {
-        return Err(format!(
-            "PDS URL mismatch: claimed {claimed_pds}, document says {doc_pds}"
-        ));
-    }
-
-    // Verify the session with the PDS
+    // Verify the session with the PDS. A PDS that answered is judged by its
+    // status; one that did not answer, or answered unreadably, may later.
     let session_info = pds::verify_session(claimed_pds, &response.signature)
         .await
-        .map_err(|e| format!("PDS session verification failed: {e}"))?;
+        .map_err(|e| {
+            let code = match e.downcast_ref::<pds::SessionRefused>() {
+                Some(refused) => pds_status_code(refused.status),
+                None => TEMPORARILY_UNAVAILABLE,
+            };
+            VerifyError::refused(code, format!("PDS session verification failed: {e}"))
+        })?;
 
     // Confirm DID matches
     if session_info.did != response.did {
-        return Err(format!(
-            "PDS session DID mismatch: claimed {}, PDS says {}",
-            response.did, session_info.did
+        return Err(VerifyError::refused(
+            IDENTITY_INVALID,
+            format!(
+                "PDS session DID mismatch: claimed {}, PDS says {}",
+                response.did, session_info.did
+            ),
         ));
     }
 
@@ -346,7 +432,7 @@ async fn verify_pds_oauth(
     challenge: &Challenge,
     response: &ChallengeResponse,
     resolver: &DidResolver,
-) -> Result<String, String> {
+) -> Result<String, VerifyError> {
     tracing::info!(did = %response.did, "Verifying SASL response (pds-oauth)");
 
     // Verify the client echoed back the challenge nonce, binding this
@@ -356,34 +442,15 @@ async fn verify_pds_oauth(
     let claimed_pds = response
         .pds_url
         .as_deref()
-        .ok_or("pds-oauth method requires pds_url")?;
+        .ok_or_else(|| VerifyError::refused(BAD_RESPONSE, "pds-oauth method requires pds_url"))?;
 
-    let dpop_proof = response
-        .dpop_proof
-        .as_deref()
-        .ok_or("pds-oauth method requires dpop_proof")?;
+    let dpop_proof = response.dpop_proof.as_deref().ok_or_else(|| {
+        VerifyError::refused(BAD_RESPONSE, "pds-oauth method requires dpop_proof")
+    })?;
 
     // Resolve DID document and verify PDS URL
-    let did_doc = resolver
-        .resolve(&response.did)
-        .await
-        .map_err(|e| format!("Failed to resolve DID document: {e}"))?;
-
-    if did_doc.id != response.did {
-        return Err(format!(
-            "DID document ID mismatch: expected {}, got {}",
-            response.did, did_doc.id
-        ));
-    }
-
-    let doc_pds = pds::pds_endpoint(&did_doc).ok_or("No PDS service endpoint in DID document")?;
-
-    let normalize = |s: &str| s.trim_end_matches('/').to_string();
-    if normalize(claimed_pds) != normalize(&doc_pds) {
-        return Err(format!(
-            "PDS URL mismatch: claimed {claimed_pds}, document says {doc_pds}"
-        ));
-    }
+    let did_doc = resolve_document(resolver, &response.did).await?;
+    claimed_pds_matches(&did_doc, claimed_pds)?;
 
     // Call PDS getSession with DPoP token + proof
     let client = reqwest::Client::new();
@@ -398,7 +465,12 @@ async fn verify_pds_oauth(
         .header("DPoP", dpop_proof)
         .send()
         .await
-        .map_err(|e| format!("Failed to call PDS getSession: {e}"))?;
+        .map_err(|e| {
+            VerifyError::refused(
+                TEMPORARILY_UNAVAILABLE,
+                format!("Failed to call PDS getSession: {e}"),
+            )
+        })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -417,21 +489,29 @@ async fn verify_pds_oauth(
             && let Some(nonce) = new_nonce
         {
             tracing::info!(did = %response.did, "DPoP nonce required by PDS, signaling client to retry");
-            return Err(format!("DPOP_NONCE:{nonce}"));
+            return Err(VerifyError::DpopNonce(nonce));
         }
 
-        return Err(format!("PDS OAuth verification failed ({status}): {text}"));
+        return Err(VerifyError::refused(
+            pds_status_code(status.as_u16()),
+            format!("PDS OAuth verification failed ({status}): {text}"),
+        ));
     }
 
-    let session_info: pds::SessionInfo = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse PDS session response: {e}"))?;
+    let session_info: pds::SessionInfo = resp.json().await.map_err(|e| {
+        VerifyError::refused(
+            TEMPORARILY_UNAVAILABLE,
+            format!("Failed to parse PDS session response: {e}"),
+        )
+    })?;
 
     if session_info.did != response.did {
-        return Err(format!(
-            "PDS session DID mismatch: claimed {}, PDS says {}",
-            response.did, session_info.did
+        return Err(VerifyError::refused(
+            IDENTITY_INVALID,
+            format!(
+                "PDS session DID mismatch: claimed {}, PDS says {}",
+                response.did, session_info.did
+            ),
         ));
     }
 
@@ -466,9 +546,9 @@ mod tests {
     fn challenge_single_use() {
         let store = ChallengeStore::new(60);
         store.create("sess-1");
-        assert!(store.take("sess-1").is_some());
-        // Replayed nonce — must fail
-        assert!(store.take("sess-1").is_none());
+        assert!(store.take("sess-1").is_ok());
+        // Replayed nonce — must fail, and say there is no such challenge
+        assert!(matches!(store.take("sess-1"), Err(NoChallenge::Unknown)));
     }
 
     #[test]
@@ -501,8 +581,20 @@ mod tests {
             },
         );
 
-        // Should fail — challenge is expired (120s > 0s timeout)
-        assert!(store.take("sess-old").is_none());
+        // Should fail — challenge is expired (120s > 0s timeout), and say so
+        assert!(matches!(store.take("sess-old"), Err(NoChallenge::Expired)));
+    }
+
+    /// A PDS that answered is judged by its status: it could not answer just
+    /// now (5xx, 429), or it refused the token (any other).
+    #[test]
+    fn a_pds_status_earns_try_again_only_when_the_pds_could_not_answer() {
+        for status in [429, 500, 502, 503, 504] {
+            assert_eq!(pds_status_code(status), TEMPORARILY_UNAVAILABLE, "{status}");
+        }
+        for status in [400, 401, 403, 404, 410] {
+            assert_eq!(pds_status_code(status), TOKEN_INVALID, "{status}");
+        }
     }
 
     #[test]
@@ -510,9 +602,9 @@ mod tests {
         let store = ChallengeStore::new(60);
         store.create("sess-a");
         // Try to take with a different session ID — must fail
-        assert!(store.take("sess-b").is_none());
+        assert!(matches!(store.take("sess-b"), Err(NoChallenge::Unknown)));
         // Original should still work
-        assert!(store.take("sess-a").is_some());
+        assert!(store.take("sess-a").is_ok());
     }
 
     /// Every base64 spelling a client might plausibly emit must parse. The
@@ -696,7 +788,11 @@ mod tests {
 
         let result = verify_response(&challenge, &challenge_bytes, &response, &resolver).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("did not verify"));
+        assert!(matches!(
+            result,
+            Err(VerifyError::Refused { code: SIGNATURE_INVALID, ref reason })
+                if reason.contains("did not verify")
+        ));
     }
 
     #[tokio::test]
@@ -762,6 +858,10 @@ mod tests {
 
         let result = verify_response(&challenge, &challenge_bytes, &response, &resolver).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("did not verify"));
+        assert!(matches!(
+            result,
+            Err(VerifyError::Refused { code: SIGNATURE_INVALID, ref reason })
+                if reason.contains("did not verify")
+        ));
     }
 }

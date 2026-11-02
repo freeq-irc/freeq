@@ -9534,7 +9534,7 @@ mod s2s_adversarial_tests {
         let record_cache = crate::record_cache::RecordCache::new(db.clone(), &config);
         Arc::new(SharedState {
             server_name: config.server_name.clone(),
-            challenge_store: crate::sasl::ChallengeStore::new(60),
+            challenge_store: crate::sasl::ChallengeStore::new(config.challenge_timeout_secs),
             key_lookup: crate::peer_keys::key_lookup(
                 resolver.clone(),
                 crate::peer_keys::LookupClients::Plain(freeq_oauth::SharedClient(

@@ -44,6 +44,7 @@ use tokio::sync::mpsc;
 use crate::irc::{self, Message};
 use crate::server::SharedState;
 use base64::Engine;
+use freeq_sdk::refusal::{KEY_EXPIRED, KEY_RETIRED};
 
 use cap::{handle_authenticate, handle_cap};
 use channel::{
@@ -187,11 +188,11 @@ pub(crate) fn file_session_signing_key(
         .flatten();
     if row.as_ref().is_some_and(|row| row.removed_at.is_some()) {
         tracing::info!(session = %session_id, %did, %kid, "Refused a signing key this server has marked retired");
-        return Err(("KEY_RETIRED", KEY_RETIRED_WORDS));
+        return Err((KEY_RETIRED, KEY_RETIRED_WORDS));
     }
     if row.is_some_and(|row| row.expired_at(now)) {
         tracing::info!(session = %session_id, %did, %kid, "Refused a signing key whose row has expired");
-        return Err(("KEY_EXPIRED", KEY_EXPIRED_WORDS));
+        return Err((KEY_EXPIRED, KEY_EXPIRED_WORDS));
     }
 
     state
@@ -233,6 +234,22 @@ pub(crate) fn file_session_signing_key(
     Ok(())
 }
 
+/// Send `FAIL <command> <code> :<text>`, the standard reply, to one session
+/// through `send`: the read loop's own `send` where the caller has it, which
+/// marks the connection unhealthy when the line cannot be queued, or
+/// [`send_to`] where it does not, which drops the line.
+pub(crate) fn send_fail(
+    state: &Arc<SharedState>,
+    session_id: &str,
+    send: &dyn Fn(&Arc<SharedState>, &str, String),
+    command: &str,
+    code: &str,
+    text: &str,
+) {
+    let reply = Message::from_server(&state.server_name, "FAIL", vec![command, code, text]);
+    send(state, session_id, format!("{reply}\r\n"));
+}
+
 /// Send a line to a specific session.
 pub(crate) fn send_to(state: &Arc<SharedState>, session_id: &str, line: String) {
     if let Some(tx) = state.connections.lock().get(session_id) {
@@ -265,8 +282,8 @@ pub(crate) fn close_for_refused_key(
     broker_token: Option<&str>,
 ) {
     let reason = match code {
-        "KEY_EXPIRED" => "Signing key expired",
-        "KEY_RETIRED" => "Signing key retired",
+        KEY_EXPIRED => "Signing key expired",
+        KEY_RETIRED => "Signing key retired",
         _ => return,
     };
     let state = Arc::clone(state);
@@ -319,7 +336,7 @@ async fn refuse_if_retired(
         let reply = irc::Message::from_server(
             &state.server_name,
             "FAIL",
-            vec!["MSGSIG", "KEY_EXPIRED", KEY_EXPIRED_WORDS],
+            vec!["MSGSIG", KEY_EXPIRED, KEY_EXPIRED_WORDS],
         );
         if let Some(tx) = state.connections.lock().get(session_id) {
             let _ = tx.try_send(format!("{reply}\r\n"));
@@ -336,7 +353,7 @@ async fn refuse_if_retired(
     let reply = irc::Message::from_server(
         &state.server_name,
         "FAIL",
-        vec!["MSGSIG", "KEY_RETIRED", KEY_RETIRED_WORDS],
+        vec!["MSGSIG", KEY_RETIRED, KEY_RETIRED_WORDS],
     );
     if let Some(tx) = state.connections.lock().get(session_id) {
         let _ = tx.try_send(format!("{reply}\r\n"));
@@ -7144,6 +7161,15 @@ mod agent_record_tests {
         key: &freeq_sdk::crypto::PrivateKey,
         owner: Option<&str>,
     ) -> String {
+        sasl_exchange_with_fail(c, key, owner).await.1
+    }
+
+    /// [`sasl_exchange`], with the FAIL that came before the verdict, if any.
+    async fn sasl_exchange_with_fail(
+        c: &mut Client,
+        key: &freeq_sdk::crypto::PrivateKey,
+        owner: Option<&str>,
+    ) -> (Option<String>, String) {
         use base64::Engine;
         let did = format!("did:key:{}", key.public_key_multibase());
         c.tx("AUTHENTICATE ATPROTO-CHALLENGE").await;
@@ -7172,9 +7198,28 @@ mod agent_record_tests {
         for line in freeq_sdk::auth::sasl_response_lines(&encoded) {
             c.tx(&line).await;
         }
-        c.rx(|l| matches!(l.split_whitespace().nth(1), Some("903") | Some("904")))
+        let fail = std::sync::Mutex::new(None);
+        let verdict = c
+            .rx(|l| {
+                if l.split_whitespace().nth(1) == Some("FAIL") {
+                    *fail.lock().unwrap() = Some(l.to_string());
+                }
+                matches!(l.split_whitespace().nth(1), Some("903") | Some("904"))
+            })
             .await
-            .expect("a SASL verdict")
+            .expect("a SASL verdict");
+        (fail.into_inner().unwrap(), verdict)
+    }
+
+    /// A connection as `nick`, through `CAP REQ :sasl`.
+    async fn negotiated_agent(state: &Arc<SharedState>, nick: &str) -> Client {
+        let mut c = Client::open(state).await;
+        c.tx("CAP LS 302").await;
+        c.tx(&format!("NICK {nick}")).await;
+        c.tx(&format!("USER {nick} 0 * :test")).await;
+        c.tx("CAP REQ :sasl").await;
+        c.rx(|l| l.contains("ACK")).await.expect("CAP ACK");
+        c
     }
 
     /// The SASL exchange a did:key agent makes, naming `owner`; the 903 or
@@ -7185,12 +7230,7 @@ mod agent_record_tests {
         nick: &str,
         owner: &str,
     ) -> (Client, String) {
-        let mut c = Client::open(state).await;
-        c.tx("CAP LS 302").await;
-        c.tx(&format!("NICK {nick}")).await;
-        c.tx(&format!("USER {nick} 0 * :test")).await;
-        c.tx("CAP REQ :sasl").await;
-        c.rx(|l| l.contains("ACK")).await.expect("CAP ACK");
+        let mut c = negotiated_agent(state, nick).await;
         let verdict = sasl_exchange(&mut c, key, Some(owner)).await;
         (c, verdict)
     }
@@ -7402,9 +7442,16 @@ mod agent_record_tests {
         let repo = owner_repo();
         repo.lock().add(AGENT_KEY_TYPE, &claim(OTHER_BOT, 24));
         let state = gated(&repo).await;
-        let (_agent, verdict) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        let mut agent = negotiated_agent(&state, "helper").await;
+        let (fail, verdict) = sasl_exchange_with_fail(&mut agent, &agent_key, Some(OWNER)).await;
         assert!(verdict.contains(" 904 "), "{verdict}");
         assert!(verdict.ends_with(&format!(":{expected}")), "{verdict}");
+        // Final for every delegation refusal, with the same text before it.
+        let fail = fail.expect("a FAIL before the 904");
+        assert!(
+            fail.ends_with(&format!(" FAIL AUTHENTICATE NOT_ALLOWED :{expected}")),
+            "{fail}"
+        );
     }
 
     /// An instance like `gated`, allowing `domains` too, and its stub PDS.

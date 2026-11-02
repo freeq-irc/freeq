@@ -8,6 +8,10 @@ use crate::irc::{self, Message};
 use crate::sasl;
 use crate::server::SharedState;
 use freeq_sdk::auth::{MAX_SASL_RESPONSE_LEN, SASL_CHUNK_LEN};
+use freeq_sdk::refusal::{
+    ABORTED, BAD_RESPONSE, IDENTITY_INVALID, MECHANISM_UNSUPPORTED, NOT_ALLOWED, SIGNATURE_INVALID,
+    TEMPORARILY_UNAVAILABLE, TOKEN_INVALID,
+};
 use std::sync::Arc;
 
 /// What a single `AUTHENTICATE` line contributed to the response.
@@ -52,6 +56,50 @@ fn close_after_too_many_failures(
         );
         // Drop the send channel to force-close the connection.
         state.connections.lock().remove(session_id);
+    }
+}
+
+/// Refuse this sign-in: `FAIL AUTHENTICATE <code> :<text>`, then the `904`
+/// with `numeric`, its text as it always was. A refusal that counts adds to
+/// the connection's SASL failures and closes it at the third, as before.
+fn refuse_sign_in(
+    conn: &mut Connection,
+    state: &Arc<SharedState>,
+    server_name: &str,
+    session_id: &str,
+    send: &impl Fn(&Arc<SharedState>, &str, String),
+    code: &str,
+    text: &str,
+    numeric: &str,
+    counted: bool,
+) {
+    conn.sasl_in_progress = false;
+    super::send_fail(state, session_id, send, "AUTHENTICATE", code, text);
+    let fail = Message::from_server(
+        server_name,
+        irc::ERR_SASLFAIL,
+        vec![conn.nick_or_star(), numeric],
+    );
+    send(state, session_id, format!("{fail}\r\n"));
+    if counted {
+        conn.sasl_failures += 1;
+        crate::server::Metrics::bump(&state.metrics.sasl_failure_total);
+        close_after_too_many_failures(conn, state, session_id, send);
+    }
+}
+
+/// What a client is told for a refusal whose reason stays in the log: the
+/// reasons can carry a PDS's response body, which this server has never put
+/// on the wire.
+fn sentence_for(code: &str) -> &'static str {
+    match code {
+        TEMPORARILY_UNAVAILABLE => {
+            "Your identity could not be checked just now. Try again shortly."
+        }
+        SIGNATURE_INVALID => "The signature does not match this identity's keys.",
+        IDENTITY_INVALID => "This identity cannot sign in here: its DID document is not usable.",
+        TOKEN_INVALID => "This sign-in token is not valid. Sign in again to continue.",
+        _ => "The sign-in response was not understood.",
     }
 }
 
@@ -366,14 +414,19 @@ pub(super) async fn handle_authenticate(
 
     if param == "*" {
         // SASL abort — client is cancelling the authentication attempt
-        conn.sasl_in_progress = false;
         conn.sasl_response_buf.clear();
-        let fail = Message::from_server(
+        let text = "SASL authentication aborted";
+        refuse_sign_in(
+            conn,
+            state,
             server_name,
-            irc::ERR_SASLFAIL,
-            vec![conn.nick_or_star(), "SASL authentication aborted"],
+            session_id,
+            send,
+            ABORTED,
+            text,
+            text,
+            false,
         );
-        send(state, session_id, format!("{fail}\r\n"));
         return;
     }
 
@@ -394,17 +447,19 @@ pub(super) async fn handle_authenticate(
         let full = match accumulate_response(conn, param) {
             Reassembly::Partial => return,
             Reassembly::TooLong => {
-                conn.sasl_in_progress = false;
-                conn.sasl_failures += 1;
-                crate::server::Metrics::bump(&state.metrics.sasl_failure_total);
-                let fail = Message::from_server(
-                    server_name,
-                    irc::ERR_SASLFAIL,
-                    vec![conn.nick_or_star(), "SASL response too long"],
-                );
-                send(state, session_id, format!("{fail}\r\n"));
                 tracing::warn!(%session_id, "SASL response exceeded the reassembly limit");
-                close_after_too_many_failures(conn, state, session_id, send);
+                let text = "SASL response too long";
+                refuse_sign_in(
+                    conn,
+                    state,
+                    server_name,
+                    session_id,
+                    send,
+                    BAD_RESPONSE,
+                    text,
+                    text,
+                    true,
+                );
                 return;
             }
             Reassembly::Complete(full) => full,
@@ -429,10 +484,16 @@ pub(super) async fn handle_authenticate(
                         conn.broker_token = broker_token;
                         Some(Ok(did.clone()))
                     } else {
-                        Some(Err("Web auth token expired".to_string()))
+                        Some(Err(sasl::VerifyError::Refused {
+                            code: TOKEN_INVALID,
+                            reason: "Web auth token expired".to_string(),
+                        }))
                     }
                 } else {
-                    Some(Err("Invalid web auth token".to_string()))
+                    Some(Err(sasl::VerifyError::Refused {
+                        code: TOKEN_INVALID,
+                        reason: "Invalid web auth token".to_string(),
+                    }))
                 }
             } else {
                 None
@@ -440,7 +501,7 @@ pub(super) async fn handle_authenticate(
 
             let taken = state.challenge_store.take(session_id);
             match taken {
-                Some((challenge, challenge_bytes)) => {
+                Ok((challenge, challenge_bytes)) => {
                     let verify_result = if let Some(result) = web_token_result {
                         result
                     } else {
@@ -455,14 +516,16 @@ pub(super) async fn handle_authenticate(
                     // An agent the allowlist does not know may still come in on
                     // the owner it names.
                     let mut refusal = "Not authorized to connect to this server".to_string();
+                    let mut refusal_code = NOT_ALLOWED;
                     let mut delegated = false;
                     // Connect-time allowlist, if the instance opted in. A web
                     // token brings its handle along; the challenge path doesn't.
                     let allowed = match &verify_result {
                         Ok(did) => {
-                            state
-                                .did_is_allowed_resolved(did, web_handle.as_deref())
-                                .await
+                            let own = state
+                                .did_is_allowed_checked(did, web_handle.as_deref())
+                                .await;
+                            own == Some(true)
                                 || match delegated_admit(
                                     state,
                                     session_id,
@@ -479,6 +542,11 @@ pub(super) async fn handle_authenticate(
                                         if response.owner_did.is_some() {
                                             refusal = format!("{refusal}: {reason}");
                                         }
+                                        // The DID's own check could not be
+                                        // done: its answer may still come.
+                                        if own.is_none() {
+                                            refusal_code = TEMPORARILY_UNAVAILABLE;
+                                        }
                                         false
                                     }
                                 }
@@ -487,21 +555,28 @@ pub(super) async fn handle_authenticate(
                     };
                     match verify_result {
                         Ok(did) if !allowed => {
-                            conn.sasl_in_progress = false;
-                            conn.sasl_failures += 1;
-                            crate::server::Metrics::bump(&state.metrics.sasl_failure_total);
-                            let fail = Message::from_server(
-                                server_name,
-                                irc::ERR_SASLFAIL,
-                                vec![conn.nick_or_star(), refusal.as_str()],
-                            );
-                            send(state, session_id, format!("{fail}\r\n"));
                             tracing::warn!(
                                 %did,
                                 method = response.method.as_deref().unwrap_or("crypto"),
+                                code = refusal_code,
                                 "connection denied by connect allowlist"
                             );
-                            close_after_too_many_failures(conn, state, session_id, send);
+                            let text = if refusal_code == TEMPORARILY_UNAVAILABLE {
+                                sentence_for(TEMPORARILY_UNAVAILABLE)
+                            } else {
+                                refusal.as_str()
+                            };
+                            refuse_sign_in(
+                                conn,
+                                state,
+                                server_name,
+                                session_id,
+                                send,
+                                refusal_code,
+                                text,
+                                &refusal,
+                                true,
+                            );
                         }
                         Ok(did) => {
                             // A sign-in with a one-time web token whose login
@@ -692,27 +767,26 @@ pub(super) async fn handle_authenticate(
                             // Broadcast account-notify to shared channels
                             broadcast_account_notify(state, session_id, &nick, &did);
                         }
-                        Err(reason) if reason.starts_with("DPOP_NONCE:") => {
+                        Err(sasl::VerifyError::DpopNonce(nonce)) => {
                             conn.dpop_retries += 1;
                             if conn.dpop_retries > 3 {
                                 tracing::warn!(%session_id, retries = conn.dpop_retries, "DPoP nonce retry limit exceeded");
-                                conn.sasl_in_progress = false;
-                                conn.sasl_failures += 1;
-                                crate::server::Metrics::bump(&state.metrics.sasl_failure_total);
-                                let fail = Message::from_server(
+                                let text =
+                                    "SASL authentication failed (DPoP nonce retry limit exceeded)";
+                                refuse_sign_in(
+                                    conn,
+                                    state,
                                     server_name,
-                                    irc::ERR_SASLFAIL,
-                                    vec![
-                                        conn.nick_or_star(),
-                                        "SASL authentication failed (DPoP nonce retry limit exceeded)",
-                                    ],
+                                    session_id,
+                                    send,
+                                    TOKEN_INVALID,
+                                    text,
+                                    text,
+                                    true,
                                 );
-                                send(state, session_id, format!("{fail}\r\n"));
-                                close_after_too_many_failures(conn, state, session_id, send);
                             } else {
                                 // DPoP nonce rotation: PDS requires a fresh nonce.
                                 // Re-issue a challenge so the client can retry with the nonce.
-                                let nonce = &reason["DPOP_NONCE:".len()..];
                                 tracing::info!(%session_id, %nonce, retry = conn.dpop_retries, "DPoP nonce required, re-issuing challenge");
 
                                 send(
@@ -729,54 +803,77 @@ pub(super) async fn handle_authenticate(
                                 send(state, session_id, format!("AUTHENTICATE {encoded}\r\n"));
                             }
                         }
-                        Err(reason) => {
-                            tracing::warn!(%session_id, "SASL auth failed: {reason}");
-                            conn.sasl_in_progress = false;
-                            conn.sasl_failures += 1;
-                            crate::server::Metrics::bump(&state.metrics.sasl_failure_total);
-                            let fail = Message::from_server(
+                        Err(sasl::VerifyError::Refused { code, reason }) => {
+                            tracing::warn!(%session_id, code, "SASL auth failed: {reason}");
+                            refuse_sign_in(
+                                conn,
+                                state,
                                 server_name,
-                                irc::ERR_SASLFAIL,
-                                vec![conn.nick_or_star(), "SASL authentication failed"],
+                                session_id,
+                                send,
+                                code,
+                                sentence_for(code),
+                                "SASL authentication failed",
+                                true,
                             );
-                            send(state, session_id, format!("{fail}\r\n"));
-                            close_after_too_many_failures(conn, state, session_id, send);
                         }
                     }
                 }
-                None => {
-                    conn.sasl_in_progress = false;
-                    let fail = Message::from_server(
+                Err(why) => {
+                    // An expired challenge is answered on a new connection with
+                    // a new one; a response to no challenge would be refused
+                    // again.
+                    let numeric = "SASL authentication failed (no challenge)";
+                    let (code, text) = match why {
+                        sasl::NoChallenge::Expired => (
+                            TEMPORARILY_UNAVAILABLE,
+                            sentence_for(TEMPORARILY_UNAVAILABLE),
+                        ),
+                        sasl::NoChallenge::Unknown => (BAD_RESPONSE, numeric),
+                    };
+                    refuse_sign_in(
+                        conn,
+                        state,
                         server_name,
-                        irc::ERR_SASLFAIL,
-                        vec![
-                            conn.nick_or_star(),
-                            "SASL authentication failed (no challenge)",
-                        ],
+                        session_id,
+                        send,
+                        code,
+                        text,
+                        numeric,
+                        false,
                     );
-                    send(state, session_id, format!("{fail}\r\n"));
                 }
             }
         } else {
-            conn.sasl_in_progress = false;
             // Say what was wrong with it: a bare "bad response" reads as "your
             // signature is wrong" and sent agents in circles (sasl.rs).
             let why = decoded.err().unwrap_or_default();
             let text = format!("SASL authentication failed (bad response: {why})");
-            let fail = Message::from_server(
+            refuse_sign_in(
+                conn,
+                state,
                 server_name,
-                irc::ERR_SASLFAIL,
-                vec![conn.nick_or_star(), &text],
+                session_id,
+                send,
+                BAD_RESPONSE,
+                &text,
+                &text,
+                false,
             );
-            send(state, session_id, format!("{fail}\r\n"));
         }
     } else {
-        let fail = Message::from_server(
+        let text = "Unsupported SASL mechanism";
+        refuse_sign_in(
+            conn,
+            state,
             server_name,
-            irc::ERR_SASLFAIL,
-            vec![conn.nick_or_star(), "Unsupported SASL mechanism"],
+            session_id,
+            send,
+            MECHANISM_UNSUPPORTED,
+            text,
+            text,
+            false,
         );
-        send(state, session_id, format!("{fail}\r\n"));
     }
 }
 
@@ -1158,6 +1255,527 @@ mod delegated_admit_tests {
         assert_eq!(
             admit(&allowed, Some(OWNER)).await,
             admit(&not_allowed, Some(OWNER)).await
+        );
+    }
+}
+
+/// Each sign-in refusal at its site: the `FAIL AUTHENTICATE <code>` line comes
+/// just before the `904`, and the `904` says what it always said.
+#[cfg(test)]
+mod sign_in_refusal_tests {
+    use super::*;
+    use crate::connection::retired_key_tests::Client;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use freeq_sdk::crypto::PrivateKey;
+    use freeq_sdk::did::{self, DidResolver};
+    use std::collections::HashMap;
+
+    fn state_with(config: crate::config::ServerConfig, resolver: DidResolver) -> Arc<SharedState> {
+        crate::server::test_state_with_resolver(config, resolver)
+    }
+
+    fn open_state() -> Arc<SharedState> {
+        state_with(Default::default(), DidResolver::static_map(HashMap::new()))
+    }
+
+    fn key(seed: u8) -> PrivateKey {
+        PrivateKey::ed25519_from_bytes(&[seed; 32]).unwrap()
+    }
+
+    fn did_key(key: &PrivateKey) -> String {
+        format!("did:key:{}", key.public_key_multibase())
+    }
+
+    /// A connection through `CAP REQ :sasl`.
+    async fn negotiated(state: &Arc<SharedState>, nick: &str) -> Client {
+        let mut c = Client::open(state).await;
+        c.tx("CAP LS 302").await;
+        c.tx(&format!("NICK {nick}")).await;
+        c.tx(&format!("USER {nick} 0 * :test")).await;
+        c.tx("CAP REQ :sasl").await;
+        c.rx(|l| l.contains("ACK")).await.expect("CAP ACK");
+        c
+    }
+
+    /// Ask for a challenge; its raw bytes.
+    async fn challenged(c: &mut Client) -> Vec<u8> {
+        c.tx("AUTHENTICATE ATPROTO-CHALLENGE").await;
+        let line = c
+            .rx(|l| l.starts_with("AUTHENTICATE "))
+            .await
+            .expect("challenge");
+        URL_SAFE_NO_PAD
+            .decode(line.trim_start_matches("AUTHENTICATE "))
+            .unwrap()
+    }
+
+    fn nonce_of(challenge: &[u8]) -> String {
+        let value: serde_json::Value = serde_json::from_slice(challenge).unwrap();
+        value["nonce"].as_str().unwrap().to_string()
+    }
+
+    async fn respond(c: &mut Client, payload: serde_json::Value) {
+        let encoded = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        for line in freeq_sdk::auth::sasl_response_lines(&encoded) {
+            c.tx(&line).await;
+        }
+    }
+
+    /// A crypto response claiming `did`, signed by `signer`.
+    fn signed(did: &str, signer: &PrivateKey, challenge: &[u8]) -> serde_json::Value {
+        serde_json::json!({
+            "did": did,
+            "method": "crypto",
+            "signature": signer.sign_base64url(challenge),
+        })
+    }
+
+    /// The next FAIL and the line straight after it, which must be the 904.
+    async fn refusal(c: &mut Client) -> (String, String) {
+        let fail = c
+            .rx(|l| l.split_whitespace().nth(1) == Some("FAIL"))
+            .await
+            .expect("a FAIL");
+        let numeric = c.rx(|_| true).await.expect("a line after the FAIL");
+        (fail, numeric)
+    }
+
+    /// `FAIL AUTHENTICATE <code> :<text>`, then the 904 with `numeric`, from
+    /// the same server, nothing between.
+    fn assert_refused(got: &(String, String), code: &str, text: &str, numeric: &str) {
+        let (fail, verdict) = got;
+        let prefix = fail.split(' ').next().unwrap();
+        assert_eq!(
+            fail,
+            &format!("{prefix} FAIL AUTHENTICATE {code} :{text}"),
+            "the FAIL"
+        );
+        assert_eq!(verdict.split(' ').next().unwrap(), prefix, "{verdict}");
+        assert_eq!(verdict.split_whitespace().nth(1), Some("904"), "{verdict}");
+        assert!(verdict.ends_with(&format!(":{numeric}")), "{verdict}");
+    }
+
+    fn only_session(state: &Arc<SharedState>) -> String {
+        let sessions: Vec<String> = state.connections.lock().keys().cloned().collect();
+        assert_eq!(sessions.len(), 1, "{sessions:?}");
+        sessions.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_aborted_sign_in_is_aborted() {
+        let state = open_state();
+        let mut c = negotiated(&state, "aborts").await;
+        challenged(&mut c).await;
+        c.tx("AUTHENTICATE *").await;
+        let text = "SASL authentication aborted";
+        assert_refused(&refusal(&mut c).await, ABORTED, text, text);
+    }
+
+    #[tokio::test]
+    async fn a_response_too_long_to_be_one_is_a_bad_response() {
+        let state = open_state();
+        let mut c = negotiated(&state, "toolong").await;
+        challenged(&mut c).await;
+        let chunk = "A".repeat(SASL_CHUNK_LEN);
+        for _ in 0..=(MAX_SASL_RESPONSE_LEN / SASL_CHUNK_LEN) {
+            c.tx(&format!("AUTHENTICATE {chunk}")).await;
+        }
+        let text = "SASL response too long";
+        assert_refused(&refusal(&mut c).await, BAD_RESPONSE, text, text);
+    }
+
+    #[tokio::test]
+    async fn a_response_that_cannot_be_read_is_a_bad_response() {
+        let state = open_state();
+        let mut c = negotiated(&state, "garbled").await;
+        challenged(&mut c).await;
+        c.tx("AUTHENTICATE !!!").await;
+        let text = "SASL authentication failed (bad response: response is not base64)";
+        assert_refused(&refusal(&mut c).await, BAD_RESPONSE, text, text);
+    }
+
+    #[tokio::test]
+    async fn another_mechanism_is_unsupported() {
+        let state = open_state();
+        let mut c = negotiated(&state, "plain").await;
+        c.tx("AUTHENTICATE PLAIN").await;
+        let text = "Unsupported SASL mechanism";
+        assert_refused(&refusal(&mut c).await, MECHANISM_UNSUPPORTED, text, text);
+    }
+
+    #[tokio::test]
+    async fn a_response_to_no_challenge_is_a_bad_response() {
+        let state = open_state();
+        let k = key(81);
+        let mut c = negotiated(&state, "nochal").await;
+        let challenge = challenged(&mut c).await;
+        state.challenge_store.take(&only_session(&state)).unwrap();
+        respond(&mut c, signed(&did_key(&k), &k, &challenge)).await;
+        let numeric = "SASL authentication failed (no challenge)";
+        assert_refused(&refusal(&mut c).await, BAD_RESPONSE, numeric, numeric);
+    }
+
+    #[tokio::test]
+    async fn a_response_after_the_challenge_expired_may_try_again() {
+        let state = state_with(
+            crate::config::ServerConfig {
+                challenge_timeout_secs: 0,
+                ..Default::default()
+            },
+            DidResolver::static_map(HashMap::new()),
+        );
+        let k = key(82);
+        let mut c = negotiated(&state, "late").await;
+        let challenge = challenged(&mut c).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        respond(&mut c, signed(&did_key(&k), &k, &challenge)).await;
+        assert_refused(
+            &refusal(&mut c).await,
+            TEMPORARILY_UNAVAILABLE,
+            "Your identity could not be checked just now. Try again shortly.",
+            "SASL authentication failed (no challenge)",
+        );
+    }
+
+    /// The catch-all: each cause the verification gives earns its code, the
+    /// code's own sentence in the FAIL, and the 904 as it always was.
+    #[tokio::test]
+    async fn each_verification_failure_earns_its_code() {
+        let a = key(83);
+        let b = key(84);
+        let mut docs = HashMap::new();
+        // A document filed under one DID that names another.
+        docs.insert(
+            "did:plc:wrongdoc".to_string(),
+            did::make_test_did_document("did:plc:someoneelse", &a.public_key_multibase()),
+        );
+        let state = state_with(Default::default(), DidResolver::static_map(docs));
+        let cases: Vec<(&str, Box<dyn Fn(&[u8]) -> serde_json::Value>)> = vec![
+            (
+                SIGNATURE_INVALID,
+                Box::new(|ch: &[u8]| signed(&did_key(&key(83)), &key(84), ch)),
+            ),
+            (
+                TEMPORARILY_UNAVAILABLE,
+                Box::new(|ch: &[u8]| signed("did:plc:nobodyhere", &key(83), ch)),
+            ),
+            (
+                IDENTITY_INVALID,
+                Box::new(|ch: &[u8]| signed("did:plc:wrongdoc", &key(83), ch)),
+            ),
+            (
+                BAD_RESPONSE,
+                Box::new(|ch: &[u8]| signed("not-a-did", &key(83), ch)),
+            ),
+            (
+                TOKEN_INVALID,
+                Box::new(
+                    |_: &[u8]| serde_json::json!({"did": "", "method": "web-token", "signature": "WT-NOT-ISSUED"}),
+                ),
+            ),
+        ];
+        drop((a, b));
+        for (n, (code, payload)) in cases.iter().enumerate() {
+            let mut c = negotiated(&state, &format!("cause{n}")).await;
+            let challenge = challenged(&mut c).await;
+            respond(&mut c, payload(&challenge)).await;
+            assert_refused(
+                &refusal(&mut c).await,
+                code,
+                sentence_for(code),
+                "SASL authentication failed",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_identity_the_allowlist_refuses_is_not_allowed() {
+        let state = state_with(
+            crate::config::ServerConfig {
+                allowed_dids: vec!["did:plc:someoneelse".to_string()],
+                ..Default::default()
+            },
+            DidResolver::static_map(HashMap::new()),
+        );
+        let k = key(85);
+        let mut c = negotiated(&state, "outsider").await;
+        let challenge = challenged(&mut c).await;
+        respond(&mut c, signed(&did_key(&k), &k, &challenge)).await;
+        let text = "Not authorized to connect to this server";
+        assert_refused(&refusal(&mut c).await, NOT_ALLOWED, text, text);
+    }
+
+    /// The allowlist could not check the identity (its document could not be
+    /// had) and no delegation admits it: the answer may still come.
+    #[tokio::test]
+    async fn an_identity_the_allowlist_could_not_check_may_try_again() {
+        let state = state_with(
+            crate::config::ServerConfig {
+                allowed_dids: vec!["did:plc:someoneelse".to_string()],
+                allowed_did_domains: vec!["allowed.test".to_string()],
+                ..Default::default()
+            },
+            DidResolver::static_map(HashMap::new()),
+        );
+        state.web_auth_tokens.lock().insert(
+            "WT-UNCHECKABLE".to_string(),
+            (
+                "did:plc:unresolvable".to_string(),
+                "someone.elsewhere.test".to_string(),
+                std::time::Instant::now(),
+                None,
+            ),
+        );
+        let mut c = negotiated(&state, "unchecked").await;
+        challenged(&mut c).await;
+        respond(
+            &mut c,
+            serde_json::json!({"did": "", "method": "web-token", "signature": "WT-UNCHECKABLE"}),
+        )
+        .await;
+        assert_refused(
+            &refusal(&mut c).await,
+            TEMPORARILY_UNAVAILABLE,
+            "Your identity could not be checked just now. Try again shortly.",
+            "Not authorized to connect to this server",
+        );
+    }
+
+    /// A PDS on a loopback port whose getSession is `answer`; the resolver
+    /// names it as the PDS of `did`, whose key is `signer`'s.
+    async fn serve_pds(
+        did: &str,
+        signer: &PrivateKey,
+        answer: axum::routing::MethodRouter,
+    ) -> (DidResolver, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route("/xrpc/com.atproto.server.getSession", answer);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (pds_resolver(did, signer, &base), base)
+    }
+
+    /// A resolver naming `base` as the PDS of `did`.
+    fn pds_resolver(did: &str, signer: &PrivateKey, base: &str) -> DidResolver {
+        let doc =
+            did::make_test_did_document_with_pds(did, &signer.public_key_multibase(), Some(base));
+        DidResolver::static_map(HashMap::from([(did.to_string(), doc)]))
+    }
+
+    /// A PDS that answers getSession with `401 use_dpop_nonce` and a new
+    /// nonce each time.
+    async fn nonce_asking_pds(did: &str, signer: &PrivateKey) -> (DidResolver, String) {
+        use axum::response::IntoResponse;
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let answer = axum::routing::get(move || {
+            let n = asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            async move {
+                (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    [("dpop-nonce", format!("nonce-{n}"))],
+                    r#"{"error":"use_dpop_nonce"}"#,
+                )
+                    .into_response()
+            }
+        });
+        serve_pds(did, signer, answer).await
+    }
+
+    /// A PDS that answers getSession with `status` and `body`.
+    async fn answering_pds(
+        did: &str,
+        signer: &PrivateKey,
+        status: u16,
+        body: &'static str,
+    ) -> (DidResolver, String) {
+        use axum::response::IntoResponse;
+        let answer = axum::routing::get(move || async move {
+            (
+                axum::http::StatusCode::from_u16(status).unwrap(),
+                [("content-type", "application/json")],
+                body,
+            )
+                .into_response()
+        });
+        serve_pds(did, signer, answer).await
+    }
+
+    /// A PDS-method response for `did` on `base` to `challenge`.
+    fn pds_answer(method: &str, did: &str, base: &str, challenge: &[u8]) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "did": did,
+            "method": method,
+            "signature": "AT-TOKEN",
+            "pds_url": base,
+            "challenge_nonce": nonce_of(challenge),
+        });
+        if method == "pds-oauth" {
+            payload["dpop_proof"] = serde_json::json!("PROOF");
+        }
+        payload
+    }
+
+    /// One sign-in by `method` against `resolver`, which names the PDS at
+    /// `base`; it must earn `code`.
+    async fn pds_sign_in_earns(method: &str, resolver: DidResolver, base: &str, code: &str) {
+        let state = state_with(Default::default(), resolver);
+        let mut c = negotiated(&state, "pdsuser").await;
+        let challenge = challenged(&mut c).await;
+        respond(&mut c, pds_answer(method, PDS_USER, base, &challenge)).await;
+        assert_refused(
+            &refusal(&mut c).await,
+            code,
+            sentence_for(code),
+            "SASL authentication failed",
+        );
+    }
+
+    const PDS_USER: &str = "did:plc:pdsuser";
+
+    /// The PDS's answer decides the code, for both PDS methods: a refusal
+    /// (4xx) is the token refused; a PDS that could not answer (5xx, 429) or
+    /// answered unreadably is worth trying again; one that names another
+    /// account means the identity cannot sign in here.
+    #[tokio::test]
+    async fn the_pds_answer_decides_the_code_for_both_pds_methods() {
+        let cases: [(&str, u16, &'static str, &str); 9] = [
+            (
+                "pds-session",
+                400,
+                r#"{"error":"ExpiredToken"}"#,
+                TOKEN_INVALID,
+            ),
+            (
+                "pds-session",
+                401,
+                r#"{"error":"AuthRequired"}"#,
+                TOKEN_INVALID,
+            ),
+            (
+                "pds-session",
+                429,
+                r#"{"error":"RateLimitExceeded"}"#,
+                TEMPORARILY_UNAVAILABLE,
+            ),
+            ("pds-session", 503, "unavailable", TEMPORARILY_UNAVAILABLE),
+            ("pds-session", 200, "not json", TEMPORARILY_UNAVAILABLE),
+            (
+                "pds-session",
+                200,
+                r#"{"did":"did:plc:someoneelse","handle":"x.test"}"#,
+                IDENTITY_INVALID,
+            ),
+            (
+                "pds-oauth",
+                401,
+                r#"{"error":"invalid_token"}"#,
+                TOKEN_INVALID,
+            ),
+            ("pds-oauth", 502, "bad gateway", TEMPORARILY_UNAVAILABLE),
+            ("pds-oauth", 200, "not json", TEMPORARILY_UNAVAILABLE),
+        ];
+        for (method, status, body, code) in cases {
+            let (resolver, base) = answering_pds(PDS_USER, &key(90), status, body).await;
+            pds_sign_in_earns(method, resolver, &base, code).await;
+        }
+    }
+
+    /// A PDS that does not answer at all, a closed port, may answer later.
+    #[tokio::test]
+    async fn a_pds_that_does_not_answer_may_try_again() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let resolver = pds_resolver(PDS_USER, &key(91), &base);
+        pds_sign_in_earns("pds-session", resolver, &base, TEMPORARILY_UNAVAILABLE).await;
+    }
+
+    /// The DPoP re-challenge is not a refusal: the client hears the nonce
+    /// and gets a new challenge, three times; the fourth ask in one attempt
+    /// is the token refused.
+    #[tokio::test]
+    async fn a_pds_asking_for_a_dpop_nonce_rechallenges_and_then_refuses_the_token() {
+        let did = "did:plc:dpopuser";
+        let k = key(86);
+        let (resolver, base) = nonce_asking_pds(did, &k).await;
+        let state = state_with(Default::default(), resolver);
+        let mut c = negotiated(&state, "dpop").await;
+        let mut challenge = challenged(&mut c).await;
+        let answer = |challenge: &[u8]| {
+            serde_json::json!({
+                "did": did,
+                "method": "pds-oauth",
+                "signature": "AT-TOKEN",
+                "pds_url": base,
+                "dpop_proof": "PROOF",
+                "challenge_nonce": nonce_of(challenge),
+            })
+        };
+        for retry in 1..=3 {
+            respond(&mut c, answer(&challenge)).await;
+            let notice = c
+                .rx(|l| {
+                    l.contains(" NOTICE ")
+                        || l.split_whitespace().nth(1) == Some("FAIL")
+                        || l.split_whitespace().nth(1) == Some("904")
+                })
+                .await
+                .expect("the nonce");
+            assert!(
+                notice.ends_with(&format!(":DPOP_NONCE nonce-{retry}")),
+                "retry {retry}: {notice}"
+            );
+            let next = c
+                .rx(|l| {
+                    l.starts_with("AUTHENTICATE ")
+                        || l.split_whitespace().nth(1) == Some("FAIL")
+                        || l.split_whitespace().nth(1) == Some("904")
+                })
+                .await
+                .expect("a new challenge");
+            assert!(next.starts_with("AUTHENTICATE "), "retry {retry}: {next}");
+            challenge = URL_SAFE_NO_PAD
+                .decode(next.trim_start_matches("AUTHENTICATE "))
+                .unwrap();
+        }
+        respond(&mut c, answer(&challenge)).await;
+        let text = "SASL authentication failed (DPoP nonce retry limit exceeded)";
+        assert_refused(&refusal(&mut c).await, TOKEN_INVALID, text, text);
+    }
+
+    /// The browser `LOGIN` completion refused by the allowlist answers
+    /// `LOGIN`, before its 904.
+    #[tokio::test]
+    async fn a_browser_login_the_allowlist_refuses_is_not_allowed() {
+        let state = state_with(
+            crate::config::ServerConfig {
+                allowed_dids: vec!["did:plc:someoneelse".to_string()],
+                ..Default::default()
+            },
+            DidResolver::static_map(HashMap::new()),
+        );
+        let mut c = Client::open(&state).await;
+        c.tx("CAP LS 302").await;
+        c.rx(|l| l.contains(" LS ")).await.expect("CAP LS");
+        let session = only_session(&state);
+        crate::connection::login::complete_irc_login(
+            &state,
+            &session,
+            "did:plc:refused",
+            "refused.test",
+        );
+        let (fail, verdict) = refusal(&mut c).await;
+        let prefix = fail.split(' ').next().unwrap();
+        assert_eq!(
+            fail,
+            format!("{prefix} FAIL LOGIN NOT_ALLOWED :Not authorized to connect to this server")
+        );
+        assert_eq!(
+            verdict,
+            format!("{prefix} 904 * :Not authorized to connect to this server")
         );
     }
 }

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::server::SharedState;
+use freeq_sdk::refusal::{KEY_EXPIRED, KEY_RETIRED};
 
 /// How often connected keys are checked against their expiry and their
 /// row's retirement mark.
@@ -91,12 +92,12 @@ pub async fn refuse_if_retired_or_expired(
         .flatten();
     let (code, words, reason) = match row {
         Some(row) if row.removed_at.is_some() => (
-            "KEY_RETIRED",
+            KEY_RETIRED,
             crate::connection::KEY_RETIRED_WORDS,
             "Signing key retired",
         ),
         Some(row) if row.expired_at(now) => (
-            "KEY_EXPIRED",
+            KEY_EXPIRED,
             crate::connection::KEY_EXPIRED_WORDS,
             "Signing key expired",
         ),
@@ -120,7 +121,7 @@ pub async fn refuse_if_retired_or_expired(
     }
     let ended = end_login_tokens_of_key(state, did, kid).await;
     crate::connection::close_session(state, sid, reason);
-    if code == "KEY_RETIRED" {
+    if code == KEY_RETIRED {
         tracing::info!(session = %sid, %did, %kid, "Closed a session whose signing key was retired");
     } else {
         tracing::info!(session = %sid, %did, %kid, "Closed a session whose signing key expired");
