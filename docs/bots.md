@@ -67,7 +67,7 @@ Features:
 - **Permissions** — `Anyone`, `Authenticated` (requires DID), `Admin` (specific DIDs)
 - **Rate limiting** — per-user token bucket with configurable window
 - **Rich context** — reply, react, thread, typing indicators from handlers
-- **Reconnect** — `run_with_reconnect()` with exponential backoff and auto-rejoin
+- **Reconnect** — `run_with_reconnect()` with exponential backoff and auto-rejoin; it returns the server's sentence as an error on a refused key or a final sign-in refusal
 
 Examples in [`freeq-sdk/examples/`](../freeq-sdk/examples/):
 - `echo_bot.rs` — minimal (10 lines of logic)

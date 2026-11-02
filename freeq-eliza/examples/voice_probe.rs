@@ -394,7 +394,8 @@ async fn main() -> anyhow::Result<()> {
     let signer: Arc<dyn ChallengeSigner> = Arc::new(KeySigner::new(did, private_key));
     let (handle, mut events) = client::connect(conn_config, Some(signer));
 
-    let registered = wait_for_registration(&mut events).await?;
+    let registered =
+        freeq_sdk::client::wait_for_registration(&mut events, Duration::from_secs(30)).await?;
     tracing::info!(nick = %registered, "registered with server");
 
     // 2. Join the channel.
@@ -512,20 +513,6 @@ async fn pump_events(
             Ok(Some(_)) => {}
             Ok(None) => anyhow::bail!("event stream closed"),
             Err(_) => {} // timeout tick
-        }
-    }
-}
-
-async fn wait_for_registration(
-    events: &mut tokio::sync::mpsc::Receiver<Event>,
-) -> anyhow::Result<String> {
-    loop {
-        match tokio::time::timeout(Duration::from_secs(30), events.recv()).await {
-            Ok(Some(Event::Registered { nick })) => return Ok(nick),
-            Ok(Some(Event::AuthFailed { reason })) => anyhow::bail!("SASL auth failed: {reason}"),
-            Ok(Some(_)) => continue,
-            Ok(None) => anyhow::bail!("connection closed during registration"),
-            Err(_) => anyhow::bail!("registration timeout"),
         }
     }
 }

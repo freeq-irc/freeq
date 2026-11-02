@@ -328,11 +328,6 @@ class ChannelState(val name: String) {
 
 // ── Connection state ──
 
-/** What the sign-in screen says when a signed-in session has ended; the
- *  web's line (freeq-app/src/irc/client.ts, SESSION_EXPIRED_LINE). */
-const val SESSION_EXPIRED_LINE =
-    "Your session expired. Sign in with AT Protocol again, or connect as guest."
-
 enum class ConnectionState {
     Disconnected,
     Connecting,
@@ -436,11 +431,15 @@ class AppState(application: Application) : AndroidViewModel(application) {
         ))
     }
 
-    /** Apply a refusal of this device's signing key, as [RefusedKeyNotice] decided it. */
-    internal fun signOutRefusedKey(refusal: RefusedKeyNotice.Refusal) {
-        if (refusal.clearsSavedLogin) logout()
-        if (!refusal.schedulesReconnect) intentionalDisconnect = true
-        errorMessage.value = refusal.line
+    /** The server refused this device's key or its sign-in for good: sign
+     *  out as logout does (the saved login, the channel and DM lists, the
+     *  nick and the saved messages go; a reconnect on the login would offer
+     *  the same key or token), nothing reconnects, and the sign-in screen
+     *  shows the server's sentence. */
+    internal fun signOutRefused(line: String) {
+        logout()
+        intentionalDisconnect = true
+        errorMessage.value = line
     }
 
     // Keep users logged in for at least 14 days unless they explicitly log out
@@ -819,13 +818,6 @@ class AppState(application: Application) : AndroidViewModel(application) {
         replyingTo.value = null
         editingMessage.value = null
         authenticatedDID.value = null
-    }
-
-    /** A signed-in session's token was refused on reconnect: sign out as
-     *  logout does, and the sign-in screen says why (the web's words). */
-    fun endExpiredSession() {
-        logout()
-        errorMessage.value = SESSION_EXPIRED_LINE
     }
 
     fun logout() {
@@ -1530,13 +1522,6 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
             is FreeqEvent.Registered -> {
                 state.reconnectAttempts = 0
                 state.ownJoinHistory.newConnection()
-                // A signed-in session back under a guest nick: the server
-                // did not take its token. Sign out, as the web does.
-                if (GuestReturn.onRegistered(state.authenticatedDID.value, event.nick)
-                    == GuestReturn.Outcome.SignOut) {
-                    state.endExpiredSession()
-                    return
-                }
                 state.connectionState.value = ConnectionState.Registered
                 state.disconnectNotice.onRegistered()
                 state.nick.value = event.nick
@@ -1569,8 +1554,16 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                 state.prefs.edit().putLong("lastLoginTime", System.currentTimeMillis()).apply()
             }
 
-            is FreeqEvent.AuthFailed -> {
-                state.errorMessage.value = "Auth failed: ${event.reason}"
+            is FreeqEvent.AuthFailed -> state.signOutRefused(event.reason)
+
+            is FreeqEvent.SigningKeyRefused -> state.signOutRefused(event.reason)
+
+            // The server could not check this account just now: the drop that
+            // follows reconnects on its growing wait and leaves this sentence
+            // shown, as on iOS and macOS.
+            is FreeqEvent.AuthFailedRetry -> {
+                state.disconnectNotice.onTryAgain()
+                state.errorMessage.value = event.reason
             }
 
             is FreeqEvent.Joined -> {
@@ -1845,10 +1838,7 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
 
             is FreeqEvent.Notice -> {
                 val text = event.text
-                val refusal = RefusedKeyNotice.parse(text)
-                if (refusal != null) {
-                    state.signOutRefusedKey(refusal)
-                } else if (text == "MOTD:START") {
+                if (text == "MOTD:START") {
                     state.collectingMotd = true
                     state.motdLines.clear()
                 } else if (text == "MOTD:END") {

@@ -22,6 +22,7 @@ use freeq_av::{AvConfig, AvParticipant, AvSession, Speaker, VideoHandle, broadca
 use freeq_sdk::auth::KeySigner;
 use freeq_sdk::client::{self, ClientHandle, ConnectConfig};
 use freeq_sdk::event::Event;
+use freeq_sdk::refusal::Refusal;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -475,6 +476,27 @@ impl Drop for ActiveCall {
     }
 }
 
+/// Wait up to 30 s for the server to let eliza in, and return her nick.
+/// `None` when it refused her signing key or her sign-in for good: the
+/// sentence goes to stderr and `run` ends with exit 0, as a refusal after
+/// registration does, so a supervisor that restarts on failure leaves her
+/// down. A try-again, like any other error, is returned: exit 1.
+async fn registered(events: &mut tokio::sync::mpsc::Receiver<Event>) -> Result<Option<String>> {
+    match client::wait_for_registration(events, Duration::from_secs(30)).await {
+        Ok(nick) => Ok(Some(nick)),
+        Err(e)
+            if matches!(
+                e.downcast_ref::<Refusal>(),
+                Some(Refusal::Final(_) | Refusal::SigningKey(_))
+            ) =>
+        {
+            eprintln!("{e}");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub async fn run(cfg: RunConfig) -> Result<()> {
     // Destructure up front so we own the individual fields; the cfg
     // we hand to the inner tasks (wrapped in Arc) is rebuilt below
@@ -561,8 +583,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let signer = Arc::new(KeySigner::new(did, private_key));
     let (handle, mut events) = client::connect(conn_config, Some(signer));
 
-    // Wait for registration.
-    let nick = wait_for_registration(&mut events).await?;
+    let Some(nick) = registered(&mut events).await? else {
+        return Ok(());
+    };
     tracing::info!(%nick, "registered with server");
 
     // Register as agent + minimal provenance so users can /whois us.
@@ -1260,6 +1283,14 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 {
                     spawn_join_greeting(cfg.clone(), handle_arc.clone(), channel, nick);
                 }
+            }
+            // The server refused this agent's signing key, or ended the
+            // session for good (a revoke, a withdrawn delegation): no
+            // reconnect would get in. Say why and stop, as the orchestrator
+            // does.
+            Event::SigningKeyRefused { reason } | Event::AuthFailed { reason } => {
+                eprintln!("{reason}");
+                return Ok(());
             }
             Event::Disconnected { reason } => {
                 tracing::warn!(%reason, "disconnected");
@@ -2914,27 +2945,6 @@ pub(crate) fn classify_av_event(
             }
         }
         _ => AvAction::Noop,
-    }
-}
-
-async fn wait_for_registration(events: &mut tokio::sync::mpsc::Receiver<Event>) -> Result<String> {
-    wait_for_registration_with_timeout(events, Duration::from_secs(30)).await
-}
-
-/// Timeout-parameterised flavour so tests don't have to wait 30s of
-/// wall-clock to exercise the deadline path. Public-in-crate only.
-pub(crate) async fn wait_for_registration_with_timeout(
-    events: &mut tokio::sync::mpsc::Receiver<Event>,
-    timeout: Duration,
-) -> Result<String> {
-    loop {
-        match tokio::time::timeout(timeout, events.recv()).await {
-            Ok(Some(Event::Registered { nick })) => return Ok(nick),
-            Ok(Some(Event::AuthFailed { reason })) => anyhow::bail!("SASL auth failed: {reason}"),
-            Ok(Some(_)) => continue,
-            Ok(None) => anyhow::bail!("connection closed during registration"),
-            Err(_) => anyhow::bail!("registration timeout"),
-        }
     }
 }
 
@@ -4941,63 +4951,15 @@ mod tests {
         assert!(format!("{err:#}").contains("parsing"), "got: {err:#}");
     }
 
-    // ---------- wait_for_registration ----------
-
-    #[tokio::test]
-    async fn registration_succeeds_on_registered_event() {
-        let (tx, mut rx) = mpsc::channel(4);
-        tx.send(Event::Connected).await.unwrap();
-        tx.send(Event::Registered {
-            nick: "tbot".to_string(),
-        })
-        .await
-        .unwrap();
-        let nick = wait_for_registration_with_timeout(&mut rx, Duration::from_millis(500))
-            .await
-            .unwrap();
-        assert_eq!(nick, "tbot");
-    }
-
-    #[tokio::test]
-    async fn registration_surfaces_authfailed_reason_verbatim() {
-        // The SASL error message is the only thing telling the user
-        // *why* auth was rejected (handle vs key mismatch, expired
-        // challenge, etc.) — pin that it bubbles up unmodified.
-        let (tx, mut rx) = mpsc::channel(2);
-        tx.send(Event::AuthFailed {
-            reason: "invalid signature: bad key type".to_string(),
-        })
-        .await
-        .unwrap();
-        let err = wait_for_registration_with_timeout(&mut rx, Duration::from_millis(500))
-            .await
-            .err()
-            .expect("expected auth error");
-        let s = format!("{err:#}");
-        assert!(s.contains("invalid signature: bad key type"), "got: {s}");
-        assert!(s.contains("SASL auth failed"), "got: {s}");
-    }
-
-    #[tokio::test]
-    async fn registration_errors_on_closed_channel() {
-        // Disconnect mid-handshake: must not hang and must not panic.
-        let (tx, mut rx) = mpsc::channel::<Event>(1);
-        drop(tx);
-        let err = wait_for_registration_with_timeout(&mut rx, Duration::from_millis(500))
-            .await
-            .err()
-            .expect("expected error");
-        assert!(
-            format!("{err:#}").contains("connection closed"),
-            "got: {err:#}"
-        );
-    }
+    // ---------- the registration wait ----------
+    // The SDK's client::wait_for_registration, which eliza calls with 30 s;
+    // its other outcomes are the SDK's own tests.
 
     #[tokio::test]
     async fn registration_times_out_when_silent() {
         let (_tx, mut rx) = mpsc::channel::<Event>(1);
         let start = std::time::Instant::now();
-        let err = wait_for_registration_with_timeout(&mut rx, Duration::from_millis(50))
+        let err = client::wait_for_registration(&mut rx, Duration::from_millis(50))
             .await
             .err()
             .expect("expected timeout");
@@ -5005,26 +4967,35 @@ mod tests {
         assert!(format!("{err:#}").contains("timeout"), "got: {err:#}");
     }
 
+    // A refused key or a final refusal at sign-in ends `run` with `Ok`, exit 0;
+    // a try-again is still its error, exit 1. The sentence goes to stderr,
+    // which this test does not read.
     #[tokio::test]
-    async fn registration_ignores_intermediate_events() {
-        // Pre-registration we may see Connected, Authenticated, etc.
-        // None of them should resolve the wait — only Registered does.
-        let (tx, mut rx) = mpsc::channel(8);
-        tx.send(Event::Connected).await.unwrap();
-        tx.send(Event::Authenticated {
-            did: "did:key:zfoo".to_string(),
+    async fn sign_in_refusal_exits_zero_only_when_final() {
+        for refused in [
+            Event::AuthFailed {
+                reason: "not allowed here".into(),
+            },
+            Event::SigningKeyRefused {
+                reason: "key retired".into(),
+            },
+        ] {
+            let (tx, mut rx) = mpsc::channel::<Event>(1);
+            tx.send(refused).await.unwrap();
+            assert_eq!(registered(&mut rx).await.unwrap(), None);
+        }
+
+        let (tx, mut rx) = mpsc::channel::<Event>(1);
+        tx.send(Event::AuthFailedRetry {
+            reason: "try later".into(),
         })
         .await
         .unwrap();
-        tx.send(Event::Registered {
-            nick: "n".to_string(),
-        })
-        .await
-        .unwrap();
-        let nick = wait_for_registration_with_timeout(&mut rx, Duration::from_millis(500))
-            .await
-            .unwrap();
-        assert_eq!(nick, "n");
+        let err = registered(&mut rx).await.err().expect("expected an error");
+        assert_eq!(
+            err.downcast_ref::<Refusal>(),
+            Some(&Refusal::TryAgain("try later".into()))
+        );
     }
 
     // ---------- classify_av_event ----------

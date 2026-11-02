@@ -470,7 +470,15 @@ pub enum FreeqEvent {
     Authenticated {
         did: String,
     },
+    /// The server refused this sign-in for good, or ended the session for
+    /// good (its sentence). `Disconnected` follows; the same credentials will
+    /// not get in.
     AuthFailed {
+        reason: String,
+    },
+    /// The server could not check this client just now (its sentence).
+    /// `Disconnected` follows; the same credentials may get in later.
+    AuthFailedRetry {
         reason: String,
     },
     Joined {
@@ -576,6 +584,12 @@ pub enum FreeqEvent {
     /// This device's key is not published to the account and the app's
     /// session cannot publish it: the user has to sign in again.
     SigningKeyUnpublished,
+    /// The server refused this device's signing key, expired or retired
+    /// (its sentence). The stored key is marked refused; `Disconnected`
+    /// follows, and the client does not reconnect.
+    SigningKeyRefused {
+        reason: String,
+    },
     /// A verdict that was `Pending` when its line arrived, now known.
     Verdict {
         msgid: String,
@@ -1217,6 +1231,12 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
         Event::Registered { nick } => FreeqEvent::Registered { nick: nick.clone() },
         Event::Authenticated { did } => FreeqEvent::Authenticated { did: did.clone() },
         Event::AuthFailed { reason } => FreeqEvent::AuthFailed {
+            reason: reason.clone(),
+        },
+        Event::AuthFailedRetry { reason } => FreeqEvent::AuthFailedRetry {
+            reason: reason.clone(),
+        },
+        Event::SigningKeyRefused { reason } => FreeqEvent::SigningKeyRefused {
             reason: reason.clone(),
         },
         Event::Joined { channel, nick, .. } => FreeqEvent::Joined {
@@ -3905,6 +3925,15 @@ mod tests {
         assert!(matches!(
             convert_event(&freeq_sdk::event::Event::SigningKeyUnpublished),
             Some(FreeqEvent::SigningKeyUnpublished)
+        ));
+        let reason = "the server's words".to_string();
+        assert!(matches!(
+            convert_event(&freeq_sdk::event::Event::SigningKeyRefused { reason: reason.clone() }),
+            Some(FreeqEvent::SigningKeyRefused { reason: r }) if r == reason
+        ));
+        assert!(matches!(
+            convert_event(&freeq_sdk::event::Event::AuthFailedRetry { reason: reason.clone() }),
+            Some(FreeqEvent::AuthFailedRetry { reason: r }) if r == reason
         ));
         let verdict = sdk::Verdict {
             state: sdk::VerdictState::Device,

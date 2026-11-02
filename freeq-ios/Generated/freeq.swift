@@ -3718,6 +3718,8 @@ public enum FreeqEvent {
     )
     case authFailed(reason: String
     )
+    case authFailedRetry(reason: String
+    )
     case joined(channel: String, nick: String
     )
     case parted(channel: String, nick: String
@@ -3763,6 +3765,8 @@ public enum FreeqEvent {
     case notice(text: String
     )
     case signingKeyUnpublished
+    case signingKeyRefused(reason: String
+    )
     case verdict(msgid: String, verdict: SignatureVerdict
     )
     case disconnected(reason: String
@@ -3795,78 +3799,84 @@ public struct FfiConverterTypeFreeqEvent: FfiConverterRustBuffer {
         case 4: return .authFailed(reason: try FfiConverterString.read(from: &buf)
         )
         
-        case 5: return .joined(channel: try FfiConverterString.read(from: &buf), nick: try FfiConverterString.read(from: &buf)
+        case 5: return .authFailedRetry(reason: try FfiConverterString.read(from: &buf)
         )
         
-        case 6: return .parted(channel: try FfiConverterString.read(from: &buf), nick: try FfiConverterString.read(from: &buf)
+        case 6: return .joined(channel: try FfiConverterString.read(from: &buf), nick: try FfiConverterString.read(from: &buf)
         )
         
-        case 7: return .nickChanged(oldNick: try FfiConverterString.read(from: &buf), newNick: try FfiConverterString.read(from: &buf)
+        case 7: return .parted(channel: try FfiConverterString.read(from: &buf), nick: try FfiConverterString.read(from: &buf)
         )
         
-        case 8: return .awayChanged(nick: try FfiConverterString.read(from: &buf), awayMsg: try FfiConverterOptionString.read(from: &buf)
+        case 8: return .nickChanged(oldNick: try FfiConverterString.read(from: &buf), newNick: try FfiConverterString.read(from: &buf)
         )
         
-        case 9: return .actorClasses(channel: try FfiConverterString.read(from: &buf), classes: try FfiConverterSequenceTypeActorClassEntry.read(from: &buf)
+        case 9: return .awayChanged(nick: try FfiConverterString.read(from: &buf), awayMsg: try FfiConverterOptionString.read(from: &buf)
         )
         
-        case 10: return .presence(nick: try FfiConverterString.read(from: &buf), state: try FfiConverterString.read(from: &buf), status: try FfiConverterOptionString.read(from: &buf), task: try FfiConverterOptionString.read(from: &buf)
+        case 10: return .actorClasses(channel: try FfiConverterString.read(from: &buf), classes: try FfiConverterSequenceTypeActorClassEntry.read(from: &buf)
         )
         
-        case 11: return .message(msg: try FfiConverterTypeIrcMessage.read(from: &buf)
+        case 11: return .presence(nick: try FfiConverterString.read(from: &buf), state: try FfiConverterString.read(from: &buf), status: try FfiConverterOptionString.read(from: &buf), task: try FfiConverterOptionString.read(from: &buf)
         )
         
-        case 12: return .tagMsg(msg: try FfiConverterTypeTagMessage.read(from: &buf)
+        case 12: return .message(msg: try FfiConverterTypeIrcMessage.read(from: &buf)
         )
         
-        case 13: return .act(event: try FfiConverterTypeActEvent.read(from: &buf)
+        case 13: return .tagMsg(msg: try FfiConverterTypeTagMessage.read(from: &buf)
         )
         
-        case 14: return .names(channel: try FfiConverterString.read(from: &buf), members: try FfiConverterSequenceTypeIrcMember.read(from: &buf)
+        case 14: return .act(event: try FfiConverterTypeActEvent.read(from: &buf)
         )
         
-        case 15: return .topicChanged(channel: try FfiConverterString.read(from: &buf), topic: try FfiConverterTypeChannelTopic.read(from: &buf)
+        case 15: return .names(channel: try FfiConverterString.read(from: &buf), members: try FfiConverterSequenceTypeIrcMember.read(from: &buf)
         )
         
-        case 16: return .modeChanged(channel: try FfiConverterString.read(from: &buf), mode: try FfiConverterString.read(from: &buf), arg: try FfiConverterOptionString.read(from: &buf), setBy: try FfiConverterString.read(from: &buf)
+        case 16: return .topicChanged(channel: try FfiConverterString.read(from: &buf), topic: try FfiConverterTypeChannelTopic.read(from: &buf)
         )
         
-        case 17: return .kicked(channel: try FfiConverterString.read(from: &buf), nick: try FfiConverterString.read(from: &buf), by: try FfiConverterString.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
+        case 17: return .modeChanged(channel: try FfiConverterString.read(from: &buf), mode: try FfiConverterString.read(from: &buf), arg: try FfiConverterOptionString.read(from: &buf), setBy: try FfiConverterString.read(from: &buf)
         )
         
-        case 18: return .userQuit(nick: try FfiConverterString.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
+        case 18: return .kicked(channel: try FfiConverterString.read(from: &buf), nick: try FfiConverterString.read(from: &buf), by: try FfiConverterString.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
         )
         
-        case 19: return .batchStart(id: try FfiConverterString.read(from: &buf), batchType: try FfiConverterString.read(from: &buf), target: try FfiConverterString.read(from: &buf)
+        case 19: return .userQuit(nick: try FfiConverterString.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
         )
         
-        case 20: return .batchEnd(id: try FfiConverterString.read(from: &buf)
+        case 20: return .batchStart(id: try FfiConverterString.read(from: &buf), batchType: try FfiConverterString.read(from: &buf), target: try FfiConverterString.read(from: &buf)
         )
         
-        case 21: return .chatHistoryTarget(nick: try FfiConverterString.read(from: &buf), timestamp: try FfiConverterOptionString.read(from: &buf), partnerDid: try FfiConverterOptionString.read(from: &buf)
+        case 21: return .batchEnd(id: try FfiConverterString.read(from: &buf)
         )
         
-        case 22: return .memberDid(nick: try FfiConverterString.read(from: &buf), did: try FfiConverterString.read(from: &buf)
+        case 22: return .chatHistoryTarget(nick: try FfiConverterString.read(from: &buf), timestamp: try FfiConverterOptionString.read(from: &buf), partnerDid: try FfiConverterOptionString.read(from: &buf)
         )
         
-        case 23: return .readMarker(target: try FfiConverterString.read(from: &buf), timestamp: try FfiConverterOptionString.read(from: &buf)
+        case 23: return .memberDid(nick: try FfiConverterString.read(from: &buf), did: try FfiConverterString.read(from: &buf)
         )
         
-        case 24: return .whoisReply(nick: try FfiConverterString.read(from: &buf), info: try FfiConverterString.read(from: &buf)
+        case 24: return .readMarker(target: try FfiConverterString.read(from: &buf), timestamp: try FfiConverterOptionString.read(from: &buf)
         )
         
-        case 25: return .whoisEnd(nick: try FfiConverterString.read(from: &buf)
+        case 25: return .whoisReply(nick: try FfiConverterString.read(from: &buf), info: try FfiConverterString.read(from: &buf)
         )
         
-        case 26: return .notice(text: try FfiConverterString.read(from: &buf)
+        case 26: return .whoisEnd(nick: try FfiConverterString.read(from: &buf)
         )
         
-        case 27: return .signingKeyUnpublished
-        
-        case 28: return .verdict(msgid: try FfiConverterString.read(from: &buf), verdict: try FfiConverterTypeSignatureVerdict.read(from: &buf)
+        case 27: return .notice(text: try FfiConverterString.read(from: &buf)
         )
         
-        case 29: return .disconnected(reason: try FfiConverterString.read(from: &buf)
+        case 28: return .signingKeyUnpublished
+        
+        case 29: return .signingKeyRefused(reason: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 30: return .verdict(msgid: try FfiConverterString.read(from: &buf), verdict: try FfiConverterTypeSignatureVerdict.read(from: &buf)
+        )
+        
+        case 31: return .disconnected(reason: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -3896,38 +3906,43 @@ public struct FfiConverterTypeFreeqEvent: FfiConverterRustBuffer {
             FfiConverterString.write(reason, into: &buf)
             
         
-        case let .joined(channel,nick):
+        case let .authFailedRetry(reason):
             writeInt(&buf, Int32(5))
-            FfiConverterString.write(channel, into: &buf)
-            FfiConverterString.write(nick, into: &buf)
+            FfiConverterString.write(reason, into: &buf)
             
         
-        case let .parted(channel,nick):
+        case let .joined(channel,nick):
             writeInt(&buf, Int32(6))
             FfiConverterString.write(channel, into: &buf)
             FfiConverterString.write(nick, into: &buf)
             
         
-        case let .nickChanged(oldNick,newNick):
+        case let .parted(channel,nick):
             writeInt(&buf, Int32(7))
+            FfiConverterString.write(channel, into: &buf)
+            FfiConverterString.write(nick, into: &buf)
+            
+        
+        case let .nickChanged(oldNick,newNick):
+            writeInt(&buf, Int32(8))
             FfiConverterString.write(oldNick, into: &buf)
             FfiConverterString.write(newNick, into: &buf)
             
         
         case let .awayChanged(nick,awayMsg):
-            writeInt(&buf, Int32(8))
+            writeInt(&buf, Int32(9))
             FfiConverterString.write(nick, into: &buf)
             FfiConverterOptionString.write(awayMsg, into: &buf)
             
         
         case let .actorClasses(channel,classes):
-            writeInt(&buf, Int32(9))
+            writeInt(&buf, Int32(10))
             FfiConverterString.write(channel, into: &buf)
             FfiConverterSequenceTypeActorClassEntry.write(classes, into: &buf)
             
         
         case let .presence(nick,state,status,task):
-            writeInt(&buf, Int32(10))
+            writeInt(&buf, Int32(11))
             FfiConverterString.write(nick, into: &buf)
             FfiConverterString.write(state, into: &buf)
             FfiConverterOptionString.write(status, into: &buf)
@@ -3935,34 +3950,34 @@ public struct FfiConverterTypeFreeqEvent: FfiConverterRustBuffer {
             
         
         case let .message(msg):
-            writeInt(&buf, Int32(11))
+            writeInt(&buf, Int32(12))
             FfiConverterTypeIrcMessage.write(msg, into: &buf)
             
         
         case let .tagMsg(msg):
-            writeInt(&buf, Int32(12))
+            writeInt(&buf, Int32(13))
             FfiConverterTypeTagMessage.write(msg, into: &buf)
             
         
         case let .act(event):
-            writeInt(&buf, Int32(13))
+            writeInt(&buf, Int32(14))
             FfiConverterTypeActEvent.write(event, into: &buf)
             
         
         case let .names(channel,members):
-            writeInt(&buf, Int32(14))
+            writeInt(&buf, Int32(15))
             FfiConverterString.write(channel, into: &buf)
             FfiConverterSequenceTypeIrcMember.write(members, into: &buf)
             
         
         case let .topicChanged(channel,topic):
-            writeInt(&buf, Int32(15))
+            writeInt(&buf, Int32(16))
             FfiConverterString.write(channel, into: &buf)
             FfiConverterTypeChannelTopic.write(topic, into: &buf)
             
         
         case let .modeChanged(channel,mode,arg,setBy):
-            writeInt(&buf, Int32(16))
+            writeInt(&buf, Int32(17))
             FfiConverterString.write(channel, into: &buf)
             FfiConverterString.write(mode, into: &buf)
             FfiConverterOptionString.write(arg, into: &buf)
@@ -3970,7 +3985,7 @@ public struct FfiConverterTypeFreeqEvent: FfiConverterRustBuffer {
             
         
         case let .kicked(channel,nick,by,reason):
-            writeInt(&buf, Int32(17))
+            writeInt(&buf, Int32(18))
             FfiConverterString.write(channel, into: &buf)
             FfiConverterString.write(nick, into: &buf)
             FfiConverterString.write(by, into: &buf)
@@ -3978,70 +3993,75 @@ public struct FfiConverterTypeFreeqEvent: FfiConverterRustBuffer {
             
         
         case let .userQuit(nick,reason):
-            writeInt(&buf, Int32(18))
+            writeInt(&buf, Int32(19))
             FfiConverterString.write(nick, into: &buf)
             FfiConverterString.write(reason, into: &buf)
             
         
         case let .batchStart(id,batchType,target):
-            writeInt(&buf, Int32(19))
+            writeInt(&buf, Int32(20))
             FfiConverterString.write(id, into: &buf)
             FfiConverterString.write(batchType, into: &buf)
             FfiConverterString.write(target, into: &buf)
             
         
         case let .batchEnd(id):
-            writeInt(&buf, Int32(20))
+            writeInt(&buf, Int32(21))
             FfiConverterString.write(id, into: &buf)
             
         
         case let .chatHistoryTarget(nick,timestamp,partnerDid):
-            writeInt(&buf, Int32(21))
+            writeInt(&buf, Int32(22))
             FfiConverterString.write(nick, into: &buf)
             FfiConverterOptionString.write(timestamp, into: &buf)
             FfiConverterOptionString.write(partnerDid, into: &buf)
             
         
         case let .memberDid(nick,did):
-            writeInt(&buf, Int32(22))
+            writeInt(&buf, Int32(23))
             FfiConverterString.write(nick, into: &buf)
             FfiConverterString.write(did, into: &buf)
             
         
         case let .readMarker(target,timestamp):
-            writeInt(&buf, Int32(23))
+            writeInt(&buf, Int32(24))
             FfiConverterString.write(target, into: &buf)
             FfiConverterOptionString.write(timestamp, into: &buf)
             
         
         case let .whoisReply(nick,info):
-            writeInt(&buf, Int32(24))
+            writeInt(&buf, Int32(25))
             FfiConverterString.write(nick, into: &buf)
             FfiConverterString.write(info, into: &buf)
             
         
         case let .whoisEnd(nick):
-            writeInt(&buf, Int32(25))
+            writeInt(&buf, Int32(26))
             FfiConverterString.write(nick, into: &buf)
             
         
         case let .notice(text):
-            writeInt(&buf, Int32(26))
+            writeInt(&buf, Int32(27))
             FfiConverterString.write(text, into: &buf)
             
         
         case .signingKeyUnpublished:
-            writeInt(&buf, Int32(27))
+            writeInt(&buf, Int32(28))
         
+        
+        case let .signingKeyRefused(reason):
+            writeInt(&buf, Int32(29))
+            FfiConverterString.write(reason, into: &buf)
+            
         
         case let .verdict(msgid,verdict):
-            writeInt(&buf, Int32(28))
+            writeInt(&buf, Int32(30))
             FfiConverterString.write(msgid, into: &buf)
             FfiConverterTypeSignatureVerdict.write(verdict, into: &buf)
             
         
         case let .disconnected(reason):
-            writeInt(&buf, Int32(29))
+            writeInt(&buf, Int32(31))
             FfiConverterString.write(reason, into: &buf)
             
         }

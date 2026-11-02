@@ -26,6 +26,7 @@ use freeq_bots::llm::LlmClient;
 use freeq_bots::memory::Memory;
 use freeq_sdk::client::{self, ConnectConfig};
 use freeq_sdk::event::Event;
+use freeq_sdk::refusal::Refusal;
 
 #[derive(Parser)]
 #[command(name = "context-bot", about = "Context-aware IRC chatbot")]
@@ -120,6 +121,11 @@ async fn main() -> Result<()> {
                 tracing::info!("Clean disconnect");
                 break;
             }
+            // The server ended this bot's session for good: say why and stop.
+            Err(e) if ends_the_bot(&e) => {
+                eprintln!("{e}");
+                break;
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "Disconnected, reconnecting in 5s...");
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -143,7 +149,7 @@ async fn run_once(args: &Args, llm: &LlmClient, ctx: &Arc<AgentContext>) -> Resu
     let (handle, mut events) = client::connect(config, None);
 
     // Wait for registration
-    wait_for_registration(&mut events).await?;
+    client::wait_for_registration(&mut events, std::time::Duration::from_secs(10)).await?;
     tracing::info!("Registered as {}", args.nick);
 
     // Join channel
@@ -339,17 +345,14 @@ async fn run_once(args: &Args, llm: &LlmClient, ctx: &Arc<AgentContext>) -> Resu
                 }
             }
 
+            // A final close: the context file is written, as at any end of
+            // the session, and the bot stops.
+            Event::AuthFailed { reason } => {
+                export_context(ctx, &args.channel).await;
+                return Err(Refusal::Final(reason).into());
+            }
             Event::Disconnected { reason } => {
-                // Export context file before disconnecting
-                let path = std::env::temp_dir().join(format!(
-                    "freeq-context-{}.md",
-                    args.channel.replace('#', "")
-                ));
-                if let Err(e) = ctx.export_context_file(&args.channel, None, &path).await {
-                    tracing::warn!(error = %e, "Failed to export context file");
-                } else {
-                    tracing::info!(path = %path.display(), "Exported context file");
-                }
+                export_context(ctx, &args.channel).await;
                 return Err(anyhow::anyhow!("Disconnected: {reason}"));
             }
 
@@ -407,21 +410,23 @@ fn split_irc_message(text: &str, max_len: usize) -> Vec<String> {
     lines
 }
 
-async fn wait_for_registration(events: &mut mpsc::Receiver<Event>) -> Result<()> {
-    let timeout = tokio::time::Duration::from_secs(10);
-    loop {
-        match tokio::time::timeout(timeout, events.recv()).await {
-            Ok(Some(Event::Registered { .. })) => return Ok(()),
-            Ok(Some(Event::Disconnected { reason })) => {
-                return Err(anyhow::anyhow!(
-                    "Disconnected during registration: {reason}"
-                ));
-            }
-            Ok(Some(_)) => continue,
-            Ok(None) => return Err(anyhow::anyhow!("Event channel closed")),
-            Err(_) => return Err(anyhow::anyhow!("Registration timed out")),
-        }
+/// Write the channel's context file, as the session ends.
+async fn export_context(ctx: &AgentContext, channel: &str) {
+    let path = std::env::temp_dir().join(format!("freeq-context-{}.md", channel.replace('#', "")));
+    if let Err(e) = ctx.export_context_file(channel, None, &path).await {
+        tracing::warn!(error = %e, "Failed to export context file");
+    } else {
+        tracing::info!(path = %path.display(), "Exported context file");
     }
+}
+
+/// Whether a session's end stops the bot: the server refused it for good or
+/// refused its key. A try-again, or any other error, is connected again.
+fn ends_the_bot(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<Refusal>(),
+        Some(Refusal::Final(_) | Refusal::SigningKey(_))
+    )
 }
 
 async fn wait_for_join(events: &mut mpsc::Receiver<Event>, channel: &str) -> Result<()> {
@@ -429,6 +434,7 @@ async fn wait_for_join(events: &mut mpsc::Receiver<Event>, channel: &str) -> Res
     loop {
         match tokio::time::timeout(timeout, events.recv()).await {
             Ok(Some(Event::Joined { channel: ch, .. })) if ch == channel => return Ok(()),
+            Ok(Some(Event::AuthFailed { reason })) => return Err(Refusal::Final(reason).into()),
             Ok(Some(Event::Disconnected { reason })) => {
                 return Err(anyhow::anyhow!("Disconnected during join: {reason}"));
             }

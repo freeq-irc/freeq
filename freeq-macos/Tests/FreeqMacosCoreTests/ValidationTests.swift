@@ -249,7 +249,6 @@ final class ValidationTests: XCTestCase {
 
     func testSavedDidIsNotTreatedAsServerConfirmedAuthentication() {
         XCTAssertNil(AuthSessionState.confirmedDidFromSavedCredentials("did:plc:stale"))
-        XCTAssertNil(AuthSessionState.didAfterAuthFailure(current: "did:plc:stale"))
     }
 
     func testBackgroundWhoisRepliesDoNotDisplayAsChannelMessages() {

@@ -74,4 +74,4 @@ cd freeq-android
 - Thread/reply chain view
 - Photo upload with cross-post to Bluesky
 - Push notifications
-- Auto-reconnect with backoff
+- Auto-reconnect with backoff, except after a refusal, which goes to the sign-in screen

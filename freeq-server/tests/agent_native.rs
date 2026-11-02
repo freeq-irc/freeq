@@ -302,8 +302,21 @@ async fn did_key_auth_wrong_key_fails() {
     )
     .await;
 
-    // Should get SASL failure (904), not success
-    expect_raw_line(&mut events, 2000, "904", "SASL failure").await;
+    // A final refusal: the server's code, then the client's event.
+    expect_raw_line(
+        &mut events,
+        2000,
+        "FAIL AUTHENTICATE SIGNATURE_INVALID",
+        "the FAIL line",
+    )
+    .await;
+    expect_event(
+        &mut events,
+        2000,
+        |e| matches!(e, Event::AuthFailed { .. }),
+        "AuthFailed",
+    )
+    .await;
 
     server_handle.abort();
 }

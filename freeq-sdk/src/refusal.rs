@@ -8,9 +8,9 @@
 //! Only [`TEMPORARILY_UNAVAILABLE`] says the answer may change by itself: the
 //! server could not get an answer it needs, or the challenge expired, so the
 //! same credentials may get in later. Every other code is final, and so is a
-//! `904` that no `FAIL` came before. The server reads the codes from here;
-//! `spec/sasl-refusals.json` lists each with its command and kind, and this
-//! module's tests and the JavaScript SDK's hold the codes to it.
+//! `904` that no `FAIL` came before. The server and the client read the codes
+//! from here; `spec/sasl-refusals.json` lists each with its command and kind,
+//! and both SDKs' tests read it.
 //!
 //! A browser sign-in through `LOGIN` that the server refuses carries `FAIL
 //! LOGIN NOT_ALLOWED` before its `904`. [`classify`] does not count it as a

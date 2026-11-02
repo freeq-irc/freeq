@@ -219,7 +219,7 @@ impl Orchestrator {
         // surfacing the error — otherwise the half-joined bot lingers
         // as a ghost participant the room can see but never hear.
         let setup = async {
-            wait_for_registration(&mut events).await?;
+            client::wait_for_registration(&mut events, Duration::from_secs(20)).await?;
             handle.join(&cfg.channel).await.context("joining channel")?;
             tracing::info!(channel = %cfg.channel, nick = %cfg.nick, "joined channel");
 
@@ -323,6 +323,13 @@ impl Orchestrator {
                 }
                 if let Event::Disconnected { reason } = &ev {
                     tracing::warn!(%reason, "IRC disconnected");
+                }
+                // The server refused the key, or ended the session for good:
+                // say why and stop everything, as disconnect() does.
+                if let Event::SigningKeyRefused { reason } | Event::AuthFailed { reason } = &ev {
+                    eprintln!("{reason}");
+                    shutdown_for_events.store(true, Ordering::Relaxed);
+                    break;
                 }
             }
         }));
@@ -1285,23 +1292,6 @@ fn is_peer(peers: &[String], nick: &str) -> bool {
         let p = p.to_lowercase();
         p == nick.to_lowercase() || p == prefix
     })
-}
-
-async fn wait_for_registration(events: &mut mpsc::Receiver<Event>) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(remaining, events.recv()).await {
-            Ok(Some(Event::Registered { .. })) => return Ok(()),
-            Ok(Some(Event::AuthFailed { reason })) => {
-                return Err(anyhow!("SASL auth failed: {reason}"));
-            }
-            Ok(Some(_)) => continue,
-            Ok(None) => return Err(anyhow!("event stream closed during registration")),
-            Err(_) => return Err(anyhow!("registration timeout")),
-        }
-    }
-    Err(anyhow!("registration timeout"))
 }
 
 /// Watch for a `+freeq.at/av-state=started` TAGMSG on the channel and

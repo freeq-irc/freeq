@@ -397,12 +397,13 @@ class AppState {
     /// connect.
     private var keyRefused = false
 
-    /// Apply a refusal of this device's signing key, as `RefusedKeyNotice`
-    /// decided it.
-    func signOutRefusedKey(_ refusal: RefusedKeyNotice.Refusal) {
-        keyRefused = !refusal.schedulesReconnect
-        if refusal.clearsSavedLogin { endLogin() }
-        errorMessage = refusal.line
+    /// The server refused this device's key or its sign-in for good: end the
+    /// login, reconnect nothing (`keyRefused` holds the disconnect that
+    /// follows), and show the server's sentence.
+    func signOutRefused(line: String) {
+        keyRefused = true
+        endLogin()
+        errorMessage = line
     }
 
     /// File what the SDK said about one line, so the row and the proof sheet
@@ -1956,9 +1957,16 @@ extension AppState {
             }
 
         case .authFailed(let reason):
-            authenticatedDID = AuthSessionState.didAfterAuthFailure(current: authenticatedDID)
             pendingWebToken = nil
-            errorMessage = "Auth failed: \(reason)"
+            signOutRefused(line: reason)
+
+        case .authFailedRetry(let reason):
+            // The server could not check this account just now: the drop that
+            // follows reconnects on ReconnectPolicy's growing wait.
+            errorMessage = reason
+
+        case .signingKeyRefused(let reason):
+            signOutRefused(line: reason)
 
         case .joined(let channel, let joinNick):
             if joinNick.lowercased() == nick.lowercased() {
@@ -2585,9 +2593,6 @@ extension AppState {
                     whoisMembers(members.map(\.nick))
                 }
                 requestHistory(channel: channel)
-                return
-            case .keyRefused(let refusal):
-                signOutRefusedKey(refusal)
                 return
             case .apiBearer(let sessionId):
                 apiBearerSessionId = sessionId

@@ -184,16 +184,12 @@ enum ServerNoticeRoute: Equatable {
     case apiBearer(String)
     case channelAccessDenied(channel: String, reason: String)
     case whoisDiagnostic(nick: String, text: String)
-    /// The server refused this device's signing key (FAIL MSGSIG KEY_RETIRED
-    /// or KEY_EXPIRED).
-    case keyRefused(RefusedKeyNotice.Refusal)
     case display(String)
 }
 
 enum ServerNoticeRouter {
     static func route(_ text: String) -> ServerNoticeRoute {
         if text.isEmpty { return .ignore }
-        if let refusal = RefusedKeyNotice.parse(text) { return .keyRefused(refusal) }
         // Speculative-history failures: the client requests DM history on its
         // own when a conversation opens; a guest (or a DM with a guest peer)
         // gets `CHATHISTORY <CODE> <target> …` back for a request the user
@@ -295,12 +291,6 @@ enum AuthSessionState {
     /// A saved DID or broker session says who we intend to authenticate as, but
     /// only the IRC server's SASL success event confirms this TCP connection.
     static func confirmedDidFromSavedCredentials(_ savedDID: String?) -> String? {
-        nil
-    }
-
-    /// After any SASL failure, the current connection is not authenticated even
-    /// if a previous app launch had a DID saved in Keychain.
-    static func didAfterAuthFailure(current: String?) -> String? {
         nil
     }
 }

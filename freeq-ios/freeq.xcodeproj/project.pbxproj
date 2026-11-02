@@ -51,7 +51,7 @@
 		4BC265FF53A0BB0A3BFECD1A /* FreeqCommands.swift in Sources */ = {isa = PBXBuildFile; fileRef = 883DBC919B347571BC792852 /* FreeqCommands.swift */; };
 		4D5006848D66CA9FF16B2680 /* DmHistoryOnOpen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6ED301BD44C5DB63F6430B53 /* DmHistoryOnOpen.swift */; };
 		4D812AA5D08CF45A2F27BF72 /* IntelligenceService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25A01703D21F0BCF9963E1B8 /* IntelligenceService.swift */; };
-		4F096EDDDC00CEA18281B088 /* RefusedKeyNotice.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC795A5BDF4DC3999132F232 /* RefusedKeyNotice.swift */; };
+		4F096EDDDC00CEA18281B088 /* RefusedLogin.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC795A5BDF4DC3999132F232 /* RefusedLogin.swift */; };
 		4F32549F7429803BCF26DE25 /* VideoFeedView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AF979D760370C0C44E53D1C /* VideoFeedView.swift */; };
 		590DB15E36CC6FECFC8FB1B6 /* ActivityKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5402990427FB4D600E4D9BA6 /* ActivityKit.framework */; };
 		5B1B81D53A3DE4767C2A498B /* PhoneWatchBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A31629FF3AFE028388F95C8 /* PhoneWatchBridge.swift */; };
@@ -276,7 +276,7 @@
 		A8B3ACAA832092748A58D823 /* freeq.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = freeq.entitlements; sourceTree = "<group>"; };
 		A968D5C7244372A54881C91E /* ServerConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerConfig.swift; sourceTree = "<group>"; };
 		ABCDE5D7A00E6A7790E2960E /* OnboardingSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingSheet.swift; sourceTree = "<group>"; };
-		AC795A5BDF4DC3999132F232 /* RefusedKeyNotice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RefusedKeyNotice.swift; sourceTree = "<group>"; };
+		AC795A5BDF4DC3999132F232 /* RefusedLogin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RefusedLogin.swift; sourceTree = "<group>"; };
 		B28D17294C06F964661A5E97 /* KeychainHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainHelper.swift; sourceTree = "<group>"; };
 		B3200A9C4EB97C507BCBA97D /* AvSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AvSessionTests.swift; sourceTree = "<group>"; };
 		B43788F5890429BF64CC12CC /* freeqLiveActivity.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = freeqLiveActivity.appex; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -508,7 +508,7 @@
 				0ACC23EC3E2A6AC3B1FCBA6E /* OutboundSend.swift */,
 				7A31629FF3AFE028388F95C8 /* PhoneWatchBridge.swift */,
 				0E8A7FC2E15A5CEC8160244E /* PresenceLines.swift */,
-				AC795A5BDF4DC3999132F232 /* RefusedKeyNotice.swift */,
+				AC795A5BDF4DC3999132F232 /* RefusedLogin.swift */,
 				74C635E269C7A5993F613F3B /* RowSignatureMark.swift */,
 				B848E491B8944927766305C4 /* SelfPartResolve.swift */,
 				A968D5C7244372A54881C91E /* ServerConfig.swift */,
@@ -858,7 +858,7 @@
 				F09302BFFFB8EAEBFFECBE57 /* PresenceDot.swift in Sources */,
 				4A7801D5F001F1C838BFCF83 /* PresenceLines.swift in Sources */,
 				DF1C8C4E7B84DAD909DCA71B /* QuickSwitcherSheet.swift in Sources */,
-				4F096EDDDC00CEA18281B088 /* RefusedKeyNotice.swift in Sources */,
+				4F096EDDDC00CEA18281B088 /* RefusedLogin.swift in Sources */,
 				AE483CC317887C7C9A75B9D5 /* RowSignatureMark.swift in Sources */,
 				E51D087B116EE63A4FA6AAF9 /* Safety.swift in Sources */,
 				B792746D241CB91D4B15E377 /* SearchSheet.swift in Sources */,

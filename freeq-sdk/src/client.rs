@@ -40,6 +40,7 @@ use tokio_rustls::rustls;
 use crate::auth::{self, ChallengeSigner};
 use crate::event::Event;
 use crate::irc::Message;
+use crate::refusal::{self, Refusal};
 
 /// Registry for pending echo-message callbacks.
 /// When a client sends a PRIVMSG with a `+freeq.at/echo-nonce` tag, the nonce
@@ -3210,7 +3211,7 @@ where
                                     use base64::Engine;
                                     let json_bytes = response.to_string();
                                     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json_bytes.as_bytes());
-                                    write_sasl_response(&mut writer, &encoded).await?;
+                                    write_sasl_response(&mut writer, Ok(encoded)).await?;
                                 }
                             } else if let Some(ref signer) = signer {
                                 handle_authenticate_challenge(&msg, signer.as_ref(), config.owner_did.as_deref(), &mut writer).await?;
@@ -3324,11 +3325,15 @@ where
                             writer.write_all(b"CAP END\r\n").await?;
                         }
                         "904" => {
-                            sasl_in_progress = false;
+                            // Reached only with no FAIL before it on this
+                            // socket (the FAIL arm ends the loop): a server
+                            // that sends none. This client asked to sign in,
+                            // so it ends the connection rather than finish
+                            // registering as a guest, and does not come back.
                             let reason = msg.params.get(1).cloned().unwrap_or_else(|| "Unknown".to_string());
-                            // eprintln!("  SASL authentication FAILED: {reason}");
-                            let _ = event_tx.send(Event::AuthFailed { reason }).await;
-                            writer.write_all(b"CAP END\r\n").await?;
+                            let _ = event_tx.send(Event::AuthFailed { reason: reason.clone() }).await;
+                            let _ = event_tx.send(Event::Disconnected { reason }).await;
+                            break;
                         }
                         "BATCH" => {
                             if let Some(ref_id) = msg.params.first() {
@@ -4090,26 +4095,40 @@ where
                                 }
                             }
                         }
-                        "FAIL" => {
-                            // The server refused the presented device key as
-                            // expired or retired: marked before the app hears
-                            // of it, so the next fresh sign-in replaces it.
-                            if msg.params.first().map(String::as_str) == Some("MSGSIG")
-                                && matches!(
-                                    msg.params.get(1).map(String::as_str),
-                                    Some("KEY_EXPIRED" | "KEY_RETIRED")
-                                )
-                            {
+                        "FAIL" => match refusal::classify(&msg.params) {
+                            // The server's verdict on this client being let
+                            // in. Each ends the connection here, the verdict
+                            // first and then the drop, with the server's
+                            // sentence as both reasons; the 904 behind a
+                            // sign-in refusal is never read.
+                            Some(Refusal::SigningKey(reason)) => {
+                                // Marked before the app hears of it, so the
+                                // next fresh sign-in replaces the key.
                                 mark_device_key_refused(
                                     config.device_key_store.as_deref(),
                                     msg_signing_did.as_deref(),
                                     presented_seed,
                                 );
+                                let _ = event_tx.send(Event::SigningKeyRefused { reason: reason.clone() }).await;
+                                let _ = event_tx.send(Event::Disconnected { reason }).await;
+                                break;
                             }
-                            // IRCv3 FAIL command — emit as ServerNotice
-                            let text = msg.params.join(" ");
-                            let _ = event_tx.send(Event::ServerNotice { text }).await;
-                        }
+                            Some(Refusal::Final(reason)) => {
+                                let _ = event_tx.send(Event::AuthFailed { reason: reason.clone() }).await;
+                                let _ = event_tx.send(Event::Disconnected { reason }).await;
+                                break;
+                            }
+                            Some(Refusal::TryAgain(reason)) => {
+                                let _ = event_tx.send(Event::AuthFailedRetry { reason: reason.clone() }).await;
+                                let _ = event_tx.send(Event::Disconnected { reason }).await;
+                                break;
+                            }
+                            None => {
+                                // Any other IRCv3 FAIL: emit as ServerNotice.
+                                let text = msg.params.join(" ");
+                                let _ = event_tx.send(Event::ServerNotice { text }).await;
+                            }
+                        },
                         _ => {
                             // Emit server error numerics (4xx, 5xx, 6xx, 9xx),
                             // MOTD lines (372/375/376), and unrecognized commands
@@ -6568,8 +6587,9 @@ fn parse_multiline_cap(caps_str: &str) -> Option<(usize, usize)> {
     Some((max_bytes, max_lines))
 }
 
-/// Write an encoded SASL response as one `AUTHENTICATE` line, however long.
-async fn write_sasl_response<W: AsyncWrite + Unpin>(writer: &mut W, encoded: &str) -> Result<()> {
+/// The `AUTHENTICATE` line for an encoded SASL response, however long, or
+/// why it cannot be sent: the server takes none over `MAX_SASL_RESPONSE_LEN`.
+fn sasl_response_line(encoded: &str) -> Result<String> {
     if encoded.len() > auth::MAX_SASL_RESPONSE_LEN {
         anyhow::bail!(
             "SASL response is {} bytes, over the {} the server accepts",
@@ -6577,9 +6597,26 @@ async fn write_sasl_response<W: AsyncWrite + Unpin>(writer: &mut W, encoded: &st
             auth::MAX_SASL_RESPONSE_LEN
         );
     }
-    writer
-        .write_all(format!("AUTHENTICATE {encoded}\r\n").as_bytes())
-        .await?;
+    Ok(format!("AUTHENTICATE {encoded}\r\n"))
+}
+
+/// Answer the server's challenge with the encoded response, or, when the
+/// response could not be made, abort the exchange with `AUTHENTICATE *`
+/// (logged with why): the server then answers `FAIL AUTHENTICATE ABORTED`,
+/// which ends the sign-in as a final refusal, since the same failure would
+/// repeat on every connect. Only a failed write is an error.
+async fn write_sasl_response<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    encoded: Result<String>,
+) -> Result<()> {
+    let line = match encoded.and_then(|e| sasl_response_line(&e)) {
+        Ok(line) => line,
+        Err(e) => {
+            tracing::warn!(error = %e, "Cannot make the SASL response; aborting the sign-in");
+            "AUTHENTICATE *\r\n".to_string()
+        }
+    };
+    writer.write_all(line.as_bytes()).await?;
     Ok(())
 }
 
@@ -6590,19 +6627,15 @@ async fn handle_authenticate_challenge<W: AsyncWrite + Unpin>(
     writer: &mut W,
 ) -> Result<()> {
     let encoded_challenge = msg.params.first().map(|s| s.as_str()).unwrap_or("");
-    // eprintln!("  Received SASL challenge ({} bytes encoded)", encoded_challenge.len());
-
-    // Decode the challenge to raw bytes — these are what we sign
-    let challenge_bytes = auth::decode_challenge_bytes(encoded_challenge)?;
-    // eprintln!("  Challenge decoded ({} bytes), signing with {}...", challenge_bytes.len(), signer.did());
-
-    // Produce the response using the signer
-    let mut response = signer.respond(&challenge_bytes)?;
-    response.owner_did = owner_did.map(str::to_string);
-    let encoded = auth::encode_response(&response);
-    // eprintln!("  Sending AUTHENTICATE response ({} bytes)", encoded.len());
-
-    write_sasl_response(writer, &encoded).await
+    // Decode the challenge to raw bytes (these are what we sign), sign them
+    // and encode the response. A failure at any step aborts the exchange.
+    let encoded = auth::decode_challenge_bytes(encoded_challenge)
+        .and_then(|challenge_bytes| signer.respond(&challenge_bytes))
+        .map(|mut response| {
+            response.owner_did = owner_did.map(str::to_string);
+            auth::encode_response(&response)
+        });
+    write_sasl_response(writer, encoded).await
 }
 
 // ── Reconnect helper ──
@@ -6652,9 +6685,17 @@ impl ReconnectConfig {
 /// Run an event loop with automatic reconnection.
 ///
 /// The `handler` is called for each event. When disconnected, the loop
-/// reconnects with exponential backoff and rejoins configured channels.
+/// reconnects on `ReconnectConfig`'s growing wait (`next_delay`), which
+/// starts again at `initial_delay` once the server has let the client in,
+/// and rejoins configured channels. A handler that returns `Err` is logged
+/// and the loop carries on.
 ///
-/// Returns only on unrecoverable errors or when the handler returns `Err`.
+/// Returns `Err` with the [`Refusal`] when the server refuses the signing
+/// key or the sign-in for good (`Refusal::SigningKey`, `Refusal::Final`), as
+/// [`wait_for_registration`] does, whose text is the server's sentence: the
+/// same credentials will never get in, so it does not reconnect. A
+/// server that cannot check the client just now (`AuthFailedRetry`) is
+/// tried again on the same growing wait.
 ///
 /// # Example
 ///
@@ -6698,7 +6739,6 @@ where
         let conn = match establish_connection(&config).await {
             Ok(c) => {
                 consecutive_failures = 0;
-                delay = reconnect_config.initial_delay;
                 c
             }
             Err(e) => {
@@ -6719,13 +6759,25 @@ where
 
         // Event loop
         let mut disconnected = false;
+        // The server's refusal of the key or the sign-in; it comes in the
+        // event before the drop, and ends this function.
+        let mut refused: Option<Refusal> = None;
         while let Some(event) = events.recv().await {
             // Join configured channels once registered with the server.
             // (JOINs sent before registration are silently dropped by IRC servers.)
             if matches!(&event, Event::Registered { .. }) {
+                // Let in: the wait starts again from the beginning.
+                delay = reconnect_config.initial_delay;
                 for ch in &reconnect_config.channels {
                     let _ = handle.join(ch).await;
                 }
+            }
+            match &event {
+                Event::SigningKeyRefused { reason } => {
+                    refused = Some(Refusal::SigningKey(reason.clone()));
+                }
+                Event::AuthFailed { reason } => refused = Some(Refusal::Final(reason.clone())),
+                _ => {}
             }
             if matches!(&event, Event::Disconnected { .. }) {
                 disconnected = true;
@@ -6737,6 +6789,9 @@ where
             if disconnected {
                 break;
             }
+        }
+        if let Some(refusal) = refused {
+            return Err(refusal.into());
         }
 
         tracing::info!(delay_secs = delay.as_secs(), "Disconnected, will reconnect");
@@ -6751,6 +6806,334 @@ fn rand_jitter(max: u64) -> u64 {
         return 0;
     }
     rand::random::<u64>() % max
+}
+
+/// Wait on a connection's events until the server has let it in, and return
+/// the nick it registered under. The server's verdict comes back as the
+/// [`Refusal`] it carries, as the error, whose text is the server's sentence:
+/// a final refusal, a refused signing key or a try-again. A drop first, an
+/// event stream that ends, or `timeout` passing is a plain error. The
+/// timeout bounds the whole wait, so events that keep arriving cannot hold
+/// it open. For a program that connects once; `run_with_reconnect` does its
+/// own waiting.
+pub async fn wait_for_registration(
+    events: &mut mpsc::Receiver<Event>,
+    timeout: std::time::Duration,
+) -> Result<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let event = match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => anyhow::bail!("connection closed during registration"),
+            Err(_) => anyhow::bail!("registration timeout"),
+        };
+        match event {
+            Event::Registered { nick } => return Ok(nick),
+            Event::AuthFailed { reason } => return Err(Refusal::Final(reason).into()),
+            Event::SigningKeyRefused { reason } => return Err(Refusal::SigningKey(reason).into()),
+            Event::AuthFailedRetry { reason } => return Err(Refusal::TryAgain(reason).into()),
+            Event::Disconnected { reason } => {
+                anyhow::bail!("disconnected during registration: {reason}")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod registration_wait_tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn waited(events: Vec<Event>) -> Result<String> {
+        let (tx, mut rx) = mpsc::channel(16);
+        for event in events {
+            tx.send(event).await.unwrap();
+        }
+        wait_for_registration(&mut rx, Duration::from_millis(500)).await
+    }
+
+    #[tokio::test]
+    async fn the_nick_once_registered_whatever_comes_first() {
+        let nick = waited(vec![
+            Event::Connected,
+            Event::Authenticated {
+                did: "did:key:zfoo".into(),
+            },
+            Event::ServerNotice {
+                text: "hello".into(),
+            },
+            Event::Registered {
+                nick: "tbot".into(),
+            },
+        ])
+        .await
+        .unwrap();
+        assert_eq!(nick, "tbot");
+    }
+
+    /// Each verdict is its Refusal, with the server's sentence as its text.
+    #[tokio::test]
+    async fn each_verdict_is_its_refusal_with_the_sentence() {
+        let words = "Not authorized to connect to this server";
+        for (event, want) in [
+            (
+                Event::AuthFailed {
+                    reason: words.into(),
+                },
+                Refusal::Final(words.into()),
+            ),
+            (
+                Event::SigningKeyRefused {
+                    reason: words.into(),
+                },
+                Refusal::SigningKey(words.into()),
+            ),
+            (
+                Event::AuthFailedRetry {
+                    reason: words.into(),
+                },
+                Refusal::TryAgain(words.into()),
+            ),
+        ] {
+            let err = waited(vec![
+                event,
+                Event::Disconnected {
+                    reason: words.into(),
+                },
+            ])
+            .await
+            .unwrap_err();
+            assert_eq!(err.downcast_ref::<Refusal>(), Some(&want));
+            assert_eq!(err.to_string(), words);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_drop_before_registration_is_a_plain_error_with_its_reason() {
+        let err = waited(vec![Event::Disconnected {
+            reason: "EOF".into(),
+        }])
+        .await
+        .unwrap_err();
+        assert!(err.downcast_ref::<Refusal>().is_none());
+        assert_eq!(err.to_string(), "disconnected during registration: EOF");
+    }
+
+    #[tokio::test]
+    async fn an_event_stream_that_ends_is_a_plain_error() {
+        let (tx, mut rx) = mpsc::channel::<Event>(1);
+        drop(tx);
+        let err = wait_for_registration(&mut rx, Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "connection closed during registration");
+    }
+
+    /// The deadline bounds the whole wait: events that keep coming do not
+    /// hold it open.
+    #[tokio::test]
+    async fn the_deadline_holds_while_other_events_keep_coming() {
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            while tx.send(Event::Connected).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let start = std::time::Instant::now();
+        let err = wait_for_registration(&mut rx, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "registration timeout");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
+mod refusal_reconnect_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    /// A listener that answers each connection, once the client has sent its
+    /// NICK, with `line`, and records when each connection arrived.
+    async fn refusing_server(
+        line: &'static str,
+    ) -> (String, mpsc::UnboundedReceiver<tokio::time::Instant>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = tx.send(tokio::time::Instant::now());
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    while let Ok(Some(l)) = lines.next_line().await {
+                        if l.starts_with("NICK ") {
+                            let _ = w.write_all(format!("{line}\r\n").as_bytes()).await;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, rx)
+    }
+
+    fn config_for(addr: &str) -> ConnectConfig {
+        ConnectConfig {
+            server_addr: addr.to_string(),
+            nick: "tester".to_string(),
+            user: "tester".to_string(),
+            realname: "Test".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A final refusal ends `run_with_reconnect` with its Refusal, whose text
+    /// is the server's sentence, after one connection.
+    #[tokio::test]
+    async fn a_final_refusal_returns_the_sentence_after_one_connection() {
+        let (addr, mut arrivals) =
+            refusing_server(":srv FAIL AUTHENTICATE NOT_ALLOWED :Not allowed here.").await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_with_reconnect(
+                config_for(&addr),
+                None,
+                ReconnectConfig::default(),
+                |_, _| Box::pin(async { Ok(()) }),
+            ),
+        )
+        .await
+        .expect("it returns");
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<Refusal>(),
+            Some(&Refusal::Final("Not allowed here.".into()))
+        );
+        assert_eq!(err.to_string(), "Not allowed here.");
+        assert!(arrivals.try_recv().is_ok());
+        assert!(arrivals.try_recv().is_err(), "one connection");
+    }
+
+    /// A refused key ends it the same way.
+    #[tokio::test]
+    async fn a_refused_key_returns_the_sentence_after_one_connection() {
+        let (addr, mut arrivals) =
+            refusing_server(":srv FAIL MSGSIG KEY_RETIRED :Signed out elsewhere.").await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_with_reconnect(
+                config_for(&addr),
+                None,
+                ReconnectConfig::default(),
+                |_, _| Box::pin(async { Ok(()) }),
+            ),
+        )
+        .await
+        .expect("it returns");
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<Refusal>(),
+            Some(&Refusal::SigningKey("Signed out elsewhere.".into()))
+        );
+        assert_eq!(err.to_string(), "Signed out elsewhere.");
+        assert!(arrivals.try_recv().is_ok());
+        assert!(arrivals.try_recv().is_err(), "one connection");
+    }
+
+    /// A try-again is tried again, on the growing wait: the second and third
+    /// connections come no sooner than 2 s and 4 s after the refusals.
+    #[tokio::test]
+    async fn a_try_again_reconnects_on_the_growing_wait() {
+        let (addr, mut arrivals) =
+            refusing_server(":srv FAIL AUTHENTICATE TEMPORARILY_UNAVAILABLE :Not just now.").await;
+        let events: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let seen = events.clone();
+        let running = tokio::spawn(run_with_reconnect(
+            config_for(&addr),
+            None,
+            ReconnectConfig::default(),
+            move |_, event| {
+                if let Event::AuthFailedRetry { reason } = &event {
+                    seen.lock().push(reason.clone());
+                }
+                Box::pin(async { Ok(()) })
+            },
+        ));
+        let mut at = Vec::new();
+        for _ in 0..3 {
+            at.push(
+                tokio::time::timeout(std::time::Duration::from_secs(15), arrivals.recv())
+                    .await
+                    .expect("a connection")
+                    .unwrap(),
+            );
+        }
+        running.abort();
+        assert!(
+            at[1] - at[0] >= std::time::Duration::from_secs(2),
+            "{:?}",
+            at[1] - at[0]
+        );
+        assert!(
+            at[2] - at[1] >= std::time::Duration::from_secs(4),
+            "{:?}",
+            at[2] - at[1]
+        );
+        assert!(events.lock().len() >= 2);
+        assert!(events.lock().iter().all(|r| r == "Not just now."));
+    }
+
+    /// Each verdict reaches the app as its event and then the drop, both with
+    /// the server's sentence, and the client closes its side.
+    #[tokio::test]
+    async fn each_verdict_is_its_event_then_the_drop_then_the_end() {
+        for (line, want) in [
+            (":srv FAIL AUTHENTICATE NOT_ALLOWED :w", "AuthFailed w"),
+            (":srv FAIL * AGENT_REVOKED :w", "AuthFailed w"),
+            (
+                ":srv FAIL AUTHENTICATE TEMPORARILY_UNAVAILABLE :w",
+                "AuthFailedRetry w",
+            ),
+            (":srv FAIL MSGSIG KEY_EXPIRED :w", "SigningKeyRefused w"),
+        ] {
+            let (addr, _arrivals) = refusing_server(line).await;
+            let conn = establish_connection(&config_for(&addr)).await.unwrap();
+            let (_handle, mut events) = connect_with_stream(conn, config_for(&addr), None);
+            let seen = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut seen = Vec::new();
+                while let Some(ev) = events.recv().await {
+                    match ev {
+                        Event::AuthFailed { reason } => seen.push(format!("AuthFailed {reason}")),
+                        Event::AuthFailedRetry { reason } => {
+                            seen.push(format!("AuthFailedRetry {reason}"))
+                        }
+                        Event::SigningKeyRefused { reason } => {
+                            seen.push(format!("SigningKeyRefused {reason}"))
+                        }
+                        Event::Disconnected { reason } => {
+                            seen.push(format!("Disconnected {reason}"))
+                        }
+                        _ => {}
+                    }
+                }
+                seen
+            })
+            .await
+            .expect("the events end: the client has closed the connection");
+            assert_eq!(
+                seen,
+                vec![want.to_string(), "Disconnected w".to_string()],
+                "{line}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6811,7 +7194,9 @@ mod sasl_write_tests {
 
     async fn lines(encoded: &str) -> Vec<String> {
         let mut buf: Vec<u8> = Vec::new();
-        write_sasl_response(&mut buf, encoded).await.unwrap();
+        write_sasl_response(&mut buf, Ok(encoded.to_string()))
+            .await
+            .unwrap();
         String::from_utf8(buf)
             .unwrap()
             .split("\r\n")
@@ -6832,20 +7217,36 @@ mod sasl_write_tests {
         }
     }
 
+    /// A response the server would not take is not sent: the exchange is
+    /// aborted, and the server's answer to that ends the sign-in.
     #[tokio::test]
-    async fn a_response_the_server_will_not_accept_is_refused() {
+    async fn a_response_the_server_will_not_accept_aborts_the_exchange() {
+        let long = "w".repeat(MAX_SASL_RESPONSE_LEN + 1);
+        assert_eq!(lines(&long).await, vec!["AUTHENTICATE *".to_string()]);
+    }
+
+    /// A response that could not be made at all aborts the exchange too; only
+    /// a failed write is an error.
+    #[tokio::test]
+    async fn a_response_that_could_not_be_made_aborts_the_exchange() {
         let mut buf: Vec<u8> = Vec::new();
-        let err = write_sasl_response(&mut buf, &"w".repeat(MAX_SASL_RESPONSE_LEN + 1))
+        write_sasl_response(&mut buf, Err(anyhow::anyhow!("the signer failed")))
             .await
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains(&format!("over the {MAX_SASL_RESPONSE_LEN}"))
-        );
-        assert!(
-            buf.is_empty(),
-            "nothing goes out when the response is refused"
-        );
+            .unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), "AUTHENTICATE *\r\n");
+    }
+
+    /// A challenge that cannot be decoded is answered the same way.
+    #[tokio::test]
+    async fn a_challenge_that_cannot_be_decoded_aborts_the_exchange() {
+        let key = crate::crypto::PrivateKey::generate_ed25519();
+        let signer = auth::KeySigner::new(format!("did:key:{}", key.public_key_multibase()), key);
+        let msg = Message::new("AUTHENTICATE", vec!["not base64!"]);
+        let mut out: Vec<u8> = Vec::new();
+        handle_authenticate_challenge(&msg, &signer, None, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "AUTHENTICATE *\r\n");
     }
 }
 
@@ -8411,7 +8812,7 @@ mod connect_config_tests {
 //   • PING keepalive → PONG reply
 //   • 001 RPL_WELCOME → Event::Registered + pending-command flush
 //   • 433 ERR_NICKNAMEINUSE → suffix retry / eventual Disconnected
-//   • 904 SASL failure → Event::AuthFailed + CAP END sent
+//   • 904 SASL failure → Event::AuthFailed, then the connection ends (no CAP END)
 //   • Command::Raw injection stripping (\r \n \0 removed)
 //   • Command::Privmsg wire format without / with signing key
 //   • JOIN / PART → Event::Joined / Event::Parted
@@ -8681,47 +9082,57 @@ mod irc_loop_tests {
 
     // ── 904 SASL failure ─────────────────────────────────────────────────────
 
-    /// 904 must emit Event::AuthFailed and send CAP END so the server can
-    /// finish registration (without CAP END the session hangs).
+    /// A 904 with no FAIL before it is a final refusal: the client says so,
+    /// reports the drop, and ends the connection itself. It sends no
+    /// `CAP END`, which would have finished registering it as a guest.
     #[tokio::test]
-    async fn sasl_904_emits_auth_failed_and_sends_cap_end() {
+    async fn a_904_ends_the_connection() {
         let (mut server, mut events, _cmd) = start_run_irc("eve").await;
-
         server
             .write_all(b":srv 904 eve :SASL authentication failed\r\n")
             .await
             .unwrap();
         server.flush().await.unwrap();
 
-        // Collect the AuthFailed event.
-        let got_auth_failed =
-            tokio::time::timeout(tokio::time::Duration::from_millis(400), async {
-                while let Some(ev) = events.recv().await {
-                    if matches!(ev, Event::AuthFailed { .. }) {
-                        return true;
+        let seen = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            let mut seen = Vec::new();
+            while let Some(ev) = events.recv().await {
+                match ev {
+                    Event::AuthFailed { reason } => seen.push(format!("AuthFailed {reason}")),
+                    Event::Disconnected { reason } => {
+                        seen.push(format!("Disconnected {reason}"));
+                        break;
                     }
+                    Event::Registered { .. } => seen.push("Registered".into()),
+                    _ => {}
                 }
-                false
-            })
-            .await
-            .unwrap_or(false);
+            }
+            seen
+        })
+        .await
+        .expect("the refusal and the drop");
+        assert_eq!(
+            seen,
+            vec![
+                "AuthFailed SASL authentication failed".to_string(),
+                "Disconnected SASL authentication failed".to_string(),
+            ]
+        );
 
-        assert!(got_auth_failed, "expected Event::AuthFailed after 904");
-
-        // run_irc must also send CAP END on the wire.
-        let mut buf = vec![0u8; 256];
-        let n = tokio::time::timeout(
-            tokio::time::Duration::from_millis(400),
-            server.read(&mut buf),
+        // The client has closed its side: the server reads to end-of-stream,
+        // and nothing it read is a CAP END.
+        let mut wire = Vec::new();
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            server.read_to_end(&mut wire),
         )
         .await
-        .expect("timeout waiting for CAP END")
-        .unwrap_or(0);
-
-        let wire = String::from_utf8_lossy(&buf[..n]);
+        .expect("end-of-stream at the server")
+        .unwrap();
+        let wire = String::from_utf8_lossy(&wire);
         assert!(
-            wire.contains("CAP END"),
-            "expected CAP END after 904, got:\n{wire}"
+            !wire.contains("CAP END"),
+            "no CAP END after the 904, got:\n{wire}"
         );
     }
 
@@ -11757,17 +12168,17 @@ mod device_key_tests {
             String::from_utf8_lossy(&wire).into_owned()
         }
 
-        /// The next server notice, as the app would hear it.
-        async fn notice(&mut self) -> String {
+        /// The refused key's sentence, as the app would hear it.
+        async fn key_refused(&mut self) -> String {
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
-                    if let Some(Event::ServerNotice { text }) = self.events.recv().await {
-                        return text;
+                    if let Some(Event::SigningKeyRefused { reason }) = self.events.recv().await {
+                        return reason;
                     }
                 }
             })
             .await
-            .expect("a notice")
+            .expect("a refused key")
         }
     }
 
@@ -11776,8 +12187,8 @@ mod device_key_tests {
         let store = MemoryStore::holding(5, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
         let mut live = connect_live(config_with(Some(store.clone()), None)).await;
         live.send(EXPIRED).await;
-        let heard = live.notice().await;
-        assert!(heard.starts_with("MSGSIG KEY_EXPIRED"), "{heard}");
+        let heard = live.key_refused().await;
+        assert!(EXPIRED.ends_with(&format!(":{heard}")), "{heard}");
         let kept = store.key.lock().clone().unwrap();
         assert!(kept.refused, "marked before the notice went out");
         assert_eq!(kept.seed, [5; 32], "the same key, marked");
@@ -11794,8 +12205,8 @@ mod device_key_tests {
         let store = MemoryStore::holding(5, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
         let mut live = connect_live(config_with(Some(store.clone()), None)).await;
         live.send(RETIRED).await;
-        let heard = live.notice().await;
-        assert!(heard.starts_with("MSGSIG KEY_RETIRED"), "{heard}");
+        let heard = live.key_refused().await;
+        assert!(RETIRED.ends_with(&format!(":{heard}")), "{heard}");
         let kept = store.key.lock().clone().unwrap();
         assert!(kept.refused, "marked before the notice went out");
         assert_eq!(kept.seed, [5; 32], "the same key, marked");
@@ -11861,7 +12272,7 @@ mod device_key_tests {
         };
         let mut live = connect_live(config).await;
         live.send(EXPIRED).await;
-        live.notice().await;
+        live.key_refused().await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!inner.key.lock().clone().unwrap().refused);
         assert!(inner.saves.lock().is_empty());
@@ -11872,7 +12283,7 @@ mod device_key_tests {
         let store = MemoryStore::holding(5, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
         let mut live = connect_live(config_with(Some(store.clone()), None)).await;
         live.send(EXPIRED).await;
-        live.notice().await;
+        live.key_refused().await;
         drop(live);
 
         let config = ConnectConfig {
