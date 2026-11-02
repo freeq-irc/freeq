@@ -88,7 +88,13 @@ describe("/freeq authorize before the server admits the agent", () => {
       journal: { append: () => {}, read: () => [] },
     };
     vi.stubGlobal("fetch", async () => new Response(null, { status: 404 }));
-    const rt = new AgentRuntime(harness, { botFactory: async () => new RefusedBot() });
+    let created = 0;
+    const rt = new AgentRuntime(harness, {
+      botFactory: async () => {
+        created++;
+        return new RefusedBot();
+      },
+    });
     await rt.start();
     notices.length = 0;
 
@@ -96,6 +102,8 @@ describe("/freeq authorize before the server admits the agent", () => {
     const shown = notices.find((n) => n.level === "info")?.text ?? "";
     expect(shown).toContain(minted.did);
     expect(notices.some((n) => /no DID to show/.test(n.text))).toBe(false);
+    // The held connection is the refused one; showing its DID connects nothing.
+    expect(created).toBe(1);
     await rt.stop();
     vi.unstubAllGlobals();
   });

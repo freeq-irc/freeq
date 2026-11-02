@@ -365,6 +365,13 @@ export class FreeqConnection {
         logProvenance: false,
       });
       this.#bot = bot;
+      // stop() stops only the bot it holds, and this one did not exist yet:
+      // a connection stopped while its bot was being created tears it down
+      // here, before it has a handler or a socket.
+      if (this.#stopped) {
+        await this.#discardBot();
+        return;
+      }
       this.#rooms = this.#buildRooms(bot);
       // Signed certificates will stop counting in a later release. Said once per
       // process: a retry or `authorize verify` builds a new bot and a new
@@ -529,12 +536,17 @@ export class FreeqConnection {
       });
 
       await bot.start();
+      // A stop that lands while bot.start() runs owns what is left of it: a
+      // start that still resolves, or one that rejects because the stop
+      // closed its socket, says and does nothing more here.
+      if (this.#stopped) return;
       this.#goOnline();
       this.#retry = RECONNECT_INITIAL_MS;
       // bot-kit joins the configured channels; rooms we hold keys for are
       // ours to re-enter.
       this.#enterRooms(true);
     } catch (err) {
+      if (this.#stopped) return;
       // Only the INITIAL connect is retried here. Once a bot exists, the
       // transport owns reconnection (see connectionStateChanged above).
       this.#state = "error";

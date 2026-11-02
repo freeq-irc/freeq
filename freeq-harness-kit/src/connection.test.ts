@@ -402,6 +402,82 @@ describe("transport state handling (the churn regression)", () => {
   });
 });
 
+describe("a stop that lands while start() runs", () => {
+  it("tears down a bot that is created after the stop, before it starts", async () => {
+    // stop() stops only the bot it holds, and the bot did not exist yet.
+    let resolveCreate!: (b: BotLike) => void;
+    const online: number[] = [];
+    const { conn, bot, notices } = mk({
+      onOnline: () => online.push(1),
+      botFactory: () => new Promise<BotLike>((r) => (resolveCreate = r)),
+    });
+    const starting = conn.start();
+    await conn.stop("bye");
+    resolveCreate(bot);
+    await starting;
+    expect(bot.startCalls).toBe(0);
+    expect(bot.stopped).toEqual(["discarded"]);
+    expect(online).toEqual([]);
+    expect(notices).toEqual([]);
+    expect(conn.state).toBe("offline");
+    expect(conn.bot).toBeUndefined();
+  });
+
+  it("says nothing and does not retry when the stop makes bot.start() reject", async () => {
+    vi.useFakeTimers();
+    try {
+      const online: number[] = [];
+      const { conn, bot, notices } = mk({ onOnline: () => online.push(1) });
+      let rejectStart!: (e: Error) => void;
+      bot.start = () => {
+        bot.startCalls++;
+        return new Promise((_, reject) => (rejectStart = reject));
+      };
+      bot.stop = async (reason?: string) => {
+        bot.stopped.push(reason ?? "");
+        rejectStart(new Error("disconnected before ready"));
+        return bot;
+      };
+      const starting = conn.start();
+      while (bot.startCalls === 0) await Promise.resolve();
+      await conn.stop("bye");
+      await starting;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(bot.startCalls).toBe(1);
+      expect(bot.stopped).toEqual(["bye"]);
+      expect(notices).toEqual([]);
+      expect(online).toEqual([]);
+      expect(conn.state).toBe("offline");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not come online when bot.start() resolves after the stop", async () => {
+    // bot.stop() waits for its send buffer before it disconnects, and a 001
+    // that arrives in that wait resolves bot.start().
+    const online: number[] = [];
+    const { conn, bot, notices } = mk({ onOnline: () => online.push(1) });
+    let resolveStart!: () => void;
+    bot.start = () => {
+      bot.startCalls++;
+      return new Promise((resolve) => (resolveStart = () => resolve(bot)));
+    };
+    bot.stop = async (reason?: string) => {
+      bot.stopped.push(reason ?? "");
+      resolveStart();
+      return bot;
+    };
+    const starting = conn.start();
+    while (bot.startCalls === 0) await Promise.resolve();
+    await conn.stop("bye");
+    await starting;
+    expect(online).toEqual([]);
+    expect(notices).toEqual([]);
+    expect(conn.state).toBe("offline");
+  });
+});
+
 describe("the confirmed channel set", () => {
   it("reports each change: a confirmed join, a leave, a refusal", async () => {
     let changes = 0;
