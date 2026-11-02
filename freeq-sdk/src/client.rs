@@ -6631,6 +6631,24 @@ impl Default for ReconnectConfig {
     }
 }
 
+impl ReconnectConfig {
+    /// The wait that follows a wait of `delay`: `delay` times
+    /// `backoff_factor`, plus a random jitter below a quarter of `delay`,
+    /// and never more than `max_delay`.
+    ///
+    /// `run_with_reconnect` waits `initial_delay` first and works out every
+    /// later wait with this. A client that runs its own reconnect loop calls
+    /// it too, so that it follows the same schedule (with the defaults:
+    /// 2 s, then 4 to 4.5 s, 8 to 10 s and 16 to 23 s, then 30 s each time).
+    pub fn next_delay(&self, delay: std::time::Duration) -> std::time::Duration {
+        let jitter = rand_jitter(delay.as_millis() as u64 / 4);
+        std::time::Duration::from_millis(
+            ((delay.as_millis() as f64 * self.backoff_factor) as u64 + jitter)
+                .min(self.max_delay.as_millis() as u64),
+        )
+    }
+}
+
 /// Run an event loop with automatic reconnection.
 ///
 /// The `handler` is called for each event. When disconnected, the loop
@@ -6692,12 +6710,7 @@ where
                     "Connection failed, retrying"
                 );
                 tokio::time::sleep(delay).await;
-                // Exponential backoff with jitter
-                let jitter = rand_jitter(delay.as_millis() as u64 / 4);
-                delay = std::time::Duration::from_millis(
-                    ((delay.as_millis() as f64 * reconnect_config.backoff_factor) as u64 + jitter)
-                        .min(reconnect_config.max_delay.as_millis() as u64),
-                );
+                delay = reconnect_config.next_delay(delay);
                 continue;
             }
         };
@@ -6728,11 +6741,7 @@ where
 
         tracing::info!(delay_secs = delay.as_secs(), "Disconnected, will reconnect");
         tokio::time::sleep(delay).await;
-        let jitter = rand_jitter(delay.as_millis() as u64 / 4);
-        delay = std::time::Duration::from_millis(
-            ((delay.as_millis() as f64 * reconnect_config.backoff_factor) as u64 + jitter)
-                .min(reconnect_config.max_delay.as_millis() as u64),
-        );
+        delay = reconnect_config.next_delay(delay);
     }
 }
 
@@ -6742,6 +6751,57 @@ fn rand_jitter(max: u64) -> u64 {
         return 0;
     }
     rand::random::<u64>() % max
+}
+
+#[cfg(test)]
+mod reconnect_delay_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The default schedule: each wait doubles, with a jitter below a
+    /// quarter of the wait before it, and stops at the cap.
+    #[test]
+    fn next_delay_doubles_within_its_jitter_and_stops_at_the_cap() {
+        let config = ReconnectConfig::default();
+        for _ in 0..500 {
+            let next = config.next_delay(Duration::from_secs(2));
+            assert!(next >= Duration::from_secs(4), "{next:?}");
+            assert!(next < Duration::from_millis(4500), "{next:?}");
+            let next = config.next_delay(Duration::from_secs(8));
+            assert!(next >= Duration::from_secs(16), "{next:?}");
+            assert!(next < Duration::from_secs(18), "{next:?}");
+            // 20 s doubled, with any jitter, is past the cap.
+            assert_eq!(
+                config.next_delay(Duration::from_secs(20)),
+                Duration::from_secs(30)
+            );
+            assert_eq!(
+                config.next_delay(Duration::from_secs(30)),
+                Duration::from_secs(30)
+            );
+        }
+    }
+
+    /// The factor and the cap come from the config; a zero wait has no jitter.
+    #[test]
+    fn next_delay_follows_its_config() {
+        let config = ReconnectConfig {
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(5),
+            backoff_factor: 3.0,
+            channels: Vec::new(),
+        };
+        for _ in 0..500 {
+            let next = config.next_delay(Duration::from_secs(1));
+            assert!(next >= Duration::from_secs(3), "{next:?}");
+            assert!(next < Duration::from_millis(3250), "{next:?}");
+            assert_eq!(
+                config.next_delay(Duration::from_secs(2)),
+                Duration::from_secs(5)
+            );
+        }
+        assert_eq!(config.next_delay(Duration::ZERO), Duration::ZERO);
+    }
 }
 
 #[cfg(test)]
