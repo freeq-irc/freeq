@@ -14,8 +14,12 @@ import {
   openSealed,
   sealedFromWire,
   verifyEd25519,
+  deriveKid,
   type ChannelCipher,
+  type DeviceKeySource,
+  type FoundKey,
   type FreeqClient,
+  type KeySource,
 } from "@freeq/sdk";
 import { loadOrCreateIdentity, type AgentIdentity } from "./identity.js";
 import { RoomManager, parseRoomUrl, roomUrl, verifyBundleBinding } from "./rooms.js";
@@ -331,8 +335,156 @@ describe("verifyBundleBinding", () => {
     const r3 = await verifyBundleBinding(a.identity.did, bare);
     expect(r3.ok).toBe(false);
 
-    // did:plc: accepted as published (the documented limitation).
-    expect(await verifyBundleBinding("did:plc:abc", bare)).toEqual({ ok: true });
+    // did:key binding never needs a device key reader.
+    expect(await verifyBundleBinding(a.identity.did, good, undefined, undefined)).toEqual({ ok: true });
+  });
+});
+
+// ── did:plc members: bound through a device key in their own PDS ──────
+
+const PLC = "did:plc:webuser00000000000000000";
+
+/** An Ed25519 device key, like a browser's. */
+async function devicePair(): Promise<CryptoKeyPair> {
+  return (await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"])) as CryptoKeyPair;
+}
+
+async function rawOf(p: CryptoKeyPair): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.exportKey("raw", p.publicKey));
+}
+
+/** A pre-key bundle as the web client publishes it: SPK signed by `signer`. */
+async function plcBundle(signer: CryptoKeyPair): Promise<{ identity_key: string; signed_pre_key: string; spk_signature: string; signing_key: string }> {
+  const ik = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])) as CryptoKeyPair;
+  const spk = crypto.getRandomValues(new Uint8Array(32));
+  const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", signer.privateKey, spk));
+  return {
+    identity_key: b64(new Uint8Array(await crypto.subtle.exportKey("raw", ik.publicKey))),
+    signed_pre_key: b64(spk),
+    spk_signature: b64(sig),
+    signing_key: b64(await rawOf(signer)),
+  };
+}
+
+/** A device key reader holding `published` as the DID's PDS records would,
+ *  answering `source` for each. */
+function deviceKeysOf(published: Map<string, Uint8Array>, source: KeySource = "IdentityRecord"): DeviceKeySource & { asked: number } {
+  const reader = {
+    asked: 0,
+    async keyFor(did: string, kid: string): Promise<FoundKey | null> {
+      reader.asked++;
+      for (const [ownerKid, key] of published) {
+        if (ownerKid === `${did} ${kid}`) return { publicKey: key, source, retiredAt: null, expiresAt: null };
+      }
+      return null;
+    },
+  };
+  return reader;
+}
+
+async function publish(into: Map<string, Uint8Array>, did: string, p: CryptoKeyPair): Promise<void> {
+  const raw = await rawOf(p);
+  into.set(`${did} ${await deriveKid(raw)}`, raw);
+}
+
+describe("verifyBundleBinding, did:plc", () => {
+  it("accepts a bundle signed by a device key published in the DID's PDS", async () => {
+    const device = await devicePair();
+    const published = new Map<string, Uint8Array>();
+    await publish(published, PLC, device);
+    expect(await verifyBundleBinding(PLC, await plcBundle(device), undefined, deviceKeysOf(published))).toEqual({ ok: true });
+  });
+
+  it("refuses a bundle the host substituted under the DID", async () => {
+    const device = await devicePair();
+    const published = new Map<string, Uint8Array>();
+    await publish(published, PLC, device);
+    const forged = await plcBundle(await devicePair());
+    const r = await verifyBundleBinding(PLC, forged, undefined, deviceKeysOf(published));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/not a device key published in/);
+  });
+
+  it("refuses a key only vouched for by the origin server", async () => {
+    const device = await devicePair();
+    const published = new Map<string, Uint8Array>();
+    await publish(published, PLC, device);
+    const r = await verifyBundleBinding(PLC, await plcBundle(device), undefined, deviceKeysOf(published, "OriginServer"));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/OriginServer/);
+  });
+
+  it("refuses any did:plc bundle when there is no device key reader", async () => {
+    const r = await verifyBundleBinding(PLC, await plcBundle(await devicePair()));
+    expect(r.ok).toBe(false);
+  });
+});
+
+describe("stewardPass with a did:plc member", () => {
+  async function founderWithPlc(published: Map<string, Uint8Array>, stewardRetryMs?: number[]) {
+    const dir = join(root, "founder");
+    const identity = await loadOrCreateIdentity({ seedPath: join(dir, "agent.key") });
+    const client = new FakeClient(server, identity.did);
+    client.nick = "founder";
+    client.apiBearer = server.session(identity.did);
+    const keys = deviceKeysOf(published);
+    const rooms = new RoomManager({
+      client: client.asClient(), identity, stateDir: dir, origin: ORIGIN,
+      fetch: server.fetch, log: (m) => logs.push(m), timeoutMs: 2000,
+      deviceKeys: keys, ...(stewardRetryMs ? { stewardRetryMs } : {}),
+    });
+    const made = await rooms.create();
+    server.admit(made.channel, PLC);
+    return { rooms, client, made, keys };
+  }
+
+  it("refuses a host-substituted bundle, and says why", async () => {
+    const device = await devicePair();
+    const published = new Map<string, Uint8Array>();
+    await publish(published, PLC, device);
+    const { rooms, made } = await founderWithPlc(published, []);
+    server.bundles.set(PLC, await plcBundle(await devicePair()));
+
+    const pass = await rooms.stewardPass(made.channel);
+    expect(pass.sealed).toEqual([]);
+    expect(pass.skipped).toHaveLength(1);
+    expect(pass.skipped[0].did).toBe(PLC);
+    expect(pass.skipped[0].reason).toMatch(/not a device key published in/);
+    expect(logs.some((l) => l.includes(PLC) && /not sealing/.test(l))).toBe(true);
+    expect(server.groupkeys.get(made.channel)!.some((r) => r.did === PLC)).toBe(false);
+  });
+
+  it("seals to a bundle signed by the member's published device key", async () => {
+    const device = await devicePair();
+    const published = new Map<string, Uint8Array>();
+    await publish(published, PLC, device);
+    const { rooms, made } = await founderWithPlc(published, []);
+    server.bundles.set(PLC, await plcBundle(device));
+
+    const pass = await rooms.stewardPass(made.channel);
+    expect(pass.sealed).toEqual([PLC]);
+  });
+
+  it("does not seal before the device key is published, and seals on a retry once it is", async () => {
+    const device = await devicePair();
+    const published = new Map<string, Uint8Array>();
+    const { client, made, keys } = await founderWithPlc(published, [400, 400]);
+    server.bundles.set(PLC, await plcBundle(device));
+
+    // The automatic pass (debounced 500 ms) refuses: no device key record yet.
+    client.emit("memberJoined", made.channel, { nick: "webuser" });
+    await new Promise((r) => setTimeout(r, 700));
+    expect(keys.asked).toBe(1);
+    expect(server.groupkeys.get(made.channel)!.some((r) => r.did === PLC)).toBe(false);
+
+    // The record lands; the retry 400 ms after the refusal seals.
+    await publish(published, PLC, device);
+    await new Promise((r) => setTimeout(r, 500));
+    expect(keys.asked).toBe(2);
+    expect(server.groupkeys.get(made.channel)!.some((r) => r.did === PLC)).toBe(true);
+    // Nothing left to retry: no further pass.
+    await new Promise((r) => setTimeout(r, 500));
+    expect(keys.asked).toBe(2);
   });
 });
 

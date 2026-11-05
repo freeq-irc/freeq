@@ -4,7 +4,7 @@ Started 2026-11-05. Branch: `instant-rooms`. Updated as work lands.
 
 The gaps come from the PR's "Known limitations" and `docs/INSTANT-ROOMS.md`.
 
-## 1. `did:plc` pre-key bundles are not bound to the DID — TODO
+## 1. `did:plc` pre-key bundles are not bound to the DID — DONE (branch `gaps/plc-binding`)
 
 **Problem:** a web (OAuth) member's e2ee bundle is signed with a random key, so
 a steward accepts any bundle the host serves for that DID. A hostile host can
@@ -20,6 +20,13 @@ substitute its own bundle and be sealed the room key.
   source `IdentityRecord`, never `OriginServer`) and `spk_signature` verifies.
 - An unbound did:plc bundle is refused, with a reason the steward surfaces.
 - Update the trust model + known limitations in `docs/INSTANT-ROOMS.md`.
+
+**Done:** the rule is one SDK function (`verifyBundleBinding`, with
+`PdsDeviceKeys` reading device keys straight from the PDS with repository
+proofs; the app and bot-kit delegate to it). The SDK signs the bundle with the
+device key once it loads it after SASL (`e2ee.useBundleSigningKey`). A refusal
+that may pass (record not published yet) schedules steward retries in both the
+app and bot-kit. Docs updated.
 
 ## 2. Web room secrets in localStorage — DONE (branch `gaps/room-secret-storage`)
 

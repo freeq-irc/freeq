@@ -155,6 +155,16 @@ export type {
   RecordReader,
 } from './key-lookup.js';
 
+// Whether a pre-key bundle belongs to its DID: a did:key's own key, or a
+// device key the account published in its own PDS (never the freeq host's word).
+export {
+  verifyBundleBinding,
+  PdsDeviceKeys,
+  DEVICE_KEYS_TTL_MS,
+  DEVICE_KEYS_RELIST_MS,
+} from './bundle-binding.js';
+export type { BindingResult, BindableBundle, DeviceKeySource } from './bundle-binding.js';
+
 // A device's own signing key, kept across connects
 export {
   MemoryDeviceKeyStore,
@@ -202,3 +212,5 @@ export type {
 // neither knows a verb — which verbs a kind allows is `spec/act-transitions.json`'s
 // business. Send them with `FreeqClient.sendAct`.
 export { actTags, actLine, msgidTimestampMs } from './signing.js';
+// The key id a signature names: the first 16 bytes of the key's SHA-256, base64url.
+export { deriveKid } from './signing.js';

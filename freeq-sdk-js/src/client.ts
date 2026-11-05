@@ -2840,6 +2840,16 @@ export class FreeqClient extends EventEmitter {
       }
       const pubkey = await this.signing.useKeyPair(stored.keyPair);
       this.presentedDeviceKey = stored.keyPair;
+      // The e2ee pre-key bundle is signed with the device key too: once its
+      // record is in the account's PDS, a room member can bind the bundle to
+      // the DID without taking this server's word for it. An identity that
+      // holds its own key (a did:key guest) signs with that instead.
+      const did = this.sasl?.did;
+      if (did && !this.opts.identitySigningKey) {
+        e2ee.useBundleSigningKey(did, stored.keyPair).catch((e) =>
+          log.warn('[e2ee] could not sign the pre-key bundle with the device key:', e),
+        );
+      }
       if (!stored.recordUri) this.pendingEnrollment = stored;
       else void this.relistIfVouched(stored);
       return pubkey;
