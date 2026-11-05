@@ -33,10 +33,14 @@ delete them. Fall back to memory only when IndexedDB is unavailable.
 Add room actions to pi (create / join by link / read / info / invite / keep /
 remove / rotate) using bot-kit's `RoomManager` over the existing connection.
 
-## 4. `freeq_say` waits up to 5 s for an echo on every send — TODO
+## 4. `freeq_say` waits up to 5 s for an echo on every send — DONE
 
-Wait for the echo only where it matters: one-shot CLI runs (process exits
-after the send) and room sends. A long-lived MCP server returns at once.
+The echo normally arrives in one round trip, so the 5 s only bit when the
+server refused the message and no echo was ever coming. Rather than drop the
+confirmation (an agent needs to know whether it was heard), `say` now ends
+the wait on a refusal numeric (401/403/404/406/477) for that target and
+returns `refused: "<server reason>"`. Only a stalled connection runs the
+full 5 s. Tests: `freeq-mcp/src/session.test.ts` "say confirmation".
 
 ## 5. Publish `@freeq/mcp` — TODO (after #118 merges)
 

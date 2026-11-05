@@ -230,7 +230,7 @@ export async function say(
   if (isChannel && !ctx.session.inChannel(args.target)) {
     ctx.session.join(args.target);
   }
-  const { confirmed } = await ctx.session.say(args.target, args.text);
+  const { confirmed, refused } = await ctx.session.say(args.target, args.text);
   const room = isChannel && ctx.session.isKnownRoom(args.target);
   // Being the one who talks makes us the natural steward: anyone who joined
   // while nobody was watching gets the key now, so they can read this.
@@ -240,9 +240,14 @@ export async function say(
     as: { nick: status.nick, did: status.did, mode: status.mode },
     encrypted: room || undefined,
     confirmed,
+    refused,
     sealed_key_to: sealed.length > 0 ? sealed : undefined,
     note: [
-      confirmed ? undefined : "The server did not echo the message back in time; it may not have been delivered. Check with freeq_inbox or freeq_room_read.",
+      refused
+        ? `The server refused the message: ${refused}. It was not delivered.`
+        : confirmed
+          ? undefined
+          : "The server did not echo the message back in time; it may not have been delivered. Check with freeq_inbox or freeq_room_read.",
       status.mode === "guest"
         ? "Sent as an unauthenticated guest — the room cannot verify who said this."
         : status.selfOwned

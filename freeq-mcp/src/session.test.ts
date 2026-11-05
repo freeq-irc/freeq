@@ -156,6 +156,37 @@ describe("say confirmation", () => {
     await expect(session.say("#x", "hi", 50)).resolves.toEqual({ confirmed: false });
   });
 
+  it("stops waiting at once when the server refuses the send, and says why", async () => {
+    const { session, client } = makeSession();
+    client.echo = false;
+    await session.connect();
+    const started = Date.now();
+    const pending = session.say("#quiet", "hi", 5_000);
+    client.emit("raw", ":srv 404 me #quiet :Cannot send to channel (+m)", {
+      command: "404",
+      params: ["me", "#quiet", "Cannot send to channel (+m)"],
+    });
+    await expect(pending).resolves.toEqual({
+      confirmed: false,
+      refused: "Cannot send to channel (+m)",
+    });
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  it("matches a refusal to its target, case-insensitively, and leaves other sends waiting", async () => {
+    const { session, client } = makeSession();
+    client.echo = false;
+    await session.connect();
+    const other = session.say("#open", "hi", 100);
+    const refused = session.say("Bob", "hi", 5_000);
+    client.emit("raw", ":srv 401 me bob :No such nick/channel", {
+      command: "401",
+      params: ["me", "bob", "No such nick/channel"],
+    });
+    await expect(refused).resolves.toEqual({ confirmed: false, refused: "No such nick/channel" });
+    await expect(other).resolves.toEqual({ confirmed: false });
+  });
+
   it("does not mistake someone else's message for the echo", async () => {
     const { session, client } = makeSession();
     client.echo = false;

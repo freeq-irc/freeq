@@ -50,8 +50,27 @@ export const ROOM_HISTORY_MAX = 50;
 /** How long to wait for a CHATHISTORY batch before answering without it. */
 const HISTORY_TIMEOUT_MS = 10_000;
 
-/** How long `say` waits for the server to echo our own message back. */
+/** How long `say` waits for the server to echo our own message back. The
+ *  echo normally lands in one round trip; a refusal numeric ends the wait
+ *  early (SEND_REFUSALS), so only a stalled connection runs the full time. */
 const SEND_CONFIRM_MS = 5_000;
+
+/** Numerics a server answers an undeliverable PRIVMSG with, in place of the
+ *  echo. Each carries the target as its second parameter and the reason last. */
+const SEND_REFUSALS = new Set([
+  "401", // ERR_NOSUCHNICK
+  "403", // ERR_NOSUCHCHANNEL
+  "404", // ERR_CANNOTSENDTOCHAN (+m, +n, banned, room without key...)
+  "406", // ERR_WASNOSUCHNICK
+  "477", // ERR_NEEDREGGEDNICK
+]);
+
+/** What `say` learned about delivery. `refused` carries the server's reason
+ *  when it turned the message down. */
+export interface SendResult {
+  confirmed: boolean;
+  refused?: string;
+}
 
 export type SessionMode = "authenticated" | "guest" | "offline";
 
@@ -240,7 +259,7 @@ export class FreeqSession {
   #roomChannels = new Set<string>();
   #buffers = new Map<string, BufferedMessage[]>();
   #waiters: Array<{ target?: string; resolve(m: BufferedMessage | undefined): void }> = [];
-  #echoWaiters: Array<{ target: string; text: string; resolve(): void }> = [];
+  #echoWaiters: Array<{ target: string; text: string; resolve(): void; refuse(reason: string): void }> = [];
   #asks = new Map<string, PendingAsk>();
   #inboundAsks: Array<{ req: string; from: string; question: string; at: number }> = [];
   #nick: string;
@@ -464,6 +483,10 @@ export class FreeqSession {
     // what lets `say` refuse cleanly instead of the SDK dropping the message,
     // and lets `freeq_history` redirect to the decrypted path.
     client.on("raw", ((_line: string, parsed: { command?: string; params?: string[] }) => {
+      if (parsed?.command && SEND_REFUSALS.has(parsed.command)) {
+        this.#onSendRefused(parsed.params ?? []);
+        return;
+      }
       if (parsed?.command !== "NOTICE") return;
       const text = parsed.params?.[1] ?? "";
       const m = /^([#&]\S+) is an end-to-end encrypted room/.exec(text);
@@ -594,7 +617,7 @@ export class FreeqSession {
    * Throws synchronously when not connected or when the target is a room we
    * hold no key for, so nothing is sent that the SDK would silently drop.
    */
-  say(target: string, text: string, confirmMs = SEND_CONFIRM_MS): Promise<{ confirmed: boolean }> {
+  say(target: string, text: string, confirmMs = SEND_CONFIRM_MS): Promise<SendResult> {
     const client = this.#require();
     if (isChannel(target) && this.isKnownRoom(target) && !this.hasRoomKey(target)) {
       throw new Error(
@@ -608,7 +631,18 @@ export class FreeqSession {
     return echo;
   }
 
-  #waitForEcho(target: string, text: string, timeoutMs: number): Promise<{ confirmed: boolean }> {
+  /** The server turned a send down: settle the oldest send still waiting on
+   *  that target with the reason, instead of letting it run out the clock. */
+  #onSendRefused(params: string[]): void {
+    const target = params[1];
+    if (!target) return;
+    const i = this.#echoWaiters.findIndex((w) => w.target.toLowerCase() === target.toLowerCase());
+    if (i < 0) return;
+    const reason = params.length > 2 ? params[params.length - 1] : "refused by the server";
+    this.#echoWaiters.splice(i, 1)[0].refuse(reason);
+  }
+
+  #waitForEcho(target: string, text: string, timeoutMs: number): Promise<SendResult> {
     if (timeoutMs <= 0) return Promise.resolve({ confirmed: false });
     return new Promise((resolve) => {
       const waiter = {
@@ -617,6 +651,10 @@ export class FreeqSession {
         resolve: () => {
           clearTimeout(timer);
           resolve({ confirmed: true });
+        },
+        refuse: (reason: string) => {
+          clearTimeout(timer);
+          resolve({ confirmed: false, refused: reason });
         },
       };
       this.#echoWaiters.push(waiter);
