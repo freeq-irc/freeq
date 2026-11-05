@@ -34,6 +34,7 @@ class FakeServer {
   bearers = new Map<string, string>(); // bearer → did
   calls: Call[] = [];
   removed: string[] = [];
+  invites: Array<{ channel: string; body: unknown; revoked: boolean }> = [];
   #n = 0;
 
   session(did: string): string {
@@ -97,6 +98,19 @@ class FakeServer {
             epochs: [...new Set(rows.filter((r) => r.did === did).map((r) => r.epoch))].sort(),
           })),
         });
+      }
+      if (seg[5] === "invites" && seg.length === 6) {
+        if (room.founder_did !== caller) return json(403, { error: "founder only" });
+        if (method === "POST") {
+          const n = ++this.#n;
+          this.invites.push({ channel, body, revoked: false });
+          return json(201, { invite: `tok${n}`, url: `${ORIGIN}/r/${channel.slice(1)}#tok${n}`, invite_expires_at: 1_700_000_000 + n });
+        }
+        if (method === "DELETE") {
+          let revoked = 0;
+          for (const i of this.invites) if (i.channel === channel && !i.revoked) { i.revoked = true; revoked++; }
+          return json(200, { revoked });
+        }
       }
       if (seg[5] === "keep" && method === "POST") {
         room.expires_at += 1000;
@@ -368,6 +382,19 @@ describe("create / join / loadKeys", () => {
     expect(server.calls.length).toBe(before);
   });
 
+  it("create() reports the minted channel before it JOINs, so a caller can expect the join", async () => {
+    const a = await actor("founder");
+    const seen: Array<{ channel: string; sentSoFar: number }> = [];
+    const made = await a.rooms.create({
+      beforeJoin: (channel) => seen.push({ channel, sentSoFar: a.client.sent.length }),
+    });
+    expect(seen).toEqual([{ channel: made.channel, sentSoFar: 0 }]);
+    expect(a.client.sent).toEqual([`JOIN ${made.channel}`]);
+    // The hook is not a field of the mint request.
+    const mint = server.calls.find((c) => c.path === "/api/v1/rooms")!;
+    expect(mint.body).toEqual({});
+  });
+
   it("join() sends the token as the channel key, is not ready until a steward seals, then reads", async () => {
     const a = await actor("founder");
     const made = await a.rooms.create();
@@ -571,5 +598,35 @@ describe("rotate / removeMember / keep / info", () => {
   it("surfaces the server's error text", async () => {
     const a = await actor("founder");
     await expect(a.rooms.info("#r-nope")).rejects.toThrow(/GET \/api\/v1\/rooms\/%23r-nope: no such room/);
+  });
+});
+
+describe("invite / revokeInvites", () => {
+  it("mints an invite URL with optional ttl and use limit, and revokes them all", async () => {
+    const a = await actor("founder");
+    const made = await a.rooms.create();
+
+    const inv = await a.rooms.invite(made.channel, { ttlSecs: 3600, maxUses: 2 });
+    expect(inv.url).toBe(`${ORIGIN}/r/${made.channel.slice(1)}#${inv.invite}`);
+    expect(inv.expiresAt).toBeGreaterThan(0);
+    const post = server.calls.find((c) => c.method === "POST" && c.path.endsWith("/invites"))!;
+    expect(post.path).toBe(`/api/v1/rooms/${encodeURIComponent(made.channel)}/invites`);
+    expect(post.body).toEqual({ invite_ttl_secs: 3600, max_uses: 2 });
+
+    const plain = await a.rooms.invite(made.channel.toUpperCase());
+    expect(plain.invite).not.toBe(inv.invite);
+    expect(server.calls.filter((c) => c.path.endsWith("/invites")).at(-1)!.body).toEqual({});
+
+    expect(await a.rooms.revokeInvites(made.channel)).toBe(2);
+    expect(await a.rooms.revokeInvites(made.channel)).toBe(0);
+  });
+
+  it("refuses a non-founder with the server's reason", async () => {
+    const a = await actor("founder");
+    const made = await a.rooms.create();
+    const b = await actor("member");
+    server.admit(made.channel, b.identity.did);
+    await expect(b.rooms.invite(made.channel)).rejects.toThrow(/founder only/);
+    await expect(b.rooms.revokeInvites(made.channel)).rejects.toThrow(/founder only/);
   });
 });
