@@ -1586,9 +1586,18 @@ function wireEvents(c: FreeqClient) {
     const upgrade = loadRoomUpgrade();
     const upgrading = !!upgrade && upgrade.channel === channel.toLowerCase()
       && !!saslState.did && saslState.did !== upgrade.guestDid;
-    if (upgrading) carryRoomKeys(upgrade!.guestDid, saslState.did, upgrade!.channel);
-    getRooms().onChannelJoined(channel, s().channels.get(channel.toLowerCase())?.isEncrypted ?? false);
-    if (upgrading) postRoomLink(channel).catch(() => undefined);
+    const openRoom = () => {
+      getRooms().onChannelJoined(channel, s().channels.get(channel.toLowerCase())?.isEncrypted ?? false);
+      if (upgrading) postRoomLink(channel).catch(() => undefined);
+    };
+    if (upgrading) {
+      // The carry is async (IndexedDB); the room's key load must see its result.
+      void carryRoomKeys(upgrade!.guestDid, saslState.did, upgrade!.channel).then(() => {
+        if (s().channels.has(channel.toLowerCase())) openRoom();
+      });
+    } else {
+      openRoom();
+    }
 
     // If a blip dropped us mid-call in this channel, rejoin the same AV
     // session with the same instance — the server held the slot in its grace

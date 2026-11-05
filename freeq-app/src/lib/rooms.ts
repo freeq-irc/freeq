@@ -15,11 +15,11 @@
  *    who lack it — on our own key load and whenever somebody joins. The
  *    founder also mints epoch 1 when the room has none yet.
  *
- * Opened secrets are persisted in localStorage (keyed by DID + channel,
- * base64) so a reload reads without waiting for a steward again. That is a
- * v1 choice: it is the same origin-scoped storage the e2ee identity itself
- * sits in (IndexedDB), so it widens no threat model, but a session-scoped
- * or encrypted store would be tidier.
+ * Opened secrets are persisted (keyed by DID + channel) so a reload reads
+ * without waiting for a steward again: in IndexedDB, encrypted under a
+ * non-extractable AES-GCM key, or in memory only when IndexedDB is not there
+ * (lib/room-secret-store.ts). Loading them is async; anything that arrived as
+ * ciphertext before they loaded is revealed once the cipher is installed.
  *
  * Nothing here logs a token or a secret.
  */
@@ -38,7 +38,8 @@ import {
   type GroupState,
 } from '@freeq/sdk';
 import { useStore, type RoomState } from '../store';
-import { isRoomChannel, roomInviteUrl, type StorageLike } from './room-link';
+import { isRoomChannel, roomInviteUrl } from './room-link';
+import { getRoomSecretStore, type RoomSecretStore } from './room-secret-store';
 
 // ── Server shapes ──
 
@@ -98,7 +99,7 @@ export interface RoomsDeps {
   setRoomState(channel: string, patch: Partial<RoomState>): void;
   clearRoomState(channel: string): void;
   /** Where opened secrets persist; null disables persistence. */
-  storage: StorageLike | null;
+  secrets: RoomSecretStore | null;
   sleep(ms: number): Promise<void>;
   /** REST origin, '' for same-origin. */
   origin: string;
@@ -267,25 +268,19 @@ export function createRooms(deps: RoomsDeps): Rooms {
     client.setChannelCipher(t.channel, makeGroupCipher(() => states(t.channel)));
   }
 
-  const storageKey = (did: string, ch: string) => `freeq-room-keys:${did}:${ch}`;
-
+  /** Write what we hold. Fire and forget: the store applies writes in order,
+   *  and every write is the whole (only ever growing) set of epochs. */
   function persist(did: string, t: Tracked): void {
-    if (!deps.storage || t.epochs.size === 0) return;
-    const epochs: Record<string, string> = {};
-    for (const [epoch, secret] of [...t.epochs.entries()].sort((a, b) => a[0] - b[0])) epochs[String(epoch)] = b64(secret);
-    try { deps.storage.setItem(storageKey(did, t.channel), JSON.stringify(epochs)); } catch { /* quota */ }
+    if (!deps.secrets || t.epochs.size === 0) return;
+    deps.secrets.save(did, t.channel, new Map(t.epochs)).catch(() => undefined);
   }
 
-  function restore(did: string, t: Tracked): void {
-    if (!deps.storage) return;
+  async function restore(did: string, t: Tracked): Promise<void> {
+    if (!deps.secrets) return;
     try {
-      const raw = deps.storage.getItem(storageKey(did, t.channel));
-      if (!raw) return;
-      const epochs = JSON.parse(raw) as Record<string, string>;
-      for (const [k, v] of Object.entries(epochs)) {
-        const epoch = Number(k);
+      const saved = await deps.secrets.load(did, t.channel);
+      for (const [epoch, secret] of saved) {
         if (!Number.isInteger(epoch) || epoch < 1 || t.epochs.has(epoch)) continue;
-        const secret = unb64(v);
         if (secret.length === 32) t.epochs.set(epoch, secret);
       }
     } catch { /* unreadable: start over */ }
@@ -326,7 +321,8 @@ export function createRooms(deps: RoomsDeps): Rooms {
       return false;
     }
     const did = client.authDid!;
-    restore(did, t);
+    await restore(did, t);
+    if (t.left) return false;
 
     const got = await fetchAndOpen(client, t, me);
     const info = await fetchInfo(client, t.channel);
@@ -722,7 +718,7 @@ export function getRooms(): Rooms {
       },
       setRoomState: (channel, patch) => useStore.getState().setRoomState(channel, patch),
       clearRoomState: (channel) => useStore.getState().clearRoomState(channel),
-      storage: (() => { try { return typeof localStorage !== 'undefined' ? localStorage : null; } catch { return null; } })(),
+      secrets: getRoomSecretStore(),
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
       origin: '',
       pollMs: 5_000,

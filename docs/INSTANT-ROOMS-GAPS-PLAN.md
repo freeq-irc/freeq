@@ -21,12 +21,19 @@ substitute its own bundle and be sealed the room key.
 - An unbound did:plc bundle is refused, with a reason the steward surfaces.
 - Update the trust model + known limitations in `docs/INSTANT-ROOMS.md`.
 
-## 2. Web room secrets in localStorage — TODO
+## 2. Web room secrets in localStorage — DONE (branch `gaps/room-secret-storage`)
 
 **Fix:** keep opened epoch secrets in IndexedDB, encrypted under a
 non-extractable AES-GCM key generated in the browser (same pattern as the
 device key store). Migrate existing localStorage entries on first read, then
 delete them. Fall back to memory only when IndexedDB is unavailable.
+
+**Done:** `freeq-app/src/lib/room-secret-store.ts` (`IndexedDbRoomSecretStore`,
+write-through memory mirror, ordered writes, AAD = slot). `rooms.ts` restores
+asynchronously before fetching keys; `carryRoomKeys` is async and the room
+upgrade waits for it before loading the room. No app path ever cleared these
+entries (leave keeps them by design), so `remove()` exists but nothing calls
+it yet.
 
 ## 3. Pi has no room tool — TODO
 
