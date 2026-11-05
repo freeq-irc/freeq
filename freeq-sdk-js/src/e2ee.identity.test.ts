@@ -245,3 +245,78 @@ describe('e2ee identity for a browser did:key', () => {
     expect(bundles[1].bundle.signed_pre_key).toBe(bundles[0].bundle.signed_pre_key);
   });
 });
+
+describe('e2ee bundle signed by a signed-in account’s device key', () => {
+  // A did:plc account's bundle can be bound to the DID only through a device
+  // key the account published in its own PDS. The client learns that key
+  // after e2ee has started (the device key is loaded once SASL succeeds), so
+  // the bundle is signed again with it and published again.
+  let bundles: Array<Record<string, any>>;
+
+  beforeEach(() => {
+    globalThis.indexedDB = new IDBFactory();
+    bundles = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url).endsWith('/api/v1/keys') && init?.method === 'POST') {
+        bundles.push(JSON.parse(String(init.body)));
+        return new Response('{}', { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    }));
+  });
+
+  afterEach(() => {
+    shutdown();
+    vi.unstubAllGlobals();
+  });
+
+  async function signedBy(bundle: Record<string, any>, device: CryptoKeyPair): Promise<boolean> {
+    const raw = new Uint8Array(await crypto.subtle.exportKey('raw', device.publicKey));
+    const unb64 = (s: string) => {
+      const std = s.replace(/-/g, '+').replace(/_/g, '/');
+      return Uint8Array.from(atob(std + '='.repeat((4 - (std.length % 4)) % 4)), (c) => c.charCodeAt(0));
+    };
+    const signing = unb64(bundle.signing_key);
+    if (signing.length !== raw.length || signing.some((b, i) => b !== raw[i])) return false;
+    return crypto.subtle.verify('Ed25519', device.publicKey, unb64(bundle.spk_signature), unb64(bundle.signed_pre_key));
+  }
+
+  it('re-signs and republishes the bundle when the device key arrives after initialize', async () => {
+    const { useBundleSigningKey } = await import('./e2ee');
+    const device = (await crypto.subtle.generateKey('Ed25519', false, ['sign', 'verify'])) as CryptoKeyPair;
+    await initialize(DID, ORIGIN);
+    expect(await signedBy(bundles[0].bundle, device)).toBe(false);
+    await useBundleSigningKey(DID, device);
+    expect(bundles).toHaveLength(2);
+    expect(await signedBy(bundles[1].bundle, device)).toBe(true);
+    expect(bundles[1].bundle.signed_pre_key).toBe(bundles[0].bundle.signed_pre_key);
+  });
+
+  it('signs the first bundle with a device key supplied before initialize', async () => {
+    const { useBundleSigningKey } = await import('./e2ee');
+    const device = (await crypto.subtle.generateKey('Ed25519', false, ['sign', 'verify'])) as CryptoKeyPair;
+    await useBundleSigningKey(DID, device);
+    expect(bundles).toHaveLength(0);
+    await initialize(DID, ORIGIN);
+    expect(bundles).toHaveLength(1);
+    expect(await signedBy(bundles[0].bundle, device)).toBe(true);
+  });
+
+  it('ignores a device key for another DID', async () => {
+    const { useBundleSigningKey } = await import('./e2ee');
+    const device = (await crypto.subtle.generateKey('Ed25519', false, ['sign', 'verify'])) as CryptoKeyPair;
+    await useBundleSigningKey('did:plc:someoneelse0000000000000', device);
+    await initialize(DID, ORIGIN);
+    expect(await signedBy(bundles[0].bundle, device)).toBe(false);
+  });
+
+  it('prefers the identity’s own key (a did:key guest) over a device key', async () => {
+    const { generateDidKey, importDidKeyPair, useBundleSigningKey } = { ...(await import('./index')), ...(await import('./e2ee')) };
+    const key = await generateDidKey();
+    const own = await importDidKeyPair(await key.exportSeed());
+    const device = (await crypto.subtle.generateKey('Ed25519', false, ['sign', 'verify'])) as CryptoKeyPair;
+    await useBundleSigningKey(key.did, device);
+    await initialize(key.did, ORIGIN, { signingKey: own });
+    expect(await signedBy(bundles[0].bundle, own)).toBe(true);
+  });
+});

@@ -1065,3 +1065,58 @@ describe('a stored key the account has retired', () => {
     });
   });
 });
+
+describe('the e2ee pre-key bundle of a signed-in account', () => {
+  // A did:plc bundle binds to the DID only through a device key the account
+  // published in its PDS, so the client signs its bundle with the device key.
+  let bundles: Array<Record<string, any>>;
+
+  beforeEach(() => {
+    globalThis.indexedDB = new IDBFactory();
+    bundles = [];
+    const prior = globalThis.fetch;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (String(url).endsWith('/api/v1/keys') && init?.method === 'POST') {
+          bundles.push(JSON.parse(String(init.body)).bundle);
+          return new Response('{}', { status: 200 });
+        }
+        return prior(url, init);
+      }),
+    );
+  });
+
+  afterEach(async () => {
+    (await import('./e2ee.js')).shutdown();
+  });
+
+  it('is signed by the device key', async () => {
+    const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+    const { client } = await makeClient(new MemoryDeviceKeyStore(stored));
+    client.connect();
+    await flushAsync();
+    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    ws.recv(`:srv CAP * LS :${CAPS}`);
+    await flushAsync();
+    ws.recv(`:srv CAP * ACK :${CAPS}`);
+    await flushAsync();
+    ws.recv(':srv 900 alice alice!alice@host did:plc:alice :You are now logged in');
+    await flushAsync();
+    ws.recv(':srv 903 alice :SASL authentication successful');
+    await flushAsync();
+    ws.recv(':srv 001 alice :Welcome');
+    const device = await rawPublicB64(stored.keyPair);
+    const toUrl = (s: string) => s.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    await until(() => bundles.some((b) => toUrl(b.signing_key) === device));
+    const last = bundles[bundles.length - 1]!;
+    expect(toUrl(last.signing_key)).toBe(device);
+    const unb64 = (s: string) => {
+      const std = s.replace(/-/g, '+').replace(/_/g, '/');
+      return Uint8Array.from(atob(std + '='.repeat((4 - (std.length % 4)) % 4)), (c) => c.charCodeAt(0));
+    };
+    expect(
+      await crypto.subtle.verify('Ed25519', stored.keyPair.publicKey, unb64(last.spk_signature), unb64(last.signed_pre_key)),
+    ).toBe(true);
+  });
+});
