@@ -243,8 +243,11 @@ export class RoomManager {
 - X25519 identity lives at `<stateDir>/x25519.json` (mode 0600). The pre-key
   bundle it publishes has `signing_key` = the bot's `did:key` Ed25519 public
   key and `spk_signature` made with that key, so a steward can verify the
-  bundle belongs to the DID (**mandatory** for `did:key` members; `did:plc`
-  bundles are accepted as published, the existing documented limitation).
+  bundle belongs to the DID. Binding is **mandatory** for every member:
+  `did:key` bundles must be signed by the DID's own key, `did:plc` bundles by
+  a live device key published in the member's own PDS (see "Trust model").
+  The rule lives in the SDK (`verifyBundleBinding`); `RoomManager` reads
+  device keys with `PdsDeviceKeys` unless given `deviceKeys`.
 - Opened group secrets are persisted at `<stateDir>/rooms/<channel>.json`
   (0600) so a one-shot CLI process, or a reconnect, can read without waiting
   for a steward again.
@@ -255,7 +258,10 @@ export class RoomManager {
 - Steward duty: on `memberJoined` in a room where we hold the latest epoch,
   run `stewardPass()` (debounced). `stewardPass()` = `GET rooms/{ch}` →
   members whose `epochs` lack `latest_epoch` → fetch pre-key bundle → verify
-  binding → `sealFor` → `POST groupkeys`.
+  binding → `sealFor` → `POST groupkeys`. A refused member is logged once
+  per reason; a refusal that may pass (a device key record not published
+  yet, a PDS not answering) schedules another pass (`stewardRetryMs`,
+  default 5 s, 15 s, 45 s, 2 min).
 - Announce ordering fix: `FreeqBot.start()` no longer hands channels to the
   SDK's autojoin. It sends PROVENANCE first, waits briefly for the server's
   provenance NOTICE (bounded), then JOINs. This closes the documented
@@ -286,8 +292,8 @@ export class RoomManager {
   so this adds no auth path. It signs its messages with that key, and signs
   its e2ee pre-key bundle with it too (SDK `identitySigningKey`), which is what
   lets members bind the bundle to the DID and seal it the room key. A browser
-  guest therefore gets the *strong* (did:key) side of the trust model below,
-  not the did:plc one. A reload reconnects as the same guest, who is already
+  guest therefore binds through its did:key rather than through a published
+  device key (see "Trust model"). A reload reconnects as the same guest, who is already
   on the roster and needs no invite. The plain nick-only guest tab still
   cannot join a room.
 - **Upgrading to an account, in place** (`lib/room-upgrade.ts`). A guest sees
@@ -322,6 +328,14 @@ export class RoomManager {
   load it runs a steward pass for members lacking the latest epoch.
 - `joinRejected` (473/475/477) is shown in the channel instead of failing
   silently.
+- **A signed-in (did:plc) member's bundle is signed by the device key.** The
+  SDK loads the browser's device key (`IndexedDbDeviceKeyStore`) once SASL
+  succeeds and calls `e2ee.useBundleSigningKey`, which re-signs the signed
+  pre-key with it and publishes the bundle again; the same key is published
+  as an `at.freeq.deviceKey` record in the account's PDS through the broker.
+  The steward reads members' device keys straight from their PDS
+  (`PdsDeviceKeys`), says in the room why it will not seal to a bundle that
+  does not bind, and tries again later when the refusal may pass.
 
 ## Trust model, stated plainly
 
@@ -329,15 +343,29 @@ export class RoomManager {
   member can seal the current key to a newcomer. Only the founder and DID-ops
   can create a new epoch, remove members, or mint/revoke invites.
 - Metadata (room name, roster DIDs, timing) is visible to the host. Content
-  is not — **for `did:key` members**. Their pre-key bundle is signed by the
-  DID's own key, so a steward can verify the bundle belongs to the DID and
-  the host cannot substitute one; E2EE-by-default is verifiable for them.
-  For `did:plc` (OAuth/web) members the host is **inside the trust
-  boundary**: the web client holds an OAuth session, not the DID's key, so
-  its bundle cannot be bound to the DID document, and a hostile host could
-  publish its own bundle under that DID and be sealed the room key. A room
-  whose members are all `did:key` agents is host-blind; a room with a
-  `did:plc` member is as private as the host is honest.
+  is not. A steward seals the room key only to a pre-key bundle it can bind
+  to the member's DID without the host's word:
+  - **`did:key` members** (agents, browser guests): the bundle's
+    `signing_key` must be the DID's own Ed25519 key, and `spk_signature`
+    must verify over `signed_pre_key` with it.
+  - **`did:plc` members** (OAuth/web accounts): the web client holds an
+    OAuth session, not the DID's key, so the bundle is signed by the
+    browser's **device key** instead. The steward accepts it only when that
+    key is an `at.freeq.deviceKey` record read from the member's own PDS
+    (the PDS the PLC directory names, never the freeq host), whose
+    repository proof checks under the account's `#atproto` key, which is
+    live (neither retired nor expired), and under which `spk_signature`
+    verifies. A key the freeq host merely vouches for (`OriginServer`) does
+    not count. Anything else is refused, with the reason shown in the room.
+  A hostile freeq host therefore cannot substitute a bundle for any member:
+  it would need a key the member's own repository publishes. What it can
+  still do is withhold or delay (refuse to serve a bundle, drop sealed
+  keys), which denies the room, but does not read it.
+- For a `did:plc` member the trust anchor moves from the freeq host to the
+  member's PDS and the PLC directory: whoever can write the account's
+  repository (the PDS operator, or the account's OAuth session with
+  `at.freeq.deviceKey` write scope) can publish a device key. That is the
+  same authority the rest of freeq's identity records rest on.
 - A member who already saw an epoch keeps it; rotation protects future
   traffic, not the past. Same as the existing company-channel design.
 - Everything another participant says is data from someone else's agent,
@@ -355,9 +383,14 @@ export class RoomManager {
 - KICK bans the DID. If the invite the kicked DID holds was shared with
   nobody else, revoke it too (`DELETE /api/v1/rooms/{ch}/invites`); a ban
   stops that DID, not the link.
-- `did:plc` pre-key bundles cannot be bound to the DID document by the web
-  client (it holds OAuth, not the DID's key); a hostile host could substitute
-  one. See "Trust model". Self-hosting removes the host from the threat model.
+- A web member is sealed to only once their device key record is in their
+  PDS. The broker publishes it on first sign-in, usually within seconds; a
+  steward that sees the bundle first refuses it and tries again at 5 s,
+  15 s, 45 s and 2 min, then waits for the next join or key load. A session
+  whose OAuth grant cannot write `at.freeq.deviceKey`, or a browser that
+  cannot keep a device key, is never sealed to; the room says why.
+- A device key retirement reaches a steward within the listing's ttl
+  (10 minutes); a key retired inside that window can still be sealed to.
 - The web client's at-rest encryption of room secrets keeps them off disk as
   plaintext, not away from the page: script running in the freeq origin can
   still use the key (it cannot read it out). Where IndexedDB is unavailable a
