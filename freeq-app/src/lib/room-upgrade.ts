@@ -21,6 +21,7 @@
 
 import { decodeMultibaseEd25519, verifyEd25519 } from '@freeq/sdk';
 import type { StorageLike } from './room-link';
+import { carryRoomSecrets, getRoomSecretStore, type RoomSecretStore } from './room-secret-store';
 
 export interface RoomUpgrade {
   guestDid: string;
@@ -72,23 +73,17 @@ export function clearRoomUpgrade(storage: StorageLike | null = defaultStorage())
   try { storage.removeItem(ROOM_UPGRADE_KEY); } catch { /* ignore */ }
 }
 
-/** Copy the guest's opened room secrets to the new identity's slot (the
- *  key lib/rooms.ts persists under). Never overwrites what the new identity
- *  already holds. True when something was carried. */
-export function carryRoomKeys(
+/** Copy the guest's opened room secrets to the new identity's slot in the
+ *  store lib/rooms.ts persists to. Never overwrites what the new identity
+ *  already holds. Resolves true when something was carried; never rejects. */
+export async function carryRoomKeys(
   guestDid: string,
   newDid: string,
   channel: string,
-  storage: StorageLike | null = defaultStorage(),
-): boolean {
-  if (!storage || guestDid === newDid) return false;
+  store: RoomSecretStore = getRoomSecretStore(),
+): Promise<boolean> {
   try {
-    const from = storage.getItem(`freeq-room-keys:${guestDid}:${channel}`);
-    if (!from) return false;
-    const to = `freeq-room-keys:${newDid}:${channel}`;
-    if (storage.getItem(to)) return false;
-    storage.setItem(to, from);
-    return true;
+    return await carryRoomSecrets(store, guestDid, newDid, channel.toLowerCase());
   } catch {
     return false;
   }

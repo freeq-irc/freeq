@@ -17,7 +17,7 @@ import {
 } from '@freeq/sdk';
 import { createRooms, type RoomsClient, type RoomsDeps, type X25519Pair } from './rooms';
 import type { RoomState } from '../store';
-import type { StorageLike } from './room-link';
+import { MemoryRoomSecretStore, type RoomSecretStore } from './room-secret-store';
 
 const CH = '#r-quiet-copper-fox';
 const ME = 'did:plc:me';
@@ -34,15 +34,7 @@ async function x25519Pair(): Promise<X25519Pair> {
 const b64 = (b: Uint8Array) => Buffer.from(b).toString('base64');
 const fromB64url = (s: string) => new Uint8Array(Buffer.from(s, 'base64url'));
 
-function memStorage(): StorageLike & { data: Map<string, string> } {
-  const data = new Map<string, string>();
-  return {
-    data,
-    getItem: (k) => data.get(k) ?? null,
-    setItem: (k, v) => void data.set(k, v),
-    removeItem: (k) => void data.delete(k),
-  };
-}
+
 
 /** A pre-key bundle as the server publishes it (X25519 identity + a signed pre-key). */
 async function bundleFor(pair: X25519Pair, signing?: { did: string; signer: (b: Uint8Array) => Promise<string> }) {
@@ -170,7 +162,7 @@ interface Harness {
   me: X25519Pair;
   messages: string[];
   states: Map<string, Partial<RoomState>>;
-  storage: ReturnType<typeof memStorage>;
+  secrets: RoomSecretStore;
   rooms: ReturnType<typeof createRooms>;
 }
 
@@ -180,7 +172,7 @@ async function harness(over: Partial<RoomsDeps> = {}): Promise<Harness> {
   const me = await x25519Pair();
   const messages: string[] = [];
   const states = new Map<string, Partial<RoomState>>();
-  const storage = memStorage();
+  const secrets: RoomSecretStore = over.secrets ?? new MemoryRoomSecretStore();
   const rooms = createRooms({
     getClient: () => client,
     fetch: server.fetch,
@@ -188,7 +180,6 @@ async function harness(over: Partial<RoomsDeps> = {}): Promise<Harness> {
     systemMessage: (_ch, text) => { messages.push(text); },
     setRoomState: (ch, patch) => { states.set(ch, { ...(states.get(ch) ?? {}), ...patch }); },
     clearRoomState: (ch) => { states.delete(ch); },
-    storage,
     sleep: async () => {},
     origin: '',
     pollMs: 1,
@@ -196,8 +187,9 @@ async function harness(over: Partial<RoomsDeps> = {}): Promise<Harness> {
     readyWaitMs: 1000,
     stewardDebounceMs: 0,
     ...over,
+    secrets,
   });
-  return { server, client, me, messages, states, storage, rooms };
+  return { server, client, me, messages, states, secrets, rooms };
 }
 
 /** A steward elsewhere seals `epoch` to us on the server. */
@@ -250,15 +242,15 @@ describe('loading a room key', () => {
     const h = await harness();
     const state = await sealedToUs(h);
     await h.rooms.loadRoomKeys(CH);
-    const raw = h.storage.getItem(`freeq-room-keys:${ME}:${CH}`);
-    expect(raw).toBeTruthy();
-    expect(JSON.parse(raw!)).toEqual({ '1': b64(state.secret) });
+    const saved = await h.secrets.load(ME, CH);
+    expect([...saved.keys()]).toEqual([1]);
+    expect(saved.get(1)).toEqual(state.secret);
   });
 
   it('restores a persisted secret silently when the server has nothing new', async () => {
     const h = await harness();
     const secret = crypto.getRandomValues(new Uint8Array(32));
-    h.storage.setItem(`freeq-room-keys:${ME}:${CH}`, JSON.stringify({ '1': b64(secret) }));
+    await h.secrets.save(ME, CH, new Map([[1, secret]]));
     // The server knows epoch 1 exists (sealed to someone else).
     await h.server.seal({ channel: CH, epoch: 1, secret }, BOB, (await x25519Pair()).publicKey);
 
@@ -266,6 +258,56 @@ describe('loading a room key', () => {
     expect(h.rooms.states(CH)[0].secret).toEqual(secret);
     expect(h.messages.some((m) => m.includes('Room key loaded'))).toBe(false);
     expect(h.states.get(CH)).toMatchObject({ hasKey: true, heldEpoch: 1 });
+  });
+
+  it('waits for a slow store and still reveals what arrived before the key', async () => {
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    const inner = new MemoryRoomSecretStore();
+    await inner.save(ME, CH, new Map([[1, secret]]));
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const slow: RoomSecretStore = {
+      load: async (did, ch) => { await gate; return inner.load(did, ch); },
+      save: (did, ch, e) => inner.save(did, ch, e),
+      remove: (did, ch) => inner.remove(did, ch),
+    };
+    const revealed: string[] = [];
+    const h = await harness({ secrets: slow, revealCiphertext: (ch) => { revealed.push(ch); } });
+    await h.server.seal({ channel: CH, epoch: 1, secret }, BOB, (await x25519Pair()).publicKey);
+
+    const loading = h.rooms.loadRoomKeys(CH);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(h.rooms.holdsKey(CH)).toBe(false);
+    release();
+    expect(await loading).toBe(true);
+    expect(h.rooms.states(CH)[0].secret).toEqual(secret);
+    expect(revealed).toEqual([CH]);
+  });
+
+  it('reloads from IndexedDB (encrypted) and imports an old localStorage entry', async () => {
+    await import('fake-indexeddb/auto');
+    const { IDBFactory } = await import('fake-indexeddb');
+    const { IndexedDbRoomSecretStore } = await import('./room-secret-store');
+    globalThis.indexedDB = new IDBFactory();
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    const data = new Map([[`freeq-room-keys:${ME}:${CH}`, JSON.stringify({ '1': b64(secret) })]]);
+    const legacy = {
+      get length() { return data.size; },
+      key: (i: number) => [...data.keys()][i] ?? null,
+      getItem: (k: string) => data.get(k) ?? null,
+      removeItem: (k: string) => void data.delete(k),
+    };
+    const h = await harness({ secrets: new IndexedDbRoomSecretStore({ legacy }) });
+    await h.server.seal({ channel: CH, epoch: 1, secret }, BOB, (await x25519Pair()).publicKey);
+    expect(await h.rooms.loadRoomKeys(CH)).toBe(true);
+    expect(h.rooms.states(CH)[0].secret).toEqual(secret);
+    expect(data.size).toBe(0);
+
+    // A reload: a new store over the same database, nothing in localStorage.
+    const again = await harness({ secrets: new IndexedDbRoomSecretStore({ legacy: null }) });
+    await again.server.seal({ channel: CH, epoch: 1, secret }, BOB, (await x25519Pair()).publicKey);
+    expect(await again.rooms.loadRoomKeys(CH)).toBe(true);
+    expect(again.rooms.states(CH)[0].secret).toEqual(secret);
   });
 
   it('is idempotent while a load is in flight', async () => {
@@ -336,7 +378,7 @@ describe('waiting for a key', () => {
       systemMessage: (_ch, text) => { h.messages.push(text); },
       setRoomState: (ch, patch) => { h.states.set(ch, { ...(h.states.get(ch) ?? {}), ...patch }); },
       clearRoomState: () => {},
-      storage: null,
+      secrets: null,
       sleep: async () => {},
       origin: '',
       pollMs: 1,
@@ -515,7 +557,7 @@ describe('leaving and invites', () => {
     expect(h.client.getChannelCipher(CH)).toBeNull();
     expect(h.rooms.holdsKey(CH)).toBe(false);
     expect(h.states.has(CH)).toBe(false);
-    expect(h.storage.getItem(`freeq-room-keys:${ME}:${CH}`)).toBeTruthy();
+    expect((await h.secrets.load(ME, CH)).size).toBe(1);
   });
 
   it('mints an invite and remembers its token for the copy button', async () => {

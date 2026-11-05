@@ -306,6 +306,17 @@ export class RoomManager {
 - Messages replayed before the room key arrives are decrypted in place once
   it does (`revealCiphertext`); before, a returning member saw them as `EG1:`
   text.
+- Opened epoch secrets persist per DID + channel so a reload reads at once
+  (`lib/room-secret-store.ts`). They live in IndexedDB (`freeq-room-secrets`),
+  each slot AES-GCM encrypted under one 256-bit key that WebCrypto generates
+  in the browser as non-extractable; the record's additional data names its
+  DID and channel, so a record moved to another slot does not open. Earlier
+  builds kept them as plaintext base64 in localStorage
+  (`freeq-room-keys:<did>:<channel>`); the first load imports those and
+  deletes them. Without IndexedDB (some private modes) secrets stay in memory
+  for that page only, never in localStorage. Leaving a room keeps its
+  secrets, as before. Loading is async; anything that arrived as ciphertext
+  first is revealed once the key is in.
 - On joining a `+E` room: `GET groupkeys` → open with the e2ee identity →
   `setChannelCipher`. The web client is also a steward: after its own keys
   load it runs a steward pass for members lacking the latest epoch.
@@ -347,4 +358,8 @@ export class RoomManager {
 - `did:plc` pre-key bundles cannot be bound to the DID document by the web
   client (it holds OAuth, not the DID's key); a hostile host could substitute
   one. See "Trust model". Self-hosting removes the host from the threat model.
+- The web client's at-rest encryption of room secrets keeps them off disk as
+  plaintext, not away from the page: script running in the freeq origin can
+  still use the key (it cannot read it out). Where IndexedDB is unavailable a
+  reload waits for a steward to seal the key again.
 - Pi has no room tool yet.

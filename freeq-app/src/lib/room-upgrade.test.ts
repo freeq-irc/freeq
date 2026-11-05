@@ -11,6 +11,7 @@ import {
   verifyRoomLink,
   ROOM_UPGRADE_TTL_MS,
 } from './room-upgrade';
+import { MemoryRoomSecretStore } from './room-secret-store';
 
 function memStorage() {
   const m = new Map<string, string>();
@@ -77,19 +78,30 @@ describe('the upgrade record', () => {
     expect(loadRoomUpgrade(storage, 2_000)).toBeNull();
   });
 
-  it('carries the room keys the guest held over to the new identity', () => {
-    const storage = memStorage();
-    storage.setItem(`freeq-room-keys:did:key:z6Mkguest:${ROOM}`, '{"1":"c2VjcmV0"}');
-    const carried = carryRoomKeys('did:key:z6Mkguest', ACCOUNT, ROOM, storage);
+  it('carries the room keys the guest held over to the new identity', async () => {
+    const store = new MemoryRoomSecretStore();
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    await store.save('did:key:z6Mkguest', ROOM, new Map([[1, secret]]));
+    const carried = await carryRoomKeys('did:key:z6Mkguest', ACCOUNT, ROOM, store);
     expect(carried).toBe(true);
-    expect(storage.getItem(`freeq-room-keys:${ACCOUNT}:${ROOM}`)).toBe('{"1":"c2VjcmV0"}');
+    expect((await store.load(ACCOUNT, ROOM)).get(1)).toEqual(secret);
   });
 
-  it('never overwrites keys the new identity already holds', () => {
-    const storage = memStorage();
-    storage.setItem(`freeq-room-keys:did:key:z6Mkguest:${ROOM}`, '{"1":"b2xk"}');
-    storage.setItem(`freeq-room-keys:${ACCOUNT}:${ROOM}`, '{"1":"b2xk","2":"bmV3"}');
-    expect(carryRoomKeys('did:key:z6Mkguest', ACCOUNT, ROOM, storage)).toBe(false);
-    expect(storage.getItem(`freeq-room-keys:${ACCOUNT}:${ROOM}`)).toBe('{"1":"b2xk","2":"bmV3"}');
+  it('never overwrites keys the new identity already holds', async () => {
+    const store = new MemoryRoomSecretStore();
+    const mine = crypto.getRandomValues(new Uint8Array(32));
+    await store.save('did:key:z6Mkguest', ROOM, new Map([[1, crypto.getRandomValues(new Uint8Array(32))]]));
+    await store.save(ACCOUNT, ROOM, new Map([[1, mine]]));
+    expect(await carryRoomKeys('did:key:z6Mkguest', ACCOUNT, ROOM, store)).toBe(false);
+    expect((await store.load(ACCOUNT, ROOM)).get(1)).toEqual(mine);
+  });
+
+  it('resolves false rather than rejecting when the store fails', async () => {
+    const broken = {
+      load: async () => { throw new Error('boom'); },
+      save: async () => {},
+      remove: async () => {},
+    };
+    expect(await carryRoomKeys('did:key:z6Mkguest', ACCOUNT, ROOM, broken)).toBe(false);
   });
 });
