@@ -78,7 +78,7 @@ publish in order: sdk → bot-kit → mcp, from `main` after #118 merges.
 Needs `npm login` as `chadfowler` (this machine is not logged in).
 Check `npm pack --dry-run` contents and `npx -y @freeq/mcp --help` after.
 
-## 6. PR #118 description — TODO
+## 6. PR #118 description — DONE
 
 Refresh: guests can now join with a browser did:key; freeqcc is gone from main;
 the gaps above are closed.
