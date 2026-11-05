@@ -197,6 +197,13 @@ freeq-server \
 
 See [Federation](federation.md), [S2S Auth](S2S-AUTH-PLAN.md), and [Security Guide](SECURITY.md) for details.
 
+#### Tasks this server referees
+
+A task opened on this server names it as the task's referee, as `did:web:<--server-name>`, and other servers count this server's rulings on the task only under that name, checked against the key list it publishes at `/api/v1/signing-keys/<its did:web name>`. Two limits follow from that:
+
+- **Changing `--server-name`** stalls this server's open tasks on other servers: the name inside each task no longer matches the name its rulings are signed under.
+- **Restoring the database from a backup** makes other servers drop this server's next rulings on tasks that were open at the time. Each ruling on a task is numbered, the restored database counts on from the backup, and a number another server already holds for something else is a conflict there.
+
 ### MOTD
 
 ```bash

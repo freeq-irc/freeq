@@ -17,11 +17,12 @@ import { MessageContextMenu } from './MessageContextMenu';
 import { MarkdownMessage } from './MarkdownRenderer';
 import { MENTION_RE, CHANNEL_RE, MentionSpan, ChannelSpan, type RenderCtx } from './messageEntities';
 import { CoordinationEventCard } from './CoordinationCards';
-import { ActEventCard, useActCompanion } from './ActCards';
+import { ActEventCard, useActCompanion, confirmLinesUnderCards } from './ActCards';
 import { jumbomojiSize } from '../lib/jumbomoji';
 import { buildTranscript, rowsInSelection } from '../lib/transcript';
 import { useCachedVerdict, useVerdictLookup, copyForVerdict, verdictCopy, type Verdict } from '../lib/verify-signature';
 import { VerifySignaturePanel } from './VerifySignaturePanel';
+import { isPresenceLine, summarizePresence } from '../lib/presence';
 
 // ── Colors ──
 
@@ -46,7 +47,7 @@ export function formatTime(d: Date): string {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
 }
 
-function formatDateSeparator(d: Date): string {
+export function formatDateSeparator(d: Date): string {
   const today = new Date();
   const yesterday = new Date(today);
   yesterday.setDate(yesterday.getDate() - 1);
@@ -774,13 +775,19 @@ function ReplyBadge({ msgId }: { msgId: string }) {
 
 // ── Message grouping ──
 
+/** Whether a device verdict's key has the full lock: published in the
+ *  sender's account, or their did:key DID itself. */
+function fullLock(verdict: Verdict): boolean {
+  return verdict.layer === 'published' || verdict.layer === 'did-key';
+}
+
 /** A row's signature mark, for grouping; null while its check is still out. */
 type RowMarkKind = 'lock' | 'dim-lock' | 'warning' | 'none';
 
 function rowMarkKind(verdict: Verdict | undefined): RowMarkKind | null {
   if (!verdict || verdict.state === 'pending') return null;
   if (verdict.state === 'invalid' || verdict.state === 'retired') return 'warning';
-  if (verdict.state === 'device') return verdict.layer === 'published' ? 'lock' : 'dim-lock';
+  if (verdict.state === 'device') return fullLock(verdict) ? 'lock' : 'dim-lock';
   return 'none';
 }
 
@@ -855,7 +862,7 @@ function Avatar({ nick, did, size = 40 }: { nick: string; did?: string; size?: n
 
 // ── Components ──
 
-function DateSeparator({ date }: { date: Date }) {
+export function DateSeparator({ date }: { date: Date }) {
   return (
     <div className="flex items-center gap-3 py-3 px-4">
       <div className="flex-1 border-t border-border" />
@@ -963,10 +970,7 @@ function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
           )}
           <span className="text-xs text-fg-dim whitespace-nowrap cursor-default" title={msg.timestamp.toLocaleString([], { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })}>{formatTime(msg.timestamp)}</span>
           {msg.isStreaming && <span className="text-xs text-blue-400 animate-pulse">streaming…</span>}
-          {/* `editOf` covers an edit seen live; the tag covers one replayed on
-              join, where the server collapses the revisions into a single row
-              and nothing else in the wire form says it was ever edited. */}
-          {(msg.editOf || msg.tags['+freeq.at/edited'] === '1') && !msg.isStreaming && (
+          {msg.editOf && !msg.isStreaming && (
             <span className="text-xs text-fg-dim">(edited)</span>
           )}
           {msg.encrypted && <EncryptedBadge />}
@@ -1188,11 +1192,12 @@ function InvalidSigMark({ verdict, onOpen }: { verdict?: Verdict; onOpen: OpenPr
 
 /**
  * The lock, when the sender's own device signed: at full strength once their
- * account publishes the key, at 30% while only their server vouches for it.
- * The title sits on the faded element itself, so the hover text is not faded.
+ * account publishes the key, or when the key is their did:key DID itself; at
+ * 30% while only their server vouches for it. The title sits on the faded
+ * element itself, so the hover text is not faded.
  */
 function SignedMark({ verdict, onOpen }: { verdict: Verdict; onOpen: OpenProof }) {
-  const published = verdict.layer === 'published';
+  const published = fullLock(verdict);
   return (
     <button
       type="button"
@@ -1487,34 +1492,24 @@ const NEAR_TOP_PX = 120;
  *  would leave a hole in its index space. */
 type RenderRow =
   | { kind: 'message'; key: string; msg: Message; at: number }
-  | { kind: 'notices'; key: string; text: string };
+  | { kind: 'notices'; key: string; text: string; events: Message[] };
 
-const IS_JOIN_PART = /^.+ (joined|left)$/;
-
-/** Collapse consecutive join/part notices, and index what is left by msgid. */
-function buildRenderRows(messages: Message[]): {
+/** Index the messages by msgid as render rows. With `group`, each run of two
+ *  or more join/part/quit notices collapses into one summary row. */
+function buildRenderRows(messages: Message[], group: boolean): {
   rows: RenderRow[];
   indexOfId: Map<string, number>;
 } {
   const rows: RenderRow[] = [];
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
-    if (msg.isSystem && IS_JOIN_PART.test(msg.text)) {
-      const prev = i > 0 ? messages[i - 1] : null;
-      if (prev?.isSystem && IS_JOIN_PART.test(prev.text)) continue; // in a run
-      const group: Message[] = [msg];
-      for (let j = i + 1; j < messages.length; j++) {
-        const m = messages[j];
-        if (m.isSystem && IS_JOIN_PART.test(m.text)) group.push(m);
-        else break;
-      }
-      if (group.length > 1) {
-        const joins = group.filter((m) => m.text.endsWith(' joined')).map((m) => m.text.replace(' joined', ''));
-        const parts = group.filter((m) => m.text.endsWith(' left')).map((m) => m.text.replace(' left', ''));
-        const said: string[] = [];
-        if (joins.length > 0) said.push(`${joins.slice(0, 3).join(', ')}${joins.length > 3 ? ` and ${joins.length - 3} more` : ''} joined`);
-        if (parts.length > 0) said.push(`${parts.slice(0, 3).join(', ')}${parts.length > 3 ? ` and ${parts.length - 3} more` : ''} left`);
-        rows.push({ kind: 'notices', key: msg.id, text: `— ${said.join('; ')}` });
+    if (group && isPresenceLine(msg)) {
+      let j = i + 1;
+      while (j < messages.length && isPresenceLine(messages[j])) j++;
+      if (j - i > 1) {
+        const events = messages.slice(i, j);
+        rows.push({ kind: 'notices', key: msg.id, text: `— ${summarizePresence(events)}`, events });
+        i = j - 1;
         continue;
       }
     }
@@ -1571,17 +1566,21 @@ export function MessageList() {
     if (s.activeChannel === 'server') return s.serverMessages;
     return s.channels.get(s.activeChannel.toLowerCase())?.messages || [];
   });
-  const showJoinPart = useStore((s) => s.showJoinPart);
+  const joinPartDisplay = useStore((s) => s.joinPartDisplay);
   const blockedDids = useStore((s) => s.blockedDids);
   const blockedNicks = useStore((s) => s.blockedNicks);
   const activeMembers = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.members);
+  const actTasks = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.actTasks);
+  const lastReadMsgId = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.lastReadMsgId);
   /** A DM buffer: not the server tab, and not a channel name. */
   const isDM = activeChannel !== 'server' && !activeChannel.startsWith('#') && !activeChannel.startsWith('&');
 
-  // Filter out join/part/quit noise unless the user opted in.
-  // Keep moderation actions (kicks, bans, mode changes) always visible.
-  const JOIN_PART_RE = /^.+ (joined|left|quit)(\s|$)/;
-  const messages = useMemo(() => {
+  // Join/part/quit notices are hidden unless the reader opted in.
+  // Moderation actions (kicks, bans, mode changes) are always visible.
+  // The "New" divider goes before the row after the last read one in time
+  // order, worked out before a confirmation line moves under its card: in the
+  // drawn order a card would be its own line's predecessor.
+  const { messages, firstUnreadId } = useMemo(() => {
     let msgs = rawMessages;
     // Hide messages from blocked users (DID first, nick fallback for guests).
     if (blockedDids.length > 0 || blockedNicks.length > 0) {
@@ -1592,9 +1591,13 @@ export function MessageList() {
         return !blockedNicks.includes(m.from.toLowerCase());
       });
     }
-    if (showJoinPart) return msgs;
-    return msgs.filter((m) => !m.isSystem || !JOIN_PART_RE.test(m.text));
-  }, [rawMessages, showJoinPart, blockedDids, blockedNicks, activeMembers]);
+    if (joinPartDisplay === 'hidden') msgs = msgs.filter((m) => !isPresenceLine(m));
+    const readAt = lastReadMsgId ? msgs.findIndex((m) => m.id === lastReadMsgId) : -1;
+    return {
+      messages: confirmLinesUnderCards(msgs, actTasks),
+      firstUnreadId: readAt >= 0 ? msgs[readAt + 1]?.id : undefined,
+    };
+  }, [rawMessages, joinPartDisplay, blockedDids, blockedNicks, activeMembers, actTasks, lastReadMsgId]);
 
   /** Whether anything on screen came from a sender, as opposed to join and
    *  part notices. A channel with none has nothing for the boundary row to
@@ -1604,7 +1607,10 @@ export function MessageList() {
   /** The rendered list, and where each row sits in it. Only a window of these
    *  is mounted at a time, so an index is the only handle on a row that works
    *  whether or not it is on screen. */
-  const { rows, indexOfId } = useMemo(() => buildRenderRows(messages), [messages]);
+  const { rows, indexOfId } = useMemo(
+    () => buildRenderRows(messages, joinPartDisplay === 'grouped'),
+    [messages, joinPartDisplay],
+  );
   /** Regrouped when a verdict settles, so a row whose mark differs from its
    *  header's moves out then. */
   const verdictOf = useVerdictLookup();
@@ -1635,7 +1641,6 @@ export function MessageList() {
     isPeerBlocked(allChannels, activeChannel, blockedNicks, blockedDids,
       (did) => getClient()?.getNickForDid(did));
 
-  const lastReadMsgId = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.lastReadMsgId);
   const pins = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.pins ?? EMPTY_PINS);
   const density = useStore((s) => s.messageDensity);
   const ref = useRef<HTMLDivElement>(null);
@@ -1898,6 +1903,15 @@ export function MessageList() {
   // Scroll to a specific message (from search, reply click, etc.)
   const scrollToMsgId = useStore((s) => s.scrollToMsgId);
   const [highlightId, setHighlightId] = useState<string | null>(null);
+  /** Grouped join/part rows the reader has opened, by the run's first id. */
+  const [expandedNotices, setExpandedNotices] = useState<Set<string>>(() => new Set());
+  const toggleNotices = useCallback((key: string) => {
+    setExpandedNotices((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
+  }, []);
   const [pendingJump, setPendingJump] = useState<string | null>(null);
   /** The same, for the activation timers to read: they fire after the render
    *  that set it and would otherwise close over the value from before. */
@@ -2150,11 +2164,33 @@ export function MessageList() {
             row.kind === 'notices' ? (
               <div key={row.key} id={`msg-${row.key}`} className="px-4 py-0.5 flex items-start gap-3">
                 <span className="w-10 shrink-0" />
-                <span className="text-fg-dim text-xs opacity-60">{row.text}</span>
+                <div className="min-w-0">
+                  <button
+                    type="button"
+                    onClick={() => toggleNotices(row.key)}
+                    aria-expanded={expandedNotices.has(row.key)}
+                    title={`${row.events.length} join/leave events — click to ${expandedNotices.has(row.key) ? 'collapse' : 'expand'}`}
+                    className="text-fg-dim text-xs opacity-60 hover:opacity-100 text-left"
+                  >
+                    {row.text} {expandedNotices.has(row.key) ? '▴' : '▾'}
+                  </button>
+                  {expandedNotices.has(row.key) && (
+                    <ul className="mt-0.5 space-y-0.5">
+                      {row.events.map((e) => (
+                        <li key={e.id} className="text-fg-dim text-[11px] opacity-60">
+                          {e.text}{' '}
+                          <span className="opacity-70">
+                            {e.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
               </div>
             ) : (
             <div key={row.key} id={`msg-${row.key}`} className={highlightId === row.key ? 'bg-accent/10 transition-colors duration-1000' : ''}>
-              {lastReadMsgId && row.at > 0 && messages[row.at - 1].id === lastReadMsgId && !row.msg.isSelf && (
+              {firstUnreadId !== undefined && row.msg.id === firstUnreadId && !row.msg.isSelf && (
                 <div className="flex items-center gap-3 px-4 my-3" id="unread-marker">
                   <div className="flex-1 h-px bg-danger/40" />
                   <span className="text-xs font-bold text-danger/70 uppercase tracking-wider">New</span>

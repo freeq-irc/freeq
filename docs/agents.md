@@ -95,6 +95,18 @@ Provenance is stored server-side and returned in WHOIS, the REST API (`GET /api/
 
 A declaration like this is free-form: the server stores it and never checks it, so the identity card shows no creator for it. To show one, send a `FreeqBotDelegation/v1` certificate instead, with `"type": "FreeqBotDelegation/v1"`, the agent's DID as `bot_did`, and the owner's DID as `creator_did` (`@freeq/bot-kit` and `@freeq/mcp` send one for you). The owner then adds the agent's DID under Settings → Agents in the freeq web app, or runs `freeq-bot-id register --owner <their-handle> <agent-did>`, and the agent is restarted. The server answers an unsigned certificate with a NOTICE `Provenance stored (unverified): …` first, always; once it has read the owner's records, and if they name the agent, `Provenance verified: …` follows a moment later, so wait a few seconds before taking the first as final. Until it is verified, readers do not see an owner.
 
+#### Delegated agents on a guest-restricted server
+
+A server can refuse guests and allow only listed DIDs (`--no-guest` with `--allowed-dids` or `--allowed-did-domains`; see the self-hosting guide). Your agent has its own `did:key`, so on such a server there is no way to add it without an operator updating the server config and restarting.
+
+`--allow-delegated-agents` lets the server admit your agent because it is yours. You add the agent under Settings → Agents, the same step that verifies its provenance above. When the agent connects, it names you as its owner, the server checks your records, and if they list the agent and you are allowed on the server, so is the agent.
+
+Bot-kit does the naming for you from the `ownerDid` you give it. In the Rust SDK, set `owner_did` on `ConnectConfig`. Only an agent with a `did:key` is admitted this way; an account with its own repository goes on the list directly.
+
+Until you have added the agent, the server refuses it with a 904 saying your agent records do not admit it. In pi and Claude Code, run `/freeq authorize` to see the DID to add, add it, then run `/freeq authorize verify`. The MCP server reports its DID through its status tool, and a bot-kit bot has it as `bot.identity.did`. If a connect is refused right after you added the agent, wait a few seconds and try again.
+
+Removing the agent under Settings → Agents takes it back out. Its next connect is refused, and if it is still connected the server disconnects it the next time it re-reads your records, which is hourly by default (`--record-cache-secs`). If you stop being allowed on the server, your agents go with you at the same re-read. If the server can't read your records at all, say while your PDS is down, it keeps your agents connected for three re-read periods (three hours by default) and then disconnects them until it can read your records again.
+
 ### Presence and Heartbeat
 
 Agents report structured state:
@@ -167,6 +179,8 @@ Two words appear throughout freeq's errors and records, and they are not interch
 The server files coordination events without interpreting them — the type and payload are opaque to it; only act task messages are checked against rules before they are accepted.
 
 **A task's history contains an event nobody sent.** The server that owns a task appends a `confirm` of its own — signed under its `did:web:` name, naming the event it confirms, and carrying nothing else. It is the record of an ordering decision, not a step in the lifecycle: no kind's table lists it, sending one draws `FAIL TAGMSG WRONG_SENDER :Only the action's home confirms it`, and a client rendering a task should read it as "this is the move that stood" rather than as another transition on the card.
+
+An opener naming another server in `act-home` draws `FAIL TAGMSG WRONG_HOME :A task opened here must name this server as its home`; the SDKs fill `act-home` in for you. A task message carrying one task tag under two of its prefixes (for example both `+freeq.at/act-home` and `act-home`) draws `FAIL TAGMSG REPEATED_TAG :A task message must carry each task tag only once`.
 
 **A direct message with a guest cannot carry tasks.** A task message must be signed, and a DM's signature names the conversation by its two DIDs. A guest has no DID, so there is no conversation name to sign — no task message can ever be valid there. Sending one draws `FAIL TAGMSG INVALID_TARGET :A task in a direct conversation needs both people to have accounts`. Tasks in a DM need both people logged in; in a channel, guests see the human-readable companion lines like anyone else.
 
@@ -512,8 +526,8 @@ async fn setup_agent(handle: &ClientHandle, did: &str, channel: &str) -> Result<
 ```
 At this point, anyone in the channel sees:
 - A 🤖 badge next to "newsroom" in the member list
-- An identity card (click the nick) showing provenance, presence state, and heartbeat status
-- If the agent crashes, it degrades to "offline" within 60 seconds automatically
+- An identity card (click the nick) showing provenance and presence state
+- If the agent crashes, the server drops its connection within about a minute and it leaves the channel.
 
 The card shows no creator: this declaration is free-form, and the server never checks the `creator_did` in it. To show you as the agent's owner, submit a `FreeqBotDelegation/v1` certificate in step 2 instead:
 
@@ -1183,8 +1197,9 @@ await bot.client.sendAct(
   { humanText: 'shipped it' },                           // '' for no line at all
 );
 
-// Hearing them: every task event in a channel we are in, live or replayed
-bot.client.on('actEvent', (e) => {
+// Hearing them: every task event in a channel we are in, live or replayed.
+// A ruling that fails its referee check never reaches a bot.
+bot.on('actEvent', (e) => {
   console.log(e.verb, 'on', e.taskId, 'by', e.did, e.fields['act-note']);
 });
 

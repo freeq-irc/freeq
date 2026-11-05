@@ -451,6 +451,7 @@ mod auth_tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            owner_did: None,
         };
         let enc = auth::encode_response(&r);
         use base64::Engine;
@@ -497,6 +498,7 @@ mod auth_tests {
             pds_url: Some("https://pds".into()),
             dpop_proof: Some("proof".into()),
             challenge_nonce: Some("n".into()),
+            owner_did: None,
         };
         let enc = auth::encode_response(&r);
         use base64::Engine;

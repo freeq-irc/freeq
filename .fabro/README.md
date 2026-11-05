@@ -12,7 +12,27 @@ Two ways work reaches it:
   workflow, close the lid; it keeps going on the boxd VM.
 
 Either way, run lifecycle lands in **#freeq-dev** on irc.freeq.at (started,
-finished + PR link, failed + reason, waiting for your approval).
+finished + PR link, failed + reason, waiting for your approval), and you can
+drive Fabro back from any freeq client — including your phone.
+
+## Driving it from freeq
+
+The `fabro` bot in #freeq-dev takes commands from its owner only (checked
+against the sender's server-verified DID; everyone else is ignored). Address
+it in the channel, or DM it without the prefix:
+
+| Command | Does |
+|---|---|
+| `fabro status` | Active runs, and any gate waiting on you |
+| `fabro run bug-hunt` | Fire an upkeep automation now, from `main` |
+| `fabro run feature <goal…>` | Start a workflow with a goal (handoff from your phone) |
+| `fabro approve [id]` / `fabro deny [id]` | Answer a waiting yes/no gate — id optional if only one waits |
+| `fabro answer <id> <choice or text>` | Multiple-choice / freeform gates |
+| `fabro cancel <id>` | Cancel a run |
+| `fabro help` | This list |
+
+`id` is the 6-character tag every notification carries, e.g. `[ndb1qw]`.
+Approval pings include the gate's actual question and the reply to send.
 
 ## The workflows
 
@@ -33,10 +53,12 @@ implementer for up to 2 bounded retries first.
 ## PR policy and models
 
 Set in [`project.toml`](project.toml): PRs open **ready for review**,
-squash-merge, **never auto-merged**. Default model `claude-sonnet-5-5`;
-hunt/explore/plan/implement nodes use `claude-opus-5-5`. Fabro 0.254 (the
-latest stable) predates the 5.5 family, so both are declared as custom models
-on the executor ([`executor/models.toml`](executor/models.toml)).
+squash-merge, **never auto-merged**. Every node names its model —
+`claude-sonnet-5-5`, or `claude-opus-5-5` for hunt/explore/plan/implement.
+The run-level default stays `claude-sonnet-4-6` because Fabro writes the PR
+title/body with a forced tool call, which the 5.5 family rejects. Fabro 0.254
+(the latest stable) predates the 5.5 family, so both are declared as custom
+models on the executor ([`executor/models.toml`](executor/models.toml)).
 
 ## Handoff from the laptop
 

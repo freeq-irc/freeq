@@ -44,6 +44,10 @@ pub struct ChallengeResponse {
     /// bind the response to the specific challenge that was issued.
     #[serde(default)]
     pub challenge_nonce: Option<String>,
+    /// The owner this agent acts for. An allowlisted server lets the agent in
+    /// if the owner's at.freeq.agentKey records list it.
+    #[serde(default)]
+    pub owner_did: Option<String>,
 }
 
 /// Stored challenge data: the struct for validation + raw bytes for signature verification.
@@ -527,6 +531,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            owner_did: None,
         };
         let json = serde_json::to_vec(&resp).unwrap();
         assert!(
@@ -598,6 +603,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            owner_did: None,
         };
         let json = serde_json::to_vec(&resp).unwrap();
         let encoded = URL_SAFE_NO_PAD.encode(&json);
@@ -614,6 +620,7 @@ mod tests {
             pds_url: Some("https://pds.example.com".to_string()),
             dpop_proof: None,
             challenge_nonce: Some("test-nonce".to_string()),
+            owner_did: None,
         };
         let json = serde_json::to_vec(&resp).unwrap();
         let encoded = URL_SAFE_NO_PAD.encode(&json);
@@ -649,6 +656,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            owner_did: None,
         };
 
         let result = verify_response(&challenge, &challenge_bytes, &response, &resolver).await;
@@ -683,6 +691,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            owner_did: None,
         };
 
         let result = verify_response(&challenge, &challenge_bytes, &response, &resolver).await;
@@ -715,6 +724,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            owner_did: None,
         };
 
         let result = verify_response(&challenge, &challenge_bytes, &response, &resolver).await;
@@ -747,6 +757,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            owner_did: None,
         };
 
         let result = verify_response(&challenge, &challenge_bytes, &response, &resolver).await;

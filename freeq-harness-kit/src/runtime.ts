@@ -34,11 +34,12 @@ import {
   type Tier,
 } from "./config.js";
 import { defaultNick, deriveInstallSlug, isDid, resolveBotName } from "./identity.js";
-import { isTerminal } from "@freeq/bot-kit";
+import { isTerminal, loadOrCreateIdentity } from "@freeq/bot-kit";
 import {
   agentInstructions,
   authorizeInstructions,
   creatorKeyPath,
+  firstSignedCertificateWarning,
   interpretProvenanceNotice,
   waitForProvenance,
 } from "./owner-key.js";
@@ -93,12 +94,14 @@ export const FREEQ_ROOT = joinPath(homedir(), ".freeq");
 export const BOTS_ROOT = joinPath(FREEQ_ROOT, "bots");
 
 /**
- * The owner's creator key, if an older `/freeq authorize` made one. When
+ * The owner's creator key, if an older `/freeq authorize`, `--sign-cert` or
+ * the signer made one. When
  * present, bot-kit signs the installation's delegation certificate with it
  * and the server can verify that signature against a key the owner
- * registered. Absent, the cert ships unsigned and the server proves it from
- * the owner's agent record naming this installation (Settings → Agents in
- * the web app, or `freeq-bot-id register`).
+ * registered; that is deprecated, and signed certificates will stop counting
+ * in a later release. Absent, the cert ships unsigned and the server proves it
+ * from the owner's agent record naming this installation (Settings → Agents
+ * in the web app, or `freeq-bot-id register`).
  */
 async function existingCreatorKey(cfg: { ownerDid?: string }): Promise<string | undefined> {
   if (!cfg.ownerDid) return undefined;
@@ -271,6 +274,13 @@ export class AgentRuntime {
 
   readonly #botFactory: BotFactory | undefined;
 
+  /**
+   * Inbound handlers still running: a message, a task event, the resume on
+   * connect. Each is fire-and-forget from the wire's point of view; this is
+   * what `settled()` waits on.
+   */
+  readonly #inFlight = new Set<Promise<unknown>>();
+
   constructor(
     readonly harness: Harness,
     options: RuntimeOptions = {},
@@ -286,6 +296,32 @@ export class AgentRuntime {
 
   /** How text and the wire name this harness. */
   readonly names: HarnessNames;
+
+  /**
+   * Remember an inbound handler's promise until it settles.
+   *
+   * Only the removal is attached. The derived promise is left unhandled on
+   * purpose: a handler that throws still surfaces as exactly one unhandled
+   * rejection carrying its own error, as it did before it was tracked.
+   */
+  #track(p: Promise<unknown>): void {
+    this.#inFlight.add(p);
+    void p.finally(() => this.#inFlight.delete(p));
+  }
+
+  /**
+   * Resolves once every inbound handler that has started — a message, a
+   * task event, the resume on connect, and the connection's own coordination
+   * handler — has finished, including any handler one of them started. For
+   * tests and shutdown. Never throws: a failing handler still reports as an
+   * unhandled rejection, not here.
+   */
+  async settled(): Promise<void> {
+    do {
+      while (this.#inFlight.size > 0) await Promise.allSettled([...this.#inFlight]);
+      await this.conn?.settled();
+    } while (this.#inFlight.size > 0);
+  }
 
   // ── presence ────────────────────────────────────────────────────────────
 
@@ -1300,6 +1336,11 @@ export class AgentRuntime {
           // undefined from the line above, so read it through a fresh
           // binding.
           const live = (): FreeqConnection | undefined => this.conn as FreeqConnection | undefined;
+          // A connect refused at SASL never sends a provenance notice.
+          if (live()?.state === "error") {
+            this.notify(`freeq: the server refused this installation: ${live()?.lastError}`, "warning");
+            return;
+          }
           // An unverified reply comes first; a verified one follows once
           // the server has read the owner's records.
           const notice = await waitForProvenance(() => live()?.provenanceNotice, {
@@ -1311,8 +1352,17 @@ export class AgentRuntime {
           return;
         }
         if (rest[0] === "--sign-cert") {
-          // For a server that does not read agent records yet: sign the
-          // certificate with a creator key the owner registers by MSGSIG.
+          // Deprecated; to be removed in a later release: sign the certificate with a
+          // creator key the owner registers by MSGSIG. It still works; it
+          // says so first, once per process, and the `authorize verify` it
+          // points to does not say it again.
+          if (firstSignedCertificateWarning()) {
+            this.notify(
+              "Signing certificates with a creator key is deprecated: signed certificates will stop counting in a later release, " +
+                `and every server now reads agent records instead. Prefer \`${this.names.hint("authorize")}\` and add this agent under Settings → Agents.`,
+              "warning",
+            );
+          }
           const ins = await authorizeInstructions({ ownerDid: cfg.ownerDid, root: FREEQ_ROOT, names: this.names });
           this.notify(
             [
@@ -1327,9 +1377,11 @@ export class AgentRuntime {
           );
           return;
         }
-        // The DID is this project's identity, made on its first connect.
+        // The DID is this project's identity, minted on its first connect.
         if (!this.conn?.did) await this.connect();
-        const botDid = (this.conn as FreeqConnection | undefined)?.did;
+        const bot = (this.conn as FreeqConnection | undefined)?.bot;
+        const onDisk = this.conn?.did && bot?.stateDir ? undefined : await this.#identityOnDisk(cfg);
+        const botDid = (this.conn as FreeqConnection | undefined)?.did ?? onDisk?.did;
         if (!botDid) {
           this.notify(
             `freeq: not connected yet, so this installation has no DID to show. Run ${this.names.hint("status")}.`,
@@ -1337,7 +1389,14 @@ export class AgentRuntime {
           );
           return;
         }
-        const ins = await agentInstructions({ ownerDid: cfg.ownerDid, botDid, root: FREEQ_ROOT, names: this.names });
+        const ins = await agentInstructions({
+          ownerDid: cfg.ownerDid,
+          botDid,
+          root: FREEQ_ROOT,
+          signature: bot?.delegation?.signature,
+          stateDir: bot?.stateDir ?? onDisk?.stateDir,
+          names: this.names,
+        });
         this.notify(
           ["freeq authorize — add this installation as one of your agents", "", ...ins.steps].join("\n"),
           "info",
@@ -1972,6 +2031,35 @@ export class AgentRuntime {
     return this.config;
   }
 
+  /** Where bot-kit keeps this project's state, named after the install and
+   *  the project. */
+  #botStateDir(cfg: FreeqConfig, project: string | undefined): string {
+    const slug = cfg.install ?? deriveInstallSlug();
+    const name = resolveBotName(
+      slug,
+      project,
+      (n: string) => existsSync(joinPath(BOTS_ROOT, n)),
+      this.names.name,
+    );
+    return joinPath(BOTS_ROOT, name);
+  }
+
+  /** This project's identity as its key file holds it, and where that file
+   *  lives; none before the first connect mints it. */
+  async #identityOnDisk(cfg: FreeqConfig): Promise<{ did: string; stateDir: string } | undefined> {
+    const meta = await collectSessionMeta({ cwd: this.harness.cwd(), model: this.harness.modelId() });
+    const stateDir = this.#botStateDir(cfg, meta.project);
+    const seedPath = joinPath(stateDir, "agent.key");
+    if (!existsSync(seedPath)) return undefined;
+    try {
+      const identity = await loadOrCreateIdentity({ seedPath });
+      return { did: identity.did, stateDir };
+    } catch (err) {
+      this.notify(`freeq: could not read ${seedPath}: ${(err as Error).message}`, "warning");
+      return undefined;
+    }
+  }
+
   /**
    * Has this installation used freeq in this project before?
    *
@@ -1984,14 +2072,7 @@ export class AgentRuntime {
     const meta = await collectSessionMeta({ cwd: this.harness.cwd(), model: this.harness.modelId() });
     this.currentProject = meta.project;
     if (meta.project && cfg.projects?.[meta.project]) return true;
-    const slug = cfg.install ?? deriveInstallSlug();
-    const name = resolveBotName(
-      slug,
-      meta.project,
-      (n: string) => existsSync(joinPath(BOTS_ROOT, n)),
-      this.names.name,
-    );
-    if (existsSync(joinPath(BOTS_ROOT, name))) return true;
+    if (existsSync(this.#botStateDir(cfg, meta.project))) return true;
     // A git checkout is somewhere someone means to keep working; a bare
     // directory is usually somewhere they are trying something out.
     return !!meta.repo || !!meta.branch;
@@ -2213,7 +2294,7 @@ export class AgentRuntime {
       },
 
       onMessage: (channel, msg) => {
-        void (async () => {
+        this.#track((async () => {
           const did = await this.conn!.resolveSenderDid(msg);
           try {
             if (this.harness.intercept?.({ channel, from: msg.from, did, text: msg.text })) return;
@@ -2276,27 +2357,32 @@ export class AgentRuntime {
             // Someone addressed us in a room: answer in the room.
             { replyToChannel: mention.addressed },
           );
-        })();
+        })());
       },
 
       onActEvent: (ev) => {
-        void (async () => {
+        this.#track((async () => {
           const store = await this.ensureHandoffs();
 
           // Check the signature BEFORE applying. Three-way outcome per the
           // RFC: a forgery is rejected, but an unreachable key store is an
           // outage — deferring beats destroying someone's completed work.
+          // A ruling the SDK found counts was checked there, against its
+          // referee's own key list: the kit does no check of its own.
           this.keyFetcher ??= serverKeyFetcher(httpOriginFor(cfg.server));
-          const verdict = await verifyActEvent(
-            {
-              channel: ev.channel,
-              did: ev.did,
-              eventId: ev.eventId,
-              tags: ev.tags,
-              sigTag: ev.sigTag,
-            },
-            { fetchKey: this.keyFetcher, selfDid: this.conn?.did ?? "" },
-          );
+          const verdict =
+            ev.ruling === "counts"
+              ? { outcome: "valid" as const, reason: "the SDK found the ruling counts" }
+              : await verifyActEvent(
+                  {
+                    channel: ev.channel,
+                    did: ev.did,
+                    eventId: ev.eventId,
+                    tags: ev.tags,
+                    sigTag: ev.sigTag,
+                  },
+                  { fetchKey: this.keyFetcher, selfDid: this.conn?.did ?? "" },
+                );
 
           if (verdict.outcome === "invalid") {
             // Do not apply, and say so loudly: this is tampering or forgery,
@@ -2336,7 +2422,7 @@ export class AgentRuntime {
             );
           }
           await this.#onHandoffEvent(cfg, ev, result.record, result.created);
-        })();
+        })());
       },
 
       // Every connect, including a reconnect after a dropped socket — the gap
@@ -2349,10 +2435,10 @@ export class AgentRuntime {
         } catch {
           /* presentation is best-effort */
         }
-        void (async () => {
+        this.#track((async () => {
           const message = await this.resumeAssigned(cfg);
           if (message !== "freeq: nothing to resume") this.notify(message, "info");
-        })();
+        })());
       },
 
       onAsk: (ask) => {

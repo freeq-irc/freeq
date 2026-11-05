@@ -5,19 +5,25 @@ import { render, cleanup, waitFor, fireEvent } from '@testing-library/react';
 // Display resolution reads the SDK's learned nick↔DID map; give it one name to
 // find so a row carrying a DID can be asserted as the name it resolves to.
 const NAMED_DID = 'did:plc:namedone';
+// The task timeline asks the SDK client for a task's history, and the audit
+// timeline for the channel's audit.
+const taskHistory = vi.fn();
+const channelAudit = vi.fn();
 vi.mock('../irc/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../irc/client')>()),
   getClient: () => ({
     apiBearer: null,
     getNickForDid: (did: string) => (did === NAMED_DID ? 'carol' : undefined),
+    taskHistory,
+    channelAudit,
   }),
 }));
 
 import { CoordinationEventCard } from './CoordinationCards';
 import { TaskTimeline } from './TaskTimeline';
 import { AuditTimeline } from './AuditTimeline';
+import { formatDateSeparator } from './MessageList';
 import type { Message } from '../store';
-import * as api from '../lib/api';
 
 afterEach(() => {
   cleanup();
@@ -65,10 +71,7 @@ describe('act surfaces carry no resting signature ink', () => {
       event_id: '01KZACPT00000000000000ACPT',
       canonical: JSON.stringify({ 'act-verb': 'accept', 'act-id': ACT_ID }),
     };
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve({ task: null, events: [offer, accept] }),
-    }));
+    taskHistory.mockResolvedValue({ act_id: ACT_ID, task: null, events: [offer, accept] });
 
     const { container, getAllByText } = render(
       <TaskTimeline actId={ACT_ID} onClose={() => {}} />,
@@ -96,10 +99,7 @@ describe('the audit timeline never renders a raw DID', () => {
       signature: 'ed25519:kid:sigsigsig',
       timestamp: 0,
     };
-    vi.spyOn(api, 'apiFetch').mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve({ events: [event] }),
-    } as unknown as Response);
+    channelAudit.mockResolvedValue({ events: [event] });
 
     const { container } = render(<AuditTimeline channel="#naptest" onClose={() => {}} />);
     // Nothing resolves this bot, so it wears the compact form — not a DID
@@ -114,31 +114,20 @@ describe('the audit timeline never renders a raw DID', () => {
 // named, the cards' seal, and the same verify link every signed row carries.
 describe('the audit timeline says why it is empty', () => {
   it('tells a refused reader the audit is for signed-in members', async () => {
-    vi.spyOn(api, 'apiFetch').mockResolvedValue({
-      ok: false,
-      status: 403,
-      json: () => Promise.resolve({ error: 'Forbidden' }),
-    } as unknown as Response);
+    channelAudit.mockRejectedValue(Object.assign(new Error('refused'), { status: 403 }));
     const { container } = render(<AuditTimeline channel="#naptest" onClose={() => {}} />);
     await waitFor(() => expect(container.textContent).toContain("This channel's audit is shown only to signed-in members."));
     expect(container.textContent).not.toContain('No audit events found.');
   });
 
   it('says when the audit could not be loaded', async () => {
-    vi.spyOn(api, 'apiFetch').mockResolvedValue({
-      ok: false,
-      status: 500,
-      json: () => Promise.resolve({}),
-    } as unknown as Response);
+    channelAudit.mockRejectedValue(Object.assign(new Error('failed'), { status: 500 }));
     const { container } = render(<AuditTimeline channel="#naptest" onClose={() => {}} />);
     await waitFor(() => expect(container.textContent).toContain('The audit could not be loaded.'));
   });
 
   it('still says no events for an empty answer', async () => {
-    vi.spyOn(api, 'apiFetch').mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve({ timeline: [] }),
-    } as unknown as Response);
+    channelAudit.mockResolvedValue({ timeline: [] });
     const { container } = render(<AuditTimeline channel="#naptest" onClose={() => {}} />);
     await waitFor(() => expect(container.textContent).toContain('No audit events found.'));
   });
@@ -146,10 +135,7 @@ describe('the audit timeline says why it is empty', () => {
 
 describe('the audit timeline reads task events', () => {
   function mockRows(rows: unknown[]) {
-    vi.spyOn(api, 'apiFetch').mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve({ timeline: rows }),
-    } as unknown as Response);
+    channelAudit.mockResolvedValue({ timeline: rows });
   }
 
   const RECEIPT_ID = '01KZRCPT00000000000000RCPT';
@@ -494,10 +480,10 @@ describe('the audit timeline reads task events', () => {
     };
     // The route's own filter, so a value the route cannot match shows up as
     // an empty list here the way it does against a real server.
-    vi.spyOn(api, 'apiFetch').mockImplementation(async (path: string) => {
-      const asked = new URL(path, 'http://x').searchParams.get('actor');
+    channelAudit.mockImplementation(async (_channel: string, opts: { actor?: string }) => {
+      const asked = opts.actor;
       const rows = [bob, worker, home].filter(r => !asked || r.actor_did === asked);
-      return { ok: true, json: () => Promise.resolve({ timeline: rows }) } as unknown as Response;
+      return { timeline: rows };
     });
 
     const { container } = render(<AuditTimeline channel="#naptest" onClose={() => {}} />);
@@ -518,6 +504,42 @@ describe('the audit timeline reads task events', () => {
     expect(menu.value).toBe('did:plc:bob');
   });
 
+  it('never draws an older answer that lands after a newer one', async () => {
+    const bob = { ...actRow, actor_did: 'did:plc:bob', actor_name: 'bob' };
+    const worker = {
+      category: 'coordination',
+      event: 'status_update',
+      actor_did: 'did:plc:worker',
+      actor_name: 'worker',
+      timestamp: 1756900000,
+      details: { state: 'working' },
+    };
+    // Each read answers when the test says so.
+    const answers: Array<(rows: unknown[]) => void> = [];
+    channelAudit.mockImplementation(
+      () => new Promise(resolve => answers.push(rows => resolve({ timeline: rows }))),
+    );
+
+    const { container } = render(<AuditTimeline channel="#naptest" onClose={() => {}} />);
+    await waitFor(() => expect(answers.length).toBe(1));
+    answers[0]!([bob, worker]);
+    await waitFor(() => expect(container.textContent).toContain('status_update'));
+    const menu = container.querySelectorAll('select')[0] as HTMLSelectElement;
+
+    // Pick bob, then everyone again; everyone's answer lands first.
+    fireEvent.change(menu, { target: { value: 'did:plc:bob' } });
+    await waitFor(() => expect(answers.length).toBe(2));
+    fireEvent.change(menu, { target: { value: '' } });
+    await waitFor(() => expect(answers.length).toBe(3));
+    answers[2]!([bob, worker]);
+    await waitFor(() => expect(container.textContent).toContain('status_update'));
+    answers[1]!([bob]);
+    await new Promise(r => setTimeout(r, 20));
+    expect(container.textContent).toContain('status_update');
+    expect(container.textContent).toContain('2 events');
+    expect(menu.value).toBe('');
+  });
+
   it('offers exactly the four type filters', async () => {
     mockRows([]);
     const { container } = render(<AuditTimeline channel="#naptest" onClose={() => {}} />);
@@ -536,5 +558,34 @@ describe('the audit timeline reads task events', () => {
     });
     expect(container.textContent).toContain(expected);
     expect(container.textContent).not.toContain('1970');
+  });
+});
+
+// The route answers oldest first; a reader wants the latest at the top, and a
+// row says only its time of day, so the day is said once above its rows.
+describe('the audit timeline lists newest first, by day', () => {
+  it('reverses the answer and puts a day divider above each day', async () => {
+    // Two fixed past days, built in local time so the split does not move
+    // with the zone the test runs in; "Today" and "Yesterday" never apply.
+    const first = new Date(2025, 8, 2, 10, 0, 0);
+    const second = new Date(2025, 8, 3, 9, 0, 0);
+    const later = new Date(2025, 8, 3, 10, 0, 0);
+    const at = (d: Date) => Math.floor(d.getTime() / 1000);
+    channelAudit.mockResolvedValue({ timeline: [
+      { category: 'coordination', event: 'first_event', actor_did: 'did:plc:a', event_id: '01KZEVT1', timestamp: at(first), details: {} },
+      { category: 'governance', event: 'resume', actor_did: 'did:plc:a', timestamp: at(second), details: { issued_by: 'did:plc:op' } },
+      { category: 'coordination', event: 'third_event', actor_did: 'did:plc:a', event_id: '01KZEVT3', timestamp: at(later), details: {} },
+    ] });
+
+    const { container } = render(<AuditTimeline channel="#naptest" onClose={() => {}} />);
+    await waitFor(() => expect(container.textContent).toContain('third_event'));
+    const text = container.textContent!;
+    const order = [formatDateSeparator(later), 'third_event', 'resumed by', formatDateSeparator(first), 'first_event']
+      .map(part => text.indexOf(part));
+    expect(order.every(i => i >= 0)).toBe(true);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    // One divider per day.
+    expect(text.split(formatDateSeparator(later)).length).toBe(2);
+    expect(text.split(formatDateSeparator(first)).length).toBe(2);
   });
 });

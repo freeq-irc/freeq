@@ -15,9 +15,11 @@
 #
 #   ./scripts/boxd-migrate.sh --vm my-box --channel '#my-room'
 #
-# The older way, `--sign-cert`, signs the VM's certificate here with the
-# owner's creator key, whose public half the server must have on file
-# (MSGSIG). It keeps working for servers from before agent records.
+# Deprecated: `--sign-cert` signs the VM's certificate here with the owner's
+# creator key, whose public half the server must have on file (MSGSIG).
+# Every server in use now reads agent records; signed certificates will stop
+# counting in a later release, and the flag is removed then. A run that finds
+# the VM's certificate signed says what to delete.
 #
 # Idempotent: safe to re-run against an existing VM. Keys are loaded, not
 # regenerated; a cert that is already signed is left alone.
@@ -45,8 +47,9 @@ usage: boxd-migrate.sh [options]
                                                  "none" to start fresh)
   --repo DIR        repo to mirror on the VM    (default: git root of cwd)
   --no-start        provision only, do not launch pi
-  --sign-cert       the older way: sign the VM's certificate with your
-                    creator key here, registered with MSGSIG
+  --sign-cert       deprecated; to be removed in a later release:
+                    sign the VM's certificate with your creator key
+                    here, registered with MSGSIG
   --dry-run         print what would happen
   -h, --help
 EOF
@@ -274,6 +277,22 @@ CERT_PATH=$(printf '%s' "$MINT" | python3 -c 'import json,sys;print(json.load(sy
 SIGNED=$(printf '%s' "$MINT" | python3 -c 'import json,sys;print(json.load(sys.stdin)["signed"])')
 say "VM agent is $BOT_DID"
 
+# Signed certificates will stop counting in a later release. Said here, before pi
+# starts on the VM, whether or not this run signs: a re-run without
+# --sign-cert keeps a certificate an earlier run signed. The key path is
+# only worked out, never created.
+if [ "$SIGNED" = "True" ]; then
+  KEY_PATH=$(node -e '
+import("'"$SCRIPT_DIR"'/../node_modules/@freeq/harness-kit/dist/owner-key.js").then((m) => {
+  console.log(m.creatorKeyPath(process.env.HOME + "/.freeq", process.argv[1]));
+});' "$OWNER_DID")
+  cat <<EOF
+
+  This bot's certificate is signed with a creator key. Signed certificates will stop counting in a later release; every server now reads agent records instead. Add this agent under Settings → Agents in the freeq web app, or with \`freeq-bot-id register --owner <handle> $BOT_DID\`, then delete the certificate on the VM at $VM:$CERT_PATH, and the creator key on this machine at $KEY_PATH, if it exists, so an unsigned certificate is made at the next start.
+
+EOF
+fi
+
 if [ "$SIGN" = 0 ]; then
   cat <<EOF
 
@@ -287,9 +306,6 @@ if [ "$SIGN" = 0 ]; then
   │
   │ It writes one record to your account saying the agent is yours; the
   │ server reads it when the agent connects. Nothing goes to the VM.
-  │
-  │ On a server that doesn't read agent records yet, run this script again
-  │ with --sign-cert instead.
   └──────────────────────────────────────────────────────────────────────────
 
 EOF
@@ -306,7 +322,7 @@ if [ "$SIGN" = 1 ] && [ "$SIGNED" != "True" ]; then
   rm -f "$TMP_CERT"
 fi
 
-# The older way: the cert is only worth anything if the server knows the key
+# Deprecated: the cert is only worth anything if the server knows the key
 # that signed it.
 if [ "$SIGN" = 1 ]; then
 PUB=$(node -e '

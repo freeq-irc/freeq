@@ -170,7 +170,13 @@ public sealed partial class TopBar : UserControl
             Width = 180,
         };
 
-        var showJoinPart = new ToggleSwitch { Header = "Show join/part messages", IsOn = ViewModel.ShowJoinPartMessages };
+        var joinPart = new ComboBox
+        {
+            Header = "Join & leave messages",
+            ItemsSource = Enum.GetValues(typeof(JoinPartDisplay)).Cast<JoinPartDisplay>().ToList(),
+            SelectedItem = ViewModel.JoinPartDisplay,
+            Width = 180,
+        };
         var autoLoadMedia = new ToggleSwitch { Header = "Auto-load external media", IsOn = ViewModel.AutoLoadExternalMedia };
         var windowsToasts = new ToggleSwitch { Header = "Enable Windows notifications", IsOn = ViewModel.EnableWindowsNotifications };
         var sounds = new ToggleSwitch { Header = "Enable notification sounds", IsOn = ViewModel.EnableNotificationSounds };
@@ -188,7 +194,7 @@ public sealed partial class TopBar : UserControl
         panel.Children.Add(theme);
         panel.Children.Add(new TextBlock { Text = "Message density" });
         panel.Children.Add(density);
-        panel.Children.Add(showJoinPart);
+        panel.Children.Add(joinPart);
         panel.Children.Add(autoLoadMedia);
         panel.Children.Add(windowsToasts);
         panel.Children.Add(sounds);
@@ -209,7 +215,7 @@ public sealed partial class TopBar : UserControl
             ViewModel.UpdatePreferences(
                 (ThemeMode)(theme.SelectedItem ?? ThemeMode.System),
                 (MessageDensity)(density.SelectedItem ?? MessageDensity.Default),
-                showJoinPart.IsOn,
+                (JoinPartDisplay)(joinPart.SelectedItem ?? JoinPartDisplay.Hidden),
                 autoLoadMedia.IsOn,
                 windowsToasts.IsOn,
                 sounds.IsOn);

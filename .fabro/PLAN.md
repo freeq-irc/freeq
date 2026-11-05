@@ -79,6 +79,14 @@ laptop can close and work keeps going. Run lifecycle notifications land in
 - Build timing (CI gate, 4 vCPU): cold 12.7 min → 9.5 min with a warm
   sccache; compile is ~4 min cold, the rest is the test suite.
 
+## Paused (2026-10-03)
+
+`fabro-server` and `freeq-fabro` are stopped and disabled on the VM at the
+owner's request — no scheduled runs, no bot. The VM itself still runs
+(with `sccache-webdav`). To resume: push the pending commits, then on the VM
+`sudo systemctl enable --now fabro-server freeq-fabro` (re-running
+`provision.sh` also re-enables the bot).
+
 ## Open
 
 - Push to GitHub (needs your OK) so nightly runs pick up this config.

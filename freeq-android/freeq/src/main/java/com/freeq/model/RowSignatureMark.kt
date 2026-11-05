@@ -14,7 +14,8 @@ internal object RowSignatureMark {
     sealed interface Mark
 
     /** The sender's own device signed: a lock at [alpha], full when the key is
-     *  published in their account, 30% while only their server vouches. */
+     *  published in their account or is their did:key DID itself, 30% while
+     *  only their server vouches. */
     data class Lock(val alpha: Float) : Mark
 
     /** The signature failed, or was made after its key was retired. */
@@ -29,7 +30,10 @@ internal object RowSignatureMark {
         if (verdict == null) return null
         return when (verdict.state) {
             VerdictState.DEVICE ->
-                Lock(if (verdict.layer == KeyLayer.PUBLISHED) 1f else VOUCHED_ALPHA)
+                Lock(
+                    if (verdict.layer == KeyLayer.PUBLISHED || verdict.layer == KeyLayer.DID_KEY) 1f
+                    else VOUCHED_ALPHA,
+                )
             VerdictState.INVALID, VerdictState.RETIRED -> Warning
             VerdictState.SERVER, VerdictState.UNSIGNED,
             VerdictState.UNVERIFIABLE, VerdictState.PENDING -> null

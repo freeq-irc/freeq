@@ -5,7 +5,8 @@
       "sentence": "Signed on the sender’s device.",
       "layers": [
         "vouched",
-        "published"
+        "published",
+        "did-key"
       ]
     },
     "server": {
@@ -29,6 +30,7 @@
   },
   "layers": {
     "vouched": "Signed on the sender’s device. Key vouched for by their server.",
-    "published": "Signed on the sender’s device. Key published in their identity record."
+    "published": "Signed on the sender’s device. Key published in their identity record.",
+    "did-key": "Signed with the sender’s own key. The key is their identity."
   }
 }

@@ -7,7 +7,7 @@ use super::helpers::{
     s2s_broadcast, s2s_broadcast_mode, s2s_next_event_id,
 };
 use crate::irc::{self, Message};
-use crate::server::SharedState;
+use crate::server::{SharedState, invite_nick_token};
 use std::sync::Arc;
 
 pub(super) fn handle_join(
@@ -148,7 +148,7 @@ pub(super) fn handle_join(
                 if !is_did_authority && ch.invite_only {
                     let has_invite = ch.invites.contains(session_id)
                         || did.is_some_and(|d| ch.invites.contains(d))
-                        || ch.invites.contains(&format!("nick:{nick}"));
+                        || ch.invites.contains(&invite_nick_token(nick));
                     let on_invite_exception = ch.is_invite_excepted(&hostmask, did);
 
                     // Delegated access: an agent may go where the person it acts
@@ -212,7 +212,7 @@ pub(super) fn handle_join(
                             {
                                 let channel_owned = channel.to_string();
                                 let did_owned = did.map(str::to_string);
-                                let nick_token = format!("nick:{nick}");
+                                let nick_token = invite_nick_token(nick);
                                 state.with_db(move |db| {
                                     if let Some(ref d) = did_owned {
                                         db.remove_invite(&channel_owned, d)?;
@@ -224,7 +224,7 @@ pub(super) fn handle_join(
                             if let Some(d) = did {
                                 ch.invites.remove(d);
                             }
-                            ch.invites.remove(&format!("nick:{nick}"));
+                            ch.invites.remove(&invite_nick_token(nick));
                         }
                     }
                 }
@@ -1586,16 +1586,8 @@ pub(super) fn handle_kick(
                         .unwrap_or_else(|| nick.to_string());
                     crate::rooms::ban_did(state, channel, &did, &set_by);
                 }
-                let other_session_still_member = {
-                    let did_sessions = state.did_sessions.lock();
-                    let channels = state.channels.lock();
-                    match (did_sessions.get(&did), channels.get(channel)) {
-                        (Some(sessions), Some(ch)) => sessions
-                            .iter()
-                            .any(|sid| sid != &target_session && ch.members.contains(sid)),
-                        _ => false,
-                    }
-                };
+                let other_session_still_member =
+                    live_sibling_still_member(state, &did, channel, &target_session);
                 if !other_session_still_member {
                     let did_owned = did.clone();
                     let channel_owned = channel.to_string();
@@ -1718,7 +1710,7 @@ pub(super) fn handle_invite(
                     }
                 }
                 // For S2S, prefer DID over nick-based token
-                did.unwrap_or_else(|| format!("nick:{target_nick}"))
+                did.unwrap_or_else(|| invite_nick_token(target_nick))
             };
 
             // Durable, because `+i` is. An invite that evaporates on restart
@@ -1770,11 +1762,11 @@ pub(super) fn handle_invite(
                     if let Some(ref did) = rm.did {
                         ch.invites.insert(did.clone());
                     }
-                    ch.invites.insert(format!("nick:{target_nick}"));
+                    ch.invites.insert(invite_nick_token(target_nick));
                 }
                 rm.did
                     .clone()
-                    .unwrap_or_else(|| format!("nick:{target_nick}"))
+                    .unwrap_or_else(|| invite_nick_token(target_nick))
             };
 
             // Notify inviter (remote target can't be notified directly)
@@ -1970,6 +1962,30 @@ pub(super) fn handle_topic(
     }
 }
 
+/// Only a connected sibling can keep the identity in a channel. Stale IDs
+/// may linger until the phantom sweeper runs; they must not veto PART/KICK.
+fn live_sibling_still_member(
+    state: &Arc<SharedState>,
+    did: &str,
+    channel: &str,
+    session_id: &str,
+) -> bool {
+    // Do not nest the DID index lock with the channel/connection locks.
+    let siblings = state
+        .did_sessions
+        .lock()
+        .get(did)
+        .cloned()
+        .unwrap_or_default();
+    let channels = state.channels.lock();
+    let connections = state.connections.lock();
+    channels.get(channel).is_some_and(|ch| {
+        siblings.iter().any(|sid| {
+            sid != session_id && ch.members.contains(sid) && connections.contains_key(sid)
+        })
+    })
+}
+
 pub(super) fn handle_part(
     conn: &Connection,
     channel: &str,
@@ -2013,16 +2029,7 @@ pub(super) fn handle_part(
     // The same reasoning already governs the auto-rejoin row below. This applies it
     // to the wire.
     let sibling_still_member = match conn.authenticated_did {
-        Some(ref did) => {
-            let did_sessions = state.did_sessions.lock();
-            let channels = state.channels.lock();
-            match (did_sessions.get(did), channels.get(channel)) {
-                (Some(sessions), Some(ch)) => sessions
-                    .iter()
-                    .any(|sid| sid != session_id && ch.members.contains(sid)),
-                _ => false,
-            }
-        }
+        Some(ref did) => live_sibling_still_member(state, did, channel, session_id),
         None => false,
     };
 
@@ -2068,17 +2075,8 @@ pub(super) fn handle_part(
     // "I left on web but iOS keeps showing it / can't get rid of it"
     // failure mode).
     if let Some(ref did) = conn.authenticated_did {
-        let other_session_still_member = {
-            let did_sessions = state.did_sessions.lock();
-            let channels = state.channels.lock();
-            match (did_sessions.get(did), channels.get(channel)) {
-                (Some(sessions), Some(ch)) => sessions
-                    .iter()
-                    .any(|sid| sid != session_id && ch.members.contains(sid)),
-                _ => false,
-            }
-        };
-        if !other_session_still_member {
+        // Phantom siblings must not keep a departed channel in auto-rejoin.
+        if !live_sibling_still_member(state, did, channel, session_id) {
             let did_owned = did.clone();
             let channel_owned = channel.to_string();
             state.with_db(|db| db.remove_user_channel(&did_owned, &channel_owned));
@@ -3308,5 +3306,168 @@ mod room_admission_tests {
         }
         assert!(seen.iter().any(|l| l.contains("#open")), "{seen:?}");
         assert!(!seen.iter().any(|l| l.contains(ROOM)), "{seen:?}");
+    }
+}
+
+#[cfg(test)]
+mod rejoin_cleanup_tests {
+    use super::*;
+    use crate::server::{ChannelState, GhostSession, test_state_with_db};
+    use tokio::sync::{mpsc, oneshot};
+
+    const DID: &str = "did:plc:rejoin-test";
+    const CHANNEL: &str = "#rejoin";
+
+    fn session(state: &Arc<SharedState>, sid: &str, nick: &str) -> Connection {
+        let mut conn = Connection::new(sid.to_string());
+        conn.nick = Some(nick.to_string());
+        conn.user = Some("user".to_string());
+        conn.authenticated_did = Some(DID.to_string());
+        state
+            .session_dids
+            .lock()
+            .insert(sid.to_string(), DID.to_string());
+        state
+            .did_sessions
+            .lock()
+            .entry(DID.to_string())
+            .or_default()
+            .insert(sid.to_string());
+        state.nick_to_session.lock().insert(nick, sid);
+        conn
+    }
+
+    fn connect(state: &Arc<SharedState>, sid: &str) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel(128);
+        state.connections.lock().insert(sid.to_string(), tx);
+        rx
+    }
+
+    async fn leave_then_reconnect(kick: bool, live_sibling: bool) {
+        let state = test_state_with_db();
+        let conn = session(&state, "leaver", "alice");
+        let _leaver_rx = connect(&state, "leaver");
+        let _sibling = session(&state, "sibling", "alice");
+        // KICK resolves the currently primary session for the shared nick.
+        state.nick_to_session.lock().insert("alice", "leaver");
+        let _sibling_rx = live_sibling.then(|| connect(&state, "sibling"));
+        let mut observer_rx = connect(&state, "observer");
+        let mut observer = Connection::new("observer".to_string());
+        observer.nick = Some("observer".to_string());
+        state.nick_to_session.lock().insert("observer", "observer");
+        let mut ch = ChannelState::default();
+        ch.members
+            .extend(["leaver", "sibling", "observer"].map(str::to_string));
+        ch.ops.insert("observer".to_string());
+        state.channels.lock().insert(CHANNEL.to_string(), ch);
+        state
+            .with_db(|db| db.add_user_channel(DID, CHANNEL))
+            .unwrap();
+        let send = |state: &Arc<SharedState>, sid: &str, msg: String| {
+            if let Some(tx) = state.connections.lock().get(sid) {
+                let _ = tx.try_send(msg);
+            }
+        };
+        if kick {
+            handle_kick(
+                &observer, CHANNEL, "alice", "test", &state, "test", "observer", &send,
+            );
+        } else {
+            handle_part(&conn, CHANNEL, &state, "test", "leaver", &send);
+            let announced = observer_rx
+                .try_recv()
+                .is_ok_and(|msg| msg.contains(" PART "));
+            assert_eq!(
+                announced, !live_sibling,
+                "only a live sibling suppresses PART"
+            );
+        }
+        assert!(!state.channels.lock()[CHANNEL].members.contains("leaver"));
+        assert_eq!(
+            state
+                .with_db(|db| db.get_user_channels(DID))
+                .unwrap()
+                .contains(&CHANNEL.to_string()),
+            live_sibling
+        );
+
+        // Reconnect immediately, before either the phantom sweeper or the
+        // sibling liveness probe can run. Exercise attach AND DB auto-rejoin.
+        // The leaver stays connected outside the channel, so even after the
+        // phantom is filtered out the multi-device attach path still runs.
+        let mut reconnect = session(&state, "reconnect", "alice");
+        let mut reconnect_rx = connect(&state, "reconnect");
+        super::super::registration::try_complete_registration(
+            &mut reconnect,
+            &state,
+            "test",
+            "reconnect",
+            &send,
+        );
+        assert!(reconnect.registered);
+        assert_eq!(
+            state.channels.lock()[CHANNEL].members.contains("reconnect"),
+            live_sibling
+        );
+        let mut joined = false;
+        while let Ok(msg) = reconnect_rx.try_recv() {
+            joined |= msg.contains(" JOIN #rejoin");
+        }
+        assert_eq!(joined, live_sibling);
+    }
+
+    #[tokio::test]
+    async fn phantom_sibling_part_does_not_rejoin() {
+        leave_then_reconnect(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn phantom_sibling_kick_does_not_rejoin() {
+        leave_then_reconnect(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn live_sibling_part_preserves_membership() {
+        leave_then_reconnect(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn live_sibling_kick_preserves_membership() {
+        leave_then_reconnect(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn intentional_disconnect_ghost_is_still_reclaimed() {
+        let state = test_state_with_db();
+        let mut ch = ChannelState::default();
+        ch.members.insert("ghost".to_string());
+        state.channels.lock().insert(CHANNEL.to_string(), ch);
+        state
+            .with_db(|db| db.add_user_channel(DID, CHANNEL))
+            .unwrap();
+        let (cancel, mut cancelled) = oneshot::channel();
+        state.ghost_sessions.lock().insert(
+            DID.to_string(),
+            GhostSession {
+                nick: "alice".to_string(),
+                hostmask: "alice!u@host".to_string(),
+                session_id: "ghost".to_string(),
+                channels: vec![(CHANNEL.to_string(), true, true, true)],
+                disconnect_time: std::time::Instant::now(),
+                cancel,
+            },
+        );
+        let mut conn = session(&state, "reconnect", "alice");
+        let _rx = connect(&state, "reconnect");
+        super::super::registration::attach_same_did(&mut conn, &state, "reconnect", &|_, _, _| {});
+        assert!(cancelled.try_recv().is_ok());
+        assert!(!state.ghost_sessions.lock().contains_key(DID));
+        let channels = state.channels.lock();
+        let ch = &channels[CHANNEL];
+        assert!(!ch.members.contains("ghost"));
+        assert!(ch.members.contains("reconnect"));
+        assert!(ch.ops.contains("reconnect"));
+        assert!(ch.voiced.contains("reconnect"));
+        assert!(ch.halfops.contains("reconnect"));
     }
 }

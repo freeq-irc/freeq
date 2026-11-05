@@ -113,9 +113,7 @@ describe("/freeq", () => {
         - in the freeq web app: Settings → Agents → + Add an agent, with the DID above; or
         - from a terminal: freeq-bot-id register --owner <your handle> did:key:zSelf
 
-      Then run:  /freeq authorize verify
-
-      On a server that doesn't read agent records yet, use /freeq authorize --sign-cert instead.",
+      Then run:  /freeq authorize verify",
       ]
     `);
   });
@@ -146,11 +144,14 @@ describe("/freeq", () => {
     `);
   });
 
+  // The deprecation warning shows here because the fake bot presents no
+  // signed certificate at connect, which would have said it already.
   it("authorize --sign-cert: makes a creator key and prints the MSGSIG line", async () => {
     const h = await startPi({ config: baseConfig() });
     await h.command("authorize --sign-cert");
     expect(h.noticeTexts().map((t) => t.replace(/MSGSIG \S+/, "MSGSIG <key>"))).toMatchInlineSnapshot(`
       [
+        "warning: Signing certificates with a creator key is deprecated: signed certificates will stop counting in a later release, and every server now reads agent records instead. Prefer \`/freeq authorize\` and add this agent under Settings → Agents.",
         "info: freeq authorize --sign-cert — sign this installation's delegation
 
       1. In the freeq web client (or any client logged in as did:plc:owner), paste this into the message box:

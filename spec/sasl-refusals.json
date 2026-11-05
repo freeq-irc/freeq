@@ -1,0 +1,7 @@
+{
+  "_comment": "The 904 a server sends a delegated agent it does not admit. harness-kit matches it to point the owner at /freeq authorize; both test against this file.",
+  "delegated_refusal": {
+    "owner": "did:plc:owner",
+    "text": "Not authorized to connect to this server: the agent records of {owner} do not admit this agent"
+  }
+}

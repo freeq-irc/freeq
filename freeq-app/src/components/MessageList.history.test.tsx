@@ -41,6 +41,9 @@ const requestHistory = client.requestHistory as unknown as ReturnType<typeof vi.
 beforeEach(() => {
   vi.clearAllMocks();
   s().reset();
+  // These rows are about channels holding only join/part notices, which are
+  // hidden by default — show them so there is something on screen.
+  s().setJoinPartDisplay('all');
   // The bridge arms every request it sends, anchored or not, and the guards
   // under test read that flag.
   requestHistory.mockImplementation((channel: string, anchor?: unknown) => {

@@ -3,20 +3,9 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// HOME decides where the runtime looks for identities (~/.freeq/bots), read
-// when the runtime module is imported, so it points at a scratch directory
-// before anything imports it.
-const home = await vi.hoisted(async () => {
-  const fs = await import("node:fs");
-  const os = await import("node:os");
-  const path = await import("node:path");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "harness-kit-doctor-home-"));
-  process.env.HOME = dir;
-  return dir;
-});
-
 import { loadOrCreateIdentity } from "@freeq/bot-kit";
 import { AgentRuntime } from "./runtime.js";
+import { TEST_HOME } from "./test-setup.js";
 import { deriveInstallSlug } from "./identity.js";
 import type { BotLike } from "./connection.js";
 import type { Harness, NoticeLevel } from "./harness.js";
@@ -126,7 +115,7 @@ function writeConfig(agentDir: string, over: Record<string, unknown> = {}): void
 
 /** The identity bot-kit would have made for project `proj`, on disk. */
 async function mintIdentity(): Promise<string> {
-  const dir = join(home, ".freeq", "bots", "pi-test1234-proj");
+  const dir = join(TEST_HOME, ".freeq", "bots", "pi-test1234-proj");
   mkdirSync(dir, { recursive: true });
   const id = await loadOrCreateIdentity({ seedPath: join(dir, "agent.key") });
   return id.did;
@@ -154,7 +143,7 @@ describe("/freeq doctor", () => {
 
     expect(h.notices).toHaveLength(1);
     expect(h.notices[0]!.level).toBe("warning");
-    expect(norm(h.notices[0]!.text, [h.root, "<root>"], [home, "<home>"], [did, "<did>"])).toMatchInlineSnapshot(`
+    expect(norm(h.notices[0]!.text, [h.root, "<root>"], [TEST_HOME, "<home>"], [did, "<did>"])).toMatchInlineSnapshot(`
       "freeq doctor
         ✓ identity: <did> (pi-test1234-proj)
         ⚠ delegation: none at <home>/.freeq/bots/pi-test1234-proj/delegation.json — made on the next connect
@@ -181,7 +170,7 @@ describe("/freeq doctor", () => {
 
     expect(h.notices).toHaveLength(1);
     expect(h.notices[0]!.level).toBe("error");
-    expect(norm(h.notices[0]!.text, [h.root, "<root>"], [home, "<home>"], [deriveInstallSlug(), "<slug>"])).toMatchInlineSnapshot(`
+    expect(norm(h.notices[0]!.text, [h.root, "<root>"], [TEST_HOME, "<home>"], [deriveInstallSlug(), "<slug>"])).toMatchInlineSnapshot(`
       "freeq doctor
         ⚠ identity: none yet at <home>/.freeq/bots/pi-<slug>-proj/agent.key — made on the first connect in this project
         ⚠ ownership: no identity to ask the server about

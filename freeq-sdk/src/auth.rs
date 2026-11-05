@@ -47,6 +47,9 @@ pub struct ChallengeResponse {
     /// the challenge it issued (the PDS itself has no knowledge of our nonce).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub challenge_nonce: Option<String>,
+    /// The account this agent acts for, whose agent records can admit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_did: Option<String>,
 }
 
 /// Decode a base64url-encoded challenge from the server.
@@ -59,6 +62,37 @@ pub fn decode_challenge(encoded: &str) -> anyhow::Result<Challenge> {
 /// Decode base64url challenge to raw bytes (for signing).
 pub fn decode_challenge_bytes(encoded: &str) -> anyhow::Result<Vec<u8>> {
     Ok(URL_SAFE_NO_PAD.decode(encoded)?)
+}
+
+/// One SASL chunk, per IRCv3; a full chunk tells the server more is coming.
+pub const SASL_CHUNK_LEN: usize = 400;
+
+/// Ceiling on a response: a single line must fit the server's 8192-byte
+/// line limit with `AUTHENTICATE ` and CRLF.
+pub const MAX_SASL_RESPONSE_LEN: usize = 8177;
+
+/// The `AUTHENTICATE` lines that carry an encoded response under IRCv3
+/// chunking: one line up to a chunk long, else 400-byte chunks with a bare
+/// `+` after one that fills the last.
+#[doc(hidden)]
+pub fn sasl_response_lines(encoded: &str) -> Vec<String> {
+    if encoded.len() <= SASL_CHUNK_LEN {
+        return vec![format!("AUTHENTICATE {encoded}")];
+    }
+    let mut lines: Vec<String> = encoded
+        .as_bytes()
+        .chunks(SASL_CHUNK_LEN)
+        .map(|c| {
+            format!(
+                "AUTHENTICATE {}",
+                std::str::from_utf8(c).expect("base64url is ASCII")
+            )
+        })
+        .collect();
+    if encoded.len().is_multiple_of(SASL_CHUNK_LEN) {
+        lines.push("AUTHENTICATE +".to_string());
+    }
+    lines
 }
 
 /// Encode a challenge response as base64url for sending via AUTHENTICATE.
@@ -105,6 +139,7 @@ impl ChallengeSigner for KeySigner {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None, // Not needed: crypto method signs the full challenge
+            owner_did: None,
         })
     }
 }
@@ -250,6 +285,7 @@ impl ChallengeSigner for PdsSessionSigner {
                 pds_url: Some(self.pds_url.clone()),
                 dpop_proof: Some(dpop_proof),
                 challenge_nonce,
+                owner_did: None,
             })
         } else {
             // App-password mode: plain Bearer token
@@ -260,6 +296,7 @@ impl ChallengeSigner for PdsSessionSigner {
                 pds_url: Some(self.pds_url.clone()),
                 dpop_proof: None,
                 challenge_nonce,
+                owner_did: None,
             })
         }
     }
@@ -361,6 +398,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            owner_did: None,
         };
         let encoded = encode_response(&resp);
         let bytes = URL_SAFE_NO_PAD.decode(&encoded).unwrap();
@@ -379,11 +417,47 @@ mod tests {
             pds_url: Some("https://pds.example.com".to_string()),
             dpop_proof: Some("dpop.proof.jwt".to_string()),
             challenge_nonce: Some("server-nonce-xyz".to_string()),
+            owner_did: None,
         };
         let encoded = encode_response(&resp);
         let bytes = URL_SAFE_NO_PAD.decode(&encoded).unwrap();
         let decoded: ChallengeResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded.method.as_deref(), Some("pds-oauth"));
         assert_eq!(decoded.dpop_proof.as_deref(), Some("dpop.proof.jwt"));
+    }
+}
+
+#[cfg(test)]
+mod sasl_response_lines_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_response_is_one_line_with_no_terminator() {
+        assert_eq!(sasl_response_lines("abc"), vec!["AUTHENTICATE abc"]);
+    }
+
+    /// Every server takes one line of this length; only newer ones join
+    /// chunks, and an older one would read the terminator as a new attempt.
+    #[test]
+    fn a_response_of_exactly_one_chunk_is_one_line_with_no_terminator() {
+        let payload = "x".repeat(SASL_CHUNK_LEN);
+        assert_eq!(
+            sasl_response_lines(&payload),
+            vec![format!("AUTHENTICATE {payload}")]
+        );
+    }
+
+    #[test]
+    fn a_response_ending_mid_chunk_needs_no_terminator() {
+        let out = sasl_response_lines(&"y".repeat(SASL_CHUNK_LEN + 1));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1], "AUTHENTICATE y");
+    }
+
+    #[test]
+    fn every_whole_multiple_of_a_chunk_is_terminated() {
+        let out = sasl_response_lines(&"z".repeat(SASL_CHUNK_LEN * 2));
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[2], "AUTHENTICATE +");
     }
 }

@@ -14,9 +14,9 @@ digraph BugHunt {
     exit  [shape=Msquare, label="Exit"]
 
     hunt      [shape=box, label="Hunt for a bug", prompt="@prompts/hunt.md", model="claude-opus-5-5", reasoning_effort="high", thread_id="bug", fidelity="full", timeout="2400s"]
-    fix       [shape=box, label="Repro + fix",    prompt="@prompts/fix.md", thread_id="bug", fidelity="full", reasoning_effort="high", timeout="2400s"]
+    fix       [shape=box, label="Repro + fix",    model="claude-sonnet-5-5", prompt="@prompts/fix.md", thread_id="bug", fidelity="full", reasoning_effort="high", timeout="2400s"]
     verify    [shape=parallelogram, label="CI gate", script="bash .fabro/verify.sh", goal_gate=true, retry_target="fix", max_retries=2, timeout="3600s"]
-    pr_body   [shape=tab, label="PR description", prompt="@prompts/pr_body.md", thread_id="bug", fidelity="full"]
+    pr_body   [shape=tab, label="PR description", model="claude-sonnet-5-5", prompt="@prompts/pr_body.md", thread_id="bug", fidelity="full"]
 
     // A failed working stage must not fall through to the next one: with
     // plain unconditional edges an LLM outage "succeeded" by running the CI

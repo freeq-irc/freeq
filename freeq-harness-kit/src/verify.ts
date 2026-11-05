@@ -24,6 +24,7 @@
  */
 
 import { verifyActTags } from "@freeq/bot-kit";
+import { msgidTimestampMs } from "@freeq/sdk";
 
 export type VerifyOutcome = "valid" | "invalid" | "unverifiable";
 
@@ -33,8 +34,16 @@ export interface VerifyResult {
   reason: string;
 }
 
-/** Fetches the raw 32-byte public key a signature names, or undefined. */
-export type KeyFetcher = (did: string, kid: string) => Promise<Uint8Array | undefined>;
+/** A key as the server's key store holds it: the raw 32-byte public key,
+ *  and when it stopped counting (unix seconds: the earlier of its removal
+ *  and its expiry), if it has. */
+export interface FetchedKey {
+  key: Uint8Array;
+  stopsAt?: number;
+}
+
+/** Fetches the key a signature names, or undefined. */
+export type KeyFetcher = (did: string, kid: string) => Promise<Uint8Array | FetchedKey | undefined>;
 
 export interface VerifiableEvent {
   channel: string;
@@ -101,17 +110,26 @@ export async function verifyActEvent(
     return { outcome: "unverifiable", reason: `cannot derive the signed venue for ${ev.channel}` };
   }
 
-  let key: Uint8Array | undefined;
+  let fetched: Uint8Array | FetchedKey | undefined;
   try {
-    key = await opts.fetchKey(ev.did, kid);
+    fetched = await opts.fetchKey(ev.did, kid);
   } catch (err) {
     // A lookup failure is an outage, not a forgery.
     return { outcome: "unverifiable", reason: `key lookup failed: ${(err as Error).message}` };
   }
-  if (!key) return { outcome: "unverifiable", reason: `no key on record for kid ${kid}` };
+  if (!fetched) return { outcome: "unverifiable", reason: `no key on record for kid ${kid}` };
+  const { key, stopsAt } = fetched instanceof Uint8Array ? { key: fetched, stopsAt: undefined } : fetched;
 
   const result = await verifyActTags(ev.tags, venue, ev.eventId, sigTag, key);
-  if (result.ok) return { outcome: "valid", reason: "signature verified" };
+  if (result.ok) {
+    // A signature made at or after its key stopped counting does not verify
+    // (ruling 24), timed by its event id as the SDK times a ruling.
+    const atMs = msgidTimestampMs(ev.eventId) ?? Date.now();
+    if (stopsAt !== undefined && stopsAt * 1000 <= atMs) {
+      return { outcome: "invalid", reason: "signed at or after its key stopped counting" };
+    }
+    return { outcome: "valid", reason: "signature verified" };
+  }
 
   switch (result.reason) {
     // The signer's identity or the document itself is missing — we cannot
@@ -133,12 +151,13 @@ export async function verifyActEvent(
  * A key fetcher backed by the server's key store, with a small cache.
  *
  * `(did, kid)` is immutable — the kid is a hash of the key — so a hit can be
- * cached forever. A miss is NOT cached: the key may simply not have been
- * registered yet, and caching that would turn a transient gap into a
- * permanent "unverifiable".
+ * cached forever, with the time it stopped counting as first read (ruling 16:
+ * a found key is never re-asked, so a later retirement is not learned). A
+ * miss is NOT cached: the key may simply not have been registered yet, and
+ * caching that would turn a transient gap into a permanent "unverifiable".
  */
 export function serverKeyFetcher(origin: string): KeyFetcher {
-  const cache = new Map<string, Uint8Array>();
+  const cache = new Map<string, FetchedKey>();
   return async (did, kid) => {
     const cacheKey = `${did}\u0000${kid}`;
     const hit = cache.get(cacheKey);
@@ -151,15 +170,22 @@ export function serverKeyFetcher(origin: string): KeyFetcher {
     if (res.status === 404) return undefined;
     if (!res.ok) throw new Error(`key store returned ${res.status}`);
 
-    const body = (await res.json()) as { public_key?: string; algorithm?: string };
+    const body = (await res.json()) as {
+      public_key?: string;
+      algorithm?: string;
+      removed_at?: number | null;
+      expires_at?: number | null;
+    };
     if (body.algorithm && body.algorithm !== "ed25519") {
       throw new Error(`unsupported key algorithm ${body.algorithm}`);
     }
     if (!body.public_key) return undefined;
     const raw = base64urlToBytes(body.public_key);
     if (raw.length !== 32) throw new Error(`expected a 32-byte key, got ${raw.length}`);
-    cache.set(cacheKey, raw);
-    return raw;
+    const stops = [body.removed_at, body.expires_at].filter((t): t is number => typeof t === "number");
+    const found: FetchedKey = { key: raw, ...(stops.length ? { stopsAt: Math.min(...stops) } : {}) };
+    cache.set(cacheKey, found);
+    return found;
   };
 }
 

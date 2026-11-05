@@ -32,11 +32,12 @@ enum VerdictKind: String, Codable, Equatable, CaseIterable {
     case pending
 }
 
-/// How far a device key has got: vouched for by the sender's server, or
-/// published in their identity record.
+/// How far a device key has got: vouched for by the sender's server,
+/// published in their identity record, or their did:key DID itself.
 enum VerdictLayer: String, Codable, Equatable {
     case vouched
     case published
+    case didKey = "did-key"
 }
 
 /// One verdict, as the row carries it.

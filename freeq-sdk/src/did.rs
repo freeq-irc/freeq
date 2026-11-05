@@ -265,6 +265,11 @@ impl HttpResolver {
         let doc: DidDocument = self
             .client
             .get(&url)
+            // Without this the directory going quiet holds the caller for as
+            // long as the socket stays open: a sign-in's signature check and
+            // the connect allowlist both wait here. Ten seconds, as the
+            // handle lookup through an API does below.
+            .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
             .context("Failed to fetch DID document from PLC directory")?

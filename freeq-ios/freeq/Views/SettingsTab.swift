@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsTab: View {
     @EnvironmentObject var appState: AppState
     @State private var showStatusEditor = false
+    @AppStorage(JoinPartDisplay.storageKey) private var joinPartDisplay: JoinPartDisplay = .default
 
     /// Start a sign-in that asks the account for permission to write this
     /// device's key records. The same link and the same in-app sheet the
@@ -115,8 +116,22 @@ struct SettingsTab: View {
                         }
                         .tint(Theme.accent)
                         .listRowBackground(Theme.bgSecondary)
+
+                        Picker(selection: $joinPartDisplay) {
+                            ForEach(JoinPartDisplay.allCases) { mode in
+                                Text(mode.label).tag(mode)
+                            }
+                        } label: {
+                            Label("Join & leave messages", systemImage: "arrow.right.arrow.left")
+                                .foregroundColor(Theme.textPrimary)
+                        }
+                        .tint(Theme.accent)
+                        .listRowBackground(Theme.bgSecondary)
                     } header: {
                         Text("Appearance")
+                            .foregroundColor(Theme.textMuted)
+                    } footer: {
+                        Text("Grouped folds a run of joins and leaves into one line. Kicks and moderation actions always show.")
                             .foregroundColor(Theme.textMuted)
                     }
 

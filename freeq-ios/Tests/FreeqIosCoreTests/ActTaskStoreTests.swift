@@ -393,4 +393,116 @@ final class ActTaskStoreTests: XCTestCase {
                 bufferHoldingTask: "#work", hasBuffer: { $0 == "#work" }),
             "#work")
     }
+
+    // ── Where a confirmation line is drawn ──
+
+    private let second: Int64 = 1_760_011_200_000
+
+    private func row(_ id: String, _ at: Int64, from: String = "worker", deleted: Bool = false) -> ChatMessage {
+        var m = ChatMessage(id: id, from: from, text: id, isAction: false,
+                            timestamp: Date(timeIntervalSince1970: Double(at) / 1000), replyTo: nil)
+        m.isDeleted = deleted
+        return m
+    }
+
+    /// The line the home's confirmation draws, stamped by the home's clock.
+    private func systemRow(_ id: String, _ at: Int64) -> ChatMessage { row(id, at, from: "") }
+
+    private func confirmOf(_ id: String, _ subject: String) -> ActTaskEvent {
+        ActTaskEvent(eventId: id, verb: "confirm", from: "home", did: nil,
+                     fields: ["act-subject": subject], msgId: nil)
+    }
+
+    /// The card a claim draws on row `card`, in a task holding `rest` too.
+    private func cardFor(_ card: String, _ claim: String, _ rest: [ActTaskEvent]) -> (String, ActCard) {
+        let step = ActTaskEvent(eventId: claim, verb: "claim", from: "worker", did: nil, fields: [:], msgId: card)
+        let task = ActTask(taskId: "t-\(claim)", kind: "handoff", title: "ship it", offerer: nil,
+                           assignee: nil, verb: "claim", note: nil, events: [step] + rest)
+        return (card, ActCard(task: task, event: step))
+    }
+
+    private func cards(_ pairs: (String, ActCard)...) -> [String: ActCard] {
+        Dictionary(uniqueKeysWithValues: pairs)
+    }
+
+    private var claimed: [String: ActCard] { cards(cardFor("card", "claim", [confirmOf("line", "claim")])) }
+
+    private func ids(_ rows: [ChatMessage]) -> [String] { rows.map(\.id) }
+
+    func testALineStoredAboveItsCardIsDrawnUnderItInEitherStamping() {
+        for cardAt in [second, second + 1000] {
+            let stored = [row("before", second - 5000), systemRow("line", second + 400),
+                          row("card", cardAt), row("after", second + 9000)]
+            XCTAssertEqual(ids(actConfirmLinesUnderCards(stored, cards: claimed)),
+                           ["before", "card", "line", "after"])
+        }
+    }
+
+    func testALineAlreadyUnderItsCardStays() {
+        for cardAt in [second, second + 1000] {
+            let stored = [row("card", cardAt), systemRow("line", cardAt + 400), row("after", second + 9000)]
+            XCTAssertEqual(ids(actConfirmLinesUnderCards(stored, cards: claimed)), ["card", "line", "after"])
+        }
+    }
+
+    func testALineWhoseCardIsNotDrawnWasDeletedOrIsHiddenStaysByItsTime() {
+        let missing = [systemRow("line", second + 400), row("after", second + 9000)]
+        XCTAssertEqual(ids(actConfirmLinesUnderCards(missing, cards: claimed)), ["line", "after"])
+
+        let deleted = [systemRow("line", second + 400), row("card", second, deleted: true)]
+        XCTAssertEqual(ids(actConfirmLinesUnderCards(deleted, cards: claimed)), ["line", "card"])
+
+        // A blocked sender's row stays in the list, drawn empty.
+        let blocked = [systemRow("line", second + 400), row("card", second)]
+        XCTAssertEqual(
+            ids(actConfirmLinesUnderCards(blocked, cards: claimed, hidden: { $0.from == "worker" })),
+            ["line", "card"])
+    }
+
+    func testAnExpiryLineStaysByItsTime() {
+        let expire = ActTaskEvent(eventId: "gone", verb: "expire", from: "home", did: nil, fields: [:], msgId: nil)
+        let stored = [systemRow("gone", second + 400), row("card", second)]
+        XCTAssertEqual(ids(actConfirmLinesUnderCards(stored, cards: cards(cardFor("card", "claim", [expire])))),
+                       ["gone", "card"])
+    }
+
+    func testEachOfTwoTasksLinesGoesUnderItsOwnCard() {
+        let both = cards(cardFor("cardA", "a", [confirmOf("lineA", "a")]),
+                         cardFor("cardB", "b", [confirmOf("lineB", "b")]))
+        let stored = [systemRow("lineA", second + 100), systemRow("lineB", second + 200),
+                      row("cardA", second), row("between", second), row("cardB", second + 1000)]
+        XCTAssertEqual(ids(actConfirmLinesUnderCards(stored, cards: both)),
+                       ["cardA", "lineA", "between", "cardB", "lineB"])
+    }
+
+    func testTwoLinesUnderOneCardKeepTheirOrder() {
+        let twice = cards(cardFor("card", "claim", [confirmOf("first", "claim"), confirmOf("second", "claim")]))
+        let stored = [systemRow("first", second + 100), systemRow("second", second + 200), row("card", second + 1000)]
+        XCTAssertEqual(ids(actConfirmLinesUnderCards(stored, cards: twice)), ["card", "first", "second"])
+    }
+
+    func testALiveConfirmationIsDrawnUnderItsCardWhateverOrderItWasStoredIn() {
+        // Live order: the step, the home's confirmation and its line, then the
+        // card's line. Stamped in the step's second, the card sorts before the
+        // line's millisecond; stamped in the next, after it.
+        let claim = idAt(second + 400)
+        let receipt = idAt(second + 450)
+        for (cardAt, stored) in [(second, ["m-card", receipt]), (second + 1000, [receipt, "m-card"])] {
+            let ch = ChannelState(name: "#work")
+            _ = ch.recordActEvent(ev())
+            _ = ch.recordActEvent(move("claim", claim))
+            let text = ch.recordActEvent(move("confirm", receipt, ["act-subject": claim], who: "acceptance", did: nil))
+            ch.appendIfNew(ChatMessage(id: receipt, from: "", text: text ?? "", isAction: false,
+                                       timestamp: Date(timeIntervalSince1970: Double(second + 450) / 1000),
+                                       replyTo: nil))
+            var card = ChatMessage(id: "m-card", from: "worker", text: "on it", isAction: false,
+                                   timestamp: Date(timeIntervalSince1970: Double(cardAt) / 1000), replyTo: nil)
+            card.account = worker
+            card.actRef = opener
+            ch.appendIfNew(card)
+
+            XCTAssertEqual(ids(ch.messages), stored)
+            XCTAssertEqual(ids(actConfirmLinesUnderCards(ch.messages, cards: ch.actCards)), ["m-card", receipt])
+        }
+    }
 }

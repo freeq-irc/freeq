@@ -33,6 +33,7 @@ import {
 } from "./discovery.js";
 import { scrubOutbound } from "./scrub.js";
 import { PI_NAMES, type HarnessNames } from "./names.js";
+import { firstSignedCertificateWarning, signedCertificateLine } from "./owner-key.js";
 import {
   AskRegistry,
   encodePayload,
@@ -78,13 +79,19 @@ export interface BotLike {
   readonly provenance: { verified: boolean; reason: string; text: string } | null;
   /** Called with each verdict bot-kit reports, when it arrives or changes. */
   onProvenance?(handler: (verdict: { verified: boolean; reason: string }) => void): () => void;
+  /** The delegation certificate bot-kit loaded or minted; a signature means
+   *  it is signed with a creator key (deprecated). */
+  readonly delegation?: { signature: string | null };
+  /** Where bot-kit keeps this bot's identity and certificate. */
+  readonly stateDir?: string;
 }
 
 /** How a bot gets built. Overridden in tests. */
 export type BotFactory = (opts: {
   name: string;
   ownerDid: string;
-  /** Owner's creator seed; when set, bot-kit signs the delegation cert. */
+  /** Owner's creator seed; when set, bot-kit signs the delegation cert
+   *  (deprecated; to be removed in a later release). */
   creatorKeyPath?: string;
   nick: string;
   url: string;
@@ -123,7 +130,8 @@ export interface ConnectionOptions {
    */
   names?: HarnessNames;
   ownerDid: string;
-  /** Owner's creator seed; when set, bot-kit signs the delegation cert. */
+  /** Owner's creator seed; when set, bot-kit signs the delegation cert
+   *  (deprecated; to be removed in a later release). */
   creatorKeyPath?: string;
   server: string;
   slug: string;
@@ -223,6 +231,8 @@ export class FreeqConnection {
   /** Notices are deduped: a flapping connection must not spam the TUI. */
   #noticed = new Set<string>();
   #asks = new AskRegistry((reason) => this.#opts.onNotice?.(`freeq ask: ${reason}`, "warning"));
+  /** Coordination handlers still running; what `settled()` waits on. */
+  readonly #inFlight = new Set<Promise<unknown>>();
 
   constructor(opts: ConnectionOptions) {
     // The configured list is the initial intent; join()/leave() keep it live.
@@ -327,6 +337,19 @@ export class FreeqConnection {
         logProvenance: false,
       });
       this.#bot = bot;
+      // Signed certificates will stop counting in a later release. Said once per
+      // process: a retry or `authorize verify` builds a new bot and a new
+      // connection, and `#notice`'s set belongs to this one.
+      if (bot.delegation?.signature && firstSignedCertificateWarning()) {
+        this.#opts.onNotice?.(
+          signedCertificateLine({
+            botDid: bot.identity.did,
+            certPath: bot.stateDir ? join(bot.stateDir, "delegation.json") : undefined,
+            keyPath: this.#opts.creatorKeyPath,
+          }),
+          "warning",
+        );
+      }
       bot.onProvenance?.((v) =>
         this.#opts.onNotice?.(
           `freeq: provenance ${v.verified ? "verified" : "unverified"}: ${v.reason}`,
@@ -369,7 +392,7 @@ export class FreeqConnection {
       // Peer discovery rides coordination events, not presence — the server
       // drops presence status for active agents (see discovery.ts).
       bot.on("coordinationEvent", (e: CoordinationEventPayload) => {
-        void this.#onCoordinationEvent(e);
+        this.#track(this.#onCoordinationEvent(e));
       });
 
       // Announce into each channel once we're actually in it.
@@ -449,7 +472,12 @@ export class FreeqConnection {
 
       bot.on("authError", (e: string) => {
         this.#lastError = e;
-        this.#notice(`freeq: authentication failed — ${e}`, "error", "auth");
+        // An allowlisted server names the owner's records; that is the
+        // owner's cue to add this installation as one of their agents.
+        const hint = /agent records of .* do not admit this agent/.test(e)
+          ? ` Run ${this.#names.hint("authorize")} to add this installation as one of your agents.`
+          : "";
+        this.#notice(`freeq: authentication failed — ${e}${hint}`, "error", "auth");
       });
 
       await bot.start();
@@ -586,6 +614,24 @@ export class FreeqConnection {
   /** Re-announce into every joined channel (after a metadata change). */
   announceAll(): void {
     for (const channel of this.#opts.channels) this.#announce(channel, PI_HELLO);
+  }
+
+  /**
+   * Remember a coordination handler's promise until it settles. Only the
+   * removal is attached: a handler that throws still surfaces as exactly one
+   * unhandled rejection carrying its own error, as it did before.
+   */
+  #track(p: Promise<unknown>): void {
+    this.#inFlight.add(p);
+    void p.finally(() => this.#inFlight.delete(p));
+  }
+
+  /**
+   * Resolves once every coordination handler that has started has finished,
+   * including any one of them started. For tests and shutdown; never throws.
+   */
+  async settled(): Promise<void> {
+    while (this.#inFlight.size > 0) await Promise.allSettled([...this.#inFlight]);
   }
 
   async #onCoordinationEvent(e: CoordinationEventPayload): Promise<void> {

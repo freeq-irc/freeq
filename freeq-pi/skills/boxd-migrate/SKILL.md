@@ -67,13 +67,15 @@ step; only a session that is the user can write to their account.
 Verify it landed: inside the remote pi, `/freeq authorize verify` reconnects
 and reports "Delegation verified" once the server has read the record.
 
-### The older way: `--sign-cert`
+### Deprecated: `--sign-cert`
 
 With `--sign-cert` the script signs the VM's certificate here with the owner's
 creator key instead, and if the server has no copy of that key's public half
 it prints `/raw MSGSIG <base64url-public-key>` for the user to paste into a
-client authenticated as them. That still works, for servers from before agent
-records; the record way needs no key on any machine.
+client authenticated as them. It is deprecated and to be removed in a later release,
+when signed certificates stop counting; every server in use reads agent
+records, and the record way needs no key on any machine. A run that finds the
+VM's certificate signed, with or without `--sign-cert`, says what to delete.
 
 ## Known sharp edges
 
@@ -106,7 +108,7 @@ remote pi prints the owner DID, the joined channels, and any refusals.
 
 - `scripts/mint-identity.mjs` — mint an installation's identity without
   connecting (run on the machine being provisioned).
-- `scripts/sign-delegation.mjs` — the older way: sign a cert with the
-  owner's creator key (run on the owner's machine).
+- `scripts/sign-delegation.mjs` — deprecated; to be removed in a later release: sign
+  a cert with the owner's creator key (run on the owner's machine).
 - `freeq-bot-id register --owner <handle> <did>...` — add agents to your
   account from a terminal, as Settings → Agents does in the web app.

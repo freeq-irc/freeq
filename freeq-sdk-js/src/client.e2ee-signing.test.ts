@@ -12,6 +12,7 @@ import { webcrypto } from 'crypto';
 import type { FreeqClient } from './client.js';
 import * as signing from './signing.js';
 import * as e2ee from './e2ee.js';
+import { waitFor } from '../test/wait-for.js';
 
 // ── WebSocket mock ────────────────────────────────────────────────
 
@@ -79,10 +80,6 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-async function flushAsync(): Promise<void> {
-  for (let i = 0; i < 12; i++) await new Promise((r) => setTimeout(r, 5));
-}
-
 /**
  * A registered client. `caps` is what the server advertises and acks, so a
  * legacy server is expressed by leaving `freeq.at/msgsig` out of it.
@@ -99,14 +96,20 @@ async function makeClient(
     skipInitialBrokerRefresh: true,
   });
   client.connect();
-  await flushAsync();
   const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+  await waitFor('the registration lines on the wire', () =>
+    ws.sent.some((l) => l.startsWith('USER ')),
+  );
   ws.recv(`:srv CAP * LS :${caps}`);
-  await flushAsync();
+  await waitFor('the CAP REQ the client answers with', () =>
+    ws.sent.some((l) => l.startsWith('CAP REQ')),
+  );
   ws.recv(`:srv CAP * ACK :${caps.replace(/=[^ ]*/g, '')}`);
-  await flushAsync();
+  await waitFor('the CAP END the client answers with', () =>
+    ws.sent.some((l) => l.startsWith('CAP END')),
+  );
   ws.recv(`:srv 001 ${nick} :Welcome`);
-  await flushAsync();
+  await waitFor('the client to finish registering', () => client.registered);
   ws.sent.length = 0;
   return { client, ws };
 }
@@ -160,9 +163,9 @@ describe('an encrypted message is signed over its ciphertext', () => {
     const verifyKey = await provisionSigningKey(client, DID);
 
     client.sendMessage(channel, 'the quiet part');
-    await flushAsync();
-
-    const line = ws.sent.find((l) => l.includes(`PRIVMSG ${channel}`));
+    const line = await waitFor(`a PRIVMSG to ${channel} on the wire`, () =>
+      ws.sent.find((l) => l.includes(`PRIVMSG ${channel}`)),
+    );
     expect(line, `sent: ${ws.sent.join(' | ')}`).toBeDefined();
     expect(line).toContain('+encrypted');
     const ciphertext = bodyOf(line!);
@@ -195,7 +198,11 @@ describe('an encrypted message is signed over its ciphertext', () => {
     const paragraph = 'Long enough that the ciphertext will not fit one line. '.repeat(30);
     const text = Array.from({ length: 5 }, (_, i) => `line${i}: ${paragraph}`).join('\n');
     client.sendMessage(channel, text);
-    await flushAsync();
+    // The closer is the batch's last frame: once it is there, the opener and
+    // every chunk are too.
+    await waitFor('the BATCH closer on the wire', () =>
+      ws.sent.find((l) => /BATCH -\S+/.test(l)),
+    );
 
     const opener = ws.sent.find((l) => l.includes('BATCH +') && l.includes('draft/multiline'));
     const chunks = ws.sent.filter((l) => l.includes('PRIVMSG') && l.includes('batch='));
@@ -234,9 +241,9 @@ describe('an encrypted message is signed over its ciphertext', () => {
     const verifyKey = await provisionSigningKey(client, DID);
 
     client.sendReply(channel, '01ROOTMSGID', 'answering in the dark');
-    await flushAsync();
-
-    const line = ws.sent.find((l) => l.includes(`PRIVMSG ${channel}`))!;
+    const line = await waitFor(`a PRIVMSG to ${channel} on the wire`, () =>
+      ws.sent.find((l) => l.includes(`PRIVMSG ${channel}`)),
+    );
     const canonical = await signing.messageCanonical({
       from: DID,
       msgid: tagOf(line, '+freeq.at/eventid')!,
@@ -254,9 +261,9 @@ describe('an encrypted message is signed over its ciphertext', () => {
     await provisionSigningKey(client, DID);
 
     client.sendMessage(channel, 'as far as this server can tell, nothing is new');
-    await flushAsync();
-
-    const line = ws.sent.find((l) => l.includes(`PRIVMSG ${channel}`));
+    const line = await waitFor(`a PRIVMSG to ${channel} on the wire`, () =>
+      ws.sent.find((l) => l.includes(`PRIVMSG ${channel}`)),
+    );
     expect(line, `sent: ${ws.sent.join(' | ')}`).toBeDefined();
     expect(line).toContain('+encrypted');
     for (const sent of ws.sent) {
@@ -275,9 +282,9 @@ describe('an encrypted message is signed over its ciphertext', () => {
     const verifyKey = await provisionSigningKey(client, DID);
 
     client.sendMessage(channel, 'plaintext, because encryption failed');
-    await flushAsync();
-
-    const line = ws.sent.find((l) => l.includes(`PRIVMSG ${channel}`))!;
+    const line = await waitFor(`a PRIVMSG to ${channel} on the wire`, () =>
+      ws.sent.find((l) => l.includes(`PRIVMSG ${channel}`)),
+    );
     expect(line).not.toContain('+encrypted');
     const canonical = await signing.messageCanonical({
       from: DID,

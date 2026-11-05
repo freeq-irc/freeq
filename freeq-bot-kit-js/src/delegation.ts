@@ -11,8 +11,9 @@
 // whose record is added later is verified when it next connects, so it is
 // restarted after adding it. No key of the owner's is kept with the bot.
 //
-// Signed (the older way, which keeps working): with the creator's ed25519
-// key (`creatorKeyPath`, a 32-byte seed file — the same format
+// Signed (deprecated; signed certificates will stop counting in a later release,
+// and the signing is removed then): with the creator's ed25519 key
+// (`creatorKeyPath`, a 32-byte seed file — the same format
 // `freeq-bot-id --creator-key` reads) the cert is JCS-canonicalized
 // (RFC 8785) with the `signature` field omitted and ed25519-signed, exactly
 // mirroring freeq-bot-id/src/main.rs. The server verifies it against the
@@ -170,6 +171,7 @@ export interface LoadOrMintDelegationOptions {
    * `freeq-bot-id --creator-key` reads). When set, freshly minted certs are
    * signed, and an existing UNSIGNED cert is upgraded in place (signed and
    * rewritten). The creator must have registered this key via MSGSIG.
+   * Deprecated; to be removed in a later release.
    */
   creatorKeyPath?: string;
 }

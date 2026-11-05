@@ -302,6 +302,16 @@ pub struct DeviceKeyHistory {
     pub record: serde_json::Value,
 }
 
+impl DeviceKeyHistory {
+    /// Whether a device holding this key must stop using it at `now`: a
+    /// retirement before its expiry counts at once, whatever its date, and an
+    /// expiry once it is reached. Message verdicts judge by date instead.
+    pub fn retired_or_expired(&self, now: DateTime<Utc>) -> bool {
+        self.retired_at
+            .is_some_and(|r| r < self.expires_at || r <= now)
+    }
+}
+
 /// Every checked device key of `did`, earliest first, each with its expiry and
 /// the date it stopped counting: the expiry, or an earlier retirement that
 /// counts. Retirements the fold ignores (wrong signer, dated before the key,
@@ -1538,6 +1548,32 @@ mod tests {
         assert_eq!(history[0].kid, kid_of(1));
         assert_eq!(history[0].created_at, instant(T0));
         assert_eq!(history[0].retired_at, Some(instant(T2)));
+    }
+
+    #[test]
+    fn a_key_is_retired_or_expired_by_a_retirement_whatever_its_date_or_once_its_expiry_is_reached()
+    {
+        let ahead = [
+            value(&build_device_record_with_expiry(&key(1), ALICE, T0, LATER, None).unwrap()),
+            value(&build_device_retirement(&key(1), ALICE, &kid_of(1), T2).unwrap()),
+        ];
+        let live = [value(
+            &build_device_record_with_expiry(&key(1), ALICE, T0, LATER, None).unwrap(),
+        )];
+        // Created at T0 with the default lifetime, so it expires at T3.
+        let expired = [value(
+            &build_device_record(&key(1), ALICE, T0, None).unwrap(),
+        )];
+        let cases: [(&str, &[serde_json::Value], &str, bool); 3] = [
+            ("a retirement dated after now", &ahead, T1, true),
+            ("no retirement and an expiry after now", &live, T1, false),
+            ("an expiry reached", &expired, T4, true),
+        ];
+        for (case, records, now, want) in cases {
+            let history = device_key_history(ALICE, records);
+            assert_eq!(history.len(), 1, "{case}");
+            assert_eq!(history[0].retired_or_expired(instant(now)), want, "{case}");
+        }
     }
 
     fn hex_seed(byte: u8) -> String {

@@ -14,7 +14,7 @@ describe("handleHook", () => {
     await handleHook({ event: "run_start", run_id: "A", workflow_name: "w" }, opts);
     await handleHook({ event: "run_complete", run_id: "B", workflow_name: "w" }, opts);
     expect(lookups).toEqual(["B"]);
-    expect(posted[1]).toBe("fabro: w finished green — PR https://gh/pr/1");
+    expect(posted[1]).toBe("fabro: w [b] finished green — PR https://gh/pr/1");
   });
 });
 
@@ -29,16 +29,21 @@ describe("createRelay", () => {
     return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   }
 
-  it("answers 204 and posts the formatted line", async () => {
+  it("answers 204, posts the public line, and sends details to the owner", async () => {
     const posted: string[] = [];
-    const base = await start((l) => posted.push(l));
+    const owner: string[] = [];
+    const server = createRelay({ post: (l) => posted.push(l), postOwner: (l) => owner.push(l) });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    close = () => server.close();
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     const res = await fetch(`${base}/hook`, {
       method: "POST",
       body: JSON.stringify({ event: "run_failed", run_id: "R", workflow_name: "dep-audit", failure_reason: "verify failed" }),
     });
     expect(res.status).toBe(204);
     await new Promise((r) => setTimeout(r, 20));
-    expect(posted).toEqual(["fabro: dep-audit FAILED: verify failed — fabro inspect R"]);
+    expect(posted).toEqual(["fabro: dep-audit [r] FAILED"]);
+    expect(owner).toEqual(["fabro: dep-audit [r] FAILED: verify failed — fabro inspect R"]);
   });
 
   it("404s other paths and tolerates junk bodies", async () => {

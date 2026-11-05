@@ -24,47 +24,34 @@ import { vi } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AgentRuntime } from "@freeq/harness-kit/runtime";
+// The floor the extension's HTTP and ~/.freeq lookups land on: a fake fetch
+// and a scratch HOME, installed from `setupFiles` before any import here.
+import {
+  defaultFetch,
+  state as net,
+  TEST_HOME,
+  type FetchHandler,
+} from "@freeq/harness-kit/test-setup";
 
 // Real timer functions, captured before any test installs fake timers, so
 // `settle()` can let promise chains run while the clock is frozen.
 const realSetImmediate = globalThis.setImmediate;
 const realSetTimeout = globalThis.setTimeout;
 
-/** A stand-in for the server's HTTP API: `/api/v1/actions`, key lookups. */
-export type FetchHandler = (url: string) => { status: number; body?: unknown } | Error;
-
-/** Default: nothing assigned to us, and no key on record for anyone. */
-const defaultFetch: FetchHandler = (url) =>
-  url.includes("/api/v1/actions") ? { status: 200, body: { tasks: [] } } : { status: 404 };
+export type { FetchHandler };
 
 /** Shared, mutable state the module mocks read from. */
 const state: {
   agentDir: string;
   bot: FakeBot | undefined;
-  fetch: FetchHandler;
-  fetched: string[];
+  /** The runtime the extension built, so `quiesce()` can await its handlers. */
+  runtime: AgentRuntime | undefined;
 } = {
   agentDir: "",
   bot: undefined,
-  fetch: defaultFetch,
-  fetched: [],
+  runtime: undefined,
 };
-
-// The extension asks the server what is assigned to it on every connect, and
-// looks up signing keys for act events. Neither may reach a network.
-globalThis.fetch = (async (input: string | URL) => {
-  const url = String(input);
-  state.fetched.push(url);
-  const r = state.fetch(url);
-  if (r instanceof Error) throw r;
-  return new Response(r.body === undefined ? null : JSON.stringify(r.body), { status: r.status });
-}) as typeof fetch;
-
-// HOME decides where the extension looks for ~/.freeq (read once, when the
-// extension module is first imported), so it points at a scratch directory
-// before anything imports it.
-const home = mkdtempSync(join(tmpdir(), "freeq-pi-pin-"));
-process.env.HOME = home;
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   CONFIG_DIR_NAME: ".pi",
@@ -86,6 +73,21 @@ vi.mock("@freeq/bot-kit", async (orig) => ({
     },
   },
 }));
+
+// The extension creates its runtime and keeps it to itself; this subclass
+// hands each instance to `state.runtime` so a test can wait on its handlers.
+vi.mock("@freeq/harness-kit/runtime", async (orig) => {
+  const real = await orig<typeof import("@freeq/harness-kit/runtime")>();
+  return {
+    ...real,
+    AgentRuntime: class extends real.AgentRuntime {
+      constructor(...args: ConstructorParameters<typeof real.AgentRuntime>) {
+        super(...args);
+        state.runtime = this;
+      }
+    },
+  };
+});
 
 export interface BotCreateOptions {
   name: string;
@@ -291,10 +293,11 @@ export async function startPi(opts: StartOptions = {}) {
   mkdirSync(cwd, { recursive: true });
   if (opts.config) writeFileSync(join(agentDir, "freeq.json"), JSON.stringify(opts.config));
   state.agentDir = agentDir;
-  state.fetch = opts.fetch ?? defaultFetch;
-  state.fetched = [];
+  net.fetch = opts.fetch ?? defaultFetch;
+  net.fetched = [];
   const fakeBot = new FakeBot();
   state.bot = fakeBot;
+  state.runtime = undefined;
 
   const handlers = new Map<string, Handler[]>();
   const tools = new Map<string, any>();
@@ -360,16 +363,19 @@ export async function startPi(opts: StartOptions = {}) {
   /**
    * Wait until the extension stops producing output. Its inbound handlers are
    * fire-and-forget and await file writes, so a fixed number of ticks is not
-   * enough; this waits for the wire, notices, deliveries, entries and
-   * confirmations to stay unchanged across several real pauses.
+   * enough; this awaits the runtime's in-flight handlers, then waits for the
+   * wire, notices, deliveries, entries and confirmations to stay unchanged
+   * across several real pauses (a handler can hand work to pi, such as a
+   * confirm or a delivery, that finishes outside the runtime).
    */
   const activity = () =>
     fakeBot.sent.length + notices.length + delivered.length + entries.length + confirms.length +
-    fakeBot.states.length + state.fetched.length;
+    fakeBot.states.length + net.fetched.length;
   async function quiesce(): Promise<void> {
     let last = -1;
     let stable = 0;
     for (let i = 0; i < 200 && stable < 3; i++) {
+      await state.runtime?.settled();
       await settle();
       const now = activity();
       stable = now === last ? stable + 1 : 0;
@@ -500,7 +506,7 @@ export async function startPi(opts: StartOptions = {}) {
     },
     /** URLs the extension fetched. */
     fetched(): string[] {
-      return [...state.fetched];
+      return [...net.fetched];
     },
     /**
      * Replace what differs between runs, so text pins stably: the scratch
@@ -518,7 +524,7 @@ export async function startPi(opts: StartOptions = {}) {
   function norm(text: string): string {
     return text
       .split(root).join("<root>")
-      .split(home).join("<home>")
+      .split(TEST_HOME).join("<home>")
       .replace(new RegExp(`\\b${process.pid}\\b`, "g"), "<pid>");
   }
 

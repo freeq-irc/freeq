@@ -30,7 +30,7 @@
     "example:fire-task": "tsx examples/fire-task.ts"
   },
   "dependencies": {
-    "@freeq/sdk": "^0.2.0",
+    "@freeq/sdk": "^0.3.0",
     "commander": "^14.0.1"
   },
   "devDependencies": {

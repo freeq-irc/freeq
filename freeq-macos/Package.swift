@@ -58,6 +58,7 @@ let package = Package(
                 "ComposeFormatting.swift",
                 "ComposeHistory.swift",
                 "MessageTimeline.swift",
+                "JoinPartDisplay.swift",
                 "MessageBlocks.swift",
                 "SyntaxHighlighter.swift",
                 "BufferNavigation.swift",

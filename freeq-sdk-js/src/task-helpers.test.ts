@@ -5,6 +5,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { waitFor } from '../test/wait-for.js';
 
 // ── WebSocket mock ────────────────────────────────────────────────
 
@@ -67,8 +68,16 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-async function flushAsync(): Promise<void> {
-  for (let i = 0; i < 12; i++) await new Promise((r) => setTimeout(r, 0));
+/** Wait for the act TAGMSGs a helper signs to reach the wire. */
+async function sentActEvents(
+  ws: MockWebSocket,
+  what: string,
+  done: (events: Record<string, string>[]) => boolean = (e) => e.length > 0,
+): Promise<Record<string, string>[]> {
+  return waitFor(what, () => {
+    const events = actEvents(ws);
+    return done(events) ? events : undefined;
+  });
 }
 
 const CAPS = 'message-tags freeq.at/msgsig';
@@ -90,14 +99,20 @@ async function signingClient(): Promise<{
   client.signing.setSigningDid(DID);
   await client.signing.generateSigningKey();
   client.connect();
-  await flushAsync();
   const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+  await waitFor('the registration lines on the wire', () =>
+    ws.sent.some((l) => l.startsWith('USER ')),
+  );
   ws.recv(`:srv CAP * LS :${CAPS}`);
-  await flushAsync();
+  await waitFor('the CAP REQ the client answers with', () =>
+    ws.sent.some((l) => l.startsWith('CAP REQ')),
+  );
   ws.recv(`:srv CAP * ACK :${CAPS}`);
-  await flushAsync();
+  await waitFor('the CAP END the client answers with', () =>
+    ws.sent.some((l) => l.startsWith('CAP END')),
+  );
   ws.recv(':srv 001 eliza :Welcome');
-  await flushAsync();
+  await waitFor('the client to finish registering', () => client.registered);
   ws.sent.length = 0;
   return { client, ws };
 }
@@ -140,9 +155,11 @@ describe('createTask', () => {
   it('opens a handoff directed at the sender and takes it', async () => {
     const { client, ws } = await signingClient();
     const taskId = await client.createTask('#ops', 'Build a todo app');
-    await flushAsync();
-
-    const events = actEvents(ws);
+    // The helper opens a handoff and then takes it: `accept` is the second
+    // and last event on the wire.
+    const events = await sentActEvents(ws, 'the offer and its accept', (e) =>
+      e.some((ev) => ev['+freeq.at/act-verb'] === 'accept'),
+    );
     expect(events).toHaveLength(2);
 
     const [offer, accept] = events as [Record<string, string>, Record<string, string>];
@@ -171,8 +188,7 @@ describe('the other four helpers', () => {
   it('updateTask reports progress with the phase in the note', async () => {
     const { client, ws } = await signingClient();
     await client.updateTask('#ops', TASK, 'designing', 'Chose React');
-    await flushAsync();
-    const [ev] = actEvents(ws) as [Record<string, string>];
+    const [ev] = (await sentActEvents(ws, 'the progress event')) as [Record<string, string>];
     expect(ev['+freeq.at/act-verb']).toBe('progress');
     expect(ev['+freeq.at/act-id']).toBe(TASK);
     expect(ev['+freeq.at/act-note']).toBe('designing:\\sChose\\sReact');
@@ -181,8 +197,7 @@ describe('the other four helpers', () => {
   it('completeTask completes and carries a result URL as context', async () => {
     const { client, ws } = await signingClient();
     await client.completeTask('#ops', TASK, 'shipped', 'https://e.g/build/9');
-    await flushAsync();
-    const [ev] = actEvents(ws) as [Record<string, string>];
+    const [ev] = (await sentActEvents(ws, 'the complete event')) as [Record<string, string>];
     expect(ev['+freeq.at/act-verb']).toBe('complete');
     expect(ev['+freeq.at/act-id']).toBe(TASK);
     expect(ev['+freeq.at/act-note']).toBe('shipped');
@@ -192,16 +207,14 @@ describe('the other four helpers', () => {
   it('completeTask without a URL carries no context', async () => {
     const { client, ws } = await signingClient();
     await client.completeTask('#ops', TASK, 'shipped');
-    await flushAsync();
-    const [ev] = actEvents(ws) as [Record<string, string>];
+    const [ev] = (await sentActEvents(ws, 'the complete event')) as [Record<string, string>];
     expect(ev['+freeq.at/act-ctx']).toBeUndefined();
   });
 
   it('failTask fails with the error as the note', async () => {
     const { client, ws } = await signingClient();
     await client.failTask('#ops', TASK, 'Out of memory');
-    await flushAsync();
-    const [ev] = actEvents(ws) as [Record<string, string>];
+    const [ev] = (await sentActEvents(ws, 'the fail event')) as [Record<string, string>];
     expect(ev['+freeq.at/act-verb']).toBe('fail');
     expect(ev['+freeq.at/act-id']).toBe(TASK);
     expect(ev['+freeq.at/act-note']).toBe('Out\\sof\\smemory');
@@ -215,8 +228,7 @@ describe('attachEvidence', () => {
       reference: 'https://e.g/report.txt',
       content: new TextEncoder().encode('12/12 passed'),
     });
-    await flushAsync();
-    const [ev] = actEvents(ws) as [Record<string, string>];
+    const [ev] = (await sentActEvents(ws, 'the evidence event')) as [Record<string, string>];
     expect(ev['+freeq.at/act-verb']).toBe('progress');
     expect(ev['+freeq.at/act-id']).toBe(TASK);
     expect(ev['+freeq.at/act-note']).toBe('test_result:\\s12/12\\spassed');
@@ -232,8 +244,7 @@ describe('attachEvidence', () => {
     await client.attachEvidence('#ops', TASK, 'artifact_link', 'the built bundle', {
       reference: 'freeq:blob/cap/abc',
     });
-    await flushAsync();
-    const [ev] = actEvents(ws) as [Record<string, string>];
+    const [ev] = (await sentActEvents(ws, 'the evidence event')) as [Record<string, string>];
     expect(ev['+freeq.at/act-ctx']).toBe('freeq:blob/cap/abc');
     expect(ev['+freeq.at/act-ctx-h']).toBeUndefined();
   });
@@ -248,8 +259,7 @@ describe('attachEvidence', () => {
     await client.attachEvidence('#ops', TASK, 'deploy_log', 'Deployed', {
       url: 'https://e.g/deploy.log',
     });
-    await flushAsync();
-    const [ev] = actEvents(ws) as [Record<string, string>];
+    const [ev] = (await sentActEvents(ws, 'the evidence event')) as [Record<string, string>];
     expect(ev['+freeq.at/act-ctx']).toBe('https://e.g/deploy.log');
     expect(ev['+freeq.at/act-ctx-h']).toBe('sha256:' + (await sha256Hex(body)));
   });
@@ -265,8 +275,7 @@ describe('attachEvidence', () => {
     await client.attachEvidence('#ops', TASK, 'deploy_log', 'Deployed', {
       url: 'https://e.g/deploy.log',
     });
-    await flushAsync();
-    const [ev] = actEvents(ws) as [Record<string, string>];
+    const [ev] = (await sentActEvents(ws, 'the evidence event')) as [Record<string, string>];
     expect(ev['+freeq.at/act-ctx']).toBe('https://e.g/deploy.log');
     expect(ev['+freeq.at/act-ctx-h']).toBeUndefined();
   });
@@ -281,10 +290,12 @@ describe('a session that cannot sign', () => {
       skipInitialBrokerRefresh: true,
     });
     client.connect();
-    await flushAsync();
     const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    await waitFor('the registration lines on the wire', () =>
+      ws.sent.some((l) => l.startsWith('USER ')),
+    );
     ws.recv(':srv 001 guest :Welcome');
-    await flushAsync();
+    await waitFor('the client to finish registering', () => client.registered);
     ws.sent.length = 0;
 
     await expect(client.createTask('#ops', 'anything')).rejects.toThrow(

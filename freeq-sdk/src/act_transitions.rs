@@ -221,6 +221,18 @@ pub fn is_confirmation(verb: &str) -> bool {
     verb == confirmation_verb()
 }
 
+/// Whether this verb is a ruling: the home's receipt, or a move only the
+/// system makes in some kind (an expiry, a closed review window). The words
+/// only a task's home signs.
+pub fn is_ruling(verb: &str) -> bool {
+    is_confirmation(verb)
+        || spec().kinds.values().any(|k| {
+            k.transitions
+                .iter()
+                .any(|t| t.verb == verb && t.who == "system")
+        })
+}
+
 /// The tag a new action names the finished one it revives in.
 pub fn revival_tag() -> &'static str {
     spec().revival.tag.as_str()

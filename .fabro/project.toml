@@ -18,13 +18,16 @@ auto_merge = false
 merge_strategy = "squash"
 
 # ── Default model ────────────────────────────────────────────────────────
-# Sonnet 5.5 is the default workhorse. Nodes that need deeper reasoning (bug
-# hunt, feature explore/plan/implement) override to claude-opus-5-5 in their
-# graph via `model=`. Fabro 0.254's built-in catalog predates the 5.5 family,
-# so both are declared as custom models in the executor's
-# ~/.fabro/settings.toml (see .fabro/executor/models.toml).
+# Every workflow node names its model explicitly (claude-sonnet-5-5, or
+# claude-opus-5-5 for hunt/explore/plan/implement). This run-level default is
+# what Fabro uses *outside* the graph — notably to write the PR title/body
+# after a run, which it does with a forced tool call. The 5.5 family rejects
+# forced tool use (400 "tool_choice ... not supported"), so the default stays
+# on claude-sonnet-4-6; with 5.5 here every green run failed to open its PR.
+# Fabro 0.254's built-in catalog predates the 5.5 family, so both are
+# declared as custom models on the executor (.fabro/executor/models.toml).
 [run.model]
-name = "claude-sonnet-5-5"
+name = "claude-sonnet-4-6"
 
 # ── Execution environment ────────────────────────────────────────────────
 # Runs execute in a Docker container on the always-on boxd VM that hosts the

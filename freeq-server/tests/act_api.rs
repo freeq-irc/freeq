@@ -253,6 +253,18 @@ impl C {
         self.rx(|l| l.contains(&id), "the step is accepted and echoed");
         id
     }
+
+    /// Post an unsigned coordination event in `target`, and return the id it
+    /// is filed under.
+    fn coordination(&mut self, target: &str) -> String {
+        let id = freeq_sdk::chatsig::new_event_id();
+        self.tx(&format!(
+            "@+freeq.at/event=task_update;msgid={id};+freeq.at/ref={id};\
+             +freeq.at/payload=%7B%7D TAGMSG {target}"
+        ));
+        self.rx(|l| l.contains(&id), "the coordination event is echoed");
+        id
+    }
 }
 
 fn ids(body: &serde_json::Value) -> Vec<String> {
@@ -847,5 +859,196 @@ async fn the_audit_timeline_carries_the_channel_s_task_events() {
             .iter()
             .any(|r| r["event_id"] == serde_json::json!(offer_id)),
         "{later}"
+    );
+}
+
+/// A reader that checks the rulings it is shown needs the bytes each one was
+/// signed over: every task step and every receipt on it carries its stored
+/// document, and the answer lists the opener of every task on the page, the
+/// referee it names being what a ruling is checked against, whoever the
+/// `actor` filter asked for.
+#[tokio::test]
+async fn the_audit_timeline_sends_each_task_event_s_signed_document() {
+    let ka = PrivateKey::generate_ed25519();
+    let kb = PrivateKey::generate_ed25519();
+    let (irc, web, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    let (offer_id, accept_id, bearer, _a, _b) = tokio::task::spawn_blocking(move || {
+        let alice_key = SigningKey::from_bytes(&[23u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[24u8; 32]);
+        let mut a = C::authenticated(irc, "alice", DID_ALICE, ka);
+        a.msgsig(&alice_key);
+        a.join("#work");
+        let mut b = C::authenticated(irc, "bob", DID_BOB, kb);
+        b.msgsig(&bob_key);
+        b.join("#work");
+
+        let venue = channel_venue("#work");
+        let offer = a.offer_to("#work", &venue, DID_BOB, DID_ALICE, &alice_key);
+        let accept = b.step("#work", &venue, &offer, "accept", DID_BOB, &bob_key);
+        let bearer = a.bearer.clone();
+        (offer, accept, bearer, a, b)
+    })
+    .await
+    .unwrap();
+
+    // The documents on file, as the task's own history serves them.
+    let (status, history) = get(web, &format!("/api/v1/actions/{offer_id}"), None).await;
+    assert_eq!(status, 200);
+    let on_file: HashMap<String, (String, serde_json::Value)> = history["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["event_id"].as_str().unwrap().to_string(),
+                (
+                    e["canonical"].as_str().unwrap().to_string(),
+                    e["signature"].clone(),
+                ),
+            )
+        })
+        .collect();
+
+    let (status, body) = get(web, "/api/v1/channels/work/audit", Some(&bearer)).await;
+    assert_eq!(status, 200);
+    let rows: Vec<&serde_json::Value> = body["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["category"] == "act")
+        .collect();
+    assert_eq!(rows.len(), 2, "{body}");
+    for row in &rows {
+        let id = row["event_id"].as_str().unwrap();
+        assert_eq!(row["canonical"], on_file[id].0, "{row}");
+        // Beside the signature, never among the facts the panel draws.
+        assert!(row["details"].get("canonical").is_none(), "{row}");
+    }
+    let receipt = &rows[1]["details"]["receipt"];
+    let receipt_id = receipt["event_id"].as_str().unwrap();
+    assert_eq!(receipt["canonical"], on_file[receipt_id].0, "{receipt}");
+    assert_eq!(receipt["signature"], on_file[receipt_id].1, "{receipt}");
+
+    let opener = serde_json::json!({
+        "event_id": offer_id,
+        "canonical": on_file[&offer_id].0,
+        "signature": on_file[&offer_id].1,
+    });
+    assert_eq!(
+        body["openers"],
+        serde_json::json!([opener.clone()]),
+        "{body}"
+    );
+
+    // Bob did not open the task: his page holds no opener row, and the
+    // answer still lists the opener his step is ruled under.
+    let (status, only_bob) = get(
+        web,
+        &format!("/api/v1/channels/work/audit?actor={DID_BOB}"),
+        Some(&bearer),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let bob_rows: Vec<&serde_json::Value> = only_bob["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["category"] == "act")
+        .collect();
+    assert_eq!(
+        bob_rows
+            .iter()
+            .map(|r| r["event_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![accept_id.as_str()],
+        "{only_bob}"
+    );
+    assert_eq!(
+        only_bob["openers"],
+        serde_json::json!([opener]),
+        "{only_bob}"
+    );
+}
+
+/// The audit panel shows the latest of a room's history: past the limit the
+/// route leaves out the oldest rows, whichever source they come from, and
+/// still answers oldest first, a task's same-second steps in their order. The
+/// openers it sends are those of the tasks left on the page. `/events` keeps
+/// answering with the oldest.
+#[tokio::test]
+async fn the_audit_timeline_keeps_the_newest_rows_past_its_limit() {
+    let ka = PrivateKey::generate_ed25519();
+    let kb = PrivateKey::generate_ed25519();
+    let (irc, web, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    let (old_task, coordination, task, accept, complete, bearer, _a, _b) =
+        tokio::task::spawn_blocking(move || {
+            let alice_key = SigningKey::from_bytes(&[25u8; 32]);
+            let bob_key = SigningKey::from_bytes(&[26u8; 32]);
+            let mut a = C::authenticated(irc, "alice", DID_ALICE, ka);
+            a.msgsig(&alice_key);
+            a.join("#work");
+            let mut b = C::authenticated(irc, "bob", DID_BOB, kb);
+            b.msgsig(&bob_key);
+            b.join("#work");
+
+            let venue = channel_venue("#work");
+            let old_task = a.offer_to("#work", &venue, DID_BOB, DID_ALICE, &alice_key);
+            // Rows are stamped in whole seconds: the next ones fall in a
+            // later second than this offer.
+            std::thread::sleep(Duration::from_millis(1100));
+            let coordination: Vec<String> = (0..3).map(|_| a.coordination("#work")).collect();
+            let task = a.offer_to("#work", &venue, DID_BOB, DID_ALICE, &alice_key);
+            let accept = b.step("#work", &venue, &task, "accept", DID_BOB, &bob_key);
+            let complete = b.step("#work", &venue, &task, "complete", DID_BOB, &bob_key);
+            let bearer = a.bearer.clone();
+            (old_task, coordination, task, accept, complete, bearer, a, b)
+        })
+        .await
+        .unwrap();
+
+    let ids = |body: &serde_json::Value| -> Vec<String> {
+        body["timeline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["event_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let openers = |body: &serde_json::Value| -> Vec<String> {
+        body["openers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["event_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // Seven rows in all: the two receipts ride on the steps they rule on.
+    let (status, all) = get(web, "/api/v1/channels/work/audit", Some(&bearer)).await;
+    assert_eq!(status, 200);
+    let mut every = vec![old_task.clone()];
+    every.extend(coordination.iter().cloned());
+    every.extend([task.clone(), accept.clone(), complete.clone()]);
+    assert_eq!(ids(&all), every, "{all}");
+
+    // Six asked for: the old task's offer is the one left out, and its
+    // opener with it.
+    let (status, page) = get(web, "/api/v1/channels/work/audit?limit=6", Some(&bearer)).await;
+    assert_eq!(status, 200);
+    assert_eq!(ids(&page), every[1..].to_vec(), "{page}");
+    assert_eq!(openers(&page), vec![task.clone()], "{page}");
+
+    // `/events` still answers with the oldest coordination events.
+    let (status, events) = get(web, "/api/v1/channels/work/events?limit=2", Some(&bearer)).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["event_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![coordination[0].as_str(), coordination[1].as_str()],
+        "{events}"
     );
 }

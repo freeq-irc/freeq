@@ -33,6 +33,7 @@ import {
   liveDeviceKeys,
   provenRecords,
   recordCid,
+  retiredOrExpired,
   retirementClosure,
   setPauseClock,
   verifyProof,
@@ -334,6 +335,27 @@ describe('device key expiry', () => {
     // A retirement before the expiry is the date that counts.
     expect((await of(k3)).expiresAt).toEqual(new Date(T3));
     expect((await of(k3)).retiredAt).toEqual(new Date(T1));
+  });
+
+  it('counts a retirement whatever its date, and an expiry once it is reached', async () => {
+    const k1 = await key(1);
+    const kid = await kidOf(k1);
+    const ahead = [
+      await buildDeviceRecord(k1, ALICE, T0, undefined, LATER),
+      await buildDeviceRetirement(k1, ALICE, kid, T2),
+    ];
+    const live = [await buildDeviceRecord(k1, ALICE, T0, undefined, LATER)];
+    // Created at T0 with the default lifetime, so it expires at T3.
+    const expired = [await buildDeviceRecord(k1, ALICE, T0)];
+    const cases: [string, unknown[], string, boolean][] = [
+      ['a retirement dated after now', ahead, T1, true],
+      ['no retirement and an expiry after now', live, T1, false],
+      ['an expiry reached', expired, T4, true],
+    ];
+    for (const [name, records, now, want] of cases) {
+      const [history] = await deviceKeyHistory(ALICE, records);
+      expect(retiredOrExpired(history!, new Date(now)), name).toBe(want);
+    }
   });
 
   it('drops a record whose expiry is not an RFC 3339 string', async () => {

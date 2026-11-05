@@ -175,6 +175,10 @@ freeq-server --config /etc/freeq/server.toml
 | `--signing-key-lifetime-days` / `SIGNING_KEY_LIFETIME_DAYS` | How long a signing key this server files lasts before it expires, counted from when it was first seen; a connection whose key expires is closed and the device signs in again. A key published in the account's records follows its record instead, and this server's own keys, other servers' own keys and a bot's did:key never expire (default: 90) |
 | `GITHUB_CLIENT_ID` | GitHub OAuth for credential verifier |
 | `GITHUB_CLIENT_SECRET` | GitHub OAuth secret |
+| `--allowed-dids` / `FREEQ_ALLOWED_DIDS` | Restrict authentication to these DIDs |
+| `--allowed-did-domains` / `FREEQ_ALLOWED_DID_DOMAINS` | Restrict authentication to DIDs whose handle is under one of the listed domains |
+| `--no-guest` / `FREEQ_NO_GUEST` | Refuse guest connections |
+| `--allow-delegated-agents` / `FREEQ_ALLOW_DELEGATED_AGENTS` | Admit a `did:key` agent not on the allowlist when it's listed in an allowed owner's `at.freeq.agentKey` records. Removing the record refuses its next connect and closes a live session at the next re-read (`--record-cache-secs`); records unreadable for three re-read periods close it too |
 
 ### Federation
 
@@ -196,6 +200,13 @@ freeq-server \
 | `--s2s-peer-trust` | *(none)* | Trust levels per peer: `id:full`, `id:relay`, `id:readonly` |
 
 See [Federation](federation.md), [S2S Auth](S2S-AUTH-PLAN.md), and [Security Guide](SECURITY.md) for details.
+
+#### Tasks this server referees
+
+A task opened on this server names it as the task's referee, as `did:web:<--server-name>`, and other servers count this server's rulings on the task only under that name, checked against the key list it publishes at `/api/v1/signing-keys/<its did:web name>`. Two limits follow from that:
+
+- **Changing `--server-name`** stalls this server's open tasks on other servers: the name inside each task no longer matches the name its rulings are signed under.
+- **Restoring the database from a backup** makes other servers drop this server's next rulings on tasks that were open at the time. Each ruling on a task is numbered, the restored database counts on from the backup, and a number another server already holds for something else is a conflict there.
 
 ### MOTD
 

@@ -11,4 +11,20 @@ ignore = [
     # rsa 0.9 Marvin timing sidechannel — no fixed release exists.
     # Transitive via freeq-claude-mcp; freeq itself does no RSA operations.
     "RUSTSEC-2023-0071",
+
+    # crypto-bigint 0.5.5 timing variability, transitive via k256 0.13 and
+    # p256 0.13 (elliptic-curve 0.13). Fixed only in crypto-bigint 0.7, which
+    # needs k256/p256 0.14 — a breaking RustCrypto migration (ecdsa 0.17,
+    # signature traits) across freeq-sdk, freeq-oauth and freeq-auth-broker.
+    # Exposure: a local timing side channel while a key signs (SASL, DPoP,
+    # message signing) on the signer's own device; the server only verifies
+    # public data. ACCEPTED TEMPORARILY — remove with the 0.14 migration.
+    "RUSTSEC-2026-0387",
+
+    # ringbuf 0.4.8 double free in Consumer::skip/clear when an element's Drop
+    # panics. Transitive via fixed-resample 0.9.2 in the pinned iroh-live rev
+    # (AV crates). Unreachable here: fixed-resample's ring buffers hold only
+    # `Sample` types, which are `Copy` (iroh-live uses f32), so elements have
+    # no Drop. Remove when iroh-live moves to fixed-resample >= 0.13.
+    "RUSTSEC-2026-0293",
 ]

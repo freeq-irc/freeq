@@ -9,16 +9,18 @@
  * `freeq-bot-id register --owner <handle> <did>`, and the server proves the
  * unsigned certificate from that record. Nothing of the owner's comes here.
  *
- * The older way: let the owner sign the cert elsewhere
- * (`sign-delegation.mjs`) and drop the signed cert back in place before
- * connecting.
+ * Deprecated; to be removed in a later release: let the owner sign the cert
+ * elsewhere (`sign-delegation.mjs`) and drop the signed cert back in place
+ * before connecting.
  *
  * Run it ON the machine being provisioned, from the freeq-pi package dir:
  *
  *     node scripts/mint-identity.mjs --owner did:plc:… --project freeq
  *
  * Idempotent: an existing key is loaded, not replaced, and an existing SIGNED
- * cert is left alone. Prints JSON on stdout:
+ * cert is left alone (`signed` says so; signed certificates will stop counting
+ * in a later release, and boxd-migrate.sh says what to delete). Prints JSON on
+ * stdout:
  *
  *     {"botName","did","seedPath","certPath","signed":false}
  */
