@@ -23,6 +23,7 @@ export * from "./owner-key.js";
 export * from "./presence.js";
 export * from "./progress.js";
 export * from "./provenance.js";
+export * from "./rooms.js";
 export * from "./runtime.js";
 export * from "./scrub.js";
 export * from "./status.js";

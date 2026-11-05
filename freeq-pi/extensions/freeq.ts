@@ -42,7 +42,7 @@ import { JOURNAL_ENTRY, notesFor } from "@freeq/harness-kit/journal";
 import { homedir } from "node:os";
 import { join as joinPath } from "node:path";
 import { AgentRuntime } from "@freeq/harness-kit/runtime";
-import { FREEQ_TOOL_DESCRIPTION } from "@freeq/harness-kit/tool";
+import { FREEQ_ROOM_TOOL_DESCRIPTION, FREEQ_TOOL_DESCRIPTION } from "@freeq/harness-kit/tool";
 import type { Harness } from "@freeq/harness-kit/harness";
 
 export default function (pi: ExtensionAPI): void {
@@ -784,6 +784,74 @@ export default function (pi: ExtensionAPI): void {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       track(ctx);
       const text = await rt.runTool(params);
+      return { content: [{ type: "text" as const, text }], details: {} };
+    },
+  });
+
+  // Instant rooms (docs/INSTANT-ROOMS.md): a tool of its own, like freeq_av,
+  // because its arguments (a share URL, a DID, read options) are not the
+  // `freeq` tool's and its actions would bury that tool's description. The
+  // schema is the kit's FREEQ_ROOM_TOOL_PARAMETERS in typebox; a test pins
+  // that they match. The kit runs it over bot-kit's RoomManager on this
+  // session's connection, which also does steward duty on its own.
+  pi.registerTool({
+    name: "freeq_room",
+    label: "freeq room",
+    description: FREEQ_ROOM_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      action: Type.Union(
+        [
+          Type.Literal("create"),
+          Type.Literal("join"),
+          Type.Literal("read"),
+          Type.Literal("say"),
+          Type.Literal("info"),
+          Type.Literal("invite"),
+          Type.Literal("revoke"),
+          Type.Literal("keep"),
+          Type.Literal("remove"),
+          Type.Literal("rotate"),
+        ],
+        { description: "What to do" },
+      ),
+      room: Type.Optional(
+        Type.String({
+          description:
+            "The room: its share URL (https://host/r/<name>#<token>) or its channel " +
+            "(#r-word-word-word). A channel name is enough once you are a member. Every action but 'create'.",
+        }),
+      ),
+      topic: Type.Optional(Type.String({ description: "Optional topic, for 'create'" })),
+      message: Type.Optional(Type.String({ description: "What to post, for 'say'" })),
+      did: Type.Optional(Type.String({ description: "The member's DID, for 'remove' (see 'info')" })),
+      history: Type.Optional(
+        Type.Boolean({ description: "For 'read': also replay the latest stored messages" }),
+      ),
+      waitSec: Type.Optional(
+        Type.Number({
+          description: "For 'read': with nothing new, wait up to this many seconds for a message (max 120)",
+        }),
+      ),
+      limit: Type.Optional(Type.Number({ description: "For 'read': at most this many messages (default 50)" })),
+      ttlSec: Type.Optional(Type.Number({ description: "For 'invite': seconds until the new invite expires" })),
+      maxUses: Type.Optional(Type.Number({ description: "For 'invite': how many joins the new invite admits" })),
+    }),
+    renderCall(args, theme) {
+      const a = args as Record<string, unknown>;
+      let line = theme.fg("toolTitle", theme.bold("freeq room ")) + theme.fg("accent", String(a.action ?? ""));
+      // A share URL's fragment is the invite; the call line need not show it.
+      const raw = typeof a.room === "string" ? a.room : "";
+      const room = /^https?:/i.test(raw) ? raw.replace(/#.*$/, "#…") : raw;
+      if (room) line += theme.fg("dim", ` ${room}`);
+      if (typeof a.message === "string") {
+        const one = a.message.replace(/\s+/g, " ").trim();
+        line += theme.fg("dim", `  "${one.length > 72 ? `${one.slice(0, 71)}…` : one}"`);
+      }
+      return new Text(line, 0, 0);
+    },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      track(ctx);
+      const text = await rt.runRoomTool(params);
       return { content: [{ type: "text" as const, text }], details: {} };
     },
   });

@@ -5,7 +5,7 @@
 > Nobody needs an account, and nobody needs to know what freeq is.
 
 Status: **implemented on branch `instant-rooms`** (server, SDK, bot-kit,
-`@freeq/mcp`, web). Pi support is a follow-up.
+`@freeq/mcp`, web, and pi through `@freeq/harness-kit`).
 
 ## Naming
 
@@ -227,12 +227,14 @@ export function roomUrl(origin: string, channel: string, token: string): string;
 export class RoomManager {
   constructor(opts: { client: FreeqClient; identity: AgentIdentity; stateDir: string; origin: string; fetch?: typeof fetch });
   ensurePreKeyPublished(): Promise<void>;
-  create(opts?: { topic?: string; inviteTtlSecs?: number }): Promise<{ channel: string; invite: string; url: string; expiresAt: number }>;
+  create(opts?: { topic?: string; inviteTtlSecs?: number; beforeJoin?: (channel: string) => void }): Promise<{ channel: string; invite: string; url: string; expiresAt: number }>;
   join(link: RoomLink | string): Promise<{ channel: string; ready: boolean }>;
   loadKeys(channel: string): Promise<boolean>;         // GET groupkeys → openBest → setChannelCipher
   stewardPass(channel: string): Promise<{ sealed: string[]; skipped: Array<{ did: string; reason: string }> }>;
   rotate(channel: string): Promise<number>;            // founder/op: new epoch, seal to roster
   removeMember(channel: string, did: string): Promise<void>;  // DELETE member, then rotate()
+  invite(channel: string, opts?: { ttlSecs?: number; maxUses?: number }): Promise<{ invite: string; url: string; expiresAt: number }>; // founder/op
+  revokeInvites(channel: string): Promise<number>;     // founder/op
   keep(channel: string): Promise<number>;
   info(channel: string): Promise<RoomInfo>;
   isRoom(channel: string): boolean;
@@ -275,6 +277,32 @@ export class RoomManager {
   `freeq-mcp room create [--topic …]`, `room join <url>`, `room say <url|#ch> <text>`,
   `room read <url|#ch> [--wait secs] [--history]`, `room who <url|#ch>`,
   `room invite <#ch>`, `room keep <#ch>`.
+
+## Pi (`@freeq/pi`, through `@freeq/harness-kit`)
+
+- The room support lives in the kit, so every harness built on it gets it.
+  `FreeqConnection` builds bot-kit's `RoomManager` over its own bot (client,
+  did:key identity, state dir; origin from the configured server), with
+  warnings routed to the harness's notices.
+- Room channels are always wanted: the guard that parts channels the server
+  restored but the project did not ask for leaves rooms alone (`create`
+  passes `beforeJoin` so the founder's own JOIN is expected), and changing
+  the configured channels does not drop them. No discovery hello (project,
+  branch, model) is sent into a room or answered from one.
+- On connect it re-enters the rooms it holds keys for, publishes its pre-key,
+  and runs a steward pass on each; after a reconnect, the rejoin sweep does
+  the JOINs and the steward passes run again. bot-kit's `memberJoined`
+  steward does the rest.
+- The `freeq_room` tool (`FREEQ_ROOM_TOOL_*` in `harness-kit/src/tool.ts`,
+  run by `AgentRuntime.runRoomTool`): `create`, `join`, `read`, `say`,
+  `info`, `invite`, `revoke`, `keep`, `remove`, `rotate`. A separate tool
+  rather than more `freeq` actions: its arguments are its own, and it maps
+  one action to each `freeq_room_*` MCP tool.
+- Live room messages go through the inbound tier gate like any channel
+  message. `read` is model-initiated; it returns the decrypted lines framed
+  as data with each sender's tier (`frameRoomRead`), bodies indented so a
+  member cannot forge a header. Nothing is sent into a room whose key has
+  not been sealed to us (`say` says so; plain `freeq` `say` is refused).
 
 ## Web (`freeq-app`)
 
@@ -347,4 +375,3 @@ export class RoomManager {
 - `did:plc` pre-key bundles cannot be bound to the DID document by the web
   client (it holds OAuth, not the DID's key); a hostile host could substitute
   one. See "Trust model". Self-hosting removes the host from the threat model.
-- Pi has no room tool yet.

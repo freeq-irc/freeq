@@ -45,11 +45,16 @@ export type { FetchHandler };
 const state: {
   agentDir: string;
   bot: FakeBot | undefined;
+  /** What the mocked `RoomManager` constructor hands back, and what it was built with. */
+  rooms: FakeRooms | undefined;
+  roomOpts: Record<string, unknown> | undefined;
   /** The runtime the extension built, so `quiesce()` can await its handlers. */
   runtime: AgentRuntime | undefined;
 } = {
   agentDir: "",
   bot: undefined,
+  rooms: undefined,
+  roomOpts: undefined,
   runtime: undefined,
 };
 
@@ -60,6 +65,15 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
 
 vi.mock("@freeq/bot-kit", async (orig) => ({
   ...(await orig<object>()),
+  // The kit builds bot-kit's RoomManager over a real bot (one with a state
+  // dir and a client that carries ciphers); this hands back the fake.
+  RoomManager: class {
+    constructor(opts: Record<string, unknown>) {
+      state.roomOpts = opts;
+      if (!state.rooms) throw new Error("fake-pi: no fake rooms installed");
+      return state.rooms;
+    }
+  },
   FreeqBot: {
     create: async (opts: BotCreateOptions) => {
       const bot = state.bot;
@@ -129,6 +143,8 @@ export class FakeBot {
   nextActIds: string[] = [];
   /** When set, `sendAct` rejects with this message. */
   failAct: string | undefined;
+  /** Set when the test wants rooms: the kit only builds a room manager for a bot with one. */
+  stateDir: string | undefined;
 
   client = ((self: FakeBot) => ({
     get nick(): string | null {
@@ -147,6 +163,10 @@ export class FakeBot {
       return this.nextActIds.shift() ?? "01JTASK0000000000000000000";
     },
     signing: { getPublicKey: () => "fake-pubkey" },
+    // Enough of FreeqClient for the kit to hand this client to a RoomManager.
+    on: () => undefined,
+    setChannelCipher: () => undefined,
+    getChannelCipher: () => null,
   }))(this);
 
   on(event: string, handler: Handler): this {
@@ -218,6 +238,8 @@ export interface StartOptions {
   start?: boolean;
   /** The server's HTTP API. Default: nothing assigned, no keys. */
   fetch?: FetchHandler;
+  /** Give the bot a room manager (this fake). Default: no rooms. */
+  rooms?: FakeRooms;
 }
 
 /** An act event as the SDK hands one to bot-kit's `actEvent` listeners. */
@@ -298,6 +320,12 @@ export async function startPi(opts: StartOptions = {}) {
   const fakeBot = new FakeBot();
   state.bot = fakeBot;
   state.runtime = undefined;
+  state.rooms = opts.rooms;
+  state.roomOpts = undefined;
+  if (opts.rooms) {
+    fakeBot.stateDir = join(root, "bot-state");
+    opts.rooms.bot = fakeBot;
+  }
 
   const handlers = new Map<string, Handler[]>();
   const tools = new Map<string, any>();
@@ -425,6 +453,16 @@ export async function startPi(opts: StartOptions = {}) {
       await commands.get("freeq").handler(args, ctx);
       await quiesce();
     },
+    /** What the kit built the room manager with. */
+    roomOpts(): Record<string, unknown> | undefined {
+      return state.roomOpts;
+    },
+    /** Run the `freeq_room` tool and return its text. */
+    async roomTool(params: Record<string, unknown>): Promise<string> {
+      const r = await tools.get("freeq_room").execute("call-1", params, undefined, undefined, ctx);
+      await quiesce();
+      return r.content.map((c: { text: string }) => c.text).join("\n");
+    },
     /** Run the `freeq` tool and return its text. */
     async tool(params: Record<string, unknown>): Promise<string> {
       const r = await tools.get("freeq").execute("call-1", params, undefined, undefined, ctx);
@@ -533,3 +571,82 @@ export async function startPi(opts: StartOptions = {}) {
 }
 
 export type Pi = Awaited<ReturnType<typeof startPi>>;
+
+/**
+ * bot-kit's RoomManager as the kit drives it: holds keys for `keys`, seals
+ * to us on the next `loadKeys` for `sealable`, and records every call. Its
+ * JOINs go through the fake bot's wire like any other.
+ */
+export class FakeRooms {
+  bot: FakeBot | undefined;
+  keys = new Set<string>();
+  sealable = new Set<string>();
+  calls: string[] = [];
+  nextChannel = "#r-quiet-copper-fox";
+  channels(): string[] {
+    return [...this.keys];
+  }
+  isRoom(channel: string): boolean {
+    return this.keys.has(channel.toLowerCase());
+  }
+  async ensurePreKeyPublished(): Promise<void> {
+    this.calls.push("prekey");
+  }
+  async create(opts: { topic?: string; beforeJoin?: (c: string) => void } = {}) {
+    this.calls.push(`create ${opts.topic ?? ""}`.trim());
+    const channel = this.nextChannel;
+    opts.beforeJoin?.(channel);
+    this.bot?.client.join(channel);
+    this.bot?.emit("channelJoined", channel);
+    this.keys.add(channel);
+    const url = `https://test.invalid/r/${channel.slice(1)}#tok_abc`;
+    return { channel, invite: "tok_abc", url, expiresAt: 1_800_000_000 };
+  }
+  async join(link: { channel: string; token: string | null }) {
+    this.calls.push(`join ${link.channel} ${link.token ?? "-"}`);
+    this.bot?.client.join(link.channel);
+    this.bot?.emit("channelJoined", link.channel);
+    return { channel: link.channel, ready: await this.loadKeys(link.channel) };
+  }
+  async loadKeys(channel: string): Promise<boolean> {
+    this.calls.push(`load ${channel}`);
+    if (this.sealable.has(channel)) this.keys.add(channel);
+    return this.keys.has(channel);
+  }
+  async stewardPass(channel: string) {
+    this.calls.push(`steward ${channel}`);
+    return { sealed: [] as string[], skipped: [] as Array<{ did: string; reason: string }> };
+  }
+  async rotate(channel: string): Promise<number> {
+    this.calls.push(`rotate ${channel}`);
+    return 2;
+  }
+  async removeMember(channel: string, did: string): Promise<void> {
+    this.calls.push(`remove ${channel} ${did}`);
+  }
+  async keep(channel: string): Promise<number> {
+    this.calls.push(`keep ${channel}`);
+    return 1_900_000_000;
+  }
+  async info(channel: string) {
+    this.calls.push(`info ${channel}`);
+    return {
+      channel,
+      topic: null,
+      founder_did: "did:key:zSelf",
+      created_at: 1_700_000_000,
+      last_activity: 1_700_000_000,
+      expires_at: 1_700_086_400,
+      latest_epoch: 1,
+      members: [{ did: "did:key:zSelf", joined_at: 1, online: true, epochs: [1] }],
+    };
+  }
+  async invite(channel: string, opts: { ttlSecs?: number; maxUses?: number } = {}) {
+    this.calls.push(`invite ${channel} ${opts.ttlSecs ?? "-"} ${opts.maxUses ?? "-"}`);
+    return { invite: "tok_new", url: `https://test.invalid/r/${channel.slice(1)}#tok_new`, expiresAt: 1_700_000_000 };
+  }
+  async revokeInvites(channel: string): Promise<number> {
+    this.calls.push(`revoke ${channel}`);
+    return 1;
+  }
+}
