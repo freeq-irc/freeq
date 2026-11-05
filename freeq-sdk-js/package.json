@@ -28,7 +28,8 @@
     "dev": "tsc --watch",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "eslint src/"
+    "lint": "eslint src/",
+    "prepublishOnly": "npm run build && npm test"
   },
   "dependencies": {
     "@atcute/car": "^6.1.0",

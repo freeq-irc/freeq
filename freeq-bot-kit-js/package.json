@@ -27,7 +27,8 @@
     "example:gated": "tsx examples/gated-bot.ts",
     "example:streaming": "tsx examples/streaming.ts",
     "example:url-worker": "tsx examples/url-fetch-worker.ts",
-    "example:fire-task": "tsx examples/fire-task.ts"
+    "example:fire-task": "tsx examples/fire-task.ts",
+    "prepublishOnly": "npm run build && npm test"
   },
   "dependencies": {
     "@freeq/sdk": "^0.3.0",
