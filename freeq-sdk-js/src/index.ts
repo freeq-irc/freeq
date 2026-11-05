@@ -212,3 +212,5 @@ export type {
 // neither knows a verb — which verbs a kind allows is `spec/act-transitions.json`'s
 // business. Send them with `FreeqClient.sendAct`.
 export { actTags, actLine, msgidTimestampMs } from './signing.js';
+// The key id a signature names: the first 16 bytes of the key's SHA-256, base64url.
+export { deriveKid } from './signing.js';

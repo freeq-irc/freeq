@@ -13,15 +13,19 @@
 // Nothing here logs a token or a secret.
 
 import {
+  PdsDeviceKeys,
   createGroup,
   decodeMultibaseEd25519,
+  makeDidResolver,
   makeGroupCipher,
   openSealed,
   rotate as rotateGroup,
   sealFor,
   sealedFromWire,
   sealedToWire,
-  verifyEd25519,
+  verifyBundleBinding as sdkVerifyBundleBinding,
+  type BindingResult,
+  type DeviceKeySource,
   type FreeqClient,
   type GroupState,
   type X25519Secret,
@@ -127,9 +131,22 @@ export interface RoomManagerOptions {
   log?: (message: string) => void;
   /** Upper bound on waiting for a JOIN to be answered or the API bearer to arrive. Default 15 s. */
   timeoutMs?: number;
+  /**
+   * Where a `did:plc` member's published device keys are read, to bind their
+   * pre-key bundle. Default: `PdsDeviceKeys` over `fetch` and the PLC
+   * directory, which reads the member's own PDS and never the freeq host.
+   */
+  deviceKeys?: DeviceKeySource;
+  /**
+   * Delays before each further steward pass while members are refused for a
+   * reason that may pass (a device key record not published yet). Default
+   * 5 s, 15 s, 45 s, 2 min; `[]` turns retries off.
+   */
+  stewardRetryMs?: number[];
 }
 
 const STEWARD_DEBOUNCE_MS = 500;
+const STEWARD_RETRY_MS = [5_000, 15_000, 45_000, 120_000];
 
 export class RoomManager {
   readonly #client: FreeqClient;
@@ -145,6 +162,13 @@ export class RoomManager {
   #x25519: Promise<X25519Pair> | null = null;
   #preKeyPublished: Promise<void> | null = null;
   readonly #stewardTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  readonly #deviceKeys: DeviceKeySource;
+  readonly #stewardRetryMs: number[];
+  /** channel → retries spent since the last pass with nothing to retry. */
+  readonly #stewardRetries = new Map<string, number>();
+  readonly #retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** `channel did reason` already logged, so a retry does not repeat it. */
+  readonly #refusalsLogged = new Set<string>();
 
   constructor(opts: RoomManagerOptions) {
     this.#client = opts.client;
@@ -154,6 +178,10 @@ export class RoomManager {
     this.#fetch = opts.fetch ?? ((input, init) => globalThis.fetch(input, init));
     this.#log = opts.log ?? ((m) => console.warn(m));
     this.#timeoutMs = opts.timeoutMs ?? 15_000;
+    this.#deviceKeys =
+      opts.deviceKeys ??
+      new PdsDeviceKeys({ fetch: (url, init) => this.#fetch(url, init), resolveDid: makeDidResolver() });
+    this.#stewardRetryMs = opts.stewardRetryMs ?? STEWARD_RETRY_MS;
 
     this.#loadPersistedRooms();
     for (const ch of this.#epochs.keys()) this.#installCipher(ch);
@@ -279,17 +307,20 @@ export class RoomManager {
   /**
    * Steward pass: seal every epoch we hold to roster members who lack the
    * latest one, after checking that each member's pre-key bundle belongs to
-   * their DID (mandatory for `did:key`; `did:plc` bundles are accepted as
-   * published). If the room has no epoch yet and we founded it, create epoch 1.
+   * their DID (`verifyBundleBinding`: the did:key itself, or a device key
+   * published in a did:plc member's own PDS). A refused member is logged once
+   * per reason; one refused for a reason that may pass is tried again later
+   * (`stewardRetryMs`). If the room has no epoch yet and we founded it,
+   * create epoch 1.
    */
   async stewardPass(channel: string): Promise<{
     sealed: string[];
-    skipped: Array<{ did: string; reason: string }>;
+    skipped: Array<{ did: string; reason: string; retry?: boolean }>;
   }> {
     const ch = channel.toLowerCase();
     const info = await this.info(ch);
     const sealed: string[] = [];
-    const skipped: Array<{ did: string; reason: string }> = [];
+    const skipped: Array<{ did: string; reason: string; retry?: boolean }> = [];
 
     let latest = info.latest_epoch;
     if (latest === null) {
@@ -322,7 +353,12 @@ export class RoomManager {
 
       const pub = await this.#memberIdentityKey(member.did);
       if (!pub.ok) {
-        skipped.push({ did: member.did, reason: pub.reason });
+        skipped.push({ did: member.did, reason: pub.reason, ...(pub.retry ? { retry: true } : {}) });
+        const said = `${ch} ${member.did} ${pub.reason}`;
+        if (!this.#refusalsLogged.has(said)) {
+          this.#refusalsLogged.add(said);
+          this.#log(`[rooms] not sealing ${ch}'s key to ${member.did}: ${pub.reason}`);
+        }
         continue;
       }
       for (const state of missing) {
@@ -346,6 +382,7 @@ export class RoomManager {
         if (!skipped.some((s) => s.did === did)) skipped.push({ did, reason: "not on the roster" });
       }
     }
+    this.#scheduleRetry(ch, skipped.some((s) => s.retry));
     return { sealed, skipped };
   }
 
@@ -427,6 +464,31 @@ export class RoomManager {
     this.#stewardTimers.set(ch, timer);
   }
 
+  /**
+   * Another pass later when this one refused someone for a reason that may
+   * pass (their device key record not in their PDS yet): at each of
+   * `stewardRetryMs`, until a pass has nothing left to retry.
+   */
+  #scheduleRetry(ch: string, wanted: boolean): void {
+    if (!wanted) {
+      this.#stewardRetries.delete(ch);
+      return;
+    }
+    if (this.#retryTimers.has(ch)) return;
+    const spent = this.#stewardRetries.get(ch) ?? 0;
+    if (spent >= this.#stewardRetryMs.length) return;
+    this.#stewardRetries.set(ch, spent + 1);
+    const timer = setTimeout(() => {
+      this.#retryTimers.delete(ch);
+      if (!this.isRoom(ch)) return;
+      this.stewardPass(ch).catch((err) => {
+        this.#log(`[rooms] steward retry for ${ch} failed: ${errorMessage(err)}`);
+      });
+    }, this.#stewardRetryMs[spent]);
+    (timer as { unref?: () => void }).unref?.();
+    this.#retryTimers.set(ch, timer);
+  }
+
   // ── Keys and bundles ──────────────────────────────────────────────────
 
   async #publishPreKey(): Promise<void> {
@@ -456,7 +518,7 @@ export class RoomManager {
   /** A member's X25519 identity key, after checking the bundle belongs to them. */
   async #memberIdentityKey(
     did: string,
-  ): Promise<{ ok: true; key: Uint8Array } | { ok: false; reason: string }> {
+  ): Promise<{ ok: true; key: Uint8Array } | { ok: false; reason: string; retry?: boolean }> {
     let bundle: PreKeyBundle | null;
     try {
       bundle = await this.#fetchBundle(did);
@@ -475,7 +537,7 @@ export class RoomManager {
     if (identityKey.length !== 32 || spk.length !== 32) {
       return { ok: false, reason: "malformed pre-key bundle" };
     }
-    const check = await verifyBundleBinding(did, bundle, spk);
+    const check = await verifyBundleBinding(did, bundle, spk, this.#deviceKeys);
     if (!check.ok) return check;
     return { ok: true, key: identityKey };
   }
@@ -667,57 +729,21 @@ export class RoomManager {
 // ── Bundle ↔ DID binding ────────────────────────────────────────────────
 
 /**
- * Does this pre-key bundle belong to `did`? For `did:key` the answer is
- * checkable: the bundle's `signing_key` must be the DID's Ed25519 key and
- * `spk_signature` must verify over `signed_pre_key` with it. A `did:plc`
- * bundle is accepted as published (the web client cannot bind one — the
- * documented limitation) unless it is outright malformed.
+ * Does this pre-key bundle belong to `did`? The SDK's rule (`@freeq/sdk`
+ * `verifyBundleBinding`): a `did:key` bundle must be signed by the DID's own
+ * Ed25519 key; any other DID's (`did:plc`) must be signed by a live device key
+ * the account published as an `at.freeq.deviceKey` record in its own PDS,
+ * read through `deviceKeys` — never on the freeq host's word. Without
+ * `deviceKeys` a `did:plc` bundle is refused. A refusal that may pass later
+ * (the record not published yet, the PDS unreachable) carries `retry: true`.
  */
 export async function verifyBundleBinding(
   did: string,
   bundle: { signing_key?: string; spk_signature: string; signed_pre_key: string },
   spkBytes?: Uint8Array,
-): Promise<{ ok: true } | { ok: false; reason: string }> {
-  let spk: Uint8Array;
-  try {
-    spk = spkBytes ?? unb64(bundle.signed_pre_key);
-  } catch {
-    return { ok: false, reason: "malformed pre-key bundle" };
-  }
-  if (!did.startsWith("did:key:")) {
-    if (typeof bundle.spk_signature !== "string" || typeof bundle.signed_pre_key !== "string") {
-      return { ok: false, reason: "malformed pre-key bundle" };
-    }
-    return { ok: true };
-  }
-  let didPub: Uint8Array;
-  try {
-    didPub = decodeMultibaseEd25519(did.slice("did:key:".length));
-  } catch {
-    return { ok: false, reason: "did:key is not an ed25519 key" };
-  }
-  if (!bundle.signing_key) {
-    return { ok: false, reason: "bundle has no signing_key; cannot bind it to the did:key" };
-  }
-  let signingKey: Uint8Array;
-  try {
-    signingKey = unb64(bundle.signing_key);
-  } catch {
-    return { ok: false, reason: "malformed signing_key" };
-  }
-  if (!bytesEqual(signingKey, didPub)) {
-    return { ok: false, reason: "bundle signing_key is not the did:key's key" };
-  }
-  let sigUrl: string;
-  try {
-    sigUrl = b64url(unb64(bundle.spk_signature));
-  } catch {
-    return { ok: false, reason: "malformed spk_signature" };
-  }
-  if (!(await verifyEd25519(didPub, spk, sigUrl))) {
-    return { ok: false, reason: "spk_signature does not verify under the did:key" };
-  }
-  return { ok: true };
+  deviceKeys?: DeviceKeySource,
+): Promise<BindingResult> {
+  return sdkVerifyBundleBinding(did, bundle, { spk: spkBytes, deviceKeys });
 }
 
 // ── X25519 identity file: { secret, publicKey } base64, mode 0600 ───────
@@ -763,13 +789,6 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
-  return diff === 0;
-}
-
 function b64(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString("base64");
 }
@@ -778,10 +797,6 @@ function unb64(s: string): Uint8Array {
   if (typeof s !== "string" || !/^[A-Za-z0-9+/_-]*={0,2}$/.test(s)) throw new Error("not base64");
   const std = s.replace(/-/g, "+").replace(/_/g, "/");
   return new Uint8Array(Buffer.from(std, "base64"));
-}
-
-function b64url(bytes: Uint8Array): string {
-  return Buffer.from(bytes).toString("base64url");
 }
 
 function unb64url(s: string): Uint8Array {
