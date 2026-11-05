@@ -1,25 +1,31 @@
 // @vitest-environment jsdom
 /**
  * The action timeline's headline: the title the opener signed, and nothing at
- * all where no opener the reader holds signed one — an id is not a name.
+ * all where no opener the reader holds signed one — an id is not a name. The
+ * task's history comes through the SDK, which has left out every ruling that
+ * fails its referee check.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, cleanup, waitFor } from '@testing-library/react';
 
-// The fetch helper reads the bearer off the singleton SDK client, so stub the
-// module both it and the display-name helper take it from.
-const mockClient: { apiBearer: string | null; getNickForDid: () => undefined } = {
-  apiBearer: null,
+// The panel asks the singleton SDK client for the task's history, and the
+// display-name helper reads it too, so stub the module both take it from.
+const mockClient = {
+  apiBearer: null as string | null,
   getNickForDid: () => undefined,
+  taskHistory: vi.fn(),
 };
-vi.mock('../irc/client', () => ({ getClient: () => mockClient }));
+let client: typeof mockClient | null = mockClient;
+vi.mock('../irc/client', () => ({ getClient: () => client }));
 
 import { TaskTimeline } from './TaskTimeline';
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
-  mockClient.apiBearer = null;
+  vi.unstubAllGlobals();
+  mockClient.taskHistory.mockReset();
+  client = mockClient;
 });
 
 const ACT_ID = '01KZACTION0000000000000ACT';
@@ -36,11 +42,9 @@ function event(eventId: string, doc: Record<string, string>) {
   };
 }
 
+/** The SDK answers the task's history with `events`. */
 function serve(events: ReturnType<typeof event>[]) {
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-    ok: true,
-    json: () => Promise.resolve({ task: null, events }),
-  }));
+  mockClient.taskHistory.mockResolvedValue({ act_id: ACT_ID, task: null, events });
 }
 
 describe('the action timeline headline', () => {
@@ -78,27 +82,41 @@ describe('the action timeline headline', () => {
   });
 });
 
-describe('reading an action the server keeps private', () => {
-  it('sends the session bearer, which is what a DM action is authorized by', async () => {
-    mockClient.apiBearer = 'sess-abc';
-    serve([event(ACT_ID, { 'act-verb': 'offer', 'act-title': 'ship the release' })]);
+describe("the task's history", () => {
+  it("draws the SDK's list, not the server's own answer", async () => {
+    // The server's answer holds a ruling the SDK left out.
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({
+        task: null,
+        events: [
+          event(ACT_ID, { 'act-verb': 'offer', 'act-title': 'ship the release' }),
+          event('01KZCONFIRM000000000000CNF', { 'act-verb': 'confirm', 'act-subject': ACT_ID }),
+          event('01KZEXPIRE0000000000000EXP', { 'act-verb': 'expire' }),
+        ],
+      }),
+    }));
+    serve([
+      event(ACT_ID, { 'act-verb': 'offer', 'act-title': 'ship the release' }),
+      event('01KZEXPIRE0000000000000EXP', { 'act-verb': 'expire' }),
+    ]);
 
     const { container } = render(<TaskTimeline actId={ACT_ID} onClose={() => {}} />);
-    await waitFor(() => expect(container.textContent).toContain('ship the release'));
-    const [, init] = (globalThis.fetch as unknown as {
-      mock: { calls: [string, RequestInit][] };
-    }).mock.calls[0];
-    expect(new Headers(init.headers).get('Authorization')).toBe('Bearer sess-abc');
+    await waitFor(() => expect(container.textContent).toContain('expired'));
+    expect(container.textContent).not.toContain('confirmed');
+    // Under the page's own origin, as the panel's own read was.
+    expect(mockClient.taskHistory).toHaveBeenCalledWith(ACT_ID, { origin: window.location.origin });
   });
 
-  it('asks anyway with no bearer, so a guest still reads a public action', async () => {
-    serve([event(ACT_ID, { 'act-verb': 'offer', 'act-title': 'ship the release' })]);
-
+  it('shows the task as not found before the first connection, not loading for ever', async () => {
+    client = null;
     const { container } = render(<TaskTimeline actId={ACT_ID} onClose={() => {}} />);
-    await waitFor(() => expect(container.textContent).toContain('ship the release'));
-    const [, init] = (globalThis.fetch as unknown as {
-      mock: { calls: [string, RequestInit][] };
-    }).mock.calls[0];
-    expect(new Headers(init.headers).has('Authorization')).toBe(false);
+    await waitFor(() => expect(container.textContent).toContain('Task not found.'));
+  });
+
+  it('shows the task as not found when its history cannot be read', async () => {
+    mockClient.taskHistory.mockRejectedValue(new Error('the task history answered 403'));
+    const { container } = render(<TaskTimeline actId={ACT_ID} onClose={() => {}} />);
+    await waitFor(() => expect(container.textContent).toContain('Task not found.'));
   });
 });

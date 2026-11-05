@@ -3,7 +3,7 @@
  *  has a real wire layer, just with no actual network. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm, readFile, stat } from "node:fs/promises";
+import { mkdtemp, rm, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -120,6 +120,85 @@ describe("FreeqBot.create", () => {
     }
     const cert = JSON.parse(await readFile(join(bot.stateDir, "delegation.json"), "utf8"));
     expect(cert.type).toBe("FreeqBotDelegation/v1");
+  });
+
+  // The signed-certificate warning is said once per process, so these two
+  // run in this order and no earlier test in the file starts a signed bot.
+  it("does not warn about an unsigned certificate", async () => {
+    const { FreeqBot } = await import("./bot.js");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const bot = await FreeqBot.create({
+      name: "unsigned-bot",
+      ownerDid: "did:plc:owner",
+      nick: "unsigned-bot",
+      url: "wss://test/irc",
+      root,
+    });
+    expect(bot.delegation.signature).toBeNull();
+    expect(warn.mock.calls.filter(([m]) => String(m).includes("signed with a creator key"))).toEqual([]);
+  });
+
+  it("warns once per process when a bot starts with a signed certificate", async () => {
+    const { FreeqBot } = await import("./bot.js");
+    const { generateDidKey } = await import("@freeq/sdk");
+    const keyPath = join(root, "creator.key");
+    await writeFile(keyPath, await (await generateDidKey()).exportSeed(), { mode: 0o600 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const opts = {
+      name: "signed-bot",
+      ownerDid: "did:plc:owner",
+      nick: "signed-bot",
+      url: "wss://test/irc",
+      root,
+      creatorKeyPath: keyPath,
+    };
+    const bot = await FreeqBot.create(opts);
+    await FreeqBot.create(opts);
+    expect(bot.delegation.signature).toBeTruthy();
+    const lines = warn.mock.calls.map(([m]) => String(m)).filter((m) => m.includes("signed with a creator key"));
+    expect(lines).toEqual([
+      "This bot's certificate is signed with a creator key. Signed certificates will stop counting in a later release; " +
+        "every server now reads agent records instead. Add this agent under Settings → Agents in the freeq web app, " +
+        `or with \`freeq-bot-id register --owner <handle> ${bot.identity.did}\`, then delete the key at ${keyPath}, ` +
+        `the certificate at ${join(bot.stateDir, "delegation.json")}, and the \`creatorKeyPath\` option from this bot's code, ` +
+        "so an unsigned certificate is made at the next start.",
+    ]);
+  });
+
+  it("hands its client the key lookup it is given", async () => {
+    const { FreeqBot } = await import("./bot.js");
+    const { KeyLookup } = await import("@freeq/sdk");
+    const keyLookup = new KeyLookup({ fetch: async () => new Response(null, { status: 404 }), resolveDid: async () => { throw new Error("none"); } }, null, 60_000);
+    const bot = await FreeqBot.create({
+      name: "lookup-bot",
+      ownerDid: "did:plc:owner",
+      nick: "lookup-bot",
+      url: "wss://test/irc",
+      root,
+      keyLookup,
+      checkLines: false,
+    });
+    const opts = (bot.client as unknown as { opts: { keyLookup?: unknown; checkLines?: boolean } }).opts;
+    expect(opts.keyLookup).toBe(keyLookup);
+    expect(opts.checkLines).toBe(false);
+  });
+
+  it("makes its own key lookup, checking rulings only, when given none", async () => {
+    const { FreeqBot } = await import("./bot.js");
+    const { KeyLookup } = await import("@freeq/sdk");
+    for (const [checkLines, expected] of [[undefined, false], [true, true]] as const) {
+      const bot = await FreeqBot.create({
+        name: "default-lookup-bot",
+        ownerDid: "did:plc:owner",
+        nick: "default-lookup-bot",
+        url: "wss://test/irc",
+        root,
+        ...(checkLines === undefined ? {} : { checkLines }),
+      });
+      const opts = (bot.client as unknown as { opts: { keyLookup?: unknown; checkLines?: boolean } }).opts;
+      expect(opts.keyLookup, String(checkLines)).toBeInstanceOf(KeyLookup);
+      expect(opts.checkLines, String(checkLines)).toBe(expected);
+    }
   });
 
   it("rederives the same DID across runs", async () => {
@@ -1017,6 +1096,28 @@ describe("session signing", () => {
     await flushAsync();
   }
 
+  it("a bot names its owner in the SASL response", async () => {
+    const { FreeqBot } = await import("./bot.js");
+    const bot = await FreeqBot.create({
+      name: "test-bot",
+      ownerDid: "did:plc:owner",
+      nick: "test-bot",
+      url: "wss://test/irc",
+      root,
+    });
+    const startPromise = bot.start();
+    await flushAsync();
+    const ws = MockWebSocket.instances[0]!;
+    await driveSigningReady(ws, "test-bot");
+    await startPromise;
+
+    const response = ws.sent.find((l) => l.startsWith("AUTHENTICATE ") && l !== "AUTHENTICATE ATPROTO-CHALLENGE")!;
+    const payload = JSON.parse(Buffer.from(response.slice("AUTHENTICATE ".length), "base64url").toString());
+    expect(payload.owner_did).toBe("did:plc:owner");
+    expect(payload.did).toBe(bot.identity.did);
+    await bot.stop();
+  });
+
   it("a bot registers a session signing key like every other client", async () => {
     const { FreeqBot } = await import("./bot.js");
     const bot = await FreeqBot.create({
@@ -1338,5 +1439,182 @@ describe("FreeqBot provenance result on stderr", () => {
 
     expect(provenanceLines()).toEqual([]);
     await bot.stop({ drainMs: 0 });
+  });
+});
+
+describe("FreeqBot task rulings", () => {
+  const ORIGIN = "https://server.test";
+  const REFEREE = "did:web:referee.test";
+  /** Seed 90's did:key: her openers check under the key her DID is. */
+  const ALICE = "did:key:z6MkfMo6gxqdBhaHMNnmfhgZFBjpCDTkmJMJLoypsBZS9PwD";
+  const ROOM = "#tasks";
+
+  let root: string;
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "freeq-bot-kit-bot-"));
+  });
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const b64url = (bytes: Uint8Array): string => Buffer.from(bytes).toString("base64url");
+
+  async function keyOf(seed: number) {
+    const { importDidKey } = await import("@freeq/sdk");
+    const { deriveKid, publicKeyFromMultibase } = await import("./act.js");
+    const key = await importDidKey(new Uint8Array(32).fill(seed));
+    const pub = publicKeyFromMultibase(key.publicKeyMultibase);
+    return { key, pub, kid: await deriveKid(pub) };
+  }
+
+  let ids = 0;
+  /** Each event's canonical and signature by id, as the server's task
+   *  history files them. */
+  const canonicals = new Map<string, string>();
+  const signatures = new Map<string, string>();
+  /** A task event signed with `seed`'s key as `signer`: an opener when
+   *  `task` is undefined, else `verb` on that task. */
+  async function taskEvent(seed: number, signer: string, verb: string, task?: string, extra: Record<string, string> = {}) {
+    const { actTags, format } = await import("@freeq/sdk");
+    const { actCanonical, signActTags } = await import("./act.js");
+    const id = `01K6Z${String(++ids).padStart(21, "0")}`;
+    const tags = { ...actTags("handoff", verb, task, signer, {}), ...extra };
+    canonicals.set(id, actCanonical(tags, ROOM, id)!);
+    const sig = await signActTags(tags, ROOM, id, (await keyOf(seed)).key);
+    signatures.set(id, sig!);
+    const formatted = format("TAGMSG", [ROOM], { ...tags, "+freeq.at/eventid": id, "+freeq.at/sig": sig! });
+    const split = formatted.indexOf(" ") + 1;
+    return { id, wire: `${formatted.slice(0, split)}:sender!u@h ${formatted.slice(split)}` };
+  }
+
+  /** The connected server's task history and key routes, holding the key
+   *  ALICE signs openers with, and the referee's own site, listing seed 91's
+   *  key. */
+  async function serve() {
+    const referee = await keyOf(91);
+    const alice = await keyOf(90);
+    const aliceKey = { did: ALICE, kid: alice.kid, public_key: b64url(alice.pub), removed_at: null };
+    vi.stubGlobal("fetch", vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.origin === "https://referee.test" && url.pathname === `/api/v1/signing-keys/${REFEREE}`) {
+        return Response.json({ did: REFEREE, keys: [{ kid: referee.kid, public_key: b64url(referee.pub), removed_at: null }] });
+      }
+      if (url.origin === ORIGIN && url.pathname === "/api/v1/signing-keys") {
+        const named = (url.searchParams.get("keys") ?? "").split(",");
+        return Response.json({ keys: named.includes(`${ALICE}/${alice.kid}`) ? [aliceKey] : [] });
+      }
+      if (url.origin === ORIGIN && url.pathname === `/api/v1/signing-keys/${ALICE}/${alice.kid}`) {
+        return Response.json(aliceKey);
+      }
+      const task = url.origin === ORIGIN && url.pathname.startsWith("/api/v1/actions/")
+        ? decodeURIComponent(url.pathname.slice("/api/v1/actions/".length))
+        : undefined;
+      const canonical = task === undefined ? undefined : canonicals.get(task);
+      if (canonical === undefined) return new Response("not found", { status: 404 });
+      return Response.json({ events: [{ event_id: task, canonical, signature: signatures.get(task) }] });
+    }));
+  }
+
+  it("passes a ruling that counts to its handlers, and never one that fails, through bot.on and bot.client.on alike", async () => {
+    await serve();
+    const { FreeqBot } = await import("./bot.js");
+    const bot = await FreeqBot.create({
+      name: "ruling-bot",
+      ownerDid: "did:plc:owner",
+      nick: "ruling-bot",
+      url: "wss://test/irc",
+      serverOrigin: ORIGIN,
+      root,
+    });
+    const seen: { id: string; ruling?: string }[] = [];
+    bot.on("actEvent", (ev) => seen.push({ id: ev.eventId, ruling: ev.ruling }));
+    // What the client itself sends up: the SDK throws a failing ruling out.
+    const raw: { id: string; ruling?: string }[] = [];
+    bot.client.on("actEvent", (ev) => raw.push({ id: ev.eventId, ruling: ev.ruling }));
+
+    const started = bot.start();
+    await flushAsync();
+    const ws = MockWebSocket.instances[0]!;
+    await driveToReady(ws, "ruling-bot");
+    await started;
+
+    const home = { "+freeq.at/act-home": REFEREE };
+    const first = await taskEvent(90, ALICE, "offer", undefined, home);
+    const second = await taskEvent(90, ALICE, "offer", undefined, home);
+    const counts = await taskEvent(91, REFEREE, "expire", first.id);
+    // Seed 93's key is not on the referee's list.
+    const fails = await taskEvent(93, REFEREE, "expire", second.id);
+    for (const l of [first.wire, second.wire, counts.wire, fails.wire]) {
+      ws.recv(l);
+      await flushAsync();
+    }
+    for (let i = 0; i < 600 && raw.length < 3; i++) await new Promise((r) => setTimeout(r, 5));
+    // Long enough for the failing ruling's check to have settled too.
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(seen.find((u) => u.id === counts.id)?.ruling).toBe("counts");
+    expect(seen.map((u) => u.id)).toEqual([first.id, second.id, counts.id]);
+    expect(raw.map((u) => u.id), "the client never hands it up").toEqual([first.id, second.id, counts.id]);
+    await bot.stop({ drainMs: 0 });
+  });
+
+  it("learns a task's referee from the opener it saw, so a ruling needs no history read", async () => {
+    await serve();
+    const { FreeqBot } = await import("./bot.js");
+    const bot = await FreeqBot.create({
+      name: "opener-bot",
+      ownerDid: "did:plc:owner",
+      nick: "opener-bot",
+      url: "wss://test/irc",
+      serverOrigin: ORIGIN,
+      root,
+    });
+    const seen: { id: string; ruling?: string }[] = [];
+    bot.on("actEvent", (ev) => seen.push({ id: ev.eventId, ruling: ev.ruling }));
+    const started = bot.start();
+    await flushAsync();
+    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    await driveToReady(ws, "opener-bot");
+    await started;
+
+    const opener = await taskEvent(90, ALICE, "offer", undefined, { "+freeq.at/act-home": REFEREE });
+    ws.recv(opener.wire);
+    await flushAsync();
+    await new Promise((r) => setTimeout(r, 50));
+    const ruling = await taskEvent(91, REFEREE, "expire", opener.id);
+    ws.recv(ruling.wire);
+    for (let i = 0; i < 600 && !seen.some((u) => u.id === ruling.id); i++) await new Promise((r) => setTimeout(r, 5));
+
+    expect(seen.find((u) => u.id === ruling.id)?.ruling).toBe("counts");
+    const asked = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => String(c[0]));
+    expect(asked.filter((u) => u.includes("/api/v1/actions/")), "no history read").toEqual([]);
+    await bot.stop({ drainMs: 0 });
+  });
+
+  it("registers on(), once() and off() handlers on the client as they are", async () => {
+    const { FreeqBot } = await import("./bot.js");
+    const bot = await FreeqBot.create({
+      name: "ruling-bot",
+      ownerDid: "did:plc:owner",
+      nick: "ruling-bot",
+      url: "wss://test/irc",
+      root,
+    });
+    const emit = (eventId: string, ruling?: string): void =>
+      (bot.client as unknown as { emit: (e: string, p: unknown) => void }).emit("actEvent", { eventId, ruling });
+    const once: string[] = [];
+    const seen: string[] = [];
+    const handler = (ev: { eventId: string }): void => { seen.push(ev.eventId); };
+    bot.once("actEvent", (ev) => once.push(ev.eventId));
+    bot.on("actEvent", handler);
+    // Whatever the client emits reaches them: the SDK itself never emits a
+    // failing ruling.
+    emit("a", "fails");
+    emit("b", "counts");
+    bot.off("actEvent", handler);
+    emit("c");
+    expect(once).toEqual(["a"]);
+    expect(seen).toEqual(["a", "b"]);
   });
 });

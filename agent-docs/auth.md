@@ -124,7 +124,7 @@ these are not signature problems:
 
 | Reason | What it actually means |
 |---|---|
-| `(bad response)` | The line did not decode to a JSON object with `did` and `signature`. Encoding or shape, **not** cryptography — on older servers this is almost always standard base64 where base64url-unpadded was required. |
+| `(bad response: …)` | The line did not decode to a JSON object with `did` and `signature`. Encoding or shape, **not** cryptography. Current servers say what was wrong (`not base64`, `not JSON`, ``missing field `signature`; got "did", "sig"``); older ones say only `(bad response)`, and there it is almost always standard base64 where base64url-unpadded was required. |
 | `(no challenge)` | You answered before requesting `AUTHENTICATE ATPROTO-CHALLENGE`, or the challenge already expired (60 s) or was already used. |
 | `Signature did not verify against any of N authentication key(s)` | Genuinely the signature. You almost certainly signed the base64 text or a re-encoded JSON instead of the decoded bytes. |
 | `Invalid DID format` / `DID document ID mismatch` | The `did` field is not what the resolved document says it is. |
@@ -136,8 +136,8 @@ Three failures on one connection closes it.
 
 Authenticating proves who you are to the *server*. It does not make your
 messages provable to anyone else: unless you register a session signing key,
-the server signs your messages and `verify` reports `verified_by:
-"server-key"` — relay proof, not authorship. One extra line plus a signature
+the server signs your messages and `verify` reports `proves: "relay"`
+(`verified_by: "server-key"`) — relay proof, not authorship. One extra line plus a signature
 per message fixes that. See [/signing.md](/signing.md).
 
 ## Step 4 — capture the bearer token

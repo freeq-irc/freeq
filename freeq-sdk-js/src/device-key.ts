@@ -18,8 +18,8 @@ export interface StoredDeviceKey {
   createdAt: string;
   /** The `at://` URI of the record that publishes the key, once written. */
   recordUri?: string;
-  /** The server refused the key as expired: the next fresh sign-in replaces
-   *  it, whatever its dates say. */
+  /** The server refused the key as expired or retired: the next fresh sign-in
+   *  replaces it, whatever its dates say. */
   refused?: boolean;
 }
 
@@ -27,6 +27,9 @@ export interface StoredDeviceKey {
 export interface DeviceKeyStore {
   load(): Promise<StoredDeviceKey | null>;
   save(key: StoredDeviceKey): Promise<void>;
+  /** Replace the stored key with a new one, in whatever form this store
+   *  keeps keys, saved with no record URI and no refused flag, and return it. */
+  replace?(): Promise<StoredDeviceKey>;
 }
 
 /** A store that forgets on reload. For tests. */
@@ -76,10 +79,11 @@ function openKeys(): Promise<IDBPDatabase> {
 }
 
 /**
- * A key kept in this browser's IndexedDB, made on first load. It is
- * generated non-extractable and the pair is stored as it is; a browser that
- * refuses a non-extractable Ed25519 key, or cannot store one, gets an
- * extractable key wrapped under a non-extractable AES-KW key instead.
+ * A key kept in this browser's IndexedDB, made on first load; `replace`
+ * makes a new one the same way. It is generated non-extractable and the pair
+ * is stored as it is; a browser that refuses a non-extractable Ed25519 key,
+ * or cannot store one, gets an extractable key wrapped under a
+ * non-extractable AES-KW key instead.
  * `name` keeps one key per account.
  */
 export class IndexedDbDeviceKeyStore implements DeviceKeyStore {
@@ -141,6 +145,15 @@ export class IndexedDbDeviceKeyStore implements DeviceKeyStore {
       };
       await db.put(STORE, pair, this.name);
       this.storage = 'pair';
+    } finally {
+      db.close();
+    }
+  }
+
+  async replace(): Promise<StoredDeviceKey> {
+    const db = await openKeys();
+    try {
+      return await this.create(db);
     } finally {
       db.close();
     }

@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect, useMemo, type KeyboardEvent, type DragEvent } from 'react';
+import { useState, useRef, useCallback, useEffect, useMemo, type KeyboardEvent, type DragEvent, type ReactNode } from 'react';
 import { useStore } from '../store';
 import { sendMessage, sendReply, sendEdit, sendMarkdown, sendAction, joinChannel, partChannel, setTopic, setMode, kickUser, inviteUser, setAway, rawCommand, sendWhois, startTyping, stopTyping } from '../irc/client';
 import { detectStepUpRequired, requestStepUp } from '../lib/oauth-step-up';
@@ -23,11 +23,44 @@ interface PendingUpload {
   error?: string;
 }
 
+function UploadIcon({ className = 'w-4 h-4' }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+      <path d="M14 10v3a1 1 0 01-1 1H3a1 1 0 01-1-1v-3M11 5L8 2M8 2L5 5M8 2v8" />
+    </svg>
+  );
+}
+
+function CameraIcon({ className = 'w-4 h-4' }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 16 16" fill="currentColor">
+      <path d="M10.5 8.5a2.5 2.5 0 11-5 0 2.5 2.5 0 015 0z"/>
+      <path d="M2 4a2 2 0 00-2 2v6a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2h-1.172a2 2 0 01-1.414-.586l-.828-.828A2 2 0 009.172 2H6.828a2 2 0 00-1.414.586l-.828.828A2 2 0 013.172 4H2zm.5 2a.5.5 0 110-1 .5.5 0 010 1zm9 2.5a3.5 3.5 0 11-7 0 3.5 3.5 0 017 0z"/>
+    </svg>
+  );
+}
+
+// A compose action that appears in the toolbar or mobile overflow menu.
+type ComposeAction = {
+  key: string;
+  label: string;
+  icon: ReactNode;
+  onSelect: () => void;
+  inToolbar: boolean;
+  inMenu: boolean;
+  title?: string;
+  active?: boolean;
+  show?: boolean;
+};
+
 export function ComposeBox() {
   const [text, setText] = useState('');
   const [history, setHistory] = useState<string[]>([]);
   const [historyPos, setHistoryPos] = useState(-1);
   const [showEmoji, setShowEmoji] = useState(false);
+  const [showMoreMenu, setShowMoreMenu] = useState(false);
+  const moreMenuRef = useRef<HTMLDivElement>(null);
+  const moreBtnRef = useRef<HTMLButtonElement>(null);
   const [autocomplete, setAutocomplete] = useState<{ items: string[]; selected: number; startPos: number } | null>(null);
   const [slashCmd, setSlashCmd] = useState<{ filter: string; selected: number } | null>(null);
   const [showFormatBar, setShowFormatBar] = useState(false);
@@ -60,7 +93,6 @@ export function ComposeBox() {
   const [spacesAvailable, setSpacesAvailable] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const emojiRef = useRef<HTMLButtonElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
   // When we last told the room we were composing; -Infinity is "never".
@@ -71,6 +103,23 @@ export function ComposeBox() {
   const replyTo = useStore((s) => s.replyTo);
   const editingMsg = useStore((s) => s.editingMsg);
   const ch = channels.get(activeChannel.toLowerCase());
+
+  // Dismiss the mobile overflow menu.
+  useEffect(() => {
+    if (!showMoreMenu) return;
+    const onPointer = (e: PointerEvent) => {
+      const t = e.target as Node;
+      if (moreMenuRef.current?.contains(t) || moreBtnRef.current?.contains(t)) return;
+      setShowMoreMenu(false);
+    };
+    const onKey = (e: globalThis.KeyboardEvent) => { if (e.key === 'Escape') setShowMoreMenu(false); };
+    document.addEventListener('pointerdown', onPointer);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('pointerdown', onPointer);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [showMoreMenu]);
 
   // Initialize edit mode with message text
   useEffect(() => {
@@ -386,22 +435,20 @@ export function ComposeBox() {
       // the next keystroke re-announce without waiting out the interval.
       stopTyping(target);
       lastTypingSent.current = -Infinity;
-      // Editing is checked before markdown mode: with both on, the send is
-      // still an edit, and the mime tag rides it so the revision keeps
-      // rendering as markdown.
+      // Editing and replying both outrank markdown mode, which is a content
+      // type rather than a kind of send: the mime tag rides whichever one it
+      // is, so the message keeps rendering as markdown either way.
+      const mimeTags = markdownMode
+        ? { tags: { '+freeq.at/mime': 'text/markdown' } }
+        : undefined;
       if (editingMsg && editingMsg.channel.toLowerCase() === activeChannel.toLowerCase()) {
-        sendEdit(
-          target,
-          editingMsg.msgId,
-          trimmed,
-          markdownMode ? { tags: { '+freeq.at/mime': 'text/markdown' } } : undefined,
-        );
+        sendEdit(target, editingMsg.msgId, trimmed, mimeTags);
         useStore.getState().setEditingMsg(null);
+      } else if (replyTo && replyTo.channel.toLowerCase() === activeChannel.toLowerCase()) {
+        sendReply(target, replyTo.msgId, trimmed, mimeTags);
+        useStore.getState().setReplyTo(null);
       } else if (markdownMode) {
         sendMarkdown(target, trimmed);
-      } else if (replyTo && replyTo.channel.toLowerCase() === activeChannel.toLowerCase()) {
-        sendReply(target, replyTo.msgId, trimmed);
-        useStore.getState().setReplyTo(null);
       } else {
         sendMessage(target, trimmed);
       }
@@ -580,6 +627,56 @@ export function ComposeBox() {
 
   const canSend = activeChannel !== 'server' || text.startsWith('/');
 
+  const canAttach = !!authDid && activeChannel !== 'server';
+  const actions: ComposeAction[] = [
+    {
+      key: 'upload',
+      label: 'Upload file',
+      title: 'Upload file (or drag & drop, or paste)',
+      icon: <UploadIcon />,
+      onSelect: () => fileInputRef.current?.click(),
+      show: canAttach,
+      inToolbar: true,
+      inMenu: true,
+    },
+    {
+      key: 'camera',
+      label: 'Take photo',
+      icon: <CameraIcon />,
+      onSelect: () => cameraInputRef.current?.click(),
+      show: canAttach,
+      inToolbar: false,
+      inMenu: true,
+    },
+    {
+      key: 'emoji',
+      label: 'Emoji',
+      icon: <span className="text-lg">😊</span>,
+      onSelect: () => setShowEmoji(!showEmoji),
+      inToolbar: true,
+      inMenu: false,
+    },
+    {
+      key: 'format',
+      label: 'Formatting',
+      icon: <span className="text-sm">Aa</span>,
+      onSelect: () => setShowFormatBar(!showFormatBar),
+      active: showFormatBar,
+      inToolbar: true,
+      inMenu: true,
+    },
+    {
+      key: 'markdown',
+      label: 'Markdown',
+      title: markdownMode ? 'Markdown mode ON, click to disable' : 'Enable markdown mode',
+      icon: <span className="text-xs font-bold">M↓</span>,
+      onSelect: () => setMarkdownMode(!markdownMode),
+      active: markdownMode,
+      inToolbar: true,
+      inMenu: true,
+    },
+  ].filter((a) => a.show !== false);
+
   return (
     <div
       className={`border-t border-border bg-bg-secondary shrink-0 relative ${dragOver ? 'ring-2 ring-accent/50 ring-inset' : ''}`}
@@ -715,6 +812,27 @@ export function ComposeBox() {
         />
       )}
 
+      {/* Collapsed toolbar, mobile only */}
+      {showMoreMenu && (
+        <div
+          ref={moreMenuRef}
+          className="absolute bottom-full left-3 mb-1 bg-bg-secondary border border-border rounded-lg shadow-2xl overflow-hidden animate-fadeIn z-30 min-w-[200px] sm:hidden"
+        >
+          {actions.filter((a) => a.inMenu).map((a) => (
+            <button
+              key={a.key}
+              onClick={() => { setShowMoreMenu(false); a.onSelect(); }}
+              className={`w-full text-left px-3 py-2.5 text-sm flex items-center gap-2.5 hover:bg-bg-tertiary ${
+                a.active ? 'text-accent' : 'text-fg-muted'
+              }`}
+            >
+              <span className="w-4 shrink-0 flex items-center justify-center">{a.icon}</span>
+              {a.label}{a.active ? ' (on)' : ''}
+            </button>
+          ))}
+        </div>
+      )}
+
       {/* Autocomplete dropdown */}
       {autocomplete && (
         <div className="absolute bottom-full left-3 mb-1 bg-bg-secondary border border-border rounded-lg shadow-2xl overflow-hidden animate-fadeIn z-20 min-w-[200px]">
@@ -741,18 +859,36 @@ export function ComposeBox() {
       )}
 
       <div className="flex items-end gap-2.5 px-4 py-3">
-        {/* File upload button (only for AT-authenticated users) */}
-        {authDid && activeChannel !== 'server' && (
+        {/* The toolbar collapses behind a + button on phones. */}
+        <button
+          ref={moreBtnRef}
+          onClick={() => setShowMoreMenu((open) => !open)}
+          className={`w-10 h-10 rounded-lg items-center justify-center shrink-0 flex sm:hidden ${
+            showMoreMenu ? 'text-accent bg-accent/10' : 'text-fg-dim hover:text-fg-muted hover:bg-bg-tertiary'
+          }`}
+          aria-label="More actions"
+          aria-expanded={showMoreMenu}
+        >
+          <svg className="w-5 h-5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+            <path d="M8 3.5v9M3.5 8h9" strokeLinecap="round" />
+          </svg>
+        </button>
+
+        {actions.filter((a) => a.inToolbar).map((a) => (
+          <button
+            key={a.key}
+            onClick={a.onSelect}
+            className={`w-10 h-10 rounded-lg items-center justify-center shrink-0 hidden sm:flex ${
+              a.active ? 'text-accent bg-accent/10' : 'text-fg-dim hover:text-fg-muted hover:bg-bg-tertiary'
+            }`}
+            title={a.title ?? a.label}
+          >
+            {a.icon}
+          </button>
+        ))}
+
+        {canAttach && (
           <>
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="w-9 h-9 rounded-lg flex items-center justify-center text-fg-dim hover:text-fg-muted hover:bg-bg-tertiary shrink-0"
-              title="Upload file (or drag & drop, or paste)"
-            >
-              <svg className="w-4 h-4" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
-                <path d="M14 10v3a1 1 0 01-1 1H3a1 1 0 01-1-1v-3M11 5L8 2M8 2L5 5M8 2v8" />
-              </svg>
-            </button>
             <input
               ref={fileInputRef}
               type="file"
@@ -764,17 +900,6 @@ export function ComposeBox() {
                 e.target.value = '';
               }}
             />
-            {/* Camera capture (mobile) */}
-            <button
-              onClick={() => cameraInputRef.current?.click()}
-              className="w-9 h-9 rounded-lg items-center justify-center text-fg-dim hover:text-fg-muted hover:bg-bg-tertiary shrink-0 hidden max-sm:flex"
-              title="Take photo"
-            >
-              <svg className="w-4 h-4" viewBox="0 0 16 16" fill="currentColor">
-                <path d="M10.5 8.5a2.5 2.5 0 11-5 0 2.5 2.5 0 015 0z"/>
-                <path d="M2 4a2 2 0 00-2 2v6a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2h-1.172a2 2 0 01-1.414-.586l-.828-.828A2 2 0 009.172 2H6.828a2 2 0 00-1.414.586l-.828.828A2 2 0 013.172 4H2zm.5 2a.5.5 0 110-1 .5.5 0 010 1zm9 2.5a3.5 3.5 0 11-7 0 3.5 3.5 0 017 0z"/>
-              </svg>
-            </button>
             <input
               ref={cameraInputRef}
               type="file"
@@ -790,40 +915,8 @@ export function ComposeBox() {
           </>
         )}
 
-        {/* Emoji button */}
-        <button
-          ref={emojiRef}
-          onClick={() => setShowEmoji(!showEmoji)}
-          className="w-10 h-10 rounded-lg flex items-center justify-center text-lg text-fg-dim hover:text-fg-muted hover:bg-bg-tertiary shrink-0"
-          title="Emoji"
-        >
-          😊
-        </button>
-
-        {/* Format toggle */}
-        <button
-          onClick={() => setShowFormatBar(!showFormatBar)}
-          className={`w-10 h-10 rounded-lg flex items-center justify-center text-sm shrink-0 ${
-            showFormatBar ? 'text-accent bg-accent/10' : 'text-fg-dim hover:text-fg-muted hover:bg-bg-tertiary'
-          }`}
-          title="Formatting"
-        >
-          Aa
-        </button>
-
-        {/* Markdown mode toggle */}
-        <button
-          onClick={() => setMarkdownMode(!markdownMode)}
-          className={`w-10 h-10 rounded-lg flex items-center justify-center text-xs font-bold shrink-0 ${
-            markdownMode ? 'text-accent bg-accent/10' : 'text-fg-dim hover:text-fg-muted hover:bg-bg-tertiary'
-          }`}
-          title={markdownMode ? 'Markdown mode ON — click to disable' : 'Enable markdown mode'}
-        >
-          M↓
-        </button>
-
         {/* Compose area */}
-        <div className={`flex-1 bg-bg-tertiary rounded-lg border focus-within:border-accent/50 flex flex-col ${markdownMode ? 'border-accent/30' : 'border-border'}`}>
+        <div className={`flex-1 min-w-0 bg-bg-tertiary rounded-lg border focus-within:border-accent/50 flex flex-col ${markdownMode ? 'border-accent/30' : 'border-border'}`}>
           {markdownMode && (
             <div className="px-3 py-1 text-[10px] text-accent font-medium border-b border-accent/20 bg-accent/[0.03]">
               Markdown — headers, lists, tables, code blocks will render
@@ -868,9 +961,7 @@ export function ComposeBox() {
           title={pendingUpload ? 'Upload' : 'Send'}
         >
           {pendingUpload ? (
-            <svg className="w-4 h-4" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
-              <path d="M14 10v3a1 1 0 01-1 1H3a1 1 0 01-1-1v-3M11 5L8 2M8 2L5 5M8 2v8" />
-            </svg>
+            <UploadIcon />
           ) : (
             <svg className="w-4 h-4" viewBox="0 0 16 16" fill="currentColor">
               <path d="M15.854 8.354a.5.5 0 000-.708L12.207 4l-.707.707L14.293 7.5H1v1h13.293l-2.793 2.793.707.707 3.647-3.646z"/>

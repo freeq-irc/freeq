@@ -1,0 +1,59 @@
+{
+  "name": "@freeq/harness-kit",
+  "version": "0.1.0",
+  "description": "A kit for building freeq into an agent harness: configured channels, trust tiers, asks, handoffs, discovery, provenance, presence and resume, shared by freeq-pi and freeq-cc.",
+  "type": "module",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./*": {
+      "types": "./dist/*.d.ts",
+      "import": "./dist/*.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "prebuild": "node scripts/build-deps.mjs",
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepare": "node scripts/build-deps.mjs"
+  },
+  "dependencies": {
+    "@freeq/bot-kit": "file:../freeq-bot-kit-js",
+    "@freeq/sdk": "file:../freeq-sdk-js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "~5.9.3",
+    "vitest": "^4.1.11"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "freeq",
+    "agent",
+    "harness",
+    "irc",
+    "did"
+  ],
+  "homepage": "https://freeq.at",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freeq-irc/freeq.git",
+    "directory": "freeq-harness-kit"
+  },
+  "bugs": {
+    "url": "https://github.com/freeq-irc/freeq/issues"
+  }
+}

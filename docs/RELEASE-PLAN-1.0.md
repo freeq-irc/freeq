@@ -49,7 +49,7 @@ live AV calls. Any legacy IRC client still connects in guest mode.
 **Current state (honest):** ~1,230 commits in 4 months, 1,420 passing tests, a
 46-bug security audit completed in March, live multi-month deployment, feature
 parity across web/iOS/macOS, working voice/video, and two flagship agent
-demos (freeqcc, revenant). The protocol and server are 1.0-grade. The gaps are
+demos (freeq-cc, revenant). The protocol and server are 1.0-grade. The gaps are
 distribution, search, abuse-handling, notifications, and federation trust — the
 things that only matter once strangers show up. Which is the point of a beta.
 
@@ -100,7 +100,7 @@ Suggested sequence: **Beta blockers → public beta announcement → fast-follow
 ### Agent platform fixes (before pushing agent developers)
 - [x] **Ghost session bug** — DONE 2026-06-11. Liveness probe on same-DID attach: siblings that don't PONG within 10s are evicted via normal cleanup (~10s instead of ~90s); healthy multi-device clients unaffected
 - [x] Audit items — DONE 2026-06-11. ConnectConfig::validate() now actually enforced in establish_connection (+5 tests); typing auto-clear and backgroundWhois cap verified already implemented
-- [ ] Agent developer quickstart: "bot in 5 minutes" + "governed agent in 30" using bot-kit/agent-kit; publish freeqcc as the reference
+- [ ] Agent developer quickstart: "bot in 5 minutes" + "governed agent in 30" using bot-kit/agent-kit; publish freeq-cc as the Claude Code agent reference
 
 ### Self-hosting story — **miren.dev is the default path**
 - [x] Miren template — DONE 2026-06-11 (deploy/miren/: parameterized deploy.sh + Dockerfile + 10-min README; runs from a fresh clone). Remaining: verify the TODO(verify) Miren CLI specifics against a real Miren instance, then test as a stranger
@@ -130,7 +130,7 @@ Suggested sequence: **Beta blockers → public beta announcement → fast-follow
 - [ ] App Store / Play Store submissions (iOS, macOS; Android after small-screen polish)
 - [~] ATPROTO-CHALLENGE IRCv3 WG draft — spec WRITTEN 2026-06-11 (docs/ircv3/atproto-challenge.md, WG house style, crypto method normative, byte-accurate examples). Editor's notes list implementation divergences to fix before submission: AUTHENTICATE 400-byte chunking not implemented anywhere, no server-name binding in challenge, abort returns 904 not 906, bare `sasl` cap (no 302 mechanism list). Remaining: fix those, open ircv3-specifications issue → PR, offer Ergo second implementation, IANA registration later
 - [ ] Second security review (external if possible) focused on federation + agent surfaces
-- [ ] Conversation↔artifact linking: msgid trailers in git commits / freeqcc emitting commit↔conversation links (thesis feature, scope after beta learnings)
+- [ ] Conversation↔artifact linking: msgid trailers in git commits / freeq-cc emitting commit↔conversation links (thesis feature, scope after beta learnings)
 - [ ] TUI auto-reconnect
 - [ ] sdk/client.rs connection state machine tests; irc/client.ts + MessageList.tsx unit tests (known undertested hotspots)
 - [ ] Scale review of single-SQLite public server; document limits, plan sharding/read-replicas only if beta demand requires

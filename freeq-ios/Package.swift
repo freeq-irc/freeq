@@ -76,6 +76,7 @@ let package = Package(
                 "IdentityClaim.swift",
                 "SignatureProof.swift",
                 "DeviceKeyNotice.swift",
+                "PresenceLines.swift",
             ],
             resources: [
                 // The seal panel's words, bundled byte-identical from

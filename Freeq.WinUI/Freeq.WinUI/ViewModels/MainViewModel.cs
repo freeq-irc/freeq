@@ -46,7 +46,7 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty] private int _unreadMentionCount;
     [ObservableProperty] private ThemeMode _themeMode = ThemeMode.System;
     [ObservableProperty] private MessageDensity _messageDensity = MessageDensity.Default;
-    [ObservableProperty] private bool _showJoinPartMessages = true;
+    [ObservableProperty] private JoinPartDisplay _joinPartDisplay = JoinPartDisplay.Hidden;
     [ObservableProperty] private bool _autoLoadExternalMedia = true;
     [ObservableProperty] private bool _enableWindowsNotifications = true;
     [ObservableProperty] private bool _enableNotificationSounds;
@@ -105,7 +105,8 @@ public partial class MainViewModel : ObservableObject
             ThemeMode = loadedTheme;
         if (Enum.TryParse<MessageDensity>(_settings.MessageDensity, true, out var loadedDensity))
             MessageDensity = loadedDensity;
-        ShowJoinPartMessages = _settings.ShowJoinPartMessages;
+        if (Enum.TryParse<JoinPartDisplay>(_settings.JoinPartDisplay, true, out var loadedJoinPart))
+            JoinPartDisplay = loadedJoinPart;
         AutoLoadExternalMedia = _settings.AutoLoadExternalMedia;
         EnableWindowsNotifications = _settings.EnableWindowsNotifications;
         EnableNotificationSounds = _settings.EnableNotificationSounds;
@@ -190,6 +191,7 @@ public partial class MainViewModel : ObservableObject
         Voiced.Clear();
         Members.Clear();
         _messagesByChannel.Clear();
+        _presenceRuns.Clear();
         _membersByChannel.Clear();
         _pendingJoinChannels.Clear();
         _typingTimers.Clear();
@@ -341,21 +343,21 @@ public partial class MainViewModel : ObservableObject
     public void UpdatePreferences(
         ThemeMode themeMode,
         MessageDensity messageDensity,
-        bool showJoinPartMessages,
+        JoinPartDisplay joinPartDisplay,
         bool autoLoadExternalMedia,
         bool enableWindowsNotifications,
         bool enableNotificationSounds)
     {
         ThemeMode = themeMode;
         MessageDensity = messageDensity;
-        ShowJoinPartMessages = showJoinPartMessages;
+        JoinPartDisplay = joinPartDisplay;
         AutoLoadExternalMedia = autoLoadExternalMedia;
         EnableWindowsNotifications = enableWindowsNotifications;
         EnableNotificationSounds = enableNotificationSounds;
 
         _settings.ThemeMode = themeMode.ToString();
         _settings.MessageDensity = messageDensity.ToString();
-        _settings.ShowJoinPartMessages = showJoinPartMessages;
+        _settings.JoinPartDisplay = joinPartDisplay.ToString();
         _settings.AutoLoadExternalMedia = autoLoadExternalMedia;
         _settings.EnableWindowsNotifications = enableWindowsNotifications;
         _settings.EnableNotificationSounds = enableNotificationSounds;
@@ -1003,7 +1005,7 @@ public partial class MainViewModel : ObservableObject
                 AddMemberToChannel(channel, nick);
             }
 
-            AddSystemMessage(channel, $"{nick} has joined {channel}", isPresenceEvent: true);
+            AddPresenceMessage(channel, nick, joined: true, $"{nick} has joined {channel}");
         });
     }
 
@@ -1027,7 +1029,7 @@ public partial class MainViewModel : ObservableObject
             else
             {
                 RemoveMemberFromChannel(channel, nick);
-                AddSystemMessage(channel, $"{nick} has left {channel}" + (string.IsNullOrEmpty(reason) ? "" : $" ({reason})"), isPresenceEvent: true);
+                AddPresenceMessage(channel, nick, joined: false, $"{nick} has left {channel}" + (string.IsNullOrEmpty(reason) ? "" : $" ({reason})"));
             }
         });
     }
@@ -1289,11 +1291,58 @@ public partial class MainViewModel : ObservableObject
             Messages.Add(msg);
     }
 
-    private void AddSystemMessage(string channel, string text, bool isPresenceEvent = false)
+    // The join/part events folded into a grouped summary line, keyed by that
+    // line's message id. Only the newest line of a channel is ever extended.
+    private readonly Dictionary<string, List<(string Nick, bool Joined)>> _presenceRuns = new();
+
+    private void AddPresenceMessage(string channel, string nick, bool joined, string text)
     {
-        if (isPresenceEvent && !ShowJoinPartMessages)
+        if (JoinPartDisplay == JoinPartDisplay.Hidden)
             return;
 
+        if (JoinPartDisplay == JoinPartDisplay.Grouped
+            && _messagesByChannel.TryGetValue(channel, out var list)
+            && list.Count > 0
+            && _presenceRuns.TryGetValue(list[^1].Id, out var run))
+        {
+            run.Add((nick, joined));
+            list[^1].Content = SummarizePresence(run);
+            return;
+        }
+
+        AddSystemMessage(channel, text);
+        if (_messagesByChannel.TryGetValue(channel, out var added) && added.Count > 0)
+            _presenceRuns[added[^1].Id] = [(nick, joined)];
+    }
+
+    /// "nap reconnected 2×" for one person's churn, else
+    /// "alice, bob and 2 more joined · carol left".
+    private static string SummarizePresence(List<(string Nick, bool Joined)> run)
+    {
+        var joins = run.Count(e => e.Joined);
+        var leaves = run.Count - joins;
+        var first = run[0].Nick;
+        if (run.All(e => e.Nick.Equals(first, StringComparison.OrdinalIgnoreCase)))
+        {
+            if (joins > 0 && leaves > 0) return $"{first} reconnected {Math.Min(joins, leaves)}×";
+            return joins > 0 ? $"{first} joined {joins}×" : $"{first} left {leaves}×";
+        }
+
+        static string Names(IEnumerable<string> nicks)
+        {
+            var list = nicks.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            var shown = string.Join(", ", list.Take(3));
+            return list.Count > 3 ? $"{shown} and {list.Count - 3} more" : shown;
+        }
+
+        var said = new List<string>();
+        if (joins > 0) said.Add($"{Names(run.Where(e => e.Joined).Select(e => e.Nick))} joined");
+        if (leaves > 0) said.Add($"{Names(run.Where(e => !e.Joined).Select(e => e.Nick))} left");
+        return string.Join(" · ", said);
+    }
+
+    private void AddSystemMessage(string channel, string text)
+    {
         AddMessage(channel, new MessageModel
         {
             Id = Guid.NewGuid().ToString(),

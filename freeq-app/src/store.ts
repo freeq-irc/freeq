@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import type { TransportState } from './irc/transport';
 import { setLastReadMsgId } from './lib/db';
 import { actEmoji } from './lib/act-verbs';
+import { initialJoinPartDisplay, type JoinPartDisplay } from './lib/presence';
 
 // ── Types ──
 
@@ -41,6 +42,8 @@ export interface Member {
   away?: string | null;
   typing?: boolean;
   actorClass?: 'human' | 'agent' | 'external_agent';
+  /** State and status from the last `presence` event for this nick. */
+  presence?: { state: string; status?: string };
 }
 
 /** Count members collapsed to one per account (same DID) — multi-session or
@@ -289,7 +292,7 @@ export interface Store {
   editingMsg: EditContext | null;
   theme: 'dark' | 'light';
   messageDensity: 'default' | 'compact' | 'cozy';
-  showJoinPart: boolean;
+  joinPartDisplay: JoinPartDisplay;
   loadExternalMedia: boolean;
   favorites: Set<string>; // lowercase channel names
   mutedChannels: Set<string>; // lowercase channel names
@@ -350,6 +353,7 @@ export interface Store {
   removeUserFromAll: (nick: string, reason: string) => void;
   renameUser: (oldNick: string, newNick: string) => void;
   setUserAway: (nick: string, reason: string | null) => void;
+  setUserPresence: (nick: string, presence: { state: string; status?: string }) => void;
   setTyping: (channel: string, nick: string, typing: boolean) => void;
   updateMemberDid: (nick: string, did: string) => void;
   /**
@@ -439,7 +443,7 @@ export interface Store {
   setEditingMsg: (ctx: EditContext | null) => void;
   setTheme: (theme: 'dark' | 'light') => void;
   setMessageDensity: (d: 'default' | 'compact' | 'cozy') => void;
-  setShowJoinPart: (v: boolean) => void;
+  setJoinPartDisplay: (v: JoinPartDisplay) => void;
   setLoadExternalMedia: (v: boolean) => void;
   toggleFavorite: (channel: string) => void;
   setFavorites: (channels: string[]) => void;
@@ -741,7 +745,7 @@ export const useStore = create<Store>((set, get) => ({
   editingMsg: null,
   theme: (localStorage.getItem('freeq-theme') as 'dark' | 'light') || 'dark',
   messageDensity: (localStorage.getItem('freeq-density') as 'default' | 'compact' | 'cozy') || 'default',
-  showJoinPart: localStorage.getItem('freeq-show-join-part') !== 'false',
+  joinPartDisplay: initialJoinPartDisplay(localStorage.getItem('freeq-join-part'), localStorage.getItem('freeq-show-join-part')),
   loadExternalMedia: localStorage.getItem('freeq-load-media') !== 'false',
   favorites: new Set(safeJsonParse(localStorage.getItem('freeq-favorites'), [])),
   mutedChannels: new Set(safeJsonParse(localStorage.getItem('freeq-muted'), [])),
@@ -917,6 +921,7 @@ export const useStore = create<Store>((set, get) => ({
       away: existing?.away,
       typing: existing?.typing,
       actorClass: member.actorClass ?? existing?.actorClass,
+      presence: existing?.presence,
     });
     channels.set(channel.toLowerCase(), ch);
     return { channels };
@@ -943,6 +948,7 @@ export const useStore = create<Store>((set, get) => ({
         away: existing?.away,
         typing: existing?.typing,
         actorClass: member.actorClass ?? existing?.actorClass,
+        presence: existing?.presence,
       });
     }
     channels.set(channel.toLowerCase(), ch);
@@ -1030,6 +1036,18 @@ export const useStore = create<Store>((set, get) => ({
       const member = ch.members.get(nick.toLowerCase());
       if (member) {
         ch.members.set(nick.toLowerCase(), { ...member, away: reason });
+        channels.set(key, { ...ch });
+      }
+    }
+    return { channels };
+  }),
+
+  setUserPresence: (nick, presence) => set((s) => {
+    const channels = new Map(s.channels);
+    for (const [key, ch] of channels) {
+      const member = ch.members.get(nick.toLowerCase());
+      if (member) {
+        ch.members.set(nick.toLowerCase(), { ...member, presence });
         channels.set(key, { ...ch });
       }
     }
@@ -1714,9 +1732,9 @@ export const useStore = create<Store>((set, get) => ({
     localStorage.setItem('freeq-density', d);
     set({ messageDensity: d });
   },
-  setShowJoinPart: (v) => {
-    localStorage.setItem('freeq-show-join-part', v ? 'true' : 'false');
-    set({ showJoinPart: v });
+  setJoinPartDisplay: (v) => {
+    localStorage.setItem('freeq-join-part', v);
+    set({ joinPartDisplay: v });
   },
   setLoadExternalMedia: (v) => {
     localStorage.setItem('freeq-load-media', v ? 'true' : 'false');

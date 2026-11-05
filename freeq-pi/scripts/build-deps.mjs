@@ -20,7 +20,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const deps = ["freeq-sdk-js", "freeq-bot-kit-js"];
+const deps = ["freeq-sdk-js", "freeq-bot-kit-js", "freeq-harness-kit"];
 
 for (const name of deps) {
   const dir = resolve(here, "..", "..", name);

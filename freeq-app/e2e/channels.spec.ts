@@ -2,7 +2,7 @@
  * E2E tests: Channel operations
  */
 import { test, expect } from '@playwright/test';
-import { uniqueNick, uniqueChannel, connectGuest, sendMessage, openSidebar, switchChannel, connectSecondUser } from './helpers';
+import { uniqueNick, uniqueChannel, connectGuest, sendMessage, openSidebar, switchChannel, connectSecondUser, showJoinParts } from './helpers';
 
 test.describe('Channels', () => {
   test('channel topic shows in top bar', async ({ page }) => {
@@ -107,6 +107,7 @@ test.describe('Channels', () => {
     const nick2 = uniqueNick('joiner');
     const channel = uniqueChannel();
 
+    await showJoinParts(page);
     await connectGuest(page, nick1, channel);
     const { ctx, page: page2 } = await connectSecondUser(browser, nick2, channel);
 
@@ -121,6 +122,7 @@ test.describe('Channels', () => {
     const nick2 = uniqueNick('leaver');
     const channel = uniqueChannel();
 
+    await showJoinParts(page);
     await connectGuest(page, nick1, channel);
     const { ctx, page: page2 } = await connectSecondUser(browser, nick2, channel);
     await page.waitForTimeout(500);

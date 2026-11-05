@@ -302,14 +302,15 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
     let has_picker = false;
 
     let buffer = app.buffers.get(&app.active_buffer).unwrap();
+    // The lines as drawn: join/part/quit hidden, grouped or all, per /joins.
+    let messages = crate::presence::apply(&buffer.messages, app.join_part);
     let inner_height = inner.height as usize;
     let inner_width = inner.width as usize;
 
     // Use the module-level wrapped_height so layout math is testable.
 
     // Calculate height of each message including wrapping + images
-    let msg_heights: Vec<usize> = buffer
-        .messages
+    let msg_heights: Vec<usize> = messages
         .iter()
         .map(|msg| {
             #[allow(unused_mut)]
@@ -375,7 +376,7 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
             break;
         }
 
-        let msg = &buffer.messages[msg_idx];
+        let msg = &messages[msg_idx];
 
         // Render the message with word wrapping
         if y < max_y {

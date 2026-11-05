@@ -483,6 +483,8 @@ class AppState(application: Application) : AndroidViewModel(application) {
     val lastReadMessageIds = mutableStateMapOf<String, String>()
     val lastReadTimestamps = mutableStateMapOf<String, Long>()
     var isDarkTheme = mutableStateOf(true)
+    /** Join/part/quit lines: hidden by default, grouped or all on request. */
+    val joinPartDisplay = mutableStateOf(JoinPartDisplay.HIDDEN)
 
     val batches = mutableMapOf<String, BatchBuffer>()
 
@@ -605,6 +607,7 @@ class AppState(application: Application) : AndroidViewModel(application) {
         }
         if (autoJoinChannels.isEmpty()) autoJoinChannels.add("#general")
         isDarkTheme.value = prefs.getBoolean("darkTheme", true)
+        joinPartDisplay.value = JoinPartDisplay.fromKey(prefs.getString("joinPartDisplay", null))
 
         // Restore read positions
         prefs.getStringSet("readPositionKeys", emptySet())?.forEach { key ->
@@ -1104,6 +1107,11 @@ class AppState(application: Application) : AndroidViewModel(application) {
         // notice handler then has to swallow. Gate only the DM case.
         val isChannel = channel.startsWith("#") || channel.startsWith("&")
         if (!isChannel && authenticatedDID.value == null) return
+        // The server drops a CHATHISTORY sent before registration without a
+        // word, and the cache restores DM threads before the client even
+        // exists. Marking one asked then meant it was never asked at all;
+        // the TARGETS reply after registration asks for it instead.
+        if (!isChannel && connectionState.value != ConnectionState.Registered) return
         if (!isChannel) dmHistoryAsked.add(channel.lowercase())
         sendRaw("CHATHISTORY LATEST $channel * 100")
     }
@@ -1153,6 +1161,11 @@ class AppState(application: Application) : AndroidViewModel(application) {
     fun toggleTheme() {
         isDarkTheme.value = !isDarkTheme.value
         prefs.edit().putBoolean("darkTheme", isDarkTheme.value).apply()
+    }
+
+    fun setJoinPartDisplay(mode: JoinPartDisplay) {
+        joinPartDisplay.value = mode
+        prefs.edit().putString("joinPartDisplay", mode.key).apply()
     }
 
     // ── Muted channels ──
@@ -1815,6 +1828,16 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
 
             is FreeqEvent.UserQuit -> {
                 for (ch in state.channels) {
+                    val wasMember = ch.members.any { it.nick.equals(event.nick, ignoreCase = true) }
+                    if (wasMember) {
+                        ch.appendIfNew(ChatMessage(
+                            id = UUID.randomUUID().toString(),
+                            from = "",
+                            text = if (event.reason.isEmpty()) "${event.nick} quit" else "${event.nick} quit (${event.reason})",
+                            isAction = false,
+                            timestamp = Date()
+                        ))
+                    }
                     ch.members.removeAll { it.nick.equals(event.nick, ignoreCase = true) }
                     ch.typingUsers.remove(event.nick)
                 }
@@ -2060,8 +2083,12 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                 // fetched — and getOrCreateDM only asks for a thread it had to
                 // create, so a restored one would never ask at all. A thread
                 // with no messages is also hidden from the chat list, so this
-                // is what makes it visible again.
-                if (dm.messages.isEmpty()) state.requestHistory(key)
+                // is what makes it visible again. A thread that holds messages
+                // asks too when the server's newest is newer than ours — what
+                // arrived while this connection was down; see [DmCatchUp].
+                if (DmCatchUp.shouldFetch(parseServerTimeMillis(event.timestamp), dm.messages)) {
+                    state.requestHistory(key)
+                }
             }
 
             is FreeqEvent.MemberDid -> {

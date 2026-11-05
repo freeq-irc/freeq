@@ -27,13 +27,13 @@ From a clone instead, if you mean to work on it:
 ```bash
 git clone https://github.com/freeq-irc/freeq.git
 cd freeq/freeq-pi
-npm install            # also builds the linked @freeq/sdk and @freeq/bot-kit
+npm install            # also builds the linked @freeq/sdk, bot-kit and harness-kit
 pi install "$(pwd)"
 ```
 
-`npm install` is required before `pi install` in that case: the SDK and
-bot-kit are linked from the same repo and must be compiled first (a `prepare`
-script handles it).
+`npm install` is required before `pi install` in that case: the SDK, bot-kit
+and harness-kit are linked from the same repo and must be compiled first (a
+`prepare` script handles it).
 
 Note that `pi install git:github.com/freeq-irc/freeq` reports success and
 installs nothing, because pi expects the package manifest at the repo root and
@@ -76,10 +76,11 @@ only you can do.
 
 | command | what it does |
 |---|---|
-| `/freeq login <did>` | bind this installation to your DID and connect |
+| `/freeq login <did> [server]` | bind this installation to your DID and connect; the server, if given, replaces the configured one |
 | `/freeq authorize` / `authorize verify` | one-time: show this project's DID to add as one of your agents (web app Settings → Agents, or `freeq-bot-id register`), then check the server verified it |
-| `/freeq authorize --sign-cert` | for a server that doesn't read agent records yet: make a creator key and print the `/raw MSGSIG` line to paste; removed once every server reads agent records |
+| `/freeq authorize --sign-cert` | make a creator key and print the `/raw MSGSIG` line to paste; deprecated; to be removed in a later release |
 | `/freeq status` | connection, identity, channels, trust summary |
+| `/freeq doctor` | setup check: identity, ownership, owner, config, server, connection, channels, and whether this window holds the connection |
 | `/freeq peers` | reachable agents, what they're working on, their tier |
 | `/freeq join #c` / `/freeq leave #c` | channel membership |
 | `/freeq mode #c <silent\|addressed\|participant>` | how the agent behaves in a channel |
@@ -311,10 +312,11 @@ You prove it by adding the agent to your account, from your own device:
 pi never sees a password and holds nothing of yours. Removing the agent under
 Settings → Agents ends the link within the hour.
 
-### On a server that doesn't read agent records yet: `--sign-cert`
+### The deprecated `--sign-cert`
 
-A server from before agent records never verifies an unsigned certificate.
-There, `/freeq authorize --sign-cert` does what `/freeq authorize` used to:
+Every server in use now reads agent records, so `/freeq authorize` is the way.
+`/freeq authorize --sign-cert` still does what `/freeq authorize` used to, and
+warns first:
 
 1. It makes a creator key on this machine and prints one line:
    `/raw MSGSIG <public-key>`.
@@ -324,8 +326,10 @@ There, `/freeq authorize --sign-cert` does what `/freeq authorize` used to:
    the server's verdict.
 
 An installation with a creator key keeps signing its certificate with it, and
-that verifies on any server that knows the key. `--sign-cert` is removed once
-every server in use reads agent records.
+that verifies on any server that knows the key, until signed certificates stop
+counting in a later release. A connection that presents a signed certificate
+warns once, naming the key and the certificate to delete. `--sign-cert` is
+deprecated; to be removed in a later release.
 
 ## One connection per project
 

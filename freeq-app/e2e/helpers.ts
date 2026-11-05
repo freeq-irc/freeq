@@ -47,6 +47,16 @@ export function heldRowCount(page: Page, channel: string): Promise<number> {
   }, channel);
 }
 
+/** How many of the rows the store holds for `channel` are presence lines —
+ *  held whatever the join/part setting says, so a bound on a window of
+ *  history has to discount them. */
+export function heldPresenceRowCount(page: Page, channel: string): Promise<number> {
+  return page.evaluate(async (ch) => {
+    const mod = await import('/src/e2e-support.ts');
+    return mod.heldPresenceRowCount(ch);
+  }, channel);
+}
+
 /** The msgid of the newest row the store holds for `channel`. */
 export function newestHeldMsgId(page: Page, channel: string): Promise<string | null> {
   return page.evaluate(async (ch) => {
@@ -79,6 +89,15 @@ export async function prepPage(page: Page) {
   });
 }
 
+/** Show join and part lines on `page`, which are hidden by default since
+ *  `5be4a57c`. Call it before the page is loaded; a spec that asserts on one
+ *  of those lines needs it. */
+export async function showJoinParts(page: Page) {
+  await page.addInitScript(() => {
+    localStorage.setItem('freeq-join-part', 'all');
+  });
+}
+
 /** Connect as guest and wait for registration */
 export async function connectGuest(page: Page, nick: string, channel: string) {
   await prepPage(page);
@@ -93,7 +112,7 @@ export async function connectGuest(page: Page, nick: string, channel: string) {
   await nickInput.fill(nick);
 
   // Fill channel
-  const channelInput = page.getByPlaceholder('#freeq');
+  const channelInput = page.getByPlaceholder('#general');
   await channelInput.fill(channel);
 
   // Click connect

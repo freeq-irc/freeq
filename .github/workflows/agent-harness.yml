@@ -1,0 +1,108 @@
+name: Agent harness packages
+
+# Builds and tests the JS packages that put freeq into agent harnesses
+# (freeq-pi, freeq-cc) and the packages they are built on (the JS SDK,
+# bot-kit and harness-kit). Runs in its own workflow, path-filtered so it only triggers when
+# one of those packages changes — most PRs skip it entirely.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'freeq-sdk-js/**'
+      - 'freeq-bot-kit-js/**'
+      - 'freeq-harness-kit/**'
+      - 'freeq-pi/**'
+      - 'freeq-cc/**'
+      - '.github/workflows/agent-harness.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'freeq-sdk-js/**'
+      - 'freeq-bot-kit-js/**'
+      - 'freeq-harness-kit/**'
+      - 'freeq-pi/**'
+      - 'freeq-cc/**'
+      - '.github/workflows/agent-harness.yml'
+
+jobs:
+  agent-harness:
+    name: Agent harness packages (vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # Built in dependency order: each package links its siblings by file:
+      # path and imports their dist/.
+      - name: Install (JS SDK)
+        working-directory: freeq-sdk-js
+        run: npm ci
+
+      - name: Build (JS SDK)
+        working-directory: freeq-sdk-js
+        run: npm run build
+
+      - name: Test (JS SDK)
+        working-directory: freeq-sdk-js
+        run: npm test
+
+      - name: Install (bot-kit)
+        working-directory: freeq-bot-kit-js
+        run: npm ci
+
+      - name: Build (bot-kit)
+        working-directory: freeq-bot-kit-js
+        run: npm run build
+
+      - name: Test (bot-kit)
+        working-directory: freeq-bot-kit-js
+        run: npm test
+
+      - name: Install (harness-kit)
+        working-directory: freeq-harness-kit
+        run: npm ci
+
+      - name: Build (harness-kit)
+        working-directory: freeq-harness-kit
+        run: npm run build
+
+      - name: Test (harness-kit)
+        working-directory: freeq-harness-kit
+        run: npm test
+
+      # freeq-pi's prepare step builds any sibling whose dist/ is missing;
+      # all three are built above, so it only links them.
+      - name: Install (freeq-pi)
+        working-directory: freeq-pi
+        run: npm ci
+
+      # Also typechecks extensions/, which pi loads as TypeScript.
+      - name: Build (freeq-pi)
+        working-directory: freeq-pi
+        run: npm run build
+
+      - name: Test (freeq-pi)
+        working-directory: freeq-pi
+        run: npm test
+
+      - name: Install (freeq-cc)
+        working-directory: freeq-cc
+        run: npm ci
+
+      - name: Build (freeq-cc)
+        working-directory: freeq-cc
+        run: npm run build
+
+      - name: Test (freeq-cc)
+        working-directory: freeq-cc
+        run: npm test
+
+      # The built entry as Claude Code starts it: over stdio, with an empty
+      # state directory, it must declare claude/channel and write nothing
+      # but JSON-RPC to stdout.
+      - name: Stdio smoke (freeq-cc)
+        working-directory: freeq-cc
+        run: node scripts/smoke-stdio.mjs

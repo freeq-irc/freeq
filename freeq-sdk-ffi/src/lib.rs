@@ -245,6 +245,8 @@ pub enum VerdictState {
 pub enum KeyLayer {
     Vouched,
     Published,
+    /// The key is the sender's `did:key` DID itself.
+    DidKey,
 }
 
 /// A line's verdict, with the sentence to show for it.
@@ -253,7 +255,7 @@ pub struct SignatureVerdict {
     pub state: VerdictState,
     pub layer: Option<KeyLayer>,
     pub kid: Option<String>,
-    /// `identity-record`, `did-document` or `origin-server`.
+    /// `identity-record`, `did-document`, `origin-server` or `did-key`.
     pub key_source: Option<String>,
     pub sentence: String,
 }
@@ -264,8 +266,8 @@ pub struct StoredDeviceKey {
     pub seed: Vec<u8>,
     pub created_at: String,
     pub record_uri: Option<String>,
-    /// The server refused the key as expired; the next fresh sign-in
-    /// replaces it.
+    /// The server refused the key as expired or retired; the next fresh
+    /// sign-in replaces it.
     pub refused: bool,
 }
 
@@ -326,12 +328,10 @@ pub struct IrcMessage {
     /// server's `+freeq.at/reactions` tag (CHATHISTORY / JOIN replay).
     /// Live reactions still arrive as separate `TagMsg` events.
     pub reactions: Vec<ReactionTally>,
-    /// This message has been edited since it was sent.
-    ///
-    /// A live edit is recognizable from `edit_of`, but join replay collapses
-    /// every revision into one row and sends no `+draft/edit` — so without
-    /// the server's `+freeq.at/edited` tag (which this reads), a message
-    /// edited before you joined renders as though it were the original.
+    /// This line is an edit: set from `edit_of`. Join replay and
+    /// CHATHISTORY send a replayed edit as its own line carrying
+    /// `+draft/edit`, so an edit made before you joined is marked the same
+    /// way as one seen live.
     pub edited: bool,
     /// For a DM: the canonical conversation key — the peer's DID when known,
     /// else their nick. `None` for channel messages. Key DM threads by this,
@@ -425,6 +425,12 @@ pub struct ActEvent {
     pub dm_key: Option<String>,
     /// Same as [`IrcMessage::verdict`].
     pub verdict: Option<SignatureVerdict>,
+    /// For a ruling, when the client checks signatures: `counts`, or
+    /// `cannot-check` (as before) when its referee is known but its site
+    /// did not answer in time. A ruling that fails its check never reaches
+    /// the app, nor does one whose referee the client cannot know. Absent
+    /// for any other event.
+    pub ruling: Option<String>,
 }
 
 pub struct TagMessage {
@@ -720,6 +726,7 @@ fn convert_verdict(verdict: &freeq_sdk::verdict::Verdict) -> SignatureVerdict {
         layer: verdict.layer.map(|l| match l {
             sdk::KeyLayer::Vouched => KeyLayer::Vouched,
             sdk::KeyLayer::Published => KeyLayer::Published,
+            sdk::KeyLayer::DidKey => KeyLayer::DidKey,
         }),
         kid: verdict.kid.clone(),
         key_source: verdict.key_source.map(|s| {
@@ -727,6 +734,7 @@ fn convert_verdict(verdict: &freeq_sdk::verdict::Verdict) -> SignatureVerdict {
                 KeySource::IdentityRecord => "identity-record",
                 KeySource::DidDocument => "did-document",
                 KeySource::OriginServer => "origin-server",
+                KeySource::DidKey => "did-key",
             }
             .to_string()
         }),
@@ -948,6 +956,7 @@ impl FreeqClient {
             device_label: self.device_label.lock().unwrap().clone(),
             fresh_sign_in: self.take_fresh_sign_in(),
             key_lookup,
+            owner_did: None,
         };
 
         // MUST call connect() inside the runtime — it uses tokio::spawn internally.
@@ -1250,11 +1259,7 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
                 .get("+freeq.at/reactions")
                 .map(|raw| parse_reactions_tag(raw))
                 .unwrap_or_default();
-            let is_edited = edit_of.is_some()
-                || tags
-                    .get("+freeq.at/edited")
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
+            let is_edited = edit_of.is_some();
             // Agent coordination event: the `+freeq.at/event` tag (with the
             // `freeq.at/` unprefixed fallback some senders use) turns this
             // message into a structured card on every client.
@@ -1289,8 +1294,6 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
                     account: tags.get("account").cloned(),
                     origin: tags.get("+freeq.at/origin").cloned(),
                     reactions,
-                    // Either signal: `edit_of` for an edit seen live, the tag
-                    // for one the server already collapsed into replay.
                     edited: is_edited,
                     dm_key: dm_key.clone(),
                     coordination,
@@ -1342,6 +1345,7 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
             replayed,
             dm_key,
             verdict,
+            ruling,
         } => FreeqEvent::Act {
             event: ActEvent {
                 from: from.clone(),
@@ -1362,6 +1366,7 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
                 replayed: *replayed,
                 dm_key: dm_key.clone(),
                 verdict: convert_verdict_opt(verdict),
+                ruling: ruling.map(|r| r.name().to_string()),
             },
         },
         Event::Names { channel, nicks } => {
@@ -3274,12 +3279,10 @@ mod tests {
         assert!(parse_reactions_tag("").is_empty());
     }
 
-    /// A message edited before you joined arrives already collapsed: the
-    /// server sends one row, the current text, and no `+draft/edit` to hint
-    /// that it was ever revised. `+freeq.at/edited` is the only signal, so a
-    /// client that doesn't surface it renders the revision as the original.
+    /// A line is marked edited when it carries `+draft/edit`, live or
+    /// replayed; a line without it is not.
     #[test]
-    fn convert_event_message_marks_edited_from_replay_tag() {
+    fn convert_event_message_marks_edited_from_draft_edit() {
         let mk = |extra: Option<(&str, &str)>| {
             let mut tags = std::collections::HashMap::new();
             tags.insert("msgid".to_string(), "01ABC".to_string());
@@ -3301,11 +3304,6 @@ mod tests {
         };
 
         assert!(!mk(None).edited, "an untouched message must not be marked");
-        assert!(
-            mk(Some(("+freeq.at/edited", "1"))).edited,
-            "replay marker ignored — an edited message would look original"
-        );
-        // A live edit is still recognizable on its own.
         assert!(mk(Some(("+draft/edit", "01ORIG"))).edited);
     }
 
@@ -3368,6 +3366,7 @@ mod tests {
             replayed: event.replayed,
             dm_key: None,
             verdict: None,
+            ruling: Some(freeq_sdk::verdict::RulingCheck::Counts),
         };
         let FreeqEvent::Act { event } = convert_event(&ev).expect("exposed event") else {
             panic!("expected Act variant");
@@ -3381,6 +3380,7 @@ mod tests {
         assert_eq!(event.task_id, "01OFFER");
         assert_eq!(event.sig_tag.as_deref(), Some("ed25519:kid:sig"));
         assert!(!event.replayed);
+        assert_eq!(event.ruling.as_deref(), Some("counts"));
         assert_eq!(
             event
                 .fields
@@ -3884,6 +3884,18 @@ mod tests {
             });
             assert_eq!(crossed.key_source.as_deref(), Some(name));
         }
+        let own = convert_verdict(&sdk::Verdict {
+            state: sdk::VerdictState::Device,
+            layer: Some(sdk::KeyLayer::DidKey),
+            kid: None,
+            key_source: Some(KeySource::DidKey),
+        });
+        assert_eq!(own.layer, Some(KeyLayer::DidKey));
+        assert_eq!(own.key_source.as_deref(), Some("did-key"));
+        assert_eq!(
+            own.sentence,
+            "Signed with the sender’s own key. The key is their identity."
+        );
     }
 
     /// The two new events reach the app.

@@ -362,6 +362,211 @@ async fn sasl_valid_after_one_failure() {
     .await;
 }
 
+/// Reassembly end to end: a response too long for one line is split, and the
+/// server joins the pieces into an authentication that works.
+#[tokio::test]
+async fn sasl_response_split_across_chunks_authenticates() {
+    let key = PrivateKey::generate_ed25519();
+    let resolver = make_resolver(vec![(DID_A, &key)]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, move |addr| {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let mut c = C::raw(addr);
+        let challenge_str = c.start_sasl("chunked");
+        let challenge_bytes = auth::decode_challenge_bytes(&challenge_str).unwrap();
+        let signer = KeySigner::new(DID_A.to_string(), key);
+        let encoded = auth::encode_response(&signer.respond(&challenge_bytes).unwrap());
+
+        // Pad past one chunk. Unknown fields are ignored, and the signature
+        // covers the challenge bytes rather than this document, so the
+        // response stays valid.
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&b64.decode(encoded.as_bytes()).unwrap()).unwrap();
+        doc["padding"] = serde_json::Value::String("p".repeat(500));
+        let padded = b64.encode(serde_json::to_vec(&doc).unwrap());
+        assert!(padded.len() > 400, "fixture must need more than one chunk");
+
+        for line in auth::sasl_response_lines(&padded) {
+            c.tx(&line);
+        }
+
+        c.num("903");
+        c.tx("CAP END");
+        c.num("001");
+    })
+    .await;
+}
+
+/// The `+` a chunking client sends after a whole number of chunks is ignored.
+#[tokio::test]
+async fn sasl_response_filling_its_last_chunk_authenticates() {
+    let key = PrivateKey::generate_ed25519();
+    let resolver = make_resolver(vec![(DID_A, &key)]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, move |addr| {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let mut c = C::raw(addr);
+        let challenge_str = c.start_sasl("exact");
+        let challenge_bytes = auth::decode_challenge_bytes(&challenge_str).unwrap();
+        let signer = KeySigner::new(DID_A.to_string(), key);
+        let encoded = auth::encode_response(&signer.respond(&challenge_bytes).unwrap());
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&b64.decode(encoded.as_bytes()).unwrap()).unwrap();
+
+        // Grow the padding until the encoded response is a whole number of
+        // chunks.
+        let mut padded = String::new();
+        for n in 400.. {
+            doc["padding"] = serde_json::Value::String("p".repeat(n));
+            padded = b64.encode(serde_json::to_vec(&doc).unwrap());
+            if padded.len().is_multiple_of(400) {
+                break;
+            }
+        }
+        assert!(padded.len() >= 800, "fixture must fill more than one chunk");
+
+        let lines = auth::sasl_response_lines(&padded);
+        assert_eq!(lines.last().map(String::as_str), Some("AUTHENTICATE +"));
+        for line in &lines {
+            c.tx(line);
+        }
+        c.num("903");
+        assert!(
+            c.maybe(|l| l.split_whitespace().nth(1) == Some("904"), 300)
+                .is_none(),
+            "the terminator after a complete response must not fail it"
+        );
+        c.tx("CAP END");
+        c.num("001");
+    })
+    .await;
+}
+
+/// Pad `encoded` with an ignored field until it is exactly `len` chars.
+fn padded_to(encoded: &str, len: usize) -> String {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&b64.decode(encoded.as_bytes()).unwrap()).unwrap();
+    for n in 1.. {
+        doc["padding"] = serde_json::Value::String("p".repeat(n));
+        let out = b64.encode(serde_json::to_vec(&doc).unwrap());
+        if out.len() == len {
+            return out;
+        }
+        assert!(out.len() < len, "padding overshot {len}");
+    }
+    unreachable!()
+}
+
+#[tokio::test]
+async fn sasl_whole_response_of_exactly_one_chunk_authenticates_without_a_terminator() {
+    let key = PrivateKey::generate_ed25519();
+    let resolver = make_resolver(vec![(DID_A, &key)]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, move |addr| {
+        let mut c = C::raw(addr);
+        let challenge_str = c.start_sasl("exactone");
+        let challenge_bytes = auth::decode_challenge_bytes(&challenge_str).unwrap();
+        let signer = KeySigner::new(DID_A.to_string(), key);
+        let encoded = auth::encode_response(&signer.respond(&challenge_bytes).unwrap());
+        let whole = padded_to(&encoded, 400);
+        c.tx(&format!("AUTHENTICATE {whole}"));
+        c.num("903");
+        c.tx("CAP END");
+        c.num("001");
+    })
+    .await;
+}
+
+/// The case a released client hits after a re-issued challenge.
+#[tokio::test]
+async fn sasl_stray_terminator_before_the_response_is_ignored() {
+    let key = PrivateKey::generate_ed25519();
+    let resolver = make_resolver(vec![(DID_A, &key)]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, move |addr| {
+        let mut c = C::raw(addr);
+        let challenge_str = c.start_sasl("plusfirst");
+        let challenge_bytes = auth::decode_challenge_bytes(&challenge_str).unwrap();
+        let signer = KeySigner::new(DID_A.to_string(), key);
+        c.tx("AUTHENTICATE +");
+        assert!(
+            c.maybe(|l| l.split_whitespace().nth(1) == Some("904"), 300)
+                .is_none(),
+            "a terminator with nothing to end must not fail the exchange"
+        );
+        let response = signer.respond(&challenge_bytes).unwrap();
+        for line in auth::sasl_response_lines(&auth::encode_response(&response)) {
+            c.tx(&line);
+        }
+        c.num("903");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn sasl_third_oversized_response_closes_the_connection() {
+    let key = PrivateKey::generate_ed25519();
+    let resolver = make_resolver(vec![(DID_A, &key)]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, move |addr| {
+        let mut c = C::raw(addr);
+        c.start_sasl("toolong");
+        let flood = "A".repeat(400);
+        for attempt in 1..=3 {
+            if attempt > 1 {
+                c.tx("AUTHENTICATE ATPROTO-CHALLENGE");
+                c.rx(|l| l.starts_with("AUTHENTICATE "), "challenge");
+            }
+            for _ in 0..(8192 / 400 + 1) {
+                c.tx(&format!("AUTHENTICATE {flood}"));
+            }
+            c.rx(|l| l.contains("SASL response too long"), "904 too long");
+        }
+        c.rx(|l| l.starts_with("ERROR :Too many SASL failures"), "ERROR");
+    })
+    .await;
+}
+
+/// A client that chunks its response may send the terminator whether or not
+/// the last chunk already ended it, and released clients do exactly that. The
+/// terminator arrives after 903, when no exchange is in progress.
+#[tokio::test]
+async fn sasl_trailing_terminator_after_success_is_ignored() {
+    let key = PrivateKey::generate_ed25519();
+    let resolver = make_resolver(vec![(DID_A, &key)]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, move |addr| {
+        let mut c = C::raw(addr);
+        let challenge_str = c.start_sasl("plustail");
+        let challenge_bytes = auth::decode_challenge_bytes(&challenge_str).unwrap();
+        let signer = KeySigner::new(DID_A.to_string(), key);
+        let response = signer.respond(&challenge_bytes).unwrap();
+        c.tx(&format!(
+            "AUTHENTICATE {}",
+            auth::encode_response(&response)
+        ));
+        c.num("903");
+
+        c.tx("AUTHENTICATE +");
+        assert!(
+            c.maybe(|l| l.split_whitespace().nth(1) == Some("904"), 300)
+                .is_none(),
+            "a trailing terminator must not fail an authentication that succeeded"
+        );
+
+        // The connection is still usable.
+        c.tx("CAP END");
+        c.num("001");
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn sasl_challenge_expired() {
     let key = PrivateKey::generate_ed25519();

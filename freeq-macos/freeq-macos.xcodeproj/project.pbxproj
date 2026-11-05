@@ -36,6 +36,7 @@
 		49E784D589512E3A936DA345 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A09A2F1C5515211E8D3BE359 /* OnboardingView.swift */; };
 		4CE6EF71CD4C106B03BD914C /* SidebarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 923CB3DCE2113F08CCB9E8F7 /* SidebarView.swift */; };
 		5086A6E848B828951BFC3044 /* UploadResponse.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F8EFFA45A91FBAF437F7ADF /* UploadResponse.swift */; };
+		50B3010E0B64B51C4FDC9E01 /* JoinPartDisplay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12B6F01DF9367210D412ACC0 /* JoinPartDisplay.swift */; };
 		530E3783C385009D658962CB /* freeq.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD5D672B7A5F1D6E78162DE1 /* freeq.swift */; };
 		53219C77DD566736E0DBD0F1 /* CallView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B840984A8780805615D0846A /* CallView.swift */; };
 		54790CCF1094BA4AEFBB3080 /* CallLayoutPolicies.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0BFAA19CD6272B8B0EB81C7 /* CallLayoutPolicies.swift */; };
@@ -171,6 +172,7 @@
 		0BD56638DA817D921B8F261C /* DebugBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugBridge.swift; sourceTree = "<group>"; };
 		0F2CEC00295C49A0D1DC34B9 /* PinnedMessagesBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PinnedMessagesBar.swift; sourceTree = "<group>"; };
 		0F52BF9F99E9D9772373AA39 /* AudioLevelMeter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioLevelMeter.swift; sourceTree = "<group>"; };
+		12B6F01DF9367210D412ACC0 /* JoinPartDisplay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JoinPartDisplay.swift; sourceTree = "<group>"; };
 		13C9D32F59D3998D69B16618 /* MediaDeviceSelection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaDeviceSelection.swift; sourceTree = "<group>"; };
 		13CDA12EAAF6604350DEAE49 /* DeviceKeyNotice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceKeyNotice.swift; sourceTree = "<group>"; };
 		14412954BB0B9B7BDB3FF5F3 /* DeviceKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceKey.swift; sourceTree = "<group>"; };
@@ -479,6 +481,7 @@
 				99635569CD2711503B3DCF7E /* FreeqAppIntents.swift */,
 				9194BD66D242EE2DD6C3BA20 /* GlobalHotKey.swift */,
 				49CC1244CD3756E771AE3933 /* IdentityClaim.swift */,
+				12B6F01DF9367210D412ACC0 /* JoinPartDisplay.swift */,
 				06D79754C3E6C19E87D67F6E /* Jumbomoji.swift */,
 				6D0D657E5F637E5EFD232E19 /* KeychainHelper.swift */,
 				62178848E83EEA18F129364E /* KeyLookupCache.swift */,
@@ -733,6 +736,7 @@
 				3CBF7B5A0C44366BC7D7399D /* HelpView.swift in Sources */,
 				EC17044DE0222489BF5FD85D /* IdentityClaim.swift in Sources */,
 				B8AB7DBFF62520564B9DDE52 /* JoinChannelSheet.swift in Sources */,
+				50B3010E0B64B51C4FDC9E01 /* JoinPartDisplay.swift in Sources */,
 				CCD46F07817FFF1625133C74 /* Jumbomoji.swift in Sources */,
 				FFFF849684AF11BFC9B3E31B /* KeyLookupCache.swift in Sources */,
 				ECC92464E4422B5DCFDC770B /* KeychainHelper.swift in Sources */,

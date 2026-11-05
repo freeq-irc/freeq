@@ -21,10 +21,10 @@
 import { parseArgs } from "node:util";
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 
-import { FreeqConnection, type InboundAsk } from "../src/connection.js";
-import { collectSessionMeta } from "../src/presence.js";
-import { decideInbound, frameInbound, reachesModel } from "../src/inbound.js";
-import { defaultConfig, modeFor, tierFor, type FreeqConfig, type Tier } from "../src/config.js";
+import { FreeqConnection, type InboundAsk } from "@freeq/harness-kit/connection";
+import { collectSessionMeta } from "@freeq/harness-kit/presence";
+import { decideInbound, frameInbound, reachesModel } from "@freeq/harness-kit/inbound";
+import { defaultConfig, modeFor, tierFor, type FreeqConfig, type Tier } from "@freeq/harness-kit/config";
 
 const { values } = parseArgs({
   options: {

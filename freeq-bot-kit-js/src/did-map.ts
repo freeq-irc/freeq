@@ -103,6 +103,9 @@ export async function createDidMap<T extends { did: string }>(
   const listeners = new Set<(entries: T[]) => void>();
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let lastMtime: number | null = null;
+  // set()/delete() in progress: raised before save(), lowered only after
+  // refreshMtime() has recorded the file's new mtime. See the poll's guard.
+  let saving = 0;
 
   const swap = (next: T[]): void => {
     entries = next;
@@ -149,11 +152,19 @@ export async function createDidMap<T extends { did: string }>(
     const filePath = (source as { path: string }).path;
     pollTimer = setInterval(() => {
       void (async (): Promise<void> => {
+        // While set()/delete() is saving, the file holds our own write and
+        // lastMtime does not know it yet, so a reload here would fire a
+        // second change for the same edit. Skip the tick; the next one after
+        // the save compares against the recorded mtime. Checked again after
+        // each await below, since a tick that began before the save must
+        // not swap after it.
+        if (saving > 0) return;
         let mtime: number | null;
         try {
           const s = await stat(filePath);
           mtime = s.mtimeMs;
         } catch (err) {
+          if (saving > 0) return;
           if ((err as NodeJS.ErrnoException).code === "ENOENT") {
             // File deleted. Swap to empty if we had anything.
             if (lastMtime !== null) {
@@ -165,9 +176,10 @@ export async function createDidMap<T extends { did: string }>(
           // Other stat error: skip this tick.
           return;
         }
-        if (mtime === lastMtime) return;
+        if (saving > 0 || mtime === lastMtime) return;
         try {
           const fresh = await read();
+          if (saving > 0) return;
           lastMtime = mtime;
           swap(fresh);
         } catch (err) {
@@ -215,18 +227,28 @@ export async function createDidMap<T extends { did: string }>(
       set: async (entry) => {
         const next = entries.filter((e) => e.did !== entry.did);
         next.push(entry);
-        await save(next);
-        swap(next);
-        // Re-baseline the mtime so the next poll doesn't see our own write
-        // as a change and trigger a redundant onChange.
-        if (isFile) await refreshMtime();
+        saving++;
+        try {
+          await save(next);
+          swap(next);
+          // Re-baseline the mtime so the next poll doesn't see our own write
+          // as a change and trigger a redundant onChange.
+          if (isFile) await refreshMtime();
+        } finally {
+          saving--;
+        }
       },
       delete: async (did) => {
         if (!byDid.has(did)) return false;
         const next = entries.filter((e) => e.did !== did);
-        await save(next);
-        swap(next);
-        if (isFile) await refreshMtime();
+        saving++;
+        try {
+          await save(next);
+          swap(next);
+          if (isFile) await refreshMtime();
+        } finally {
+          saving--;
+        }
         return true;
       },
     };

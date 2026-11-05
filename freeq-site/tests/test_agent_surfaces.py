@@ -151,8 +151,9 @@ def test_agents_md_is_agent_facing_not_internal():
     """
     body = _client().get("/AGENTS.md").data.decode()
     assert "deploy.sh" not in body
-    # And it is the agent-facing document, not the dev one.
-    assert "AT Protocol DID" in body
+    # And it is the agent-facing document, not the dev one. Keyed on its
+    # title, not on tagline wording, which changes with positioning.
+    assert "instructions for AI agents" in body
 
 
 def test_auth_md_served_as_markdown():

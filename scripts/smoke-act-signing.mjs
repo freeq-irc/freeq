@@ -191,7 +191,7 @@ const tx = await makeBot('actsmoke-tx', `asmk-tx-${STAMP}`);
 const rx = await makeBot('actsmoke-rx', `asmk-rx-${STAMP}`);
 
 const actSeen = [];
-rx.client.on('actEvent', (e) =>
+rx.on('actEvent', (e) =>
   actSeen.push({ eventId: e.eventId, verb: e.verb, taskId: e.taskId }));
 
 
@@ -427,8 +427,8 @@ console.log(`\nEvidence: ${EVIDENCE}/`);
 console.log('Not covered here, and why:');
 console.log('  - a signed NOTICE: the server never stores one (persistence is gated on');
 console.log('    PRIVMSG, messaging.rs), so there is no server record to verify against.');
-console.log('    Its signature is pinned cryptographically on the wire by the SDK suite');
-console.log('    and its routing by the freeqcc suite.');
+console.log('    Its signature is pinned cryptographically on the wire by the SDK suite;');
+console.log('    its routing is not covered by any test now.');
 console.log('  - the Rust SDK emitter: this driver is node. The Rust half is pinned by');
 console.log('    coordination_events_rest_api against a real server in the Rust suite.');
 console.log('  - an unverifiable-but-kept signature: needs a key this server cannot');

@@ -134,4 +134,10 @@ final class ActFactsTests: XCTestCase {
             "act-pay-to": "p2", "act-tx": "tx", "act-replaces": "r", "act-scope": "sc",
         ]).isEmpty)
     }
+
+    func testTheRefereeAnOpenerNamesAndARulingsNumberAreNeverDrawn() {
+        XCTAssertTrue(ActFacts.unknownFields([
+            "act-home": "did:web:irc.example", "act-seq": "3",
+        ]).isEmpty)
+    }
 }

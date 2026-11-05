@@ -6,8 +6,9 @@ import Foundation
 /// The labels live in the bundled copy of `spec/act-card-copy.json`, the same
 /// file the other clients read; the card body is the title and this one grid,
 /// so no value is ever drawn without its key. A field with no label still
-/// draws, under its own key (`unknownFields`), so nothing signed is ever
-/// invisible. Mirrors the web `act-facts.ts`.
+/// draws, under its own key (`unknownFields`), except `act-home` and
+/// `act-seq`, which name the task's referee and number its rulings and are
+/// not drawn at all. Mirrors the web `act-facts.ts`.
 enum ActFacts {
 
     private static let copy: [String: String] = {
@@ -100,6 +101,7 @@ enum ActFacts {
         "act", "act-verb", "act-id", "act-title", "act-to", "act-note", "act-ctx", "act-ctx-h",
         "act-deadline", "act-bid-deadline", "act-caps", "act-price", "act-bid",
         "act-accepts", "act-subject", "act-pay-to", "act-tx", "act-replaces", "act-scope",
+        "act-home", "act-seq",
     ]
 
     /// Fields the card has no label for, under their raw keys — the

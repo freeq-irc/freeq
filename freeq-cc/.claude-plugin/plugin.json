@@ -1,0 +1,16 @@
+{
+  "name": "freeq",
+  "version": "0.1.0",
+  "description": "freeq for Claude Code: puts a running Claude Code session on freeq as an agent, with freeq-pi's channels, trust tiers, asks, handoffs and discovery.",
+  "author": { "name": "freeq" },
+  "homepage": "https://freeq.at",
+  "repository": "https://github.com/freeq-irc/freeq",
+  "license": "MIT",
+  "mcpServers": {
+    "freeq": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/server.js"]
+    }
+  },
+  "channels": [{ "server": "freeq" }]
+}

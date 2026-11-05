@@ -93,7 +93,7 @@ pub async fn register_with<P: freeq_oauth::ClientProvider>(
     let kid = kid_of(&stored);
     let retired = device_key_history(did, &records)
         .iter()
-        .any(|k| k.kid == kid && k.retired_at.is_some_and(|r| r <= now));
+        .any(|k| k.kid == kid && k.retired_or_expired(now));
     if retired {
         stored = StoredDeviceKey::generate();
         store.save(did, &stored)?;
@@ -381,5 +381,58 @@ mod tests {
             .map(|l| l.agent_did)
             .collect();
         assert!(live.contains(&bot(2)), "the new claim counts: {live:?}");
+    }
+
+    #[tokio::test]
+    async fn a_retirement_dated_ahead_of_the_clock_replaces_the_stored_key() {
+        let at = |hours: i64| {
+            (chrono::Utc::now() + chrono::TimeDelta::hours(hours))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        let made = at(-2);
+        let key = freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&[9; 32]).unwrap();
+        let kid = freeq_sdk::sigtag::derive_kid(
+            &ed25519_dalek::SigningKey::from_bytes(&[9; 32]).verifying_key(),
+        );
+        let repo = Arc::new(Mutex::new(StubRepo::new(OWNER)));
+        for record in [
+            serde_json::to_value(
+                freeq_sdk::identity_records::build_device_record(&key, OWNER, &made, None).unwrap(),
+            )
+            .unwrap(),
+            serde_json::to_value(
+                freeq_sdk::identity_records::build_device_retirement(&key, OWNER, &kid, &at(1))
+                    .unwrap(),
+            )
+            .unwrap(),
+        ] {
+            repo.lock().unwrap().add(DEVICE_KEY_TYPE, &record);
+        }
+        let (pds, _created) = stub_pds(repo.clone()).await;
+        let doc = repo.lock().unwrap().document(&pds);
+        let reader = RecordReader::new(
+            freeq_sdk::did::DidResolver::static_map(HashMap::from([(OWNER.to_string(), doc)])),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = freeq_sdk::device_key::FileDeviceKeyStore::new(dir.path().join("key.json"));
+        store
+            .save(
+                OWNER,
+                &StoredDeviceKey {
+                    seed: [9; 32],
+                    created_at: made,
+                    record_uri: None,
+                    refused: false,
+                },
+            )
+            .unwrap();
+
+        register_with(&session(&pds), &store, &reader, &[bot(8)], None)
+            .await
+            .unwrap();
+
+        let signing = store.load(OWNER).unwrap().unwrap();
+        assert_ne!(signing.seed, [9; 32], "the stored key is replaced");
     }
 }

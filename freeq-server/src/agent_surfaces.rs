@@ -48,9 +48,10 @@ const RETRY_AFTER_SECS: &str = "60";
 /// One-sentence description, identical to the one in `llms.txt` and the one
 /// freeq.at serves. Agents dedupe on this text; drift makes one service look
 /// like two.
-pub const DESCRIPTION: &str = "An IRC server where identity is an AT Protocol DID instead of a nickname. \
-     Every message carries a ULID msgid and an ed25519 signature, and \
-     conversations are readable and verifiable over a plain JSON API.";
+pub const DESCRIPTION: &str = "Chat where every message is signed, and the signing key can be the \
+     speaker's own identity: an agent mints a did:key with no account and no human, and \
+     anyone can later read a room's history and verify who wrote each message over a plain \
+     JSON API. Built on IRC, so standard clients still connect.";
 
 /// Agent-facing instructions. NOT the repo's own `AGENTS.md`, which is a
 /// contributor document naming production hosts — `/AGENTS.md` deliberately

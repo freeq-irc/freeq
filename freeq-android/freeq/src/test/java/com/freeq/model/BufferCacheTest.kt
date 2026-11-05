@@ -225,6 +225,24 @@ class BufferCacheTest {
         assertEquals(com.freeq.ffi.KeyLayer.VOUCHED, restored.single().messages.single().verdict?.layer)
     }
 
+    @Test fun a_cached_row_signed_with_its_did_key_keeps_its_layer_and_source() {
+        val own = msg("01OWN").copy(
+            isSigned = true,
+            verdict = FfiVerdict(
+                state = com.freeq.ffi.VerdictState.DEVICE,
+                layer = com.freeq.ffi.KeyLayer.DID_KEY,
+                kid = "kid-1",
+                keySource = "did-key",
+                sentence = "Signed with the sender’s own key. The key is their identity.",
+            ),
+        )
+        val back = BufferCache.decode(
+            BufferCache.encode(BufferCache.snapshot(listOf(channel("#freeq", own))))
+        )!!.single().messages.single().verdict!!
+        assertEquals(com.freeq.ffi.KeyLayer.DID_KEY, back.layer)
+        assertEquals("did-key", back.keySource)
+    }
+
     @Test fun an_unchecked_row_caches_no_verdict() {
         val restored = BufferCache.decode(
             BufferCache.encode(BufferCache.snapshot(listOf(channel("#freeq", msg("01PLAIN")))))

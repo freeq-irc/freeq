@@ -30,6 +30,8 @@ pub struct Config {
     pub channels: Option<Vec<String>>,
     /// Iroh endpoint address (P2P transport).
     pub iroh_addr: Option<String>,
+    /// Join/part/quit lines: "hidden" (default), "grouped" or "all".
+    pub join_part: Option<crate::presence::JoinPartDisplay>,
 }
 
 /// Session state saved on quit, restored on start.
@@ -401,6 +403,7 @@ pub fn interactive_setup(config: &Config, session: &Session) -> Option<Resolved>
         vi: config.vi,
         channels: Some(channels.clone()),
         iroh_addr: config.iroh_addr.clone(),
+        join_part: config.join_part,
     };
     save_cfg.save();
 

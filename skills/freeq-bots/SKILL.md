@@ -61,7 +61,8 @@ or with `freeq-bot-id register --owner <handle> <bot-did>`. That writes an
 `at.freeq.agentKey` record to the owner's account, the server reads it when
 the bot connects and reports the certificate verified, and nothing of the
 owner's is kept on the bot's machine. The older way, `creatorKeyPath`, signs
-the certificate with an owner key kept on the bot's machine; it keeps working.
+the certificate with an owner key kept on the bot's machine; it is deprecated
+and to be removed in a later release.
 
 Never send a private key to the server. The SASL flow signs a challenge; the
 key stays local.
@@ -111,7 +112,7 @@ curl -s -X POST https://irc.freeq.at/agent/tools/diagnose_join_failure \
 `diagnose_join_failure`, `diagnose_disconnect`, `inspect_my_session`,
 `explain_message_routing`, `replay_missed_messages` and
 `predict_message_outcome` exist precisely so a bot author does not have to
-guess. With `@freeq/mcp` (built from the repo's `freeq-mcp/` — not on npm yet),
+guess. With `@freeq/mcp` (`npx -y @freeq/mcp`),
 this is the `freeq_diagnose` tool.
 
 ## Related

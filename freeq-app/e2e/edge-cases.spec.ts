@@ -5,7 +5,7 @@
  * race conditions, layout limits, and multi-tab behavior.
  */
 import { test, expect } from '@playwright/test';
-import { uniqueNick, uniqueChannel, connectGuest, sendMessage, expectMessage, openSidebar, switchChannel, connectSecondUser, prepPage } from './helpers';
+import { uniqueNick, uniqueChannel, connectGuest, sendMessage, expectMessage, openSidebar, switchChannel, connectSecondUser, prepPage, showJoinParts } from './helpers';
 
 test.describe('Nick with dots (AT Protocol handles)', () => {
   test('dotted nick can send and receive messages', async ({ browser }) => {
@@ -195,7 +195,7 @@ test.describe('Multi-tab / nick collision', () => {
     await page2.goto('/');
     await page2.getByRole('button', { name: 'Guest' }).click();
     await page2.getByPlaceholder('your_nick').fill(nick);
-    await page2.getByPlaceholder('#freeq').fill(channel);
+    await page2.getByPlaceholder('#general').fill(channel);
     await page2.getByRole('button', { name: 'Connect as Guest' }).click();
 
     // Wait for connection
@@ -293,6 +293,7 @@ test.describe('Cross-user events', () => {
     const page1 = await ctx1.newPage();
     const page2 = await ctx2.newPage();
 
+    await showJoinParts(page1);
     await connectGuest(page1, nick1, channel);
     await connectGuest(page2, nick2, channel);
     await page1.waitForTimeout(500);

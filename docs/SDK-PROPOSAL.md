@@ -1,5 +1,7 @@
 # `@freeq/sdk-js` — Proposed Design
 
+> Historical note: `freeqcc` became `freeq-cc`, a Claude Code plugin built on `freeq-harness-kit`, and the freeqcc daemon was removed. This proposal describes the daemon as it was.
+
 A first-principles redesign of the TS SDK. Companion doc: [SDK-API-REFERENCE.md](./SDK-API-REFERENCE.md) — raw audit of current Rust + TS surfaces.
 
 ---
@@ -499,7 +501,7 @@ Everything else — replacing `client.raw('PROVENANCE ...')` with `submitProvena
 - `daemon.ts:282` streaming-tagged PRIVMSG → `sendTagged(target, text, { '+freeq.at/streaming': '1' })`
 - `daemon.ts:295`/`382` `@+draft/edit=msgid PRIVMSG` → `sendEdit(target, msgid, text)`
 - `daemon.ts:349`/`364` plain PRIVMSG → `sendMessage(target, text)`
-- Replace hand-rolled `nickToDid` Map + `pendingByNick` queue ([daemon.ts:156-203](freeqcc/src/daemon.ts#L156-L203)) with SDK's `getDidForNick` / `requestWhois`.
+- Replace hand-rolled `nickToDid` Map + `pendingByNick` queue ([daemon.ts:156-203](https://github.com/freeq-irc/freeq/blob/427478a56dd0e364073db8a8e6c59126437990c5/freeqcc/src/daemon.ts#L156-L203)) with SDK's `getDidForNick` / `requestWhois`.
 
 Net: ~18 raw() calls → typed methods, plus ~50 LoC of DID-cache plumbing deleted.
 

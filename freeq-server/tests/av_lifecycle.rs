@@ -33,6 +33,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+mod util;
+use util::ready::{Listener, pin_addr, wait_ready};
+
 /// The AV disconnect grace these tests run the server at. Production is 30 s
 /// (`docs/AV-MAP.md` §2); the boundary behavior is identical, only the wait is
 /// shorter. Long enough that a test doing two round trips inside the window
@@ -870,22 +873,52 @@ struct Proc {
     irc: String,
     web: String,
     args: Vec<String>,
+    /// Where its tracing output is captured: how the harness learns the ports
+    /// it bound, and what the readiness wait prints if a boot fails. Nothing
+    /// captured it before, so a failed bind landed on the test runner's own
+    /// output with nothing naming the test it belonged to.
+    log: String,
 }
 
 impl Proc {
-    fn spawn(args: Vec<String>, irc: String, web: String, dir: tempfile::TempDir) -> Self {
-        let child = std::process::Command::new(env!("CARGO_BIN_EXE_freeq-server"))
-            .args(&args)
-            .env("RUST_LOG", "freeq_server=warn")
-            .spawn()
-            .expect("spawn freeq-server");
+    /// Spawn the server with `127.0.0.1:0` for both listeners and read back
+    /// what the kernel gave it, then pin both addresses into the argv so
+    /// [`restart`] comes back on the same ports — which is what the test
+    /// needs, since every client reconnects to the address it already has.
+    ///
+    /// [`restart`]: Proc::restart
+    async fn spawn(mut args: Vec<String>, dir: tempfile::TempDir) -> Self {
+        let log = dir.path().join("server.log").to_str().unwrap().to_string();
+        let mut child = Self::command(&args, &log);
+        let bound = wait_ready(&mut child, &log, &[Listener::Irc, Listener::Web]).await;
+        pin_addr(&mut args, "--listen-addr", &bound.irc);
+        pin_addr(&mut args, "--web-addr", &bound.web);
         Proc {
             _dir: dir,
             child,
-            irc,
-            web,
+            irc: bound.irc,
+            web: bound.web,
             args,
+            log,
         }
+    }
+
+    fn command(args: &[String], log: &str) -> std::process::Child {
+        let out = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(log)
+            .expect("open server log");
+        let err = out.try_clone().expect("clone server log handle");
+        std::process::Command::new(env!("CARGO_BIN_EXE_freeq-server"))
+            .args(args)
+            // Quiet, plus the boot lines of `server.rs`, which name the
+            // addresses its two listeners bound.
+            .env("RUST_LOG", "freeq_server=warn,freeq_server::server=info")
+            .stdout(std::process::Stdio::from(out))
+            .stderr(std::process::Stdio::from(err))
+            .spawn()
+            .expect("spawn freeq-server")
     }
 
     /// SIGKILL — no shutdown hook, no last-gasp persistence. What a crash or
@@ -896,13 +929,8 @@ impl Proc {
     }
 
     async fn restart(&mut self) {
-        self.child = std::process::Command::new(env!("CARGO_BIN_EXE_freeq-server"))
-            .args(&self.args)
-            .env("RUST_LOG", "freeq_server=warn")
-            .spawn()
-            .expect("respawn freeq-server");
-        wait_port(&self.irc).await;
-        wait_port(&self.web).await;
+        self.child = Self::command(&self.args, &self.log);
+        wait_ready(&mut self.child, &self.log, &[Listener::Irc, Listener::Web]).await;
     }
 }
 
@@ -910,28 +938,6 @@ impl Drop for Proc {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-    }
-}
-
-fn alloc_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-async fn wait_port(addr: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if std::net::TcpStream::connect(addr).is_ok() {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "server at {addr} never became ready"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -949,13 +955,11 @@ async fn wait_port(addr: &str) {
 async fn restart_mid_call_one_session() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = dir.path().join("server.db").to_str().unwrap().to_string();
-    let irc = format!("127.0.0.1:{}", alloc_port());
-    let web = format!("127.0.0.1:{}", alloc_port());
     let args: Vec<String> = [
         "--listen-addr",
-        &irc,
+        "127.0.0.1:0",
         "--web-addr",
-        &web,
+        "127.0.0.1:0",
         "--data-dir",
         dir.path().to_str().unwrap(),
         "--db-path",
@@ -969,11 +973,9 @@ async fn restart_mid_call_one_session() {
     .map(|s| s.to_string())
     .collect();
 
-    let mut proc = Proc::spawn(args, irc.clone(), web.clone(), dir);
-    wait_port(&irc).await;
-    wait_port(&web).await;
-    let irc_addr: SocketAddr = irc.parse().unwrap();
-    let web_addr: SocketAddr = web.parse().unwrap();
+    let mut proc = Proc::spawn(args, dir).await;
+    let irc_addr: SocketAddr = proc.irc.parse().unwrap();
+    let web_addr: SocketAddr = proc.web.parse().unwrap();
     let chan = "#av-restart";
     let nicks = ["res_a", "res_b", "res_c"];
 

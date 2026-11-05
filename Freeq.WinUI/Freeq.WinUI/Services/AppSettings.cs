@@ -32,10 +32,10 @@ public class AppSettings
         set => _data.MessageDensity = value;
     }
 
-    public bool ShowJoinPartMessages
+    public string JoinPartDisplay
     {
-        get => _data.ShowJoinPartMessages;
-        set => _data.ShowJoinPartMessages = value;
+        get => _data.JoinPartDisplay;
+        set => _data.JoinPartDisplay = value;
     }
 
     public bool AutoLoadExternalMedia
@@ -100,7 +100,7 @@ public class AppSettings
         public HashSet<string> MutedChannels { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public string ThemeMode { get; set; } = "System";
         public string MessageDensity { get; set; } = "Default";
-        public bool ShowJoinPartMessages { get; set; } = true;
+        public string JoinPartDisplay { get; set; } = "Hidden";
         public bool AutoLoadExternalMedia { get; set; } = true;
         public bool EnableWindowsNotifications { get; set; } = true;
         public bool EnableNotificationSounds { get; set; } = false;

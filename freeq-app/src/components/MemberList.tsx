@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react';
 import { useStore, type Member } from '../store';
 import { fetchProfile, getCachedProfile, type ATProfile } from '../lib/profiles';
-import { UserPopover } from './UserPopover';
-import { sendWhois, getClient } from '../irc/client';
+import { UserPopover, AgentBadge, AgentPresenceAndProvenance } from './UserPopover';
+import { useActorInfo } from '../hooks/useActorInfo';
+import { sendWhois, getClient, dmPeerDid } from '../irc/client';
 import { SpeakerIcon } from './SessionIndicator';
 import { parseAwayStatus } from '../lib/status';
 import { isDid, resolveIdentityName, findMemberByKey } from '../lib/identity';
@@ -117,12 +118,12 @@ export function MemberList() {
   );
 }
 
-/** Determine online/away status by checking shared channel member lists (not
- *  the DM member map). `key` is the DM thread key — a nick or a DID. */
-function usePresence(key: string): { online: boolean; away: string | null } {
+/** The DM peer's member record in a shared channel (not the DM member map),
+ *  or null: online is having one, and away and live presence are read from
+ *  it. `key` is the DM thread key — a nick or a DID. */
+function usePresence(key: string): Member | null {
   const channels = useStore((s) => s.channels);
-  const hit = findMemberByKey(channels, key, true);
-  return { online: !!hit, away: hit?.member.away ?? null };
+  return findMemberByKey(channels, key, true)?.member ?? null;
 }
 
 /** Rich profile panel shown in the right sidebar for DMs */
@@ -136,11 +137,16 @@ function DMProfilePanel({ nick, channel }: { nick: string; channel: { members: M
     : nick;
   const whoisCache = useStore((s) => s.whoisCache);
   const whois = peerNick ? whoisCache.get(peerNick.toLowerCase()) : undefined;
-  const partnerMember = channel.members.values().next().value;
-  const did = isDid(nick) ? nick : (partnerMember?.did || whois?.did);
+  const did = dmPeerDid(nick, whois?.did);
   const [profile, setProfile] = useState<ATProfile | null>(null);
   const [safetyNumber, setSafetyNumber] = useState<string | null>(null);
-  const presence = usePresence(nick);
+  const peer = usePresence(nick);
+  const presence = { online: !!peer, away: peer?.away ?? null };
+  const actorInfo = useActorInfo(
+    did,
+    peerNick,
+    [presence.online, peer?.presence?.state ?? '', peer?.presence?.status ?? ''].join('|'),
+  );
   // Same rule the popover uses: pending outranks the cache, because a WHOIS
   // fills it incrementally and a half-filled entry would read as "guest" a
   // beat before the account lands.
@@ -277,6 +283,8 @@ function DMProfilePanel({ nick, channel }: { nick: string; channel: { members: M
           )}
         </div>
 
+        <AgentBadge actorInfo={actorInfo} />
+
         {/* Bluesky stats */}
         {profile && (profile.followersCount != null || profile.postsCount != null) && (
           <div className="flex justify-center gap-4 mt-3 py-2 border-y border-border">
@@ -336,6 +344,8 @@ function DMProfilePanel({ nick, channel }: { nick: string; channel: { members: M
             {did}
           </div>
         )}
+
+        <AgentPresenceAndProvenance actorInfo={actorInfo} live={peer?.presence} />
 
         {/* WHOIS details */}
         {whois && (

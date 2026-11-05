@@ -1,0 +1,55 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "plugin:freeq:freeq",
+            "tool": "freeq_hook",
+            "input": {
+              "hook_event_name": "UserPromptSubmit",
+              "prompt": "${prompt}"
+            },
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "plugin:freeq:freeq",
+            "tool": "freeq_hook",
+            "input": {
+              "hook_event_name": "PreToolUse",
+              "tool_name": "${tool_name}",
+              "command": "${tool_input.command}",
+              "file_path": "${tool_input.file_path}",
+              "action": "${tool_input.action}",
+              "to": "${tool_input.to}"
+            }
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "plugin:freeq:freeq",
+            "tool": "freeq_hook",
+            "input": {
+              "hook_event_name": "Stop",
+              "last_assistant_message": "${last_assistant_message}"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

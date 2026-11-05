@@ -13,6 +13,7 @@ struct MessageListView: View {
 
     @State private var showScrollButton = false
     @State private var lastReadId: String? = nil
+    @AppStorage(JoinPartDisplay.storageKey) private var joinPartDisplay: JoinPartDisplay = .default
     @State private var isNearBottom = true
     /// Throttle so a rapid scroll-up doesn't spam CHATHISTORY requests.
     @State private var lastHistoryFetch: Date = .distantPast
@@ -88,18 +89,21 @@ struct MessageListView: View {
                     .buttonStyle(.plain)
 
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        let headers = headerFlags()
-                        ForEach(Array(channel.messages.enumerated()), id: \.element.renderKey) { idx, msg in
+                        // Presence lines are hidden/folded before anything is
+                        // indexed, so a hidden join doesn't break a sender's run.
+                        let rows = displayRows
+                        let headers = headerFlags(rows)
+                        let unreadAt = unreadBoundary(rows)
+                        ForEach(Array(rows.enumerated()), id: \.element.renderKey) { idx, msg in
                             let showHeader = headers[idx]
-                            let showDate = shouldShowDateSeparator(at: idx)
+                            let showDate = shouldShowDateSeparator(rows, at: idx)
 
                             if showDate {
                                 dateSeparator(for: msg.timestamp)
                             }
 
                             // Unread separator
-                            if let readId = lastReadId, idx > 0,
-                               channel.messages[idx - 1].id == readId,
+                            if idx == unreadAt,
                                msg.from.lowercased() != appState.nick.lowercased() {
                                 unreadSeparator
                             }
@@ -170,7 +174,7 @@ struct MessageListView: View {
                 // Scroll to bottom FAB with message preview
                 if showScrollButton {
                     Button(action: {
-                        if let last = channel.messages.last {
+                        if let last = displayRows.last {
                             withAnimation(.easeOut(duration: 0.2)) {
                                 proxy.scrollTo(last.renderKey, anchor: .bottom)
                             }
@@ -341,23 +345,23 @@ struct MessageListView: View {
 
     private func scrollToBottom(proxy: ScrollViewProxy) {
         // Triple-scroll: immediate + short delay + after CHATHISTORY arrives
-        if let last = channel.messages.last {
+        if let last = displayRows.last {
             proxy.scrollTo(last.renderKey, anchor: .bottom)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            if let last = channel.messages.last {
+            if let last = displayRows.last {
                 proxy.scrollTo(last.renderKey, anchor: .bottom)
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            if let last = channel.messages.last {
+            if let last = displayRows.last {
                 proxy.scrollTo(last.renderKey, anchor: .bottom)
             }
         }
     }
 
     private func onNewMessages(proxy: ScrollViewProxy) {
-        guard let last = channel.messages.last else { return }
+        guard let last = displayRows.last else { return }
         // Always scroll if the new message is from us, or if user was near bottom
         let isOwnMessage = last.from == appState.nick
         if isOwnMessage || isNearBottom {
@@ -578,22 +582,44 @@ struct MessageListView: View {
 
     /// Every row's header flag, worked out once per render: checking row by
     /// row re-walked the sender's run for every row (`RowSignatureMark.headers`).
-    private func headerFlags() -> [Bool] {
-        let indices = channel.messages.indices
+    /// The buffer as the transcript draws it: presence lines hidden, folded,
+    /// or all shown per the setting, and each "confirmed" line under its card.
+    /// Everything that indexes rendered rows indexes this, not
+    /// `channel.messages`.
+    private var displayRows: [ChatMessage] {
+        actConfirmLinesUnderCards(
+            PresenceLines.apply(channel.messages, mode: joinPartDisplay),
+            cards: channel.actCards,
+            // A blocked sender's row stays in the list but is drawn empty.
+            hidden: { appState.isBlocked(nick: $0.from, did: channel.memberInfo(for: $0.from)?.did) })
+    }
+
+    /// The row the "New" separator sits above: the first one past the last
+    /// read message. Resolved through buffer positions, since the last read
+    /// line may be a presence line that isn't drawn.
+    private func unreadBoundary(_ rows: [ChatMessage]) -> Int? {
+        guard let readId = lastReadId, let readAt = channel.findMessage(byId: readId) else { return nil }
+        for idx in rows.indices.dropFirst() {
+            if let at = channel.findMessage(byId: rows[idx].id), at > readAt { return idx }
+        }
+        return nil
+    }
+
+    private func headerFlags(_ rows: [ChatMessage]) -> [Bool] {
+        let indices = rows.indices
         return RowSignatureMark.headers(
-            breaksRun: indices.map { breaksRun(at: $0) },
-            marks: indices.map { settledMark(at: $0) })
+            breaksRun: indices.map { breaksRun(rows, at: $0) },
+            marks: indices.map { settledMark(rows[$0]) })
     }
 
-    private func settledMark(at idx: Int) -> RowSignatureMark.Settled? {
-        let msg = channel.messages[idx]
-        return RowSignatureMark.settled(appState.checkedVerdicts[msg.id] ?? msg.verdict)
+    private func settledMark(_ msg: ChatMessage) -> RowSignatureMark.Settled? {
+        RowSignatureMark.settled(appState.checkedVerdicts[msg.id] ?? msg.verdict)
     }
 
-    private func breaksRun(at idx: Int) -> Bool {
+    private func breaksRun(_ rows: [ChatMessage], at idx: Int) -> Bool {
         guard idx > 0 else { return true }
-        let prev = channel.messages[idx - 1]
-        let curr = channel.messages[idx]
+        let prev = rows[idx - 1]
+        let curr = rows[idx]
         if curr.from.isEmpty || prev.from.isEmpty { return true }
         if prev.from != curr.from { return true }
         // Break across a provenance boundary: a federated message (origin set)
@@ -603,11 +629,11 @@ struct MessageListView: View {
         return curr.timestamp.timeIntervalSince(prev.timestamp) > 300
     }
 
-    private func shouldShowDateSeparator(at idx: Int) -> Bool {
+    private func shouldShowDateSeparator(_ rows: [ChatMessage], at idx: Int) -> Bool {
         guard idx > 0 else { return true }
         return !Calendar.current.isDate(
-            channel.messages[idx - 1].timestamp,
-            inSameDayAs: channel.messages[idx].timestamp
+            rows[idx - 1].timestamp,
+            inSameDayAs: rows[idx].timestamp
         )
     }
 

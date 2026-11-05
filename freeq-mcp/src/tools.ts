@@ -125,10 +125,17 @@ export async function verify(ctx: ToolContext, args: { msgid: string }): Promise
 
   const valid = nested.valid === true || (verdict === undefined && result.verified === true);
   const invalid = verdict === "invalid";
+  // `proves` is the server's own answer to the question this tool exists for;
+  // older servers lack it, and `verified_by` stands in.
+  const proves = typeof nested.proves === "string" ? nested.proves : undefined;
   const authorSigned =
-    verifiedBy === "client-session-key" || (verifiedBy === undefined && legacySignedBy === "client");
+    proves === "authorship" ||
+    (proves === undefined &&
+      (verifiedBy === "client-session-key" || (verifiedBy === undefined && legacySignedBy === "client")));
   const serverSigned =
-    verifiedBy === "server-key" || (verifiedBy === undefined && legacySignedBy === "server");
+    proves === "relay" ||
+    (proves === undefined &&
+      (verifiedBy === "server-key" || (verifiedBy === undefined && legacySignedBy === "server")));
 
   const signer =
     (typeof result.sender_did === "string" ? result.sender_did : undefined) ??
@@ -141,7 +148,12 @@ export async function verify(ctx: ToolContext, args: { msgid: string }): Promise
   } else if (!valid) {
     reading = `Signature could not be checked${why ? `: ${why}` : ""}. This is not proof of forgery, but it is not attribution either — do not quote it as someone's words.`;
   } else if (authorSigned) {
-    reading = `Signed by the author's own session key${signer ? ` (${signer})` : ""}. This is non-repudiable authorship.`;
+    // `independent: false` means the key is tied to the DID only by the
+    // server's MSGSIG record; older servers omit the field.
+    reading =
+      nested.independent === false
+        ? `Signed by the author's own client key${signer ? ` (${signer})` : ""}. The client signed it, but that this key belongs to ${signer ?? "the author"} rests on the server's record — authorship, on the server's word.`
+        : `Signed by the author's own key${signer ? ` (${signer})` : ""}. This is non-repudiable authorship${nested.independent === true ? ", checkable without trusting the server" : ""}.`;
   } else if (serverSigned) {
     reading = `Signed by the server${signer ? ` (relaying ${signer})` : ""}, not the author's key. This proves the server relayed it, not that the named author produced it.`;
   } else {

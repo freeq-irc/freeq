@@ -181,8 +181,37 @@ pub(crate) struct ParkedEvent {
     /// thing arrives, the event is judged again, and the ceilings that bound
     /// one have to bound the other.
     pub waiting_on: Option<String>,
+    /// Set for a move whose task this server has no post for yet, which then
+    /// waits on the task's id (the post's own id): when it began waiting.
+    /// Such a move is not lost: evicted, or still waiting after the time
+    /// limit, it is delivered unfiled, as it was before moves waited.
+    pub awaiting_task_since: Option<std::time::Instant>,
+    /// Parked by catch-up: once released it is filed and shown to nobody, as
+    /// catch-up shows nothing.
+    pub quiet: bool,
+    /// The origin stamped on a replayed event catch-up parked behind a
+    /// ruling held for its referee: the server it was minted at. A person's
+    /// move is filed under it on release, as catch-up files one it did not
+    /// hold; `origin` and `peer` keep the connection, which the queue's
+    /// ceilings are keyed on.
+    pub stamped_origin: Option<String>,
+    /// The timestamp on a replayed event catch-up held: it is filed at that
+    /// time on release, as catch-up files one it did not hold, so held and
+    /// unheld events list in the order they were made. `None` for a live
+    /// event, filed at the time it is filed.
+    pub replayed_at: Option<i64>,
+    /// A ruling held while its referee's own site is asked about its key: a
+    /// later event on its task waits behind it ([`DeferQueue::held_for_referee`]).
+    pub for_referee: bool,
     /// Park order across every origin. Overwritten by [`DeferQueue::park`].
     pub seq: u64,
+}
+
+/// The task a parked event names: its `act-id` under any spelling, or its
+/// own id for an opener.
+fn task_of(tags: &HashMap<String, String>) -> Option<String> {
+    freeq_sdk::act::parse_event(tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .map(|ev| ev.task_id)
 }
 
 /// Whether a parked event is a receipt — the home server's own word about an
@@ -250,6 +279,13 @@ pub(crate) struct DeferQueue {
     next_seq: u64,
     max_per_origin: usize,
     max_total: usize,
+    /// Rulings taken out of their wait for their referee's site to be judged,
+    /// by event id, with their task and park order: still held for that task
+    /// until their judgment is done ([`DeferQueue::judged`]). Kept beside the queue, not
+    /// in it, because a ruling being judged must be out of the queue — a
+    /// second release must not judge it again, and the ceilings must not
+    /// evict it halfway — while a later event on its task must still wait.
+    judging: HashMap<String, (String, u64)>,
 }
 
 impl DeferQueue {
@@ -264,6 +300,7 @@ impl DeferQueue {
             // feature. One is the smallest honest queue.
             max_per_origin: max_per_origin.max(1),
             max_total: max_total.max(1),
+            judging: HashMap::new(),
         }
     }
 
@@ -429,27 +466,99 @@ impl DeferQueue {
                 e.remove();
             }
         }
-        tracing::warn!(
-            fate = %fate,
-            reason = %why,
-            event_id = %event.event_id,
-            origin = %event.origin,
-            peer = %event.peer,
-            target = %event.target,
-            max_per_origin = self.max_per_origin,
-            max_total = self.max_total,
-            "Dropped a relayed task event that was waiting for its signer's key — \
-             never delivered, never stored"
-        );
+        match event.awaiting_task_since {
+            Some(_) => tracing::warn!(
+                fate = %fate,
+                reason = %why,
+                event_id = %event.event_id,
+                origin = %event.origin,
+                peer = %event.peer,
+                target = %event.target,
+                max_per_origin = self.max_per_origin,
+                max_total = self.max_total,
+                "Stopped holding a relayed move for its task's post — delivered unfiled"
+            ),
+            None => tracing::warn!(
+                fate = %fate,
+                reason = %why,
+                event_id = %event.event_id,
+                origin = %event.origin,
+                peer = %event.peer,
+                target = %event.target,
+                max_per_origin = self.max_per_origin,
+                max_total = self.max_total,
+                "Dropped a relayed task event that was waiting for its signer's key — \
+                 never delivered, never stored"
+            ),
+        }
         event
     }
 
-    /// Take every parked receipt this event would settle, oldest first.
+    /// Take every move that has waited `limit` or longer for its task's
+    /// post, oldest first.
+    pub(crate) fn take_overdue_task_waits(
+        &mut self,
+        limit: std::time::Duration,
+    ) -> Vec<ParkedEvent> {
+        self.take_matching(|event| {
+            event
+                .awaiting_task_since
+                .is_some_and(|since| since.elapsed() >= limit)
+        })
+    }
+
+    /// Take every parked event this event would settle, oldest first: a
+    /// receipt that overtook its subject, and a move that overtook the post
+    /// that opens its task (whose id is the task's).
     ///
-    /// The other half of the release: a receipt that overtook its subject
-    /// waits here, and the subject being filed is what lets it be judged.
+    /// The other half of the release: they wait here, and the subject being
+    /// filed is what lets them be judged.
     pub(crate) fn take_for_subject(&mut self, subject: &str) -> Vec<ParkedEvent> {
         self.take_matching(|event| event.waiting_on.as_deref() == Some(subject))
+    }
+
+    /// The newest ruling on `act_id` held for its referee, by event id, held
+    /// before the event asking (`except`): what a later event on that task
+    /// waits behind, so the two go in the order they came. One taken out and
+    /// still being judged counts. A ruling being judged waits only behind one
+    /// held before it, never one released with it after it, so rulings
+    /// released together are judged in the order they were held.
+    pub(crate) fn held_for_referee(&self, act_id: &str, except: &str) -> Option<String> {
+        let before = self.judging.get(except).map_or(u64::MAX, |(_, seq)| *seq);
+        let queued = self.by_origin.values().flatten().filter_map(|event| {
+            (event.for_referee
+                && event.event_id != except
+                && event.seq < before
+                && task_of(&event.tags).is_some_and(|task| task == act_id))
+            .then_some((event.seq, &event.event_id))
+        });
+        let judged = self.judging.iter().filter_map(|(id, (task, seq))| {
+            (task == act_id && id != except && *seq < before).then_some((*seq, id))
+        });
+        queued
+            .chain(judged)
+            .max_by_key(|(seq, _)| *seq)
+            .map(|(_, id)| id.clone())
+    }
+
+    /// A ruling taken out of its wait for its referee has been judged: it no
+    /// longer holds its task. With `release`, what waited behind it comes
+    /// back with it, under the same lock, so nothing can park behind it
+    /// after the release has gone.
+    pub(crate) fn judged(&mut self, event_id: &str, release: bool) -> Vec<ParkedEvent> {
+        self.judging.remove(event_id);
+        match release {
+            true => self.take_for_subject(event_id),
+            false => Vec::new(),
+        }
+    }
+
+    /// Whether the event `event_id` is parked waiting for its referee's site.
+    pub(crate) fn is_held_for_referee(&self, event_id: &str) -> bool {
+        self.by_origin
+            .values()
+            .flatten()
+            .any(|event| event.for_referee && event.event_id == event_id)
     }
 
     /// Take every parked event this key could settle, oldest first.
@@ -463,6 +572,14 @@ impl DeferQueue {
         });
         self.retries
             .retain(|(_, signer, key_id), _| signer != did || key_id != kid);
+        // A ruling out of its wait for its referee holds its task until it
+        // is judged.
+        for event in taken.iter().filter(|event| event.for_referee) {
+            if let Some(task) = task_of(&event.tags) {
+                self.judging
+                    .insert(event.event_id.clone(), (task, event.seq));
+            }
+        }
         taken
     }
 
@@ -833,6 +950,11 @@ mod defer_tests {
             signer: signer.to_string(),
             kid: kid.to_string(),
             waiting_on: None,
+            awaiting_task_since: None,
+            quiet: false,
+            stamped_origin: None,
+            replayed_at: None,
+            for_referee: false,
             seq: 0,
         }
     }

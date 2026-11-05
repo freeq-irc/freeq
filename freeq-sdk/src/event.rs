@@ -102,8 +102,19 @@ pub enum Event {
         /// Same as [`Event::Message::dm_key`]: the DM conversation key,
         /// `None` for channels.
         dm_key: Option<String>,
-        /// Same as [`Event::Message::verdict`].
+        /// Same as [`Event::Message::verdict`]. A ruling goes up once its
+        /// check has settled, or its wait ran out, with the verdict settled
+        /// by then; any other task event goes up with the verdict it was
+        /// delivered with, and a pending one's `Event::Verdict` follows it.
         verdict: Option<crate::verdict::Verdict>,
+        /// For a ruling, when the client checks signatures, whether it
+        /// counts: `Counts`, or `CannotCheck` when its referee is known but
+        /// its site did not answer in time; never `Fails`, since a ruling
+        /// that fails its check never goes up, nor does one whose referee
+        /// the client cannot know (its task's opening post missing,
+        /// uncheckable, or trusted only through the server); `None` for any
+        /// other event.
+        ruling: Option<crate::verdict::RulingCheck>,
     },
 
     /// BATCH start (e.g., chathistory)

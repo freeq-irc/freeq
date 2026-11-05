@@ -12,6 +12,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { webcrypto } from 'crypto';
 import type { FreeqClient } from './client.js';
 import * as e2ee from './e2ee.js';
+import { waitFor } from '../test/wait-for.js';
 
 type ReadyState = 0 | 1 | 2 | 3;
 
@@ -76,10 +77,6 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-async function flushAsync(): Promise<void> {
-  for (let i = 0; i < 12; i++) await new Promise((r) => setTimeout(r, 5));
-}
-
 async function makeClient(nick: string): Promise<{ client: FreeqClient; ws: MockWebSocket }> {
   const caps = 'message-tags server-time batch echo-message';
   const { FreeqClient } = await import('./client.js');
@@ -89,14 +86,20 @@ async function makeClient(nick: string): Promise<{ client: FreeqClient; ws: Mock
     skipInitialBrokerRefresh: true,
   });
   client.connect();
-  await flushAsync();
   const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+  await waitFor('the registration lines on the wire', () =>
+    ws.sent.some((l) => l.startsWith('USER ')),
+  );
   ws.recv(`:srv CAP * LS :${caps}`);
-  await flushAsync();
+  await waitFor('the CAP REQ the client answers with', () =>
+    ws.sent.some((l) => l.startsWith('CAP REQ')),
+  );
   ws.recv(`:srv CAP * ACK :${caps}`);
-  await flushAsync();
+  await waitFor('the CAP END the client answers with', () =>
+    ws.sent.some((l) => l.startsWith('CAP END')),
+  );
   ws.recv(`:srv 001 ${nick} :Welcome`);
-  await flushAsync();
+  await waitFor('the client to finish registering', () => client.registered);
   ws.sent.length = 0;
   return { client, ws };
 }
@@ -108,9 +111,9 @@ describe('a DM stays plaintext even with E2EE fully ready', () => {
 
     const { client, ws } = await makeClient('alice');
     client.sendMessage('did:plc:bob-the-recipient', 'readable on every device');
-    await flushAsync();
-
-    const line = ws.sent.find((l) => l.includes('PRIVMSG did:plc:bob-the-recipient'));
+    const line = await waitFor('a PRIVMSG to the DM target on the wire', () =>
+      ws.sent.find((l) => l.includes('PRIVMSG did:plc:bob-the-recipient')),
+    );
     expect(line, `sent: ${ws.sent.join(' | ')}`).toBeDefined();
     expect(line).toContain('readable on every device');
     expect(line).not.toContain('+encrypted');
@@ -124,9 +127,9 @@ describe('a DM stays plaintext even with E2EE fully ready', () => {
     const { client, ws } = await makeClient('alice');
 
     client.sendMessage(channel, 'the quiet part');
-    await flushAsync();
-
-    const line = ws.sent.find((l) => l.includes(`PRIVMSG ${channel}`));
+    const line = await waitFor(`a PRIVMSG to ${channel} on the wire`, () =>
+      ws.sent.find((l) => l.includes(`PRIVMSG ${channel}`)),
+    );
     expect(line, `sent: ${ws.sent.join(' | ')}`).toBeDefined();
     expect(line).toContain('+encrypted');
     expect(line).not.toContain('the quiet part');

@@ -660,6 +660,8 @@ pub struct App {
     pub bg_result_rx: Option<tokio::sync::mpsc::Receiver<BgResult>>,
     /// Show raw IRC lines in the status buffer (toggled by /debug).
     pub debug_raw: bool,
+    /// How join/part/quit lines are drawn (`/joins` changes it).
+    pub join_part: crate::presence::JoinPartDisplay,
     /// P2P direct messaging handle (None if P2P not started).
     pub p2p_handle: Option<freeq_sdk::p2p::P2pHandle>,
     /// P2P event receiver (moved to main loop on first use).
@@ -785,6 +787,7 @@ impl App {
             authenticated_did: None,
             show_net_popup: false,
             debug_raw: false,
+            join_part: crate::presence::JoinPartDisplay::default(),
             nick: nick.to_string(),
             should_quit: false,
             reconnect_pending: false,
@@ -1720,6 +1723,7 @@ mod tests {
             authenticated_did: None,
             show_net_popup: false,
             debug_raw: false,
+            join_part: crate::presence::JoinPartDisplay::default(),
             nick: "alice".into(),
             should_quit: false,
             reconnect_pending: false,

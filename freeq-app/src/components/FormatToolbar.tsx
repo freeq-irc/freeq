@@ -4,7 +4,7 @@ interface Props {
 
 export function FormatToolbar({ onFormat }: Props) {
   return (
-    <div className="flex items-center gap-0.5 px-2 py-1 border-b border-border/50">
+    <div className="flex flex-wrap items-center gap-0.5 px-2 py-1 border-b border-border/50">
       <FmtBtn label="B" title="Bold (wrap with **)" className="font-bold" onClick={() => onFormat('**', '**')} />
       <FmtBtn label="I" title="Italic (wrap with *)" className="italic" onClick={() => onFormat('*', '*')} />
       <FmtBtn label="S" title="Strikethrough (wrap with ~~)" className="line-through" onClick={() => onFormat('~~', '~~')} />

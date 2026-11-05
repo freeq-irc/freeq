@@ -30,7 +30,9 @@ use freeq_sdk::event::Event;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-const READY_TIMEOUT: Duration = Duration::from_secs(15);
+mod util;
+use util::ready::{Listener, pin_addr, read_log, wait_ready};
+
 const EVENT_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long to keep retrying a cross-server assertion while the S2S link and
 /// peer state settle. Behavioural readiness — no fixed pre-sleep.
@@ -111,7 +113,17 @@ impl TestServer {
             .stderr(std::process::Stdio::from(log_err))
             .spawn()
             .expect("respawn freeq-server");
-        wait_port(&self.irc_addr).await;
+        // Its argv names the ports the first boot bound, so it comes back on
+        // the same ones and nothing holding its address has to be told. Both
+        // listeners are waited on, for the reason the first boot waits on
+        // both: the web bind is several hundred milliseconds behind the IRC
+        // one, so a server that fails it is otherwise called ready.
+        wait_ready(
+            &mut self.child,
+            &self.log_path,
+            &[Listener::Irc, Listener::Web],
+        )
+        .await;
     }
 }
 
@@ -140,48 +152,89 @@ impl Drop for TestServer {
 }
 
 /// Quiet by default, plus the observe-only task-event verdict lines, which
-/// one test reads back out of the server's captured log.
-const HARNESS_RUST_LOG: &str = "freeq_server=warn,freeq_server::act_relay=info";
+/// one test reads back out of the server's captured log, and the boot lines of
+/// `server.rs`, which name the addresses its listeners bound.
+const HARNESS_RUST_LOG: &str =
+    "freeq_server=warn,freeq_server::server=info,freeq_server::act_relay=info";
 
-/// Bind an ephemeral port, read it, release it. Small reuse race; startup
-/// failure is retried by the caller if it bites.
+/// Bind an ephemeral port, read it, release it.
+///
+/// One caller left: the test that points a server's key source at an address
+/// **nothing** may answer on until it says so. Every other port here is either
+/// bound by the server itself (`127.0.0.1:0`, read back from its log) or held
+/// until the moment of spawn by one of the reservations below.
 fn alloc_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     l.local_addr().unwrap().port()
 }
 
+/// Reserve a TCP port, and hold it until `Command::spawn`.
+///
+/// Two ports per server must be known *before* either side of a pair boots —
+/// the iroh port and the web port, named in the other's `--s2s-peers` and
+/// `--s2s-peer-api` — so there is nothing to read back from a log and the
+/// number has to be drawn in advance. Drawing it from a socket that is then
+/// dropped is what put one number in two slots: nothing held it, so the next
+/// draw could legally repeat it. Holding it until spawn makes the four draws
+/// distinct by construction.
+///
+/// What is left is the window between the drop and the child's bind, so this
+/// narrows the race rather than removing it.
+fn reserve_tcp() -> (std::net::TcpListener, u16) {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    (l, port)
+}
+
+/// The same for iroh's UDP port, on the wildcard address because that is what
+/// the server's endpoint binds (`iroh.rs`: `Ipv4Addr::UNSPECIFIED`). The old
+/// helper bound TCP for this one, which reserved nothing at all.
+fn reserve_udp() -> (std::net::UdpSocket, u16) {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let port = s.local_addr().unwrap().port();
+    (s, port)
+}
+
 /// Deterministic iroh identity: write the hex key file the server loads, and
 /// derive the endpoint ID from the same bytes so we know it before boot.
-fn seed_iroh_identity(dir: &std::path::Path, seed: u8) -> (String, u16) {
+fn seed_iroh_identity(dir: &std::path::Path, seed: u8) -> (String, std::net::UdpSocket, u16) {
     let bytes = [seed; 32];
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.join("iroh-key.secret"), hex).unwrap();
     let id = iroh::SecretKey::from_bytes(&bytes).public().to_string();
-    (id, alloc_port())
+    let (held, port) = reserve_udp();
+    (id, held, port)
 }
 
 /// Plan for one server before spawning — identity/ports known so peers can
 /// reference each other.
 struct ServerPlan {
     dir: tempfile::TempDir,
-    irc_port: u16,
     /// REST/WebSocket listener. Real deployments run one, and cross-server
     /// key lookup reaches a peer through it.
     web_port: u16,
     iroh_id: String,
     iroh_port: u16,
+    /// The web and iroh ports, held so the kernel cannot issue either to
+    /// anything else, and dropped at `Command::spawn`. There is no IRC port
+    /// here: nothing needs it before boot, so the server binds `:0` and the
+    /// harness reads back what it got.
+    web_held: std::net::TcpListener,
+    iroh_held: std::net::UdpSocket,
     seed: u8,
 }
 
 fn plan_server(seed: u8) -> ServerPlan {
     let dir = tempfile::TempDir::new().unwrap();
-    let (iroh_id, iroh_port) = seed_iroh_identity(dir.path(), seed);
+    let (iroh_id, iroh_held, iroh_port) = seed_iroh_identity(dir.path(), seed);
+    let (web_held, web_port) = reserve_tcp();
     ServerPlan {
         dir,
-        irc_port: alloc_port(),
-        web_port: alloc_port(),
+        web_port,
         iroh_id,
         iroh_port,
+        web_held,
+        iroh_held,
         seed,
     }
 }
@@ -221,7 +274,8 @@ fn spawn_server(
         .to_str()
         .unwrap()
         .to_string();
-    let irc_addr = format!("127.0.0.1:{}", plan.irc_port);
+    // The kernel picks the IRC port and the server logs what it picked, so
+    // there is no moment where this harness holds a number nothing has bound.
     let web_addr = format!("127.0.0.1:{}", plan.web_port);
     let peer_spec = format!("{}@127.0.0.1:{}", peer.iroh_id, peer.iroh_port);
     // Where this server looks for the peer's users' signing keys. Operator
@@ -230,7 +284,7 @@ fn spawn_server(
 
     let args: Vec<String> = [
         "--listen-addr",
-        &irc_addr,
+        "127.0.0.1:0",
         "--iroh",
         "--iroh-port",
         &plan.iroh_port.to_string(),
@@ -265,6 +319,8 @@ fn spawn_server(
         .to_string();
     let log = std::fs::File::create(&log_path).expect("create server log");
     let log_err = log.try_clone().expect("clone server log handle");
+    // The last moment the reserved ports are held: the child binds them next.
+    drop((plan.web_held, plan.iroh_held));
     let child = Command::new(env!("CARGO_BIN_EXE_freeq-server"))
         .args(&args)
         .env("RUST_LOG", HARNESS_RUST_LOG)
@@ -278,7 +334,8 @@ fn spawn_server(
     TestServer {
         _dir: plan.dir,
         child,
-        irc_addr,
+        // Filled from the server's own startup line by the readiness wait.
+        irc_addr: String::new(),
         web_addr,
         db_path,
         log_path,
@@ -290,22 +347,7 @@ fn spawn_server(
 /// A server's captured tracing output, ANSI stripped so assertions can match
 /// the plain field text.
 fn server_log(server: &TestServer) -> String {
-    let raw = std::fs::read_to_string(&server.log_path).unwrap_or_default();
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            // Skip an escape sequence through its final letter.
-            for d in chars.by_ref() {
-                if d.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    read_log(&server.log_path)
 }
 
 /// Boot two mutually-peered servers, both resolving every `ids` DID offline.
@@ -364,26 +406,29 @@ async fn spawn_pair_with_seeds_and_args(
     let a_ref = PeerRef::of(&a_plan);
     let b_ref = PeerRef::of(&b_plan);
     let mut a = spawn_server(a_plan, &b_ref, &resolver, extra_a);
-    let b = spawn_server(b_plan, &a_ref, &resolver, extra_b);
+    let mut b = spawn_server(b_plan, &a_ref, &resolver, extra_b);
     a.serial = Some(serial);
 
-    wait_port(&a.irc_addr).await;
-    wait_port(&b.irc_addr).await;
-    (a, b)
-}
-
-/// Poll a TCP port until it accepts (server IRC listener up).
-async fn wait_port(addr: &str) {
-    let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
-    loop {
-        if std::net::TcpStream::connect(addr).is_ok() {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("server at {addr} never became ready");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    // Both are spawned before either is waited on, so the two boot together
+    // and each finds the other's endpoint where its `--s2s-peers` says.
+    //
+    // The web listener is waited on as well as the IRC one. It binds several
+    // hundred milliseconds later, and its port is the one still drawn in
+    // advance — so a collision on it kills the server after the IRC line is
+    // already in the log. Waiting on the IRC line alone called that server
+    // ready and left the bind error to surface as a refused connection in
+    // whatever the test did next.
+    for server in [&mut a, &mut b] {
+        let bound = wait_ready(
+            &mut server.child,
+            &server.log_path,
+            &[Listener::Irc, Listener::Web],
+        )
+        .await;
+        pin_addr(&mut server.args, "--listen-addr", &bound.irc);
+        server.irc_addr = bound.irc;
     }
+    (a, b)
 }
 
 // ── client helpers (mirrors multi_device.rs) ─────────────────────

@@ -45,7 +45,7 @@ struct SettingsView: View {
 
 struct GeneralSettings: View {
     @Environment(AppState.self) private var appState
-    @AppStorage("freeq.showJoinPart") private var showJoinPart = true
+    @AppStorage(JoinPartDisplay.storageKey) private var joinPartDisplayRaw = JoinPartDisplay.hidden.rawValue
     @AppStorage("freeq.notificationsEnabled") private var notificationsEnabled = true
     @AppStorage("freeq.notifyAllMessages") private var notifyAllMessages = false
     @AppStorage("freeq.compactMode") private var compactMode = false
@@ -63,7 +63,15 @@ struct GeneralSettings: View {
                 }
                 .pickerStyle(.segmented)
                 Toggle("Compact message display", isOn: $compactMode)
-                Toggle("Show join/part/quit messages", isOn: $showJoinPart)
+                Picker("Join & leave messages", selection: $joinPartDisplayRaw) {
+                    ForEach(JoinPartDisplay.allCases) { mode in
+                        Text(mode.label).tag(mode.rawValue)
+                    }
+                }
+                .pickerStyle(.segmented)
+                Text("Grouped folds a run of joins and leaves into one line. Kicks and moderation actions always show.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("Notifications") {
                 Toggle("Enable notifications", isOn: $notificationsEnabled)

@@ -1,6 +1,6 @@
 {
   "name": "@freeq/mcp",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Model Context Protocol server for freeq — read, verify and participate in DID-authenticated IRC conversations from any MCP client.",
   "type": "module",
   "main": "dist/index.js",
@@ -29,8 +29,8 @@
     "inspector": "npx -y @modelcontextprotocol/inspector node dist/index.js"
   },
   "dependencies": {
-    "@freeq/bot-kit": "^0.1.0",
-    "@freeq/sdk": "^0.1.0",
+    "@freeq/bot-kit": "^0.2.0",
+    "@freeq/sdk": "^0.3.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "zod": "^3.25.76"
   },

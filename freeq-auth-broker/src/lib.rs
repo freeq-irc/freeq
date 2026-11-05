@@ -368,6 +368,9 @@ pub struct BrokerSessionRecord {
 /// Where broker sessions (`broker_token → refresh_token/dpop`) are kept.
 /// [`SqliteStore`] is durable (standalone; or embedded opt-in);
 /// [`InMemoryStore`] is ephemeral (embedded default).
+// `#[async_trait]` marks each generated method `#[must_use]` on a type that
+// already is; clippy 1.99 flags that in the macro's output, not in this code.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait SessionStore: Send + Sync {
     async fn get(&self, broker_token: &str) -> Option<BrokerSessionRecord>;
@@ -1901,6 +1904,9 @@ pub struct SessionPush<'a> {
 
 /// How a freshly-minted session reaches the freeq-server. Standalone pushes
 /// over HTTP+HMAC ([`RemoteWriter`]); an embedding server writes in-process.
+// `#[async_trait]` marks each generated method `#[must_use]` on a type that
+// already is; clippy 1.99 flags that in the macro's output, not in this code.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait SessionWriter: Send + Sync {
     /// Mint a one-time SASL web-token for this identity → `(token, nick)`.

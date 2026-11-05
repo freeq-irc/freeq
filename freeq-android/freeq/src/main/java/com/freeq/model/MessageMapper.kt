@@ -29,9 +29,8 @@ internal object MessageMapper {
             isAction = ircMsg.isAction,
             timestamp = Date(ircMsg.timestampMs),
             replyTo = ircMsg.replyTo,
-            // Covers both signals: a live edit (`editOf`) and one the server
-            // already collapsed into join replay, which carries no
-            // `+draft/edit` and would otherwise read as the original.
+            // Set by the FFI from `editOf`, live or replayed: a replayed edit
+            // arrives as its own line carrying `+draft/edit`.
             isEdited = ircMsg.edited,
             isSigned = ircMsg.isSigned,
             account = ircMsg.account,

@@ -9,6 +9,7 @@
  * the app imports it, so it never reaches a production bundle.
  */
 import { useStore } from './store';
+import { isPresenceLine } from './lib/presence';
 
 export { FreeqClient, generateDidKey, actTags } from '@freeq/sdk';
 
@@ -24,6 +25,24 @@ export function heldRowCount(channel: string): number {
   const s = useStore.getState();
   if (channel.toLowerCase() === 'server') return s.serverMessages.length;
   return s.channels.get(channel.toLowerCase())?.messages.length ?? 0;
+}
+
+/**
+ * How many of the rows the store holds for `channel` are presence lines.
+ *
+ * The store holds them whatever the reader's join/part setting says, since
+ * the setting only decides whether the view draws them (`5be4a57c`). A spec
+ * bounding a window by how many rows a page of history carries has to
+ * discount them: readers coming and going during the spec add rows the page
+ * size says nothing about.
+ */
+export function heldPresenceRowCount(channel: string): number {
+  const s = useStore.getState();
+  const rows =
+    channel.toLowerCase() === 'server'
+      ? s.serverMessages
+      : (s.channels.get(channel.toLowerCase())?.messages ?? []);
+  return rows.filter(isPresenceLine).length;
 }
 
 /** The msgid of the newest row the store holds for `channel`, or null.

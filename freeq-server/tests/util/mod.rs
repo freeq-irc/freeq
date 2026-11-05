@@ -7,3 +7,4 @@
 #![allow(dead_code)]
 
 pub mod lying_peer;
+pub mod ready;

@@ -2,7 +2,7 @@
 
 CLI utility for minting and managing freeq bot identities.
 
-This is the **Rust-side identity utility**: it generates the ed25519 keypair (did:key or did:web), persists the seed at `~/.freeq/bots/<name>/key.ed25519` with mode 0600, and optionally writes a signed delegation certificate binding the bot to a creator DID.
+This is the **Rust-side identity utility**: it generates the ed25519 keypair (did:key or did:web), persists the seed at `~/.freeq/bots/<name>/key.ed25519` with mode 0600, and optionally writes a delegation certificate naming a creator DID as the bot's owner, which the owner proves with an agent record (`register`, below).
 
 ## Who uses this
 
@@ -61,14 +61,17 @@ the machine after the run. Nothing is written on the bot's machine either;
 the bot keeps presenting the same unsigned certificate. The web app's
 Settings → Agents does the same from a browser, and removes a bot.
 
-### The older way: a signed certificate
+### Deprecated: a signed certificate
 
 Adding `--creator-key <path>` to `create` signs the certificate with
 a key of the owner's, which the owner must have registered with the server
-(`MSGSIG`). That still works, for owners with no agent record, but the key
-lives on the bot's machine and counts as one of the owner's signing keys,
-and a certificate signed while the key was valid cannot be withdrawn.
-Prefer `register`.
+(`MSGSIG`). It is deprecated and to be removed in a later release, when signed
+certificates stop counting; every server in use now reads agent records.
+The key lives on the bot's machine and counts as one of the owner's signing
+keys, and a certificate signed while the key was valid cannot be withdrawn.
+`create` warns when it signs one. Use `register`, then set `"signature":
+null` in the bot's `identity.json` and in its `delegation.json` (did:key) or
+the `did.json` you serve (did:web).
 
 ## File layout
 
