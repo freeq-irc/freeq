@@ -35,10 +35,24 @@ upgrade waits for it before loading the room. No app path ever cleared these
 entries (leave keeps them by design), so `remove()` exists but nothing calls
 it yet.
 
-## 3. Pi has no room tool — TODO
+## 3. Pi has no room tool — DONE
 
 Add room actions to pi (create / join by link / read / info / invite / keep /
 remove / rotate) using bot-kit's `RoomManager` over the existing connection.
+
+Done in `@freeq/harness-kit` (so any harness on the kit gets it) with a thin
+pi tool on top:
+- bot-kit `RoomManager` gained `invite()` / `revokeInvites()` and a
+  `create({ beforeJoin })` hook.
+- harness-kit `rooms.ts`: the `RoomsLike` slice, the default factory over the
+  connection's bot, a read buffer, room-target parsing. `FreeqConnection`
+  keeps rooms wanted, sends no hello into them, re-enters and stewards held
+  rooms on connect, and refuses to send into a room it has no key for.
+- `freeq_room` tool (create, join, read, say, info, invite, revoke, keep,
+  remove, rotate): schema in `tool.ts`, run by `AgentRuntime.runRoomTool`,
+  registered by pi. Reads are framed as data with each sender's tier
+  (`frameRoomRead` in `inbound.ts`); live room traffic still goes through
+  the tier gate.
 
 ## 4. `freeq_say` waits up to 5 s for an echo on every send — DONE
 

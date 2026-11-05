@@ -194,8 +194,15 @@ export class RoomManager {
     return this.#preKeyPublished;
   }
 
-  /** Mint a room, join it, create epoch 1 sealed to ourselves, and install the cipher. */
-  async create(opts: { topic?: string; inviteTtlSecs?: number } = {}): Promise<{
+  /**
+   * Mint a room, join it, create epoch 1 sealed to ourselves, and install the
+   * cipher. `beforeJoin` is told the minted channel before the JOIN goes out,
+   * for a caller that must expect the join (one that parts channels it did
+   * not ask for, say).
+   */
+  async create(
+    opts: { topic?: string; inviteTtlSecs?: number; beforeJoin?: (channel: string) => void } = {},
+  ): Promise<{
     channel: string;
     invite: string;
     url: string;
@@ -214,6 +221,7 @@ export class RoomManager {
     };
     const channel = res.channel.toLowerCase();
 
+    opts.beforeJoin?.(channel);
     await this.#joinAndWait(channel, undefined);
 
     const state = createGroup(channel);
@@ -388,6 +396,39 @@ export class RoomManager {
       `/api/v1/rooms/${encodeURIComponent(ch)}/members/${encodeURIComponent(did)}`,
     );
     await this.rotate(ch);
+  }
+
+  /**
+   * Founder / DID-op: mint another invite for the room, optionally limited in
+   * lifetime and uses. The token rides the URL fragment, as on create.
+   */
+  async invite(
+    channel: string,
+    opts: { ttlSecs?: number; maxUses?: number } = {},
+  ): Promise<{ invite: string; url: string; expiresAt: number }> {
+    const ch = channel.toLowerCase();
+    const body: Record<string, unknown> = {};
+    if (opts.ttlSecs !== undefined) body.invite_ttl_secs = Math.max(1, Math.trunc(opts.ttlSecs));
+    if (opts.maxUses !== undefined) body.max_uses = Math.max(1, Math.trunc(opts.maxUses));
+    const res = (await this.#api("POST", `/api/v1/rooms/${encodeURIComponent(ch)}/invites`, body)) as {
+      invite: string;
+      url?: string;
+      invite_expires_at?: number;
+    };
+    return {
+      invite: res.invite,
+      url: res.url ?? roomUrl(this.#origin, ch, res.invite),
+      expiresAt: res.invite_expires_at ?? 0,
+    };
+  }
+
+  /** Founder / DID-op: revoke every outstanding invite. Returns how many were revoked. */
+  async revokeInvites(channel: string): Promise<number> {
+    const ch = channel.toLowerCase();
+    const res = (await this.#api("DELETE", `/api/v1/rooms/${encodeURIComponent(ch)}/invites`)) as {
+      revoked?: number;
+    };
+    return res.revoked ?? 0;
   }
 
   /** Push the room's expiry out by the idle TTL. Returns the new `expires_at`. */
