@@ -25,16 +25,19 @@
  */
 
 import {
+  PdsDeviceKeys,
   createGroup,
-  decodeMultibaseEd25519,
   getIdentityX25519Secret,
+  makeDidResolver,
   makeGroupCipher,
   openSealed,
   sealFor,
   sealedFromWire,
   sealedToWire,
-  verifyEd25519,
+  verifyBundleBinding as sdkVerifyBundleBinding,
+  type BindingResult,
   type ChannelCipher,
+  type DeviceKeySource,
   type GroupState,
 } from '@freeq/sdk';
 import { useStore, type RoomState } from '../store';
@@ -109,11 +112,25 @@ export interface RoomsDeps {
   /** How long to wait for the bearer and the e2ee identity to appear. */
   readyWaitMs: number;
   stewardDebounceMs: number;
+  /**
+   * Where a did:plc member's published device keys are read, to bind their
+   * pre-key bundle to their DID. The app reads each member's own PDS
+   * (`PdsDeviceKeys`); without one, did:plc members are never sealed to.
+   */
+  deviceKeys?: DeviceKeySource;
+  /** Delays before each further steward pass while a member is refused for a
+   *  reason that may pass (their device key record not published yet).
+   *  Default 5 s, 15 s, 45 s, 2 min. */
+  stewardRetryMs?: number[];
 }
+
+/** Steward retry delays when none are given. */
+export const STEWARD_RETRY_MS = [5_000, 15_000, 45_000, 120_000];
 
 export interface StewardResult {
   sealed: string[];
-  skipped: Array<{ did: string; reason: string }>;
+  /** `retry`: the refusal may pass later, and another pass is scheduled. */
+  skipped: Array<{ did: string; reason: string; retry?: boolean }>;
 }
 
 export interface Rooms {
@@ -147,6 +164,12 @@ interface Tracked {
   founderDid: string | null;
   latestEpoch: number | null;
   left: boolean;
+  /** A steward pass scheduled because a member's refusal may pass. */
+  retryTimer: ReturnType<typeof setTimeout> | null;
+  /** Retries spent since the last pass with nothing to retry. */
+  retries: number;
+  /** `did reason` refusals already shown in the room. */
+  refusalsShown: Set<string>;
 }
 
 export function createRooms(deps: RoomsDeps): Rooms {
@@ -168,6 +191,9 @@ export function createRooms(deps: RoomsDeps): Rooms {
         founderDid: null,
         latestEpoch: null,
         left: false,
+        retryTimer: null,
+        retries: 0,
+        refusalsShown: new Set(),
       };
       tracked.set(ch, t);
     }
@@ -423,7 +449,7 @@ export function createRooms(deps: RoomsDeps): Rooms {
     const ch = channel.toLowerCase();
     const t = track(ch);
     const sealed: string[] = [];
-    const skipped: Array<{ did: string; reason: string }> = [];
+    const skipped: StewardResult['skipped'] = [];
     const client = deps.getClient();
     const me = deps.identity();
     if (!client || !client.apiBearer || !client.authDid || !me) return { sealed, skipped };
@@ -464,7 +490,17 @@ export function createRooms(deps: RoomsDeps): Rooms {
       const missing = held.filter((s) => !member.epochs.includes(s.epoch));
       if (missing.length === 0) continue;
       const pub = await memberIdentityKey(member.did);
-      if (!pub.ok) { skipped.push({ did: member.did, reason: pub.reason }); continue; }
+      if (!pub.ok) {
+        skipped.push({ did: member.did, reason: pub.reason, ...(pub.retry ? { retry: true } : {}) });
+        // A bundle that does not bind to the DID is said once per reason:
+        // the room should know why someone cannot read yet.
+        const said = `${member.did} ${pub.reason}`;
+        if (pub.binding && !t.refusalsShown.has(said)) {
+          t.refusalsShown.add(said);
+          deps.systemMessage(ch, `⚠️ Not sealing the room key to ${member.did}${pub.retry ? ' yet' : ''}: ${pub.reason}${pub.retry ? '. Will check again.' : ''}`);
+        }
+        continue;
+      }
       for (const state of missing) {
         const wire = sealedToWire(await sealFor(state, pub.key));
         let batch = batches.get(state.epoch);
@@ -484,11 +520,31 @@ export function createRooms(deps: RoomsDeps): Rooms {
     if (sealed.length > 0) {
       deps.systemMessage(ch, `🔑 Sealed the room key to ${sealed.length === 1 ? 'a new member' : `${sealed.length} new members`}`);
     }
+    scheduleRetry(t, skipped.some((s) => s.retry));
     return { sealed, skipped };
   }
 
-  /** A member's X25519 identity key, after checking the bundle belongs to them. */
-  async function memberIdentityKey(did: string): Promise<{ ok: true; key: Uint8Array } | { ok: false; reason: string }> {
+  /**
+   * Another pass later when this one refused someone for a reason that may
+   * pass (their device key record not in their PDS yet): at each of
+   * `stewardRetryMs`, until a pass has nothing left to retry.
+   */
+  function scheduleRetry(t: Tracked, wanted: boolean): void {
+    if (!wanted) { t.retries = 0; return; }
+    const delays = deps.stewardRetryMs ?? STEWARD_RETRY_MS;
+    if (t.retryTimer || t.left || t.retries >= delays.length) return;
+    const delay = delays[t.retries++];
+    t.retryTimer = setTimeout(() => {
+      t.retryTimer = null;
+      if (!t.left) void runSteward(t);
+    }, delay);
+  }
+
+  /** A member's X25519 identity key, after checking the bundle belongs to them.
+   *  `binding`: refused because the bundle does not bind to the DID. */
+  async function memberIdentityKey(
+    did: string,
+  ): Promise<{ ok: true; key: Uint8Array } | { ok: false; reason: string; retry?: boolean; binding?: boolean }> {
     let bundle: PreKeyBundle | null;
     try {
       const resp = await deps.fetch(`${deps.origin}/api/v1/keys/${encodeURIComponent(did)}`);
@@ -509,8 +565,8 @@ export function createRooms(deps: RoomsDeps): Rooms {
       return { ok: false, reason: 'malformed pre-key bundle' };
     }
     if (identityKey.length !== 32 || spk.length !== 32) return { ok: false, reason: 'malformed pre-key bundle' };
-    const check = await verifyBundleBinding(did, bundle, spk);
-    if (!check.ok) return check;
+    const check = await verifyBundleBinding(did, bundle, spk, deps.deviceKeys);
+    if (!check.ok) return { ...check, binding: true };
     return { ok: true, key: identityKey };
   }
 
@@ -549,6 +605,7 @@ export function createRooms(deps: RoomsDeps): Rooms {
       t.pollGen++;
       t.polling = false;
       if (t.stewardTimer) { clearTimeout(t.stewardTimer); t.stewardTimer = null; }
+      if (t.retryTimer) { clearTimeout(t.retryTimer); t.retryTimer = null; }
       tracked.delete(ch);
       deps.getClient()?.setChannelCipher(ch, null);
       deps.clearRoomState(ch);
@@ -590,6 +647,7 @@ export function createRooms(deps: RoomsDeps): Rooms {
         t.left = true;
         t.pollGen++;
         if (t.stewardTimer) clearTimeout(t.stewardTimer);
+        if (t.retryTimer) clearTimeout(t.retryTimer);
       }
       tracked.clear();
     },
@@ -600,51 +658,21 @@ export function createRooms(deps: RoomsDeps): Rooms {
 // ── Bundle ↔ DID binding ──
 
 /**
- * Does this pre-key bundle belong to `did`? For `did:key` the answer is
- * checkable: `signing_key` must be the DID's Ed25519 key and `spk_signature`
- * must verify over `signed_pre_key` with it. A `did:plc` bundle is accepted
- * as published (the web client holds OAuth, not the DID's key — the
- * documented limitation) unless it is outright malformed.
+ * Does this pre-key bundle belong to `did`? The SDK's rule
+ * (`@freeq/sdk` `verifyBundleBinding`): a `did:key` bundle must be signed by
+ * the DID's own Ed25519 key; any other DID's (`did:plc`) must be signed by a
+ * live device key the account published as an `at.freeq.deviceKey` record in
+ * its own PDS, read through `deviceKeys` — never on the freeq host's word —
+ * and `spk_signature` must verify under it. Without `deviceKeys` a did:plc
+ * bundle is refused. A refusal that may pass later carries `retry: true`.
  */
 export async function verifyBundleBinding(
   did: string,
   bundle: { signing_key?: string; spk_signature: string; signed_pre_key: string },
   spkBytes?: Uint8Array,
-): Promise<{ ok: true } | { ok: false; reason: string }> {
-  let spk: Uint8Array;
-  try {
-    spk = spkBytes ?? unb64(bundle.signed_pre_key);
-  } catch {
-    return { ok: false, reason: 'malformed pre-key bundle' };
-  }
-  if (!did.startsWith('did:key:')) {
-    if (typeof bundle.spk_signature !== 'string' || typeof bundle.signed_pre_key !== 'string') {
-      return { ok: false, reason: 'malformed pre-key bundle' };
-    }
-    return { ok: true };
-  }
-  let didPub: Uint8Array;
-  try {
-    didPub = decodeMultibaseEd25519(did.slice('did:key:'.length));
-  } catch {
-    return { ok: false, reason: 'did:key is not an ed25519 key' };
-  }
-  if (!bundle.signing_key) return { ok: false, reason: 'bundle has no signing_key; cannot bind it to the did:key' };
-  let signingKey: Uint8Array;
-  try {
-    signingKey = unb64(bundle.signing_key);
-  } catch {
-    return { ok: false, reason: 'malformed signing_key' };
-  }
-  if (!bytesEqual(signingKey, didPub)) return { ok: false, reason: 'bundle signing_key is not the did:key\'s key' };
-  let sigUrl: string;
-  try {
-    sigUrl = b64url(unb64(bundle.spk_signature));
-  } catch {
-    return { ok: false, reason: 'malformed spk_signature' };
-  }
-  if (!(await verifyEd25519(didPub, spk, sigUrl))) return { ok: false, reason: 'spk_signature does not verify under the did:key' };
-  return { ok: true };
+  deviceKeys?: DeviceKeySource,
+): Promise<BindingResult> {
+  return sdkVerifyBundleBinding(did, bundle, { spk: spkBytes, deviceKeys });
 }
 
 // ── Small helpers ──
@@ -654,19 +682,6 @@ function serverSkipped(v: unknown): string[] {
   return v
     .map((x) => (typeof x === 'string' ? x : x && typeof x === 'object' ? (x as { did?: unknown }).did : null))
     .filter((x): x is string => typeof x === 'string');
-}
-
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
-  return diff === 0;
-}
-
-function b64(bytes: Uint8Array): string {
-  let s = '';
-  for (const byte of bytes) s += String.fromCharCode(byte);
-  return btoa(s);
 }
 
 function unb64(s: string): Uint8Array {
@@ -679,14 +694,17 @@ function unb64(s: string): Uint8Array {
   return out;
 }
 
-function b64url(bytes: Uint8Array): string {
-  return b64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
 // ── The app's singleton ──
 
 let singleton: Rooms | null = null;
 let clientProvider: (() => RoomsClient | null) | null = null;
+let deviceKeyReader: PdsDeviceKeys | null = null;
+
+/** The one reader of members' device keys, made on first use. */
+function memberDeviceKeys(): PdsDeviceKeys {
+  deviceKeyReader ??= new PdsDeviceKeys({ fetch: (target, init) => fetch(target, init), resolveDid: makeDidResolver() });
+  return deviceKeyReader;
+}
 
 /**
  * `irc/client.ts` owns the SDK client and registers how to reach it here,
@@ -702,6 +720,10 @@ export function getRooms(): Rooms {
     singleton = createRooms({
       getClient: () => clientProvider?.() ?? null,
       fetch: (input, init) => fetch(input, init),
+      // Members' device keys come from their own PDS (resolved through the
+      // PLC directory), never from this freeq host: that is what binds a
+      // did:plc bundle to the DID.
+      deviceKeys: { keyFor: (did, kid) => memberDeviceKeys().keyFor(did, kid) },
       identity: () => {
         const s = getIdentityX25519Secret();
         return s && 'secret' in s ? { secret: s.secret, publicKey: s.publicKey } : null;

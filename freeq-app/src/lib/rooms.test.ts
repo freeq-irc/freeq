@@ -12,10 +12,14 @@ import {
   sealFor,
   sealedFromWire,
   sealedToWire,
+  deriveKid,
   type ChannelCipher,
+  type DeviceKeySource,
+  type FoundKey,
   type GroupState,
+  type KeySource,
 } from '@freeq/sdk';
-import { createRooms, type RoomsClient, type RoomsDeps, type X25519Pair } from './rooms';
+import { createRooms, verifyBundleBinding, type RoomsClient, type RoomsDeps, type X25519Pair } from './rooms';
 import type { RoomState } from '../store';
 import { MemoryRoomSecretStore, type RoomSecretStore } from './room-secret-store';
 
@@ -50,6 +54,43 @@ async function bundleFor(pair: X25519Pair, signing?: { did: string; signer: (b: 
     bundle.signing_key = b64(decodeMultibaseEd25519(signing.did.slice('did:key:'.length)));
   }
   return bundle;
+}
+
+/**
+ * What the members' own PDSes publish: device keys by `did kid`, answered
+ * with `source` (a PDS read says `IdentityRecord`). Separate from the freeq
+ * host, which only serves bundles.
+ */
+class FakePds implements DeviceKeySource {
+  published = new Map<string, Uint8Array>();
+  source: KeySource = 'IdentityRecord';
+  asked = 0;
+  async keyFor(did: string, kid: string): Promise<FoundKey | null> {
+    this.asked++;
+    const key = this.published.get(`${did} ${kid}`);
+    return key ? { publicKey: key, source: this.source, retiredAt: null, expiresAt: null } : null;
+  }
+  async publish(did: string, device: CryptoKeyPair): Promise<void> {
+    const raw = new Uint8Array(await crypto.subtle.exportKey('raw', device.publicKey));
+    this.published.set(`${did} ${await deriveKid(raw)}`, raw);
+  }
+}
+
+async function devicePair(): Promise<CryptoKeyPair> {
+  return (await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])) as CryptoKeyPair;
+}
+
+/** A did:plc web member's bundle: the signed pre-key signed by their device key. */
+async function plcBundle(pair: X25519Pair, device: CryptoKeyPair) {
+  const spk = pair.publicKey;
+  const sig = new Uint8Array(await crypto.subtle.sign('Ed25519', device.privateKey, spk));
+  return {
+    identity_key: b64(pair.publicKey),
+    signed_pre_key: b64(spk),
+    spk_signature: b64(sig),
+    spk_id: 1,
+    signing_key: b64(new Uint8Array(await crypto.subtle.exportKey('raw', device.publicKey))),
+  };
 }
 
 /**
@@ -158,6 +199,9 @@ class FakeClient implements RoomsClient {
 
 interface Harness {
   server: FakeServer;
+  pds: FakePds;
+  /** Publish `did`'s device key in its PDS and its bundle signed by it on the host. */
+  member(did: string, pair: X25519Pair): Promise<void>;
   client: FakeClient;
   me: X25519Pair;
   messages: string[];
@@ -168,6 +212,7 @@ interface Harness {
 
 async function harness(over: Partial<RoomsDeps> = {}): Promise<Harness> {
   const server = new FakeServer();
+  const pds = new FakePds();
   const client = new FakeClient();
   const me = await x25519Pair();
   const messages: string[] = [];
@@ -186,10 +231,17 @@ async function harness(over: Partial<RoomsDeps> = {}): Promise<Harness> {
     pollMaxMs: 3,
     readyWaitMs: 1000,
     stewardDebounceMs: 0,
+    deviceKeys: pds,
+    stewardRetryMs: [],
     ...over,
     secrets,
   });
-  return { server, client, me, messages, states, secrets, rooms };
+  const member = async (did: string, pair: X25519Pair) => {
+    const device = await devicePair();
+    await pds.publish(did, device);
+    server.bundles.set(did, await plcBundle(pair, device));
+  };
+  return { server, pds, member, client, me, messages, states, secrets, rooms };
 }
 
 /** A steward elsewhere seals `epoch` to us on the server. */
@@ -428,7 +480,7 @@ describe('steward duty', () => {
     const h = await harness();
     const bob = await x25519Pair();
     h.server.roster = [ME, BOB, 'did:plc:carol', 'did:plc:dave'];
-    h.server.bundles.set(BOB, await bundleFor(bob));
+    await h.member(BOB, bob);
     const e1 = await sealedToUs(h, 1);
     const e2 = await sealedToUs(h, 2);
     // carol already has both; dave has no bundle.
@@ -458,7 +510,7 @@ describe('steward duty', () => {
     const h = await harness();
     const bob = await x25519Pair();
     h.server.roster = [ME, BOB];
-    h.server.bundles.set(BOB, await bundleFor(bob));
+    await h.member(BOB, bob);
 
     expect(await h.rooms.loadRoomKeys(CH)).toBe(true);
 
@@ -485,7 +537,7 @@ describe('steward duty', () => {
   it('hands out nothing when we do not hold the latest epoch', async () => {
     const h = await harness();
     h.server.roster = [ME, BOB];
-    h.server.bundles.set(BOB, await bundleFor(await x25519Pair()));
+    await h.member(BOB, await x25519Pair());
     await sealedToUs(h, 1);
     // Epoch 2 exists on the server, sealed to someone else — not to us.
     await h.server.seal({ ...createGroup(CH), epoch: 2 }, 'did:plc:carol', (await x25519Pair()).publicKey);
@@ -505,7 +557,7 @@ describe('steward duty', () => {
 
     const bob = await x25519Pair();
     h.server.roster = [ME, BOB];
-    h.server.bundles.set(BOB, await bundleFor(bob));
+    await h.member(BOB, bob);
     h.rooms.onMemberJoined(CH, 'me'); // our own join: ignored
     h.rooms.onMemberJoined(CH, 'bob');
     h.rooms.onMemberJoined(CH, 'bob'); // coalesced
@@ -519,7 +571,7 @@ describe('steward duty', () => {
     await h2.server.seal({ ...createGroup(CH), epoch: 2 }, 'did:plc:carol', (await x25519Pair()).publicKey);
     await h2.rooms.loadRoomKeys(CH);
     h2.server.roster = [ME, BOB];
-    h2.server.bundles.set(BOB, await bundleFor(bob));
+    await h2.member(BOB, bob);
     h2.rooms.onMemberJoined(CH, 'bob');
     await new Promise((r) => setTimeout(r, 5));
     expect(h2.server.posts).toEqual([]);
@@ -543,6 +595,102 @@ describe('steward duty', () => {
     expect(res.skipped).toEqual([{ did: bad, reason: "bundle signing_key is not the did:key's key" }]);
     const opened = await openSealed(sealedFromWire(h.server.keys.get(1)!.get(good)!)!, agentPair);
     expect(opened?.secret).toEqual(h.rooms.states(CH)[0].secret);
+  });
+});
+
+describe('binding a did:plc member\'s bundle', () => {
+  it('seals to a bundle signed by a device key published in the member\'s PDS', async () => {
+    const h = await harness();
+    await sealedToUs(h, 1);
+    h.server.roster = [ME, BOB];
+    await h.member(BOB, await x25519Pair());
+    await h.rooms.loadRoomKeys(CH);
+    expect(h.server.posts).toEqual([{ epoch: 1, dids: [BOB] }]);
+  });
+
+  it('refuses a bundle the host substituted, and says so in the room once', async () => {
+    const h = await harness();
+    await sealedToUs(h, 1);
+    h.server.roster = [ME, BOB];
+    await h.member(BOB, await x25519Pair());
+    // The host swaps in a bundle of its own under BOB's DID.
+    h.server.bundles.set(BOB, await plcBundle(await x25519Pair(), await devicePair()));
+
+    await h.rooms.loadRoomKeys(CH);
+    const res = await h.rooms.stewardPass(CH);
+    expect(h.server.posts).toEqual([]);
+    expect(res.skipped).toHaveLength(1);
+    expect(res.skipped[0]).toMatchObject({ did: BOB, retry: true });
+    expect(res.skipped[0].reason).toMatch(/not a device key published in did:plc:bob/);
+    const said = h.messages.filter((m) => m.includes(BOB));
+    expect(said).toHaveLength(1);
+    expect(said[0]).toMatch(/Not sealing the room key to did:plc:bob/);
+  });
+
+  it('refuses a bundle with the random signing key a web client used to publish', async () => {
+    const h = await harness();
+    await sealedToUs(h, 1);
+    h.server.roster = [ME, BOB];
+    h.server.bundles.set(BOB, await bundleFor(await x25519Pair()));
+    await h.rooms.loadRoomKeys(CH);
+    expect(h.server.posts).toEqual([]);
+  });
+
+  it('refuses a device key only the origin server vouches for', async () => {
+    const h = await harness();
+    h.pds.source = 'OriginServer';
+    await sealedToUs(h, 1);
+    h.server.roster = [ME, BOB];
+    await h.member(BOB, await x25519Pair());
+    await h.rooms.loadRoomKeys(CH);
+    const res = await h.rooms.stewardPass(CH);
+    expect(h.server.posts).toEqual([]);
+    expect(res.skipped[0].reason).toMatch(/OriginServer/);
+  });
+
+  it('waits for a device key published after the member joined, then seals on a retry', async () => {
+    const h = await harness({ stewardRetryMs: [20, 20, 20] });
+    await sealedToUs(h, 1);
+    h.server.roster = [ME, BOB];
+    const bob = await x25519Pair();
+    const device = await devicePair();
+    h.server.bundles.set(BOB, await plcBundle(bob, device));
+
+    await h.rooms.loadRoomKeys(CH);
+    expect(h.server.posts).toEqual([]);
+
+    await h.pds.publish(BOB, device);
+    await vi.waitFor(() => expect(h.server.posts).toEqual([{ epoch: 1, dids: [BOB] }]));
+    const opened = await openSealed(sealedFromWire(h.server.keys.get(1)!.get(BOB)!)!, bob);
+    expect(opened?.secret).toEqual(h.rooms.states(CH)[0].secret);
+    // Sealed: no further retries.
+    const asked = h.pds.asked;
+    await new Promise((r) => setTimeout(r, 80));
+    expect(h.pds.asked).toBe(asked);
+  });
+
+  it('gives up retrying after the last delay', async () => {
+    const h = await harness({ stewardRetryMs: [5, 5] });
+    await sealedToUs(h, 1);
+    h.server.roster = [ME, BOB];
+    h.server.bundles.set(BOB, await plcBundle(await x25519Pair(), await devicePair()));
+    await h.rooms.loadRoomKeys(CH);
+    await new Promise((r) => setTimeout(r, 60));
+    // The arrival pass and two retries.
+    expect(h.pds.asked).toBe(3);
+  });
+
+  it('verifyBundleBinding refuses any did:plc bundle without a device key reader', async () => {
+    const bundle = await plcBundle(await x25519Pair(), await devicePair());
+    expect((await verifyBundleBinding(BOB, bundle)).ok).toBe(false);
+  });
+
+  it('verifyBundleBinding leaves did:key alone: the did:key itself, no reader asked', async () => {
+    const agent = await generateDidKey();
+    const pds = new FakePds();
+    const bundle = await bundleFor(await x25519Pair(), { did: agent.did, signer: agent.signer });
+    expect(await verifyBundleBinding(agent.did, bundle as never, undefined, pds)).toEqual({ ok: true });
+    expect(pds.asked).toBe(0);
   });
 });
 
