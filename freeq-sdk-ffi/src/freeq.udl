@@ -231,7 +231,11 @@ interface FreeqEvent {
     Connected();
     Registered(string nick);
     Authenticated(string did);
+    // The server refused this sign-in for good (its sentence); the same
+    // credentials will not get in.
     AuthFailed(string reason);
+    // The server could not check this client just now (its sentence).
+    AuthFailedRetry(string reason);
     Joined(string channel, string nick);
     Parted(string channel, string nick);
     NickChanged(string old_nick, string new_nick);
@@ -265,6 +269,9 @@ interface FreeqEvent {
     // This device's key is not published to the account and the app's
     // session cannot publish it: the user has to sign in again.
     SigningKeyUnpublished();
+    // The server refused this device's signing key (its sentence); the
+    // stored key is marked refused and the client does not reconnect.
+    SigningKeyRefused(string reason);
     // A verdict that was Pending when its line arrived, now known.
     Verdict(string msgid, SignatureVerdict verdict);
     Disconnected(string reason);

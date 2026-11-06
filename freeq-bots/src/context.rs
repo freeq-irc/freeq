@@ -382,6 +382,11 @@ impl AgentContext {
                 Ok(Some(Event::BatchEnd { id })) if id == batch_id => {
                     break;
                 }
+                // The server ended the session for good (a final close):
+                // the caller ends on it, as on any final refusal.
+                Ok(Some(Event::AuthFailed { reason })) => {
+                    return Err(freeq_sdk::refusal::Refusal::Final(reason).into());
+                }
                 Ok(Some(_)) => {
                     // Ignore other events during batch collection
                 }
@@ -610,6 +615,58 @@ impl AgentContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A final close during the history fetch ends it with a final Refusal
+    /// carrying the server's sentence, which the bot's loop ends on.
+    #[tokio::test]
+    async fn a_final_close_during_the_history_fetch_is_a_final_refusal() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut lines = BufReader::new(r).lines();
+            while let Ok(Some(l)) = lines.next_line().await {
+                if l.starts_with("NICK ") {
+                    let _ = w.write_all(b":srv 001 testbot :Welcome\r\n").await;
+                }
+                if l.starts_with("CHATHISTORY") {
+                    let _ = w
+                        .write_all(
+                            b":srv FAIL * ACCOUNT_REQUIRED :This server requires an account.\r\n",
+                        )
+                        .await;
+                }
+            }
+        });
+        let config = freeq_sdk::client::ConnectConfig {
+            server_addr: addr,
+            nick: "testbot".into(),
+            user: "testbot".into(),
+            realname: "Test".into(),
+            ..Default::default()
+        };
+        let (handle, mut events) = freeq_sdk::client::connect(config, None);
+        loop {
+            if let Some(Event::Registered { .. }) = events.recv().await {
+                break;
+            }
+        }
+        let mem = Arc::new(Memory::in_memory().unwrap());
+        let ctx = AgentContext::new(test_identity(), mem, ContextConfig::default());
+        let err = ctx
+            .fetch_and_ingest(&handle, &mut events, "#test")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<freeq_sdk::refusal::Refusal>(),
+            Some(&freeq_sdk::refusal::Refusal::Final(
+                "This server requires an account.".into()
+            ))
+        );
+    }
+
     fn test_identity() -> AgentIdentity {
         AgentIdentity {
             nick: "testbot".into(),

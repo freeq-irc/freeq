@@ -336,26 +336,41 @@ async fn auth_fails_wrong_key() {
     )
     .await;
 
-    // Should get AuthFailed
-    expect_event(
+    // A final refusal with the server's sentence, then the drop; the client
+    // does not register as a guest.
+    let refused = expect_event(
         &mut events,
         2000,
         |e| matches!(e, Event::AuthFailed { .. }),
         "AuthFailed",
     )
     .await;
-
-    // Should still register as guest (fallback)
+    assert!(
+        matches!(&refused, Event::AuthFailed { reason } if reason == "The signature does not match this identity's keys."),
+        "{refused:?}"
+    );
     expect_event(
         &mut events,
         2000,
-        |e| matches!(e, Event::Registered { .. }),
-        "Registered as guest",
+        |e| matches!(e, Event::Disconnected { .. }),
+        "Disconnected",
     )
     .await;
+    expect_no_registration(&mut events).await;
 
-    handle.quit(None).await.unwrap();
+    drop(handle);
     server_handle.abort();
+}
+
+/// No `Registered` within a second, and the events end or go quiet.
+async fn expect_no_registration(events: &mut mpsc::Receiver<Event>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.recv()).await {
+        assert!(
+            !matches!(event, Event::Registered { .. }),
+            "registered as a guest: {event:?}"
+        );
+    }
 }
 
 // ── Test: Auth fails with unknown DID ───────────────────────────────
@@ -388,22 +403,26 @@ async fn auth_fails_unknown_did() {
         "Connected",
     )
     .await;
+    // The static resolver cannot find the DID: a resolution failure, which
+    // may pass, so the client is told to try again. It does not register as
+    // a guest.
     expect_event(
         &mut events,
         2000,
-        |e| matches!(e, Event::AuthFailed { .. }),
-        "AuthFailed",
+        |e| matches!(e, Event::AuthFailedRetry { .. }),
+        "AuthFailedRetry",
     )
     .await;
     expect_event(
         &mut events,
         2000,
-        |e| matches!(e, Event::Registered { .. }),
-        "Registered as guest",
+        |e| matches!(e, Event::Disconnected { .. }),
+        "Disconnected",
     )
     .await;
+    expect_no_registration(&mut events).await;
 
-    handle.quit(None).await.unwrap();
+    drop(handle);
     server_handle.abort();
 }
 

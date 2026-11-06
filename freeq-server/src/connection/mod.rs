@@ -44,6 +44,7 @@ use tokio::sync::mpsc;
 use crate::irc::{self, Message};
 use crate::server::SharedState;
 use base64::Engine;
+use freeq_sdk::refusal::{AGENT_REVOKED, KEY_EXPIRED, KEY_RETIRED};
 
 use cap::{handle_authenticate, handle_cap};
 use channel::{
@@ -187,11 +188,11 @@ pub(crate) fn file_session_signing_key(
         .flatten();
     if row.as_ref().is_some_and(|row| row.removed_at.is_some()) {
         tracing::info!(session = %session_id, %did, %kid, "Refused a signing key this server has marked retired");
-        return Err(("KEY_RETIRED", KEY_RETIRED_WORDS));
+        return Err((KEY_RETIRED, KEY_RETIRED_WORDS));
     }
     if row.is_some_and(|row| row.expired_at(now)) {
         tracing::info!(session = %session_id, %did, %kid, "Refused a signing key whose row has expired");
-        return Err(("KEY_EXPIRED", KEY_EXPIRED_WORDS));
+        return Err((KEY_EXPIRED, KEY_EXPIRED_WORDS));
     }
 
     state
@@ -233,6 +234,35 @@ pub(crate) fn file_session_signing_key(
     Ok(())
 }
 
+/// Send `FAIL <command> <code> :<text>`, the standard reply, to one session
+/// through `send`: the read loop's own `send` where the caller has it, which
+/// marks the connection unhealthy when the line cannot be queued, or
+/// [`send_to`] where it does not, which drops the line.
+pub(crate) fn send_fail(
+    state: &Arc<SharedState>,
+    session_id: &str,
+    send: &dyn Fn(&Arc<SharedState>, &str, String),
+    command: &str,
+    code: &str,
+    text: &str,
+) {
+    let reply = Message::from_server(&state.server_name, "FAIL", vec![command, code, text]);
+    send(state, session_id, format!("{reply}\r\n"));
+}
+
+/// Send a line to a specific session.
+pub(crate) fn send_to(state: &Arc<SharedState>, session_id: &str, line: String) {
+    if let Some(tx) = state.connections.lock().get(session_id) {
+        let _ = tx.try_send(line);
+    }
+}
+
+/// How long a connection that is closing waits for its last lines to reach
+/// the client and for the client to finish: here, the writer's queue and the
+/// client's input read to its end; in the WebSocket bridge, the closing
+/// handshake (`web.rs`); in the iroh bridge, the send stream (`iroh.rs`).
+pub(crate) const CLOSE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// What a device whose signing key has expired is told.
 pub(crate) const KEY_EXPIRED_WORDS: &str =
     "This device's signing key has expired. Sign in again to continue.";
@@ -252,8 +282,8 @@ pub(crate) fn close_for_refused_key(
     broker_token: Option<&str>,
 ) {
     let reason = match code {
-        "KEY_EXPIRED" => "Signing key expired",
-        "KEY_RETIRED" => "Signing key retired",
+        KEY_EXPIRED => "Signing key expired",
+        KEY_RETIRED => "Signing key retired",
         _ => return,
     };
     let state = Arc::clone(state);
@@ -306,7 +336,7 @@ async fn refuse_if_retired(
         let reply = irc::Message::from_server(
             &state.server_name,
             "FAIL",
-            vec!["MSGSIG", "KEY_EXPIRED", KEY_EXPIRED_WORDS],
+            vec!["MSGSIG", KEY_EXPIRED, KEY_EXPIRED_WORDS],
         );
         if let Some(tx) = state.connections.lock().get(session_id) {
             let _ = tx.try_send(format!("{reply}\r\n"));
@@ -323,7 +353,7 @@ async fn refuse_if_retired(
     let reply = irc::Message::from_server(
         &state.server_name,
         "FAIL",
-        vec!["MSGSIG", "KEY_RETIRED", KEY_RETIRED_WORDS],
+        vec!["MSGSIG", KEY_RETIRED, KEY_RETIRED_WORDS],
     );
     if let Some(tx) = state.connections.lock().get(session_id) {
         let _ = tx.try_send(format!("{reply}\r\n"));
@@ -765,7 +795,8 @@ where
 
     let server_name = state.server_name.clone();
 
-    // Spawn writer task
+    // Spawn writer task. It hands its half back when its queue ends, so the
+    // close below can shut it rather than drop it.
     let write_session_id = session_id.clone();
     let mut write_half = writer;
     let write_handle = tokio::spawn(async move {
@@ -781,7 +812,7 @@ where
             while let Ok(queued) = rx.try_recv() {
                 if let Err(e) = write_half.write_all(queued.as_bytes()).await {
                     tracing::warn!(session_id = %write_session_id, "Write error: {e}");
-                    return;
+                    return write_half;
                 }
                 batch_count += 1;
                 if batch_count >= 64 {
@@ -794,6 +825,7 @@ where
                 break;
             }
         }
+        write_half
     });
 
     // Track whether our own send channel is healthy
@@ -2193,10 +2225,23 @@ where
                                     state.with_db(|db| db.revoke_all_capabilities(ch, did));
                                 }
                             }
-                            // Send ERROR to force disconnect
-                            if let Some(tx) = state.connections.lock().get(&target_session) {
-                                let _ = tx
-                                    .try_send(format!("ERROR :Revoked by {nick}{reason_str}\r\n"));
+                            // Refused for good, and closed from here: every
+                            // connection of the target's identity, all the
+                            // sessions of its DID or a guest's one session,
+                            // each through its own loop. The issuer's own
+                            // connection is never among them, even when it
+                            // shares the target's DID.
+                            let mut sessions: std::collections::BTreeSet<String> = target_did
+                                .as_ref()
+                                .and_then(|did| state.did_sessions.lock().get(did).cloned())
+                                .unwrap_or_default()
+                                .into_iter()
+                                .collect();
+                            sessions.insert(target_session.clone());
+                            sessions.remove(&session_id);
+                            let words = format!("Revoked by {nick}{reason_str}");
+                            for sid in &sessions {
+                                close_refused(&state, sid, &send_to, AGENT_REVOKED, &words);
                             }
                         }
 
@@ -4097,13 +4142,31 @@ where
     );
 
     // Cleanup removed this session's only Sender, so the writer ends once it
-    // has written what was queued (a FAIL and ERROR before a close); abort
-    // as before if it stalls.
+    // has written what was queued (a FAIL and ERROR before a close). Its half
+    // is then shut: FIN on TCP, close_notify on TLS, end of stream into a
+    // WebSocket or iroh bridge. What the client still sends is read and
+    // dropped until it closes too, because a socket dropped with input
+    // unread is reset, and the reset can take the lines just written. That
+    // read runs while the writer drains, not after it: the WebSocket bridge
+    // carries both directions in one task, and with its input unread it
+    // would stop sending the writer's lines. All within CLOSE_DRAIN; on the
+    // bound the writer is aborted, as before.
     let mut write_handle = write_handle;
-    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut write_handle)
-        .await
-        .is_err()
-    {
+    let drained = tokio::time::timeout(CLOSE_DRAIN, async {
+        tokio::join!(
+            async {
+                if let Ok(mut write_half) = (&mut write_handle).await {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = write_half.shutdown().await;
+                }
+            },
+            async {
+                let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+            },
+        )
+    })
+    .await;
+    if drained.is_err() {
         write_handle.abort();
     }
     Ok(())
@@ -4227,6 +4290,21 @@ pub(crate) fn close_session(state: &Arc<SharedState>, session_id: &str, reason: 
         }
         None => false,
     }
+}
+
+/// End a session the server refuses: `FAIL * <code> :<reason>` through
+/// `send` (the refusal answers no command the client sent, hence `*`), then
+/// [`close_session`], which writes `ERROR :<reason>` and ends the session's
+/// read loop. Returns what `close_session` returns.
+pub(crate) fn close_refused(
+    state: &Arc<SharedState>,
+    session_id: &str,
+    send: &dyn Fn(&Arc<SharedState>, &str, String),
+    code: &str,
+    reason: &str,
+) -> bool {
+    send_fail(state, session_id, send, "*", code, reason);
+    close_session(state, session_id, reason)
 }
 
 /// Clean up per-session state (connections, caps, etc.) but NOT channel membership.
@@ -4363,10 +4441,11 @@ mod retired_key_tests {
     const DID: &str = "did:plc:retiredkeytest";
 
     /// A connection to `state` over an in-memory stream, signed in with a web
-    /// token carrying `broker_token`.
+    /// token carrying `broker_token`; or over a socket a test connected
+    /// itself ([`Client::over`]).
     pub(super) struct Client {
-        reader: BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
-        writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        reader: BufReader<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
+        writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
     }
 
     impl Client {
@@ -4419,6 +4498,24 @@ mod retired_key_tests {
             broker_token: Option<&str>,
             before_welcome: Option<&str>,
         ) -> Client {
+            Self::open(state)
+                .await
+                .sign_in(state, did, nick, web_token, broker_token, before_welcome)
+                .await
+        }
+
+        /// Signed in on this connection as `did` under `nick`, with the web
+        /// token `web_token` carrying `broker_token`; `before_welcome` as in
+        /// [`Client::offering_at_registration`].
+        async fn sign_in(
+            self,
+            state: &Arc<SharedState>,
+            did: &str,
+            nick: &str,
+            web_token: &str,
+            broker_token: Option<&str>,
+            before_welcome: Option<&str>,
+        ) -> Client {
             state.web_auth_tokens.lock().insert(
                 web_token.to_string(),
                 (
@@ -4428,7 +4525,7 @@ mod retired_key_tests {
                     broker_token.map(str::to_string),
                 ),
             );
-            let mut c = Self::authenticating(state, nick, web_token).await;
+            let mut c = self.authenticate(nick, web_token).await;
             c.rx(|l| l.split_whitespace().nth(1) == Some("903"))
                 .await
                 .expect("903");
@@ -4461,16 +4558,13 @@ mod retired_key_tests {
         /// Through `AUTHENTICATE` with the web token `web_token`, not waiting
         /// for its answer.
         async fn authenticating(state: &Arc<SharedState>, nick: &str, web_token: &str) -> Client {
-            let (client_side, server_side) = tokio::io::duplex(16384);
-            let served = state.clone();
-            tokio::spawn(async move {
-                let _ = handle_generic(server_side, served).await;
-            });
-            let (reader, writer) = tokio::io::split(client_side);
-            let mut c = Client {
-                reader: BufReader::new(reader),
-                writer,
-            };
+            Self::open(state).await.authenticate(nick, web_token).await
+        }
+
+        /// This connection through `AUTHENTICATE` with the web token
+        /// `web_token`, not waiting for its answer.
+        async fn authenticate(self, nick: &str, web_token: &str) -> Client {
+            let mut c = self;
             c.tx("CAP LS 302").await;
             c.tx(&format!("NICK {nick}")).await;
             c.tx(&format!("USER {nick} 0 * :test")).await;
@@ -4499,11 +4593,75 @@ mod retired_key_tests {
             tokio::spawn(async move {
                 let _ = handle_generic(server_side, served).await;
             });
-            let (reader, writer) = tokio::io::split(client_side);
+            Self::over(client_side)
+        }
+
+        /// A client on `stream`, which the caller has connected to a server.
+        fn over(
+            stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        ) -> Client {
+            let (reader, writer) = tokio::io::split(stream);
             Client {
-                reader: BufReader::new(reader),
-                writer,
+                reader: BufReader::new(Box::new(reader)),
+                writer: Box::new(writer),
             }
+        }
+
+        /// Every line until the stream ends, while a second task writes as
+        /// fast as the socket takes them (PONG lines, which the server answers
+        /// with nothing), as a busy client does. Also how the stream ended
+        /// (`None` at its end, or the read error), and the first write that
+        /// failed before then: a reset shows there even when the read sees a
+        /// plain end, because whichever call meets a reset's error first takes
+        /// it. Reading starts only after 100 ms, as a client busy elsewhere
+        /// would, so what the server sent is still waiting in the socket when
+        /// the server closes.
+        async fn read_to_end_while_writing(
+            self,
+        ) -> (
+            Vec<String>,
+            Option<std::io::ErrorKind>,
+            Option<std::io::ErrorKind>,
+        ) {
+            let Client {
+                mut reader,
+                mut writer,
+            } = self;
+            let stop = Arc::new(tokio::sync::Notify::new());
+            let stopped = stop.clone();
+            let writing = tokio::spawn(async move {
+                let mut failed = None;
+                loop {
+                    tokio::select! {
+                        _ = stopped.notified() => break,
+                        written = writer.write_all(b"PONG :busy\r\n") => {
+                            if let Err(e) = written {
+                                failed = Some(e.kind());
+                                break;
+                            }
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                (writer, failed)
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let mut lines = Vec::new();
+            let end = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let mut buf = String::new();
+                    match reader.read_line(&mut buf).await {
+                        Ok(0) => return None,
+                        Ok(_) => lines.push(buf.trim_end().to_string()),
+                        Err(e) => return Some(e.kind()),
+                    }
+                }
+            })
+            .await
+            .expect("the stream ends within 10s");
+            stop.notify_one();
+            let (_writer, write_failed) = writing.await.unwrap();
+            (lines, end, write_failed)
         }
 
         /// Every line until the server closes the connection.
@@ -5653,6 +5811,97 @@ mod retired_key_tests {
         );
     }
 
+    /// A refused key over TCP, with the client still writing: the client
+    /// reads the FAIL, the ERROR and then the end of the stream, never a
+    /// reset. The server shuts its side and reads what the client sends until
+    /// it closes, so it never drops the socket with input unread. Repeated,
+    /// because the reset was a race.
+    #[tokio::test]
+    async fn a_refused_tcp_client_still_writing_reads_the_refusal_then_the_end() {
+        let key = signing_key(63);
+        let (state, _) = state_holding_an_expired_row(&key).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = state.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let state = served.clone();
+                tokio::spawn(async move {
+                    let _ = handle(stream, state).await;
+                });
+            }
+        });
+
+        for n in 0..50 {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut client = Client::over(stream)
+                .sign_in(
+                    &state,
+                    DID,
+                    &format!("tcp{n}"),
+                    &format!("WT-TCP-CLOSE-{n}"),
+                    Some(&format!("BT-TCP-CLOSE-{n}")),
+                    None,
+                )
+                .await;
+            client.tx(&msgsig_line(&key)).await;
+            let (lines, end, write_failed) = client.read_to_end_while_writing().await;
+            assert!(
+                lines.iter().any(|l| l.contains("FAIL MSGSIG KEY_EXPIRED")),
+                "repetition {n}, no FAIL: {lines:?}, ended {end:?}"
+            );
+            assert!(
+                lines.iter().any(|l| l.starts_with("ERROR ")),
+                "repetition {n}, no ERROR: {lines:?}, ended {end:?}"
+            );
+            assert_eq!(end, None, "repetition {n} ended in an error: {lines:?}");
+            assert_eq!(
+                write_failed, None,
+                "repetition {n}: a write failed before the end of the stream (a reset): {lines:?}"
+            );
+        }
+    }
+
+    /// Over an in-memory stream: after the refusal the client reads the end of
+    /// the stream, but the server's side is shut, not gone, so the client can
+    /// still write until it closes; the handler then ends at once.
+    #[tokio::test]
+    async fn a_refused_connection_ends_the_stream_and_reads_on_until_the_client_closes() {
+        let key = signing_key(64);
+        let (state, _) = state_holding_an_expired_row(&key).await;
+        let (client_side, server_side) = tokio::io::duplex(16384);
+        let served = state.clone();
+        let handler = tokio::spawn(async move { handle_generic(server_side, served).await });
+        let mut client = Client::over(client_side)
+            .sign_in(
+                &state,
+                DID,
+                "dora",
+                "WT-DUPLEX-CLOSE",
+                Some("BT-DUPLEX-CLOSE"),
+                None,
+            )
+            .await;
+        client.tx(&msgsig_line(&key)).await;
+        refused_as_expired(&client.rest().await);
+
+        client
+            .writer
+            .write_all(b"PING :after the end\r\n")
+            .await
+            .expect("the server's side still reads after its end of stream, not a broken pipe");
+        assert!(
+            !handler.is_finished(),
+            "the handler waits for the client to close"
+        );
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(1), handler)
+            .await
+            .expect("the handler ends once the client closes")
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn a_key_its_record_let_expire_is_refused_as_expired_and_keeps_no_retirement() {
         let key = signing_key(62);
@@ -6165,6 +6414,7 @@ mod retired_key_tests {
 #[cfg(test)]
 mod agent_record_tests {
     //! Plan step 8.1: a bot's ownership proven by its owner's agent record.
+    use super::refusal_close_tests::assert_refused;
     use super::retired_key_tests::Client;
     use super::*;
     use freeq_sdk::crypto::PrivateKey;
@@ -6940,6 +7190,15 @@ mod agent_record_tests {
         key: &freeq_sdk::crypto::PrivateKey,
         owner: Option<&str>,
     ) -> String {
+        sasl_exchange_with_fail(c, key, owner).await.1
+    }
+
+    /// [`sasl_exchange`], with the FAIL that came before the verdict, if any.
+    async fn sasl_exchange_with_fail(
+        c: &mut Client,
+        key: &freeq_sdk::crypto::PrivateKey,
+        owner: Option<&str>,
+    ) -> (Option<String>, String) {
         use base64::Engine;
         let did = format!("did:key:{}", key.public_key_multibase());
         c.tx("AUTHENTICATE ATPROTO-CHALLENGE").await;
@@ -6968,9 +7227,28 @@ mod agent_record_tests {
         for line in freeq_sdk::auth::sasl_response_lines(&encoded) {
             c.tx(&line).await;
         }
-        c.rx(|l| matches!(l.split_whitespace().nth(1), Some("903") | Some("904")))
+        let fail = std::sync::Mutex::new(None);
+        let verdict = c
+            .rx(|l| {
+                if l.split_whitespace().nth(1) == Some("FAIL") {
+                    *fail.lock().unwrap() = Some(l.to_string());
+                }
+                matches!(l.split_whitespace().nth(1), Some("903") | Some("904"))
+            })
             .await
-            .expect("a SASL verdict")
+            .expect("a SASL verdict");
+        (fail.into_inner().unwrap(), verdict)
+    }
+
+    /// A connection as `nick`, through `CAP REQ :sasl`.
+    async fn negotiated_agent(state: &Arc<SharedState>, nick: &str) -> Client {
+        let mut c = Client::open(state).await;
+        c.tx("CAP LS 302").await;
+        c.tx(&format!("NICK {nick}")).await;
+        c.tx(&format!("USER {nick} 0 * :test")).await;
+        c.tx("CAP REQ :sasl").await;
+        c.rx(|l| l.contains("ACK")).await.expect("CAP ACK");
+        c
     }
 
     /// The SASL exchange a did:key agent makes, naming `owner`; the 903 or
@@ -6981,12 +7259,7 @@ mod agent_record_tests {
         nick: &str,
         owner: &str,
     ) -> (Client, String) {
-        let mut c = Client::open(state).await;
-        c.tx("CAP LS 302").await;
-        c.tx(&format!("NICK {nick}")).await;
-        c.tx(&format!("USER {nick} 0 * :test")).await;
-        c.tx("CAP REQ :sasl").await;
-        c.rx(|l| l.contains("ACK")).await.expect("CAP ACK");
+        let mut c = negotiated_agent(state, nick).await;
         let verdict = sasl_exchange(&mut c, key, Some(owner)).await;
         (c, verdict)
     }
@@ -7060,11 +7333,10 @@ mod agent_record_tests {
         repo.lock().add(AGENT_KEY_TYPE, &removal(&agent_did, 1));
         recheck_agent_links(&state, std::time::Duration::ZERO).await;
         let closing = agent.rest().await;
-        assert!(
-            closing
-                .iter()
-                .any(|l| l.starts_with("ERROR :Delegation withdrawn")),
-            "the connection is closed with the reason: {closing:?}"
+        assert_refused(
+            &closing,
+            freeq_sdk::refusal::NOT_ALLOWED,
+            "Delegation withdrawn: the owner's agent record no longer names this bot",
         );
         assert!(state.delegated_sessions.lock().is_empty());
     }
@@ -7086,11 +7358,10 @@ mod agent_record_tests {
         repo.lock().add(AGENT_KEY_TYPE, &removal(&agent_did, 1));
         agent.tx(&provenance_line(&unsigned_cert(&agent_did))).await;
         let closing = agent.rest().await;
-        assert!(
-            closing
-                .iter()
-                .any(|l| l.starts_with("ERROR :Delegation withdrawn")),
-            "{closing:?}"
+        assert_refused(
+            &closing,
+            freeq_sdk::refusal::NOT_ALLOWED,
+            "Delegation withdrawn: the owner's agent record no longer names this bot",
         );
     }
 
@@ -7115,11 +7386,10 @@ mod agent_record_tests {
 
         repo.lock().add(AGENT_KEY_TYPE, &removal(&first, 1));
         recheck_agent_links(&state, std::time::Duration::ZERO).await;
-        assert!(
-            a.rest()
-                .await
-                .iter()
-                .any(|l| l.starts_with("ERROR :Delegation withdrawn"))
+        assert_refused(
+            &a.rest().await,
+            freeq_sdk::refusal::NOT_ALLOWED,
+            "Delegation withdrawn: the owner's agent record no longer names this bot",
         );
         assert!(still_served(&mut b).await, "the sibling is still served");
         assert_eq!(state.delegated_sessions.lock().len(), 1);
@@ -7161,11 +7431,10 @@ mod agent_record_tests {
         admitted_under(&state, STRANGER, &agent_did);
         recheck_agent_links(&state, std::time::Duration::ZERO).await;
         let closing = agent.rest().await;
-        assert!(
-            closing
-                .iter()
-                .any(|l| l.starts_with("ERROR :Delegation withdrawn")),
-            "{closing:?}"
+        assert_refused(
+            &closing,
+            freeq_sdk::refusal::NOT_ALLOWED,
+            "Delegation withdrawn: the owner is no longer allowed here",
         );
     }
 
@@ -7177,11 +7446,18 @@ mod agent_record_tests {
         let (mut agent, v) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
         assert!(v.contains(" 904 "), "{v}");
         agent.tx("CAP END").await;
-        let answer = agent
-            .rx(|l| l.starts_with("ERROR :") || l.split_whitespace().nth(1) == Some("001"))
-            .await
-            .expect("an answer to registration");
-        assert!(answer.contains("requires authentication"), "{answer}");
+        let answer = agent.rest().await;
+        assert_refused(
+            &answer,
+            freeq_sdk::refusal::ACCOUNT_REQUIRED,
+            "This server requires authentication (guest connections disabled)",
+        );
+        assert!(
+            answer
+                .iter()
+                .all(|l| l.split_whitespace().nth(1) != Some("001")),
+            "{answer:?}"
+        );
     }
 
     /// harness-kit reads this exact text to point the owner at /freeq
@@ -7198,9 +7474,16 @@ mod agent_record_tests {
         let repo = owner_repo();
         repo.lock().add(AGENT_KEY_TYPE, &claim(OTHER_BOT, 24));
         let state = gated(&repo).await;
-        let (_agent, verdict) = sasl_as_agent(&state, &agent_key, "helper", OWNER).await;
+        let mut agent = negotiated_agent(&state, "helper").await;
+        let (fail, verdict) = sasl_exchange_with_fail(&mut agent, &agent_key, Some(OWNER)).await;
         assert!(verdict.contains(" 904 "), "{verdict}");
         assert!(verdict.ends_with(&format!(":{expected}")), "{verdict}");
+        // Final for every delegation refusal, with the same text before it.
+        let fail = fail.expect("a FAIL before the 904");
+        assert!(
+            fail.ends_with(&format!(" FAIL AUTHENTICATE NOT_ALLOWED :{expected}")),
+            "{fail}"
+        );
     }
 
     /// An instance like `gated`, allowing `domains` too, and its stub PDS.
@@ -7296,11 +7579,10 @@ mod agent_record_tests {
         tokio::time::sleep(std::time::Duration::from_millis(3100)).await;
         recheck_agent_links(&state, std::time::Duration::ZERO).await;
         let closing = agent.rest().await;
-        assert!(
-            closing
-                .iter()
-                .any(|l| l.starts_with("ERROR :Delegation unverifiable")),
-            "{closing:?}"
+        assert_refused(
+            &closing,
+            freeq_sdk::refusal::TEMPORARILY_UNAVAILABLE,
+            "Delegation unverifiable: the owner's agent records could not be read",
         );
     }
 
@@ -7415,6 +7697,163 @@ mod join_key_redaction_tests {
         assert_eq!(
             redact_join_key("PRIVMSG #chan :JOIN #x y"),
             "PRIVMSG #chan :JOIN #x y"
+        );
+    }
+}
+
+#[cfg(test)]
+mod refusal_close_tests {
+    //! The closes that refuse a session: `FAIL * <code>`, then `ERROR`, then
+    //! the connection closed.
+    use super::retired_key_tests::Client;
+    use super::*;
+
+    /// `lines`, read to the server's close, hold `FAIL * <code> :<words>`
+    /// and after it `ERROR :<words>`.
+    pub(super) fn assert_refused(lines: &[String], code: &str, words: &str) {
+        let fail = lines
+            .iter()
+            .position(|l| l.ends_with(&format!(" FAIL * {code} :{words}")));
+        let error = lines.iter().position(|l| *l == format!("ERROR :{words}"));
+        assert!(
+            matches!((fail, error), (Some(f), Some(e)) if f < e),
+            "FAIL * {code} then ERROR, with {words:?}: {lines:?}"
+        );
+    }
+
+    /// A guest that registers on `--no-guest`: refused for good, and the
+    /// connection's own loop ends.
+    #[tokio::test]
+    async fn a_guest_on_a_no_guest_server_is_refused_and_closed() {
+        let state = crate::server::test_state_with_config(crate::config::ServerConfig {
+            no_guest: true,
+            ..Default::default()
+        });
+        let mut c = Client::open(&state).await;
+        c.tx("NICK roamer").await;
+        c.tx("USER roamer 0 * :test").await;
+        let lines = c.rest().await;
+        assert_refused(
+            &lines,
+            freeq_sdk::refusal::ACCOUNT_REQUIRED,
+            "This server requires authentication (guest connections disabled)",
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.split_whitespace().nth(1) != Some("001")),
+            "never welcomed: {lines:?}"
+        );
+    }
+
+    /// A guest registered on `nick`, in `channel`.
+    async fn guest_in(state: &Arc<SharedState>, nick: &str, channel: &str) -> Client {
+        let mut c = Client::open(state).await;
+        c.tx(&format!("NICK {nick}")).await;
+        c.tx(&format!("USER {nick} 0 * :test")).await;
+        c.rx(|l| l.split_whitespace().nth(1) == Some("001"))
+            .await
+            .expect("001");
+        c.tx(&format!("JOIN {channel}")).await;
+        c.rx(|l| l.contains(&format!(" JOIN {channel}")))
+            .await
+            .expect("joined");
+        c
+    }
+
+    /// An op's `AGENT REVOKE`: the target is refused for good and closed
+    /// from the issuer's task; the issuer stays.
+    #[tokio::test]
+    async fn a_revoked_session_is_refused_and_closed() {
+        let state = crate::server::test_state();
+        let mut op = guest_in(&state, "opper", "#rev").await;
+        let mut target = guest_in(&state, "target", "#rev").await;
+        op.tx("AGENT REVOKE target :bye").await;
+        let lines = target.rest().await;
+        assert_refused(&lines, AGENT_REVOKED, "Revoked by opper: bye");
+        op.tx("PING still").await;
+        assert!(
+            op.rx(|l| l.contains("PONG")).await.is_some(),
+            "the issuer is still served"
+        );
+    }
+
+    /// Whether `c` is still served: its `PING` is answered before any
+    /// refusal or close.
+    async fn answers(c: &mut Client) -> bool {
+        c.tx("PING still").await;
+        c.rx(|l| l.contains("PONG") || l.contains(" FAIL ") || l.starts_with("ERROR "))
+            .await
+            .is_some_and(|l| l.contains("PONG"))
+    }
+
+    /// A revoke closes every connection of the target's identity: both
+    /// sessions of its DID, which share its nick, are refused and closed,
+    /// not only the one the nick points at.
+    #[tokio::test]
+    async fn a_revoke_closes_every_session_of_the_targets_did() {
+        let state = crate::server::test_state();
+        let mut op = guest_in(&state, "opper", "#rev").await;
+        let did = "did:plc:twodevices";
+        let mut first = Client::signed_in_as(&state, did, "twodev", "first-token").await;
+        first.tx("JOIN #rev").await;
+        first
+            .rx(|l| l.contains(" JOIN #rev"))
+            .await
+            .expect("joined");
+        // The second session of the DID joins its channels with it.
+        let mut second = Client::signed_in_as(&state, did, "twodev", "second-token").await;
+        assert_eq!(state.did_sessions.lock().get(did).map(|s| s.len()), Some(2));
+        op.tx("AGENT REVOKE twodev :both").await;
+        let words = "Revoked by opper: both";
+        assert_refused(&first.rest().await, AGENT_REVOKED, words);
+        assert_refused(&second.rest().await, AGENT_REVOKED, words);
+        assert!(answers(&mut op).await, "the issuer is still served");
+    }
+
+    /// An issuer that is a session of the target's DID (a server operator
+    /// revoking its own nick, which its other session shares): the DID's
+    /// other session is refused and closed, and the issuer's own connection
+    /// is left.
+    #[tokio::test]
+    async fn a_revoke_from_a_session_of_the_targets_did_leaves_the_issuer() {
+        let did = "did:plc:ownrevoke";
+        let state = crate::server::test_state_with_config(crate::config::ServerConfig {
+            oper_dids: vec![did.to_string()],
+            ..Default::default()
+        });
+        let mut issuer = Client::signed_in_as(&state, did, "selfrev", "issuer-token").await;
+        let mut other = Client::signed_in_as(&state, did, "selfrev", "other-token").await;
+        issuer.tx("AGENT REVOKE selfrev :lost phone").await;
+        assert_refused(
+            &other.rest().await,
+            AGENT_REVOKED,
+            "Revoked by selfrev: lost phone",
+        );
+        assert!(answers(&mut issuer).await, "the issuer is still served");
+    }
+
+    /// The identity re-check: a DID that resolves with no key it can sign in
+    /// with has every session refused for good and closed.
+    #[tokio::test]
+    async fn a_session_whose_identity_has_no_key_left_is_refused_and_closed() {
+        let did = "did:plc:keyless";
+        let doc: freeq_sdk::did::DidDocument =
+            serde_json::from_value(serde_json::json!({ "id": did })).unwrap();
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            freeq_sdk::did::DidResolver::static_map(std::collections::HashMap::from([(
+                did.to_string(),
+                doc,
+            )])),
+        );
+        let mut c = Client::signed_in_as(&state, did, "keyless", "keyless-token").await;
+        crate::server::reverify_identities(&state).await;
+        let lines = c.rest().await;
+        assert_refused(
+            &lines,
+            freeq_sdk::refusal::IDENTITY_INVALID,
+            "Identity no longer valid (deactivated or key removed)",
         );
     }
 }

@@ -1,4 +1,7 @@
-/** WebSocket IRC transport with auto-reconnect and heartbeat. */
+/** WebSocket IRC transport with auto-reconnect and heartbeat. The wait
+ *  between reconnects grows until resetBackoff() is called, so a caller
+ *  that uses Transport without FreeqClient must call it once its session
+ *  is established, as FreeqClient does at 001. */
 
 import type { TransportState } from './types.js';
 import { log } from "./log.js";
@@ -43,7 +46,6 @@ export class Transport {
     }
 
     this.ws.onopen = () => {
-      this.reconnectAttempts = 0;
       this.lastDataReceived = Date.now();
       this.opts.onStateChange('connected');
       this.startHeartbeat();
@@ -102,7 +104,15 @@ export class Transport {
     }
   }
 
+  /** Close and stop reconnecting, and report the drop. */
   disconnect() {
+    this.detach();
+    this.opts.onStateChange('disconnected');
+  }
+
+  /** What disconnect() does but its report: the caller reports the drop
+   *  itself, once its listeners have heard why. */
+  detach() {
     this.intentionalClose = true;
     this.stopHeartbeat();
     if (this.reconnectTimer) {
@@ -114,13 +124,12 @@ export class Transport {
       // call `flush()` first. We still emit a defensive QUIT here for callers
       // that haven't sent one, but it may be lost if the buffer is non-empty.
       try { this.send('QUIT :Leaving'); } catch { /* ignore */ }
-      // Unhooked first: the drop is reported below, and the socket's own
-      // close can arrive after a later connect() is up.
+      // Unhooked first: the drop is reported by disconnect() or the caller,
+      // and the socket's own close can arrive after a later connect() is up.
       Transport.unhook(this.ws);
       this.ws.close();
       this.ws = null;
     }
-    this.opts.onStateChange('disconnected');
   }
 
   private static unhook(ws: WebSocket) {
@@ -138,21 +147,32 @@ export class Transport {
         log.warn(
           `[transport] no data for ${Transport.DEAD_TIMEOUT / 1000}s, forcing reconnect`,
         );
-        this.stopHeartbeat();
-        if (this.ws) {
-          // Its close handler's two jobs are done here, so that a dead
-          // socket's late close cannot follow a later reconnect() or
-          // connect().
-          Transport.unhook(this.ws);
-          this.ws.close();
-          this.ws = null;
-          this.opts.onStateChange('disconnected');
-          this.scheduleReconnect();
-        }
+        this.restart();
       } else if (elapsed > Transport.PING_INTERVAL) {
         this.send('PING :heartbeat');
       }
     }, 10_000);
+  }
+
+  /** Close this socket and open another after the wait, as when the server
+   *  stops answering. The socket's close handler's two jobs are done here,
+   *  so that its late close cannot follow a later reconnect() or connect(). */
+  restart() {
+    this.stopHeartbeat();
+    if (!this.ws) return;
+    Transport.unhook(this.ws);
+    this.ws.close();
+    this.ws = null;
+    this.opts.onStateChange('disconnected');
+    this.scheduleReconnect();
+  }
+
+  /** Start the wait between reconnects again from 1 s. The client calls this
+   *  once the server has welcomed it (001), not when a socket opens, so a
+   *  server that accepts the socket and then refuses the client is retried
+   *  on a growing wait. */
+  resetBackoff() {
+    this.reconnectAttempts = 0;
   }
 
   private stopHeartbeat() {

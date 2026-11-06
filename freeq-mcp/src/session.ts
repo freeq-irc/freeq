@@ -133,7 +133,7 @@ export interface SessionClient {
   nick?: string | null;
   apiBearer?: string | null;
   on(event: string, handler: (...args: never[]) => void): unknown;
-  off?(event: string, handler: (...args: never[]) => void): unknown;
+  off(event: string, handler: (...args: never[]) => void): unknown;
   connect(): void;
   disconnect(): void;
   join(channel: string, key?: string): void;
@@ -170,12 +170,13 @@ export interface ClientFactoryResult {
   did?: string;
   selfOwned?: boolean;
   /**
-   * Connect and resolve on `ready` (reject on auth failure). When absent the
-   * session calls `client.connect()` and waits for `ready` itself. bot-kit's
+   * Connect and resolve on `ready` (reject on auth failure), or on a
+   * try-again (bot-kit's `'deferred'`). When absent the session calls
+   * `client.connect()`; it waits for `ready` itself either way. bot-kit's
    * `FreeqBot.start()` goes here so the announce sequence (PROVENANCE, then
    * the configured JOINs) actually runs.
    */
-  start?(): Promise<void>;
+  start?(): Promise<unknown>;
   /** Graceful shutdown; defaults to QUIT + disconnect on the client. */
   stop?(reason: string): Promise<void>;
   /** Fire-and-forget connect in place of `client.connect()`; the session
@@ -254,6 +255,12 @@ export class FreeqSession {
   #provenance?: () => ProvenanceVerdict | null;
   #connected = false;
   #connecting?: Promise<void>;
+  /** The server's sentence for the last refused connection, until a later
+   *  one is admitted. */
+  #refusal?: string;
+  /** Whether the session joins the configured channels once the client is
+   *  ready: not when the factory's `start` does (bot-kit, after PROVENANCE). */
+  #joinsChannels = false;
   #channels = new Set<string>();
   /** Channels known to be E2EE rooms (lowercase), whether or not we hold a key. */
   #roomChannels = new Set<string>();
@@ -292,6 +299,8 @@ export class FreeqSession {
     } else if (mode === "guest") {
       note =
         "Connected as a guest (FREEQ_GUEST is set): the nick is not proven, nothing you send is attributable, and rooms are unavailable. Unset FREEQ_GUEST to connect with a did:key agent identity; set FREEQ_OWNER_DID to bind it to your DID.";
+    } else if (this.#refusal) {
+      note = `Not connected: the server refused the last connection: ${this.#refusal}. Read-only tools work over REST without a connection; joining, sending, asking and rooms need one.`;
     } else {
       note =
         "Not connected. Read-only tools work over REST without a connection; joining, sending, asking and rooms need one.";
@@ -346,27 +355,74 @@ export class FreeqSession {
   }
 
   async #doConnect(): Promise<void> {
-    const factory = this.#deps.createClient ?? defaultCreateClient;
-    const made = await factory(this.#cfg, this.#nick);
-    this.#client = made.client;
-    this.#mode = made.mode;
-    this.#did = made.did;
-    this.#selfOwned = made.selfOwned ?? false;
-    this.#rooms = made.rooms;
-    this.#stop = made.stop ?? made.close;
-    this.#provenance = made.provenance;
-    this.#wire(made.client);
-
-    if (made.start) {
+    // One bot per session. A bot that is held but not connected yet is
+    // still being connected, and retried, by the SDK: wait for it rather
+    // than start another one with the same identity beside it. A refused
+    // bot is not held: the refusal closes and clears it.
+    let start: (() => Promise<unknown>) | undefined;
+    if (!this.#client) {
+      const factory = this.#deps.createClient ?? defaultCreateClient;
+      const made = await factory(this.#cfg, this.#nick);
+      this.#client = made.client;
+      this.#mode = made.mode;
+      this.#did = made.did;
+      this.#selfOwned = made.selfOwned ?? false;
+      this.#rooms = made.rooms;
+      this.#stop = made.stop ?? made.close;
+      this.#provenance = made.provenance;
+      this.#joinsChannels = !made.start;
+      this.#wire(made.client);
       // bot-kit drives connect → ready → PROVENANCE → JOINs, and rejects on
       // SASL failure or timeout with its own actionable message.
-      await made.start();
-    } else {
-      await this.#connectAndWaitReady(made.client, made.connect);
-      for (const channel of this.#cfg.channels) this.join(channel);
+      start = made.start
+        ? () => made.start!()
+        : async () => {
+            if (made.connect) made.connect();
+            else made.client.connect();
+          };
     }
-    this.#connected = true;
+    const client = this.#client;
+
+    // This call's wait. Its listeners are removed when it settles, so each
+    // call leaves the client as it found it.
+    const ready = new Promise<void>((resolve, reject) => {
+      const onReady = (): void => {
+        cleanup();
+        resolve();
+      };
+      const onAuthError = (err: string): void => {
+        cleanup();
+        reject(new Error(`SASL authentication failed: ${err}`));
+      };
+      // Not refused: the bot stays, and the SDK keeps trying.
+      const onRetry = (reason: string): void => {
+        cleanup();
+        reject(new Error(`the server could not check this identity just now: ${reason}`));
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`timed out connecting to ${this.#cfg.wsUrl} after 30s`));
+      }, 30_000);
+      timer.unref?.();
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        client.off("ready", onReady as never);
+        client.off("authError", onAuthError as never);
+        client.off("authErrorRetry", onRetry as never);
+      };
+      client.on("ready", onReady as never);
+      client.on("authError", onAuthError as never);
+      client.on("authErrorRetry", onRetry as never);
+      // A start that rejects ends this wait with its error.
+      start?.().catch((err: unknown) => {
+        cleanup();
+        reject(err);
+      });
+    });
+
+    await ready;
     this.#captureBearer();
+    if (this.#joinsChannels) for (const channel of this.#cfg.channels) this.join(channel);
 
     // Publish our X25519 pre-key so a room steward can seal keys to us. It
     // waits for the API bearer (a beat after ready) and is one POST; awaiting
@@ -421,31 +477,24 @@ export class FreeqSession {
     }
   }
 
-  #connectAndWaitReady(client: SessionClient, connect?: () => void): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error(`timed out connecting to ${this.#cfg.wsUrl} after 30s`)),
-        30_000,
-      );
-      timer.unref?.();
-      client.on("ready", (() => {
-        clearTimeout(timer);
-        resolve();
-      }) as never);
-      client.on("authError", ((err: string) => {
-        clearTimeout(timer);
-        reject(new Error(`SASL authentication failed: ${err}`));
-      }) as never);
-      if (connect) connect();
-      else client.connect();
-    });
-  }
-
   #wire(client: SessionClient): void {
+    // Every admission, the first and each one after the SDK reconnects.
     client.on("ready", (() => {
-      // Also fires on the SDK's automatic reconnects.
       this.#connected = true;
+      this.#refusal = undefined;
     }) as never);
+
+    // A refused sign-in or key ends this bot, before or after it was
+    // admitted: the asks in flight get the server's sentence, and close()
+    // drops the bot, so the next connect builds a new one instead of
+    // waiting on this one.
+    const refused = (reason: string): void => {
+      this.#failAllAsks(reason);
+      this.#refusal = reason;
+      void this.close(reason);
+    };
+    client.on("authError", refused as never);
+    client.on("signingKeyRefused", refused as never);
 
     client.on("message", ((target: string, msg: Message) => {
       this.#record(target, msg);
@@ -460,6 +509,9 @@ export class FreeqSession {
     }) as never);
 
     client.on("authenticated", ((did: string) => {
+      // A refusal reports the identity cleared ("") and drops the bot; that
+      // is no authenticated session, and the client may be gone already.
+      if (!did || client !== this.#client) return;
       this.#did = did;
       this.#mode = "authenticated";
       // API-BEARER arrives as a NOTICE immediately after SASL success and the
@@ -944,7 +996,11 @@ export class FreeqSession {
 
   #require(): SessionClient {
     if (!this.#client || !this.#connected) {
-      throw new Error("not connected to freeq — call freeq_connect first");
+      throw new Error(
+        this.#refusal
+          ? `not connected to freeq: the server refused the last connection: ${this.#refusal} — call freeq_connect to try again`
+          : "not connected to freeq — call freeq_connect first",
+      );
     }
     return this.#client;
   }
@@ -1110,7 +1166,7 @@ export interface BotKitModule {
       identity: { did: string };
       rooms: SessionRooms;
       provenance: ProvenanceVerdict | null;
-      start(): Promise<void>;
+      start(): Promise<unknown>;
       stop(opts: { reason: string }): Promise<void>;
     }>;
   };

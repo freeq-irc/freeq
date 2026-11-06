@@ -30,13 +30,24 @@ export interface FreeqEvents {
   /** Fired on successful SASL authentication. */
   authenticated: (did: string, message: string) => void;
 
-  /** Fired on SASL authentication failure. */
+  /** The server refused this sign-in or ended the session for good, or the
+   *  nick was taken under a `refuse` policy. The text is the server's
+   *  sentence when it sent one. The client does not reconnect. */
   authError: (error: string) => void;
+
+  /** The server could not check this client just now (its sentence); the
+   *  client keeps trying, on the growing wait between reconnects. */
+  authErrorRetry: (reason: string) => void;
 
   /** Fired at most once per connection, after registration, when the
    *  broker refuses to publish this device's key (401 or 403): the user has
    *  to sign in again with the permission to publish it. */
   signingKeyUnpublished: () => void;
+
+  /** The server refused this device's signing key, expired or retired (its
+   *  sentence). The stored key is marked refused before this fires, and the
+   *  client does not reconnect. */
+  signingKeyRefused: (reason: string) => void;
 
   /** A signature's verdict that was `pending` when its line was delivered,
    *  now known. `msgid` is the id the signature covers — a message's

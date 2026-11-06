@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentRuntime, httpOriginFor, type RuntimeOptions } from "./runtime.js";
+import { SignInRefusedError } from "@freeq/bot-kit";
 import type { BotLike } from "./connection.js";
 import type { Delivery, Harness, NoticeLevel } from "./harness.js";
 import type { TaskNote } from "./journal.js";
@@ -124,6 +125,28 @@ async function started(configOver: Record<string, unknown> = {}, options: Runtim
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 10));
+
+describe("AgentRuntime: config", () => {
+  it("shares one load between two first calls at once", async () => {
+    // The session start and a command typed while it reads the config: with
+    // a load each, the last to finish replaced the other's copy.
+    const h = fakeHarness();
+    writeConfig(h.agentDir);
+    const rt = new AgentRuntime(h.harness);
+    const [a, b] = await Promise.all([rt.ensureConfig(), rt.ensureConfig()]);
+    expect(a).toBe(b);
+    expect(rt.config).toBe(a);
+  });
+
+  it("reads the file again after a load that failed", async () => {
+    const h = fakeHarness();
+    writeFileSync(join(h.agentDir, "freeq.json"), "{ not json");
+    const rt = new AgentRuntime(h.harness);
+    await expect(rt.ensureConfig()).rejects.toThrow(/cannot read config/);
+    writeConfig(h.agentDir);
+    await expect(rt.ensureConfig()).resolves.toMatchObject({ ownerDid: OWNER });
+  });
+});
 
 describe("AgentRuntime: start", () => {
   it("stays silent and offline when not set up", async () => {
@@ -564,6 +587,486 @@ describe("AgentRuntime: /freeq commands", () => {
   });
 });
 
+/** A bot the server refuses at sign-in, as bot-kit reports it: authError,
+ *  then start() rejects with SignInRefusedError. */
+function refusedBot(): FakeBot {
+  const bot = new FakeBot();
+  bot.start = async () => {
+    bot.emit("authError", "not allowed");
+    throw new SignInRefusedError("not allowed");
+  };
+  return bot;
+}
+
+/** The one line a refusal is told in: the connection's own notice. */
+const refusalLines = (notices: Array<{ text: string; level: NoticeLevel }>) =>
+  notices.filter((n) => /not allowed/.test(n.text));
+
+/** A factory that hands out `next()`'s bots and records what it was asked for. */
+function countingFactory(next: () => FakeBot = () => new FakeBot()) {
+  const made: Array<{ bot: FakeBot; ownerDid: string; url: string }> = [];
+  const factory: NonNullable<RuntimeOptions["botFactory"]> = async (o) => {
+    const bot = next();
+    made.push({ bot, ownerDid: o.ownerDid, url: o.url });
+    return bot;
+  };
+  return { factory, made };
+}
+
+const stuck = (notices: Array<{ text: string }>) =>
+  notices.filter((n) => /freeq: already (error|connecting)/.test(n.text));
+
+describe("AgentRuntime: login and connect replace a connection that is not online", () => {
+  it("login reconnects a connection the server refused", async () => {
+    const h = fakeHarness();
+    writeConfig(h.agentDir);
+    let n = 0;
+    const { factory, made } = countingFactory(() => (n++ === 0 ? refusedBot() : new FakeBot()));
+    const rt = new AgentRuntime(h.harness, { botFactory: factory });
+    await rt.start();
+    const refused = rt.conn;
+    expect(refused?.state).toBe("error");
+    await rt.runCommand(`login ${OWNER}`);
+    expect(made).toHaveLength(2);
+    expect(refused?.state).toBe("offline");
+    expect(rt.conn).not.toBe(refused);
+    expect(rt.conn?.state).toBe("online");
+    expect(stuck(h.notices)).toEqual([]);
+    await rt.stop();
+  });
+
+  it("login reconnects a connection that is still trying, once the old one has stopped", async () => {
+    const h = fakeHarness();
+    writeConfig(h.agentDir);
+    const events: string[] = [];
+    const first = new FakeBot();
+    first.stop = async (reason?: string) => {
+      events.push(`stop ${reason}`);
+      await tick();
+      events.push("stopped");
+      return first;
+    };
+    let n = 0;
+    const rt = new AgentRuntime(h.harness, {
+      botFactory: async () => {
+        events.push(`create ${++n}`);
+        return n === 1 ? first : new FakeBot();
+      },
+    });
+    await rt.start();
+    first.emit("connectionStateChanged", "disconnected");
+    expect(rt.conn?.state).toBe("connecting");
+    await rt.runCommand(`login ${OWNER}`);
+    expect(events).toEqual(["create 1", "stop login", "stopped", "create 2"]);
+    expect(rt.conn?.state).toBe("online");
+    expect(stuck(h.notices)).toEqual([]);
+    await rt.stop();
+  });
+
+  it("login while online for the same owner and server says so and does not reconnect", async () => {
+    const h = fakeHarness();
+    writeConfig(h.agentDir);
+    const { factory, made } = countingFactory();
+    const rt = new AgentRuntime(h.harness, { botFactory: factory });
+    await rt.start();
+    const held = rt.conn;
+    await rt.runCommand(`login ${OWNER}`);
+    await rt.runCommand(`login ${OWNER} ws://test.invalid/irc`);
+    expect(made).toHaveLength(1);
+    expect(rt.conn).toBe(held);
+    expect(rt.conn?.state).toBe("online");
+    expect(h.notices.slice(-2)).toEqual([
+      { text: `freeq: already online as pi-test1234-proj for ${OWNER} on ws://test.invalid/irc`, level: "info" },
+      { text: `freeq: already online as pi-test1234-proj for ${OWNER} on ws://test.invalid/irc`, level: "info" },
+    ]);
+    await rt.stop();
+  });
+
+  it("login while online for another owner reconnects as that owner", async () => {
+    const h = fakeHarness();
+    writeConfig(h.agentDir);
+    const stops: string[] = [];
+    const { factory, made } = countingFactory(() => {
+      const bot = new FakeBot();
+      bot.stop = async (reason?: string) => {
+        stops.push(reason ?? "");
+        return bot;
+      };
+      return bot;
+    });
+    const rt = new AgentRuntime(h.harness, { botFactory: factory });
+    await rt.start();
+    await rt.runCommand("login did:plc:other");
+    expect(made.map((m) => m.ownerDid)).toEqual([OWNER, "did:plc:other"]);
+    expect(stops).toEqual(["login"]);
+    expect(rt.conn?.bot).toBe(made[1]!.bot);
+    expect(rt.conn?.state).toBe("online");
+    await rt.stop();
+  });
+
+  it("on replaces a refused connection, and answers an online one with its line", async () => {
+    const h = fakeHarness();
+    writeConfig(h.agentDir);
+    let n = 0;
+    const { factory, made } = countingFactory(() => (n++ === 0 ? refusedBot() : new FakeBot()));
+    const rt = new AgentRuntime(h.harness, { botFactory: factory });
+    await rt.start();
+    expect(rt.conn?.state).toBe("error");
+    await rt.runCommand("on");
+    expect(made).toHaveLength(2);
+    expect(rt.conn?.state).toBe("online");
+    await rt.runCommand("on");
+    expect(made).toHaveLength(2);
+    expect(h.notices.at(-1)).toEqual({ text: `freeq: ${rt.conn!.describe()}`, level: "info" });
+    expect(stuck(h.notices)).toEqual([]);
+    await rt.stop();
+  });
+
+  it("login in a dormant project connects once", async () => {
+    // Waking first would connect, be refused, and the login would then
+    // connect and be refused again.
+    let changes = 0;
+    const h = fakeHarness({ stateChanged: () => void changes++ });
+    writeConfig(h.agentDir, { projects: undefined });
+    const { factory, made } = countingFactory(refusedBot);
+    const rt = new AgentRuntime(h.harness, { botFactory: factory });
+    await rt.start();
+    expect(rt.dormant).toBe(true);
+    changes = 0;
+    await rt.runCommand(`login ${OWNER}`);
+    expect(made).toHaveLength(1);
+    expect(rt.dormant).toBe(false);
+    expect(changes).toBeGreaterThan(0);
+    expect(refusalLines(h.notices)).toHaveLength(1);
+    expect(stuck(h.notices)).toEqual([]);
+    await rt.stop();
+  });
+});
+
+describe("AgentRuntime: a try-again is told once, until the agent is in", () => {
+  const WORDS = "Your identity could not be checked just now.";
+  /** A bot the server cannot check just now, as bot-kit reports it:
+   *  authErrorRetry, then start() resolves 'deferred'. */
+  function deferredBot(): FakeBot {
+    const bot = new FakeBot();
+    bot.start = async () => {
+      bot.emit("authErrorRetry", WORDS);
+      return "deferred";
+    };
+    return bot;
+  }
+  const told = (notices: Array<{ text: string }>) => notices.filter((n) => n.text.includes(WORDS));
+  const one = [{ text: `freeq: the server could not check this agent just now — ${WORDS}`, level: "warning" }];
+
+  it("at the session start", async () => {
+    const h = fakeHarness();
+    writeConfig(h.agentDir);
+    const rt = new AgentRuntime(h.harness, { botFactory: async () => deferredBot() });
+    await rt.start();
+    expect(rt.conn?.state).toBe("connecting");
+    expect(told(h.notices)).toEqual(one);
+    await rt.stop();
+  });
+
+  it("when a command wakes a dormant project", async () => {
+    const h = fakeHarness();
+    writeConfig(h.agentDir, { projects: undefined });
+    const rt = new AgentRuntime(h.harness, { botFactory: async () => deferredBot() });
+    await rt.start();
+    await rt.runCommand("mute");
+    expect(told(h.notices)).toEqual(one);
+    await rt.stop();
+  });
+
+  it("from /freeq on, a login and takeover", async () => {
+    for (const command of ["on", "login did:plc:other", "takeover"]) {
+      // Online first; every later connect is the deferred one.
+      const h = fakeHarness({ confirm: async () => true });
+      writeConfig(h.agentDir);
+      let n = 0;
+      const rt = new AgentRuntime(h.harness, { botFactory: async () => (n++ === 0 ? new FakeBot() : deferredBot()) });
+      await rt.start();
+      if (command === "on") await rt.runCommand("off");
+      h.notices.length = 0;
+      await rt.runCommand(command);
+      expect(told(h.notices), command).toEqual(one);
+      await rt.stop();
+    }
+  });
+});
+
+describe("AgentRuntime: two connects at once", () => {
+  async function overlapping(first: FakeBot, inStart: boolean) {
+    const h = fakeHarness();
+    writeConfig(h.agentDir);
+    const second = new FakeBot();
+    let releaseFirst: ((b: BotLike) => void) | undefined;
+    let n = 0;
+    const rt = new AgentRuntime(h.harness, {
+      botFactory: (): Promise<BotLike> => {
+        n++;
+        if (n > 1) return Promise.resolve(second);
+        if (inStart) return Promise.resolve(first);
+        return new Promise((r) => (releaseFirst = r));
+      },
+    });
+    return { h, rt, second, release: () => releaseFirst?.(first), created: () => n };
+  }
+
+  it("leaves one bot when the second starts while the first bot is being created", async () => {
+    const first = new FakeBot();
+    const firstLog: string[] = [];
+    first.start = async () => {
+      firstLog.push("start");
+      return first;
+    };
+    first.stop = async (reason?: string) => {
+      firstLog.push(`stop ${reason}`);
+      return first;
+    };
+    const { h, rt, second, release, created } = await overlapping(first, false);
+    const a = rt.connect();
+    while (created() === 0) await tick();
+    const b = await rt.connect();
+    release();
+    const aLine = await a;
+    expect(firstLog).toEqual(["stop discarded"]);
+    expect(rt.conn?.bot).toBe(second);
+    expect(rt.conn?.state).toBe("online");
+    expect(b).toBe(`freeq: ${rt.conn!.describe()}`);
+    expect(aLine).toBe(b);
+    expect(stuck(h.notices)).toEqual([]);
+    await rt.stop();
+  });
+
+  it("leaves one bot when the second starts while the first is inside bot.start()", async () => {
+    const first = new FakeBot();
+    const firstLog: string[] = [];
+    let rejectStart: ((e: Error) => void) | undefined;
+    first.start = () => {
+      firstLog.push("start");
+      return new Promise((_, reject) => (rejectStart = reject));
+    };
+    first.stop = async (reason?: string) => {
+      firstLog.push(`stop ${reason}`);
+      rejectStart?.(new Error("disconnected before ready"));
+      return first;
+    };
+    const { h, rt, second } = await overlapping(first, true);
+    const a = rt.connect();
+    while (!rejectStart) await tick();
+    const b = await rt.connect();
+    const aLine = await a;
+    expect(firstLog).toEqual(["start", "stop replaced"]);
+    expect(rt.conn?.bot).toBe(second);
+    expect(rt.conn?.state).toBe("online");
+    expect(aLine).toBe(b);
+    expect(b).toBe(`freeq: ${rt.conn!.describe()}`);
+    expect(h.notices.filter((n) => /could not connect/.test(n.text))).toEqual([]);
+    expect(stuck(h.notices)).toEqual([]);
+    await rt.stop();
+  });
+
+  /** Bots in the order the factory made them, each with the stops it got. */
+  function recordingFactory(next: () => FakeBot = () => new FakeBot()) {
+    const made: Array<{ bot: FakeBot; ownerDid: string; stops: string[] }> = [];
+    const factory: NonNullable<RuntimeOptions["botFactory"]> = async (o) => {
+      const bot = next();
+      const stops: string[] = [];
+      const stop = bot.stop.bind(bot);
+      bot.stop = async (reason?: string) => {
+        stops.push(reason ?? "");
+        return stop(reason);
+      };
+      made.push({ bot, ownerDid: o.ownerDid, stops });
+      return bot;
+    };
+    const running = () => made.filter((m) => m.stops.length === 0);
+    return { factory, made, running };
+  }
+
+  it("leaves one bot when both start before either has stored its connection", async () => {
+    const h = fakeHarness();
+    writeConfig(h.agentDir);
+    const { factory, made, running } = recordingFactory();
+    const rt = new AgentRuntime(h.harness, { botFactory: factory });
+    const [a, b] = await Promise.all([rt.connect(), rt.connect()]);
+    expect(made).toHaveLength(1);
+    expect(rt.conn?.bot).toBe(made[0]!.bot);
+    expect(a).toBe(b);
+    await rt.stop();
+    expect(running()).toEqual([]);
+  });
+
+  it("leaves one new bot when two logins at once replace a refused connection", async () => {
+    const h = fakeHarness();
+    writeConfig(h.agentDir);
+    let n = 0;
+    const { factory, made, running } = recordingFactory(() => (n++ === 0 ? refusedBot() : new FakeBot()));
+    const rt = new AgentRuntime(h.harness, { botFactory: factory });
+    await rt.start();
+    expect(rt.conn?.state).toBe("error");
+    await Promise.all([rt.runCommand(`login ${OWNER}`), rt.runCommand(`login ${OWNER}`)]);
+    expect(made).toHaveLength(2);
+    expect(rt.conn?.bot).toBe(made[1]!.bot);
+    expect(rt.conn?.state).toBe("online");
+    await rt.stop();
+    expect(running()).toEqual([]);
+  });
+
+  it("leaves one bot when a login for another owner comes before the session start has stored its connection", async () => {
+    const h = fakeHarness();
+    writeConfig(h.agentDir);
+    const { factory, made, running } = recordingFactory();
+    const rt = new AgentRuntime(h.harness, { botFactory: factory });
+    await Promise.all([rt.start(), rt.runCommand("login did:plc:other")]);
+    expect(made.map((m) => m.ownerDid)).toEqual(["did:plc:other"]);
+    expect(rt.conn?.bot).toBe(made[0]!.bot);
+    expect(rt.conn?.state).toBe("online");
+    await rt.stop();
+    expect(running()).toEqual([]);
+  });
+});
+
+describe("AgentRuntime: a login while the session start's connect is running", () => {
+  /** Start the runtime; its first bot's start() waits for `settle`, and a stop
+   *  makes it reject as a real bot's does. Later bots come from `next`. */
+  async function startingUp(next: () => FakeBot = () => new FakeBot(), over: Partial<Harness> = {}) {
+    const h = fakeHarness(over);
+    writeConfig(h.agentDir);
+    const first = new FakeBot();
+    const log: string[] = [];
+    let settle: ((outcome: "online" | "refused") => void) | undefined;
+    let rejectStart: ((e: Error) => void) | undefined;
+    first.start = () => {
+      log.push("start");
+      return new Promise((resolve, reject) => {
+        rejectStart = reject;
+        settle = (outcome) => {
+          if (outcome === "online") return resolve(first);
+          first.emit("authError", "not allowed");
+          reject(new SignInRefusedError("not allowed"));
+        };
+      });
+    };
+    first.stop = async (reason?: string) => {
+      log.push(`stop ${reason}`);
+      rejectStart?.(new Error("disconnected before ready"));
+      return first;
+    };
+    const made: Array<{ bot: FakeBot; ownerDid: string }> = [];
+    const rt = new AgentRuntime(h.harness, {
+      botFactory: async (o) => {
+        const bot = made.length === 0 ? first : next();
+        made.push({ bot, ownerDid: o.ownerDid });
+        return bot;
+      },
+    });
+    const starting = rt.start();
+    while (!settle) await tick();
+    return { h, rt, log, made, starting, settle: (o: "online" | "refused") => settle!(o) };
+  }
+
+  /** The lines that report a connect's outcome: `freeq: <state>: …`. */
+  const outcomes = (notices: Array<{ text: string; level: NoticeLevel }>) =>
+    notices.filter((n) => /^freeq: (online|connecting|error|offline): /.test(n.text));
+  const waiting = (notices: Array<{ text: string }>) => notices.filter((n) => /already under way/.test(n.text));
+
+  it("a login for the same owner and server waits for it, and tells it once when it comes online", async () => {
+    const s = await startingUp();
+    const login = s.rt.runCommand(`login ${OWNER}`);
+    await tick();
+    s.settle("online");
+    await Promise.all([s.starting, login]);
+    expect(s.log).toEqual(["start"]);
+    expect(s.made).toHaveLength(1);
+    expect(s.rt.conn?.state).toBe("online");
+    expect(waiting(s.h.notices)).toEqual([
+      { text: `freeq: a connect for ${OWNER} on ws://test.invalid/irc is already under way; waiting for it`, level: "info" },
+    ]);
+    expect(outcomes(s.h.notices)).toEqual([{ text: `freeq: ${s.rt.conn!.describe()}`, level: "info" }]);
+    expect(stuck(s.h.notices)).toEqual([]);
+    await s.rt.stop();
+  });
+
+  it("a login for the same owner and server waits for it, and the refusal is told once, in the connection's notice", async () => {
+    const s = await startingUp();
+    const login = s.rt.runCommand(`login ${OWNER}`);
+    await tick();
+    s.settle("refused");
+    await Promise.all([s.starting, login]);
+    // Nothing stopped it but bot-kit: the refused bot is kept.
+    expect(s.log).toEqual(["start"]);
+    expect(s.made).toHaveLength(1);
+    expect(s.rt.conn?.state).toBe("error");
+    expect(waiting(s.h.notices)).toHaveLength(1);
+    expect(outcomes(s.h.notices)).toEqual([]);
+    expect(refusalLines(s.h.notices)).toEqual([{ text: "freeq: authentication failed — not allowed", level: "error" }]);
+    expect(stuck(s.h.notices)).toEqual([]);
+    await s.rt.stop();
+  });
+
+  it("a login for another owner replaces it, leaves one bot, and tells no false offline", async () => {
+    const s = await startingUp();
+    await s.rt.runCommand("login did:plc:other");
+    await s.starting;
+    expect(s.log).toEqual(["start", "stop login"]);
+    expect(s.made.map((m) => m.ownerDid)).toEqual([OWNER, "did:plc:other"]);
+    expect(s.rt.conn?.bot).toBe(s.made[1]!.bot);
+    expect(s.rt.conn?.state).toBe("online");
+    expect(s.h.notices.filter((n) => /freeq: offline/.test(n.text))).toEqual([]);
+    expect(outcomes(s.h.notices)).toEqual([{ text: `freeq: ${s.rt.conn!.describe()}`, level: "info" }]);
+    expect(stuck(s.h.notices)).toEqual([]);
+    await s.rt.stop();
+  });
+
+  it("a login for another owner replaces it, and a refusal of the new owner is told once", async () => {
+    const s = await startingUp(refusedBot);
+    await s.rt.runCommand("login did:plc:other");
+    await s.starting;
+    expect(s.log).toEqual(["start", "stop login"]);
+    expect(s.made.map((m) => m.ownerDid)).toEqual([OWNER, "did:plc:other"]);
+    expect(s.h.notices.filter((n) => /freeq: offline/.test(n.text))).toEqual([]);
+    expect(outcomes(s.h.notices)).toEqual([]);
+    expect(refusalLines(s.h.notices)).toEqual([{ text: "freeq: authentication failed — not allowed", level: "error" }]);
+    expect(stuck(s.h.notices)).toEqual([]);
+    await s.rt.stop();
+  });
+
+  it("authorize verify replaces it, and tells no false offline", async () => {
+    const s = await startingUp(() => {
+      const bot = new FakeBot();
+      // The server's answer to the new connection's provenance, at once,
+      // so verify does not wait for it.
+      (bot as { provenance: unknown }).provenance = { verified: true, reason: "ok", text: "Provenance verified: ok" };
+      return bot;
+    });
+    await s.rt.runCommand("authorize verify");
+    await s.starting;
+    expect(s.log).toEqual(["start", "stop re-presenting delegation"]);
+    expect(s.made).toHaveLength(2);
+    expect(s.rt.conn?.bot).toBe(s.made[1]!.bot);
+    expect(s.h.notices.filter((n) => /freeq: offline/.test(n.text))).toEqual([]);
+    expect(s.h.notices.map((n) => n.text)).toEqual([
+      "freeq: reconnecting to ask the server…",
+      "freeq: Delegation verified — this installation provably acts for you.",
+    ]);
+    await s.rt.stop();
+  });
+
+  it("takeover replaces it, and tells no false offline", async () => {
+    const s = await startingUp(undefined, { confirm: async () => true });
+    await s.rt.runCommand("takeover");
+    await s.starting;
+    expect(s.log).toEqual(["start", "stop takeover"]);
+    expect(s.made).toHaveLength(2);
+    expect(s.rt.conn?.bot).toBe(s.made[1]!.bot);
+    expect(s.h.notices.filter((n) => /freeq: offline/.test(n.text))).toEqual([]);
+    expect(outcomes(s.h.notices)).toEqual([{ text: `freeq: ${s.rt.conn!.describe()}`, level: "info" }]);
+    await s.rt.stop();
+  });
+});
+
 describe("AgentRuntime: harness names", () => {
   it("uses pi's names by default", async () => {
     const { rt } = await started();
@@ -695,5 +1198,25 @@ describe("AgentRuntime: settled", () => {
     } finally {
       process.off("unhandledRejection", onRejection);
     }
+  });
+});
+
+describe("AgentRuntime: /freeq on in a dormant project", () => {
+  it("connects once, and the refusal is told once", async () => {
+    // freeq is already on. Waking first would connect and be refused, and
+    // on would then connect and be refused again.
+    const h = fakeHarness();
+    writeConfig(h.agentDir, { projects: undefined });
+    const { factory, made } = countingFactory(refusedBot);
+    const rt = new AgentRuntime(h.harness, { botFactory: factory });
+    await rt.start();
+    expect(rt.dormant).toBe(true);
+    await rt.runCommand("on");
+    expect(made).toHaveLength(1);
+    expect(rt.dormant).toBe(false);
+    // The connection's own line for the refused connect, once.
+    expect(h.notices.filter((n) => /could not connect|authentication failed/.test(n.text))).toHaveLength(1);
+    expect(stuck(h.notices)).toEqual([]);
+    await rt.stop();
   });
 });

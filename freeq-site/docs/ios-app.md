@@ -14,7 +14,7 @@ The freeq iOS app is a native SwiftUI client built on the Rust SDK via FFI (UniF
 - **Haptic feedback** — Throughout the app
 - **Push notifications** — On mention/DM (permission requested on first mention)
 - **Skeleton loading** — Shimmer placeholders during load
-- **Exponential backoff** — Automatic reconnection (2→4→8→16→30s)
+- **Exponential backoff** — Automatic reconnection (1→2→4→8→15s); a refused key goes to the sign-in screen instead, and so does a refused sign-in, after one more try with a new token from the broker when it was refused at sign-in
 - **Background/foreground lifecycle** — Reconnects on foreground
 
 ## Architecture

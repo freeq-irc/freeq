@@ -159,6 +159,16 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            // The server refused the key or the sign-in, or could not check
+            // it just now: a demo that connects once ends, saying why.
+            Some(
+                Event::SigningKeyRefused { reason }
+                | Event::AuthFailed { reason }
+                | Event::AuthFailedRetry { reason },
+            ) => {
+                println!("❌ {reason}");
+                break;
+            }
             Some(Event::Disconnected { reason }) => {
                 println!("❌ Disconnected: {reason}");
                 break;

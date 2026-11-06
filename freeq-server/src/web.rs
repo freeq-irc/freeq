@@ -19,6 +19,7 @@ use axum::handler::HandlerWithoutStateExt;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json, Redirect};
 use axum::routing::{get, post};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tower_http::cors::CorsLayer;
@@ -48,8 +49,12 @@ pub struct WsBridge {
 ///
 /// Spawns two async tasks that shuttle data between the WebSocket and a
 /// DuplexStream. The returned `WsBridge` implements `AsyncRead + AsyncWrite`
-/// and can be passed directly to `handle_generic()`.
-fn bridge_ws(socket: WebSocket) -> WsBridge {
+/// and can be passed directly to `handle_generic()`. Generic over the socket,
+/// as [`pump`] is, so a test can bridge an in-memory one.
+fn bridge_ws<S>(socket: S) -> WsBridge
+where
+    S: Stream<Item = Result<WsMessage, axum::Error>> + Sink<WsMessage> + Unpin + Send + 'static,
+{
     // Split WebSocket into two halves via a channel so each task owns one.
     let (ws_tx, ws_rx) = tokio::sync::mpsc::channel::<WsMessage>(64);
 
@@ -57,63 +62,10 @@ fn bridge_ws(socket: WebSocket) -> WsBridge {
     // bridge_side is what our background tasks read/write.
     let (irc_side, bridge_side) = tokio::io::duplex(16384);
     let (irc_read, irc_write) = tokio::io::split(irc_side);
-    let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge_side);
-
-    // We need the WebSocket as a single owner. Use an Arc<Mutex> for sends,
-    // and move the socket into the rx task which also handles sends.
-    // Actually simpler: move socket into one task, use channel for the other direction.
+    let (mut bridge_read, bridge_write) = tokio::io::split(bridge_side);
 
     // Task 1: owns the WebSocket, reads frames → bridge_write, reads ws_rx → sends frames
-    tokio::spawn(async move {
-        let mut socket = socket;
-        let mut ws_rx = ws_rx;
-        let ws_send_timeout = tokio::time::Duration::from_secs(30);
-        loop {
-            tokio::select! {
-                // Read from WebSocket → write to bridge (→ IRC handler reads)
-                frame = socket.recv() => {
-                    match frame {
-                        Some(Ok(WsMessage::Text(text))) => {
-                            let mut bytes = text.as_bytes().to_vec();
-                            bytes.extend_from_slice(b"\r\n");
-                            if bridge_write.write_all(&bytes).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(Ok(WsMessage::Binary(data))) => {
-                            let mut bytes = data.to_vec();
-                            if !bytes.ends_with(b"\r\n") {
-                                bytes.extend_from_slice(b"\r\n");
-                            }
-                            if bridge_write.write_all(&bytes).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(Ok(WsMessage::Close(_))) | None => break,
-                        Some(Ok(_)) => {} // Ping/Pong handled by axum
-                        Some(Err(_)) => break,
-                    }
-                }
-                // Read from channel → send as WebSocket frame (with timeout to detect dead sockets)
-                msg = ws_rx.recv() => {
-                    match msg {
-                        Some(ws_msg) => {
-                            match tokio::time::timeout(ws_send_timeout, socket.send(ws_msg)).await {
-                                Ok(Ok(())) => {}
-                                Ok(Err(_)) | Err(_) => {
-                                    tracing::debug!("WebSocket send failed or timed out, closing bridge");
-                                    break;
-                                }
-                            }
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-        let _ = bridge_write.shutdown().await;
-        let _ = socket.send(WsMessage::Close(None)).await;
-    });
+    tokio::spawn(pump(socket, ws_rx, bridge_write));
 
     // Task 2: reads from bridge (← IRC handler writes) → sends as WS text frames via channel
     tokio::spawn(async move {
@@ -141,6 +93,334 @@ fn bridge_ws(socket: WebSocket) -> WsBridge {
     WsBridge {
         reader: irc_read,
         writer: irc_write,
+    }
+}
+
+/// The WebSocket's own task: client frames to the IRC side through
+/// `bridge_write`, and the IRC side's lines from `ws_rx` to the client.
+/// Generic over the socket so a test can drive it with an in-memory one.
+///
+/// When the IRC side is done, its lines still queued in `ws_rx` go out
+/// first, then the Close; the socket is held until the client's own Close,
+/// within `CLOSE_DRAIN`, so it is not dropped with the client's frames
+/// unread, which resets it and can take the last lines with it.
+async fn pump<S, W>(
+    mut socket: S,
+    mut ws_rx: tokio::sync::mpsc::Receiver<WsMessage>,
+    mut bridge_write: W,
+) where
+    S: Stream<Item = Result<WsMessage, axum::Error>> + Sink<WsMessage> + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let ws_send_timeout = tokio::time::Duration::from_secs(30);
+    // Whether client frames still go to the IRC side. A failed write there
+    // means the handler has gone; what it queued is still in `ws_rx`.
+    let mut forwarding = true;
+    // Whether the client closed, or its socket failed: then there is no
+    // Close of its own to wait for.
+    let mut client_gone = false;
+    loop {
+        tokio::select! {
+            // Read from WebSocket → write to bridge (→ IRC handler reads)
+            frame = socket.next(), if forwarding => {
+                let bytes = match frame {
+                    Some(Ok(WsMessage::Text(text))) => {
+                        let mut bytes = text.as_bytes().to_vec();
+                        bytes.extend_from_slice(b"\r\n");
+                        bytes
+                    }
+                    Some(Ok(WsMessage::Binary(data))) => {
+                        let mut bytes = data.to_vec();
+                        if !bytes.ends_with(b"\r\n") {
+                            bytes.extend_from_slice(b"\r\n");
+                        }
+                        bytes
+                    }
+                    Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => {
+                        client_gone = true;
+                        break;
+                    }
+                    Some(Ok(_)) => continue, // Ping/Pong handled by axum
+                };
+                if bridge_write.write_all(&bytes).await.is_err() {
+                    forwarding = false;
+                }
+            }
+            // Read from channel → send as WebSocket frame (with timeout to detect dead sockets)
+            msg = ws_rx.recv() => {
+                match msg {
+                    Some(ws_msg) => {
+                        match tokio::time::timeout(ws_send_timeout, socket.send(ws_msg)).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) | Err(_) => {
+                                tracing::debug!("WebSocket send failed or timed out, closing bridge");
+                                client_gone = true;
+                                break;
+                            }
+                        }
+                    }
+                    // The IRC side has finished and everything it sent is out.
+                    None => break,
+                }
+            }
+        }
+    }
+    let _ = bridge_write.shutdown().await;
+    let _ = tokio::time::timeout(crate::connection::CLOSE_DRAIN, async {
+        let _ = socket.send(WsMessage::Close(None)).await;
+        if !client_gone {
+            // The client's frames after our Close are read and dropped.
+            while let Some(Ok(frame)) = socket.next().await {
+                if matches!(frame, WsMessage::Close(_)) {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+}
+
+#[cfg(test)]
+mod pump_tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    /// A client's end of a WebSocket, in memory: frames it sends arrive
+    /// through `incoming`, frames the server sends land in `outgoing`.
+    struct FakeSocket {
+        incoming: mpsc::UnboundedReceiver<Result<WsMessage, axum::Error>>,
+        outgoing: mpsc::UnboundedSender<WsMessage>,
+    }
+
+    impl Stream for FakeSocket {
+        type Item = Result<WsMessage, axum::Error>;
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.get_mut().incoming.poll_recv(cx)
+        }
+    }
+
+    impl Sink<WsMessage> for FakeSocket {
+        type Error = axum::Error;
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn start_send(self: Pin<&mut Self>, item: WsMessage) -> Result<(), Self::Error> {
+            let _ = self.outgoing.send(item);
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A fake client, the sender that feeds it frames, and the receiver that
+    /// collects what the server sent it.
+    fn client() -> (
+        FakeSocket,
+        mpsc::UnboundedSender<Result<WsMessage, axum::Error>>,
+        mpsc::UnboundedReceiver<WsMessage>,
+    ) {
+        let (in_tx, incoming) = mpsc::unbounded_channel();
+        let (outgoing, out_rx) = mpsc::unbounded_channel();
+        (FakeSocket { incoming, outgoing }, in_tx, out_rx)
+    }
+
+    fn text(line: &str) -> WsMessage {
+        WsMessage::Text(line.to_string().into())
+    }
+
+    fn sent(out_rx: &mut mpsc::UnboundedReceiver<WsMessage>) -> Vec<WsMessage> {
+        std::iter::from_fn(|| out_rx.try_recv().ok()).collect()
+    }
+
+    /// The handler has already gone (its end of the duplex is dropped), a
+    /// client frame is waiting, and the handler's last two lines are queued:
+    /// both lines still reach the client, then the Close. Repeated, because
+    /// which ready branch a `select!` takes is random.
+    #[tokio::test]
+    async fn the_last_lines_reach_the_client_after_the_handler_has_gone() {
+        for _ in 0..100 {
+            let (irc_side, bridge_side) = tokio::io::duplex(1024);
+            drop(irc_side);
+            let (_bridge_read, bridge_write) = tokio::io::split(bridge_side);
+            let (ws_tx, ws_rx) = mpsc::channel(64);
+            ws_tx
+                .send(text("FAIL MSGSIG KEY_RETIRED :words"))
+                .await
+                .unwrap();
+            ws_tx
+                .send(text("ERROR :Signing key retired"))
+                .await
+                .unwrap();
+            drop(ws_tx);
+            let (socket, in_tx, mut out_rx) = client();
+            in_tx.send(Ok(text("PING :still talking"))).unwrap();
+            in_tx.send(Ok(WsMessage::Close(None))).unwrap();
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                pump(socket, ws_rx, bridge_write),
+            )
+            .await
+            .expect("the pump ends once the client has closed");
+            assert_eq!(
+                sent(&mut out_rx),
+                vec![
+                    text("FAIL MSGSIG KEY_RETIRED :words"),
+                    text("ERROR :Signing key retired"),
+                    WsMessage::Close(None),
+                ]
+            );
+        }
+    }
+
+    /// After its Close, the bridge reads on until the client's own Close,
+    /// discarding the frames in between, and only then lets the socket go.
+    #[tokio::test]
+    async fn the_bridge_waits_for_the_clients_close() {
+        let (irc_side, bridge_side) = tokio::io::duplex(1024);
+        let (_bridge_read, bridge_write) = tokio::io::split(bridge_side);
+        let (ws_tx, ws_rx) = mpsc::channel(64);
+        ws_tx.send(text("ERROR :Closing link")).await.unwrap();
+        drop(ws_tx);
+        let (socket, in_tx, mut out_rx) = client();
+        let pumping = tokio::spawn(pump(socket, ws_rx, bridge_write));
+
+        let mut got = Vec::new();
+        while got.len() < 2 {
+            got.push(out_rx.recv().await.unwrap());
+        }
+        assert_eq!(
+            got,
+            vec![text("ERROR :Closing link"), WsMessage::Close(None)]
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !pumping.is_finished(),
+            "the socket is held until the client closes"
+        );
+
+        in_tx.send(Ok(text("PING :late"))).unwrap();
+        in_tx.send(Ok(WsMessage::Close(None))).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), pumping)
+            .await
+            .expect("the pump ends at the client's Close")
+            .unwrap();
+        assert!(
+            sent(&mut out_rx).is_empty(),
+            "nothing is sent after the Close"
+        );
+        drop(irc_side);
+    }
+
+    /// A client that never answers the Close holds the socket no longer than
+    /// the close bound.
+    #[tokio::test]
+    async fn a_client_that_never_closes_is_let_go_at_the_bound() {
+        let (_irc_side, bridge_side) = tokio::io::duplex(1024);
+        let (_bridge_read, bridge_write) = tokio::io::split(bridge_side);
+        let (ws_tx, ws_rx) = mpsc::channel(64);
+        drop(ws_tx);
+        let (socket, _in_tx, mut out_rx) = client();
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            crate::connection::CLOSE_DRAIN + std::time::Duration::from_secs(2),
+            pump(socket, ws_rx, bridge_write),
+        )
+        .await
+        .expect("the pump ends at the bound");
+        let waited = started.elapsed();
+        assert!(
+            waited >= crate::connection::CLOSE_DRAIN,
+            "waited only {waited:?}"
+        );
+        assert_eq!(sent(&mut out_rx), vec![WsMessage::Close(None)]);
+    }
+
+    /// The real handler behind the real bridge, closing a session that has
+    /// more queued than the bridge's buffers hold, while the client is still
+    /// sending: every queued line reaches the client, then the ERROR. The
+    /// handler must read the client's input while its writer drains, or the
+    /// bridge, stuck forwarding that input, stops sending lines to the client.
+    #[tokio::test]
+    async fn a_long_queue_reaches_a_client_still_sending_when_its_session_is_closed() {
+        let state = crate::server::test_state();
+        let (socket, in_tx, mut out_rx) = client();
+        let served = state.clone();
+        let handler = tokio::spawn(async move {
+            crate::connection::handle_generic(bridge_ws(socket), served).await
+        });
+
+        in_tx.send(Ok(text("NICK stall"))).unwrap();
+        in_tx.send(Ok(text("USER stall 0 * :test"))).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match out_rx.recv().await {
+                    Some(WsMessage::Text(t)) if t.as_str().split(' ').nth(1) == Some("001") => {
+                        break;
+                    }
+                    Some(_) => continue,
+                    None => panic!("the bridge ended before the welcome"),
+                }
+            }
+        })
+        .await
+        .expect("registered");
+        let session = state.connections.lock().keys().next().cloned().unwrap();
+
+        // In one turn, with nothing else running between: the client has
+        // 50,000 lines in flight that the server answers with nothing, the
+        // session has 2,000 lines of 200 bytes queued, and then it is closed.
+        for _ in 0..50_000 {
+            in_tx.send(Ok(text("PONG :busy"))).unwrap();
+        }
+        const QUEUED: usize = 2_000;
+        for n in 0..QUEUED {
+            let line = format!(":test NOTICE stall :{n:04} {}", "x".repeat(170));
+            crate::connection::send_to(&state, &session, format!("{line}\r\n"));
+        }
+        assert!(crate::connection::close_session(
+            &state,
+            &session,
+            "Closing link"
+        ));
+
+        let mut lines = 0;
+        let mut last = String::new();
+        let got_error = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match out_rx.recv().await {
+                    Some(WsMessage::Text(t)) => {
+                        let t = t.as_str();
+                        if t.starts_with(":test NOTICE stall :") {
+                            assert_eq!(&t[20..24], format!("{lines:04}"), "in order");
+                            lines += 1;
+                        }
+                        last = t.to_string();
+                        if t.starts_with("ERROR ") {
+                            return true;
+                        }
+                    }
+                    Some(_) => {}
+                    None => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert_eq!(lines, QUEUED, "every queued line reached the client");
+        assert!(got_error, "the ERROR came last; the last line was {last:?}");
+
+        drop(in_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), handler)
+            .await
+            .expect("the handler ends")
+            .unwrap()
+            .unwrap();
     }
 }
 

@@ -6,7 +6,7 @@
  * caller keeps working. Nothing here throws into pi's event loop.
  */
 
-import { FreeqBot, matchMention, type RoomLink } from "@freeq/bot-kit";
+import { FreeqBot, matchMention, SignInRefusedError, type RoomLink } from "@freeq/bot-kit";
 import type {
   ActEventPayload,
   CoordinationEventPayload,
@@ -279,6 +279,11 @@ export class FreeqConnection {
   get lastError(): string | undefined {
     return this.#lastError;
   }
+  /** Whether the server could not check this agent just now and it has not
+   *  got in since: its notice saying so is up, and 'ready' takes it down. */
+  get deferred(): boolean {
+    return this.#noticed.has("deferred");
+  }
   get nick(): string | undefined {
     return this.#bot?.client.nick ?? undefined;
   }
@@ -365,6 +370,13 @@ export class FreeqConnection {
         logProvenance: false,
       });
       this.#bot = bot;
+      // stop() stops only the bot it holds, and this one did not exist yet:
+      // a connection stopped while its bot was being created tears it down
+      // here, before it has a handler or a socket.
+      if (this.#stopped) {
+        await this.#discardBot();
+        return;
+      }
       this.#rooms = this.#buildRooms(bot);
       // Signed certificates will stop counting in a later release. Said once per
       // process: a retry or `authorize verify` builds a new bot and a new
@@ -467,6 +479,25 @@ export class FreeqConnection {
         this.#opts.onJoinRefused?.(channel, numeric === "477" ? "policy" : reason);
       });
 
+      // Online only once the server has let the agent in (001, which the SDK
+      // reports as 'ready'), not when a socket opens: a socket the server
+      // refuses before then is not online, and it does not re-arm the
+      // 'connection dropped' notice, which so prints once per gap. Nothing
+      // more happens once the connection is stopped, or once this bot is no
+      // longer the one held (a failed start discards it before it stops it):
+      // bot.stop() waits for its send buffer before it disconnects, and a
+      // welcome can arrive in that wait.
+      bot.on("ready", () => {
+        if (this.#stopped || this.#bot !== bot) return;
+        this.#goOnline();
+        this.#noticed.delete("offline");
+        this.#noticed.delete("deferred");
+        // Rooms rejoin with the rest (they are wanted); stewarding is a
+        // REST pass, owed to anyone who arrived while we were away. A start
+        // still running enters them itself once bot.start() returns.
+        if (!this.#starting) this.#enterRooms(false);
+      });
+
       // Transport state is only 'connected' | 'connecting' | 'disconnected'.
       //
       // IMPORTANT: the SDK transport auto-reconnects, and bot-kit re-runs its
@@ -478,8 +509,6 @@ export class FreeqConnection {
       // ghost-mode churn and re-registration, and peers saw a hello storm.
       bot.on("connectionStateChanged", (s: string) => {
         if (s === "connected") {
-          this.#goOnline();
-          this.#noticed.delete("offline");
           // Membership does not survive a socket. Whatever the server ends up
           // restoring will re-announce itself through channelJoined; until
           // then we are in nothing, and saying otherwise is how the footer
@@ -487,44 +516,67 @@ export class FreeqConnection {
           this.#joined.clear();
           this.#channelsChanged();
           this.#scheduleRejoin();
-          // Rooms rejoin with the rest (they are wanted); stewarding is a
-          // REST pass, owed to anyone who arrived while we were away.
-          this.#enterRooms(false);
         } else if (s === "connecting") {
           if (this.#state === "online") this.#state = "connecting";
-        } else if (s === "disconnected" && !this.#stopped) {
+        } else if (s === "disconnected" && !this.#stopped && this.#state !== "error") {
+          // A refusal comes before its drop and leaves `error`: nothing is
+          // reconnecting then. While the server cannot check the agent, its
+          // own notice already says why the agent is not in.
           this.#state = "connecting";
           this.#joined.clear();
           this.#channelsChanged();
           this.#clearRejoinTimers();
-          this.#notice(
-            `freeq: connection dropped — the transport is reconnecting; ${this.#names.name} continues normally`,
-            "warning",
-            "offline",
-          );
+          if (!this.#noticed.has("deferred")) {
+            this.#notice(
+              `freeq: connection dropped — the transport is reconnecting; ${this.#names.name} continues normally`,
+              "warning",
+              "offline",
+            );
+          }
         }
       });
 
-      bot.on("authError", (e: string) => {
-        this.#lastError = e;
-        // An allowlisted server names the owner's records; that is the
-        // owner's cue to add this installation as one of their agents.
-        const hint = /agent records of .* do not admit this agent/.test(e)
-          ? ` Run ${this.#names.hint("authorize")} to add this installation as one of your agents.`
-          : "";
-        this.#notice(`freeq: authentication failed — ${e}${hint}`, "error", "auth");
+      // The server refused the key or the sign-in, before or after it let
+      // the agent in: bot-kit has stopped the bot, and nothing reconnects.
+      const refused = (reason: string): void => {
+        if (this.#stopped || this.#bot !== bot) return;
+        this.#refusedSignIn(reason);
+      };
+      bot.on("authError", refused);
+      bot.on("signingKeyRefused", refused);
+
+      // The server could not check the agent just now: the SDK keeps
+      // trying, and 'ready' clears this notice when it gets in.
+      bot.on("authErrorRetry", (reason: string) => {
+        if (this.#stopped || this.#bot !== bot) return;
+        this.#lastError = reason;
+        this.#notice(`freeq: the server could not check this agent just now — ${reason}`, "warning", "deferred");
       });
 
-      await bot.start();
-      this.#goOnline();
-      this.#retry = RECONNECT_INITIAL_MS;
-      // bot-kit joins the configured channels; rooms we hold keys for are
-      // ours to re-enter.
-      this.#enterRooms(true);
+      const how = await bot.start();
+      // A stop that lands while bot.start() runs owns what is left of it: a
+      // start that still resolves, or one that rejects because the stop
+      // closed its socket, says and does nothing more here.
+      if (this.#stopped) return;
+      // 'deferred': not in yet; the 'ready' handler brings it online.
+      if (how !== "deferred") {
+        this.#goOnline();
+        this.#retry = RECONNECT_INITIAL_MS;
+        // bot-kit joins the configured channels; rooms we hold keys for are
+        // ours to re-enter.
+        this.#enterRooms(true);
+      }
     } catch (err) {
+      if (this.#stopped) return;
+      // A verdict: kept as one, with the bot, and never retried.
+      if (err instanceof SignInRefusedError) {
+        this.#refusedSignIn(err.reason);
+        return;
+      }
+      // Not a verdict (an unreachable server, a timeout, a nick collision).
       // Only the INITIAL connect is retried here. Once a bot exists, the
       // transport owns reconnection (see connectionStateChanged above).
-      this.#state = "error";
+      this.#state = "connecting";
       this.#lastError = (err as Error).message;
       this.#notice(
         `freeq: could not connect (${this.#lastError}) — ${this.#names.name} continues normally`,
@@ -541,10 +593,10 @@ export class FreeqConnection {
   /**
    * Become online, telling the host once per gap.
    *
-   * Both `bot.start()` returning and the transport's own 'connected' event
-   * land here, and a reconnect fires the second one again — so the transition
-   * is what is reported, not the event. A handler that resumes work would
-   * otherwise run twice for one connect.
+   * Both `bot.start()` returning and the bot's 'ready' event land here, and a
+   * reconnect fires the second one again — so the transition is what is
+   * reported, not the event. A handler that resumes work would otherwise run
+   * twice for one connect.
    */
   #goOnline(): void {
     const wasOnline = this.#state === "online";
@@ -555,6 +607,25 @@ export class FreeqConnection {
     } catch (err) {
       this.#opts.onNotice?.(`freeq: online handler error: ${(err as Error).message}`, "error");
     }
+  }
+
+  /**
+   * The server said this agent will not get in: it refused its key or its
+   * sign-in. `error` means this and nothing else. The bot is kept, already
+   * stopped by bot-kit with no socket (its stop clears the nick), so `did`
+   * still names the refused identity, and neither `start()` nor the initial
+   * retry runs again.
+   */
+  #refusedSignIn(reason: string): void {
+    if (this.#stopped) return;
+    this.#state = "error";
+    this.#lastError = reason;
+    // An allowlisted server names the owner's records; that is the owner's
+    // cue to add this installation as one of their agents.
+    const hint = /agent records of .* do not admit this agent/.test(reason)
+      ? ` Run ${this.#names.hint("authorize")} to add this installation as one of your agents.`
+      : "";
+    this.#notice(`freeq: authentication failed — ${reason}${hint}`, "error", "auth");
   }
 
   /** Tear down a half-built bot so a retry cannot leave two sessions live. */

@@ -463,6 +463,7 @@ describe("resume on connect", () => {
     expect(h.delivered).toHaveLength(1);
     h.bot.emit("connectionStateChanged", "disconnected");
     h.bot.emit("connectionStateChanged", "connected");
+    h.bot.emit("ready");
     await h.quiesce();
     expect(h.fetched()).toHaveLength(2);
     expect(h.delivered).toHaveLength(1);

@@ -3,8 +3,9 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::Duration;
 
-use freeq_sdk::client::{self, ConnectConfig};
+use freeq_sdk::client::{self, ConnectConfig, ReconnectConfig};
 use freeq_sdk::event::Event;
+use freeq_sdk::refusal::Refusal;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -74,15 +75,52 @@ async fn main() -> anyhow::Result<()> {
         fifo_path: std::env::var("PI_FIFO").ok(),
     };
 
+    // Fresh broker token per connect, so its own loop rather than
+    // run_with_reconnect; the wait is the SDK's schedule all the same.
+    let schedule = ReconnectConfig::default();
+    let mut delay = schedule.initial_delay;
     loop {
-        if let Err(e) = run_once(cfg.clone()).await {
-            tracing::warn!(error = %e, "pi-bridge disconnected, retrying in 5s");
-            tokio::time::sleep(Duration::from_secs(5)).await;
+        match next_step(&run_once(cfg.clone()).await, delay, &schedule) {
+            Step::Stop(sentence) => {
+                eprintln!("{sentence}");
+                return Ok(());
+            }
+            Step::Sleep(wait) => {
+                tracing::info!(delay_secs = wait.as_secs(), "pi-bridge reconnecting");
+                tokio::time::sleep(wait).await;
+                delay = schedule.next_delay(wait);
+            }
         }
     }
 }
 
-async fn run_once(cfg: Config) -> anyhow::Result<()> {
+/// What the loop does after a connection: stop on a refusal (the server
+/// refused the key or the sign-in, or the broker refused the login), else
+/// sleep, from the beginning of the schedule if the server had let the bridge
+/// in, else for the wait it was on.
+#[derive(Debug, PartialEq)]
+enum Step {
+    Stop(String),
+    Sleep(Duration),
+}
+
+fn next_step(result: &anyhow::Result<bool>, delay: Duration, schedule: &ReconnectConfig) -> Step {
+    match result {
+        Err(e) => match e.downcast_ref::<Refusal>() {
+            Some(refusal) => Step::Stop(refusal.to_string()),
+            None => {
+                tracing::warn!(error = %e, "pi-bridge disconnected");
+                Step::Sleep(delay)
+            }
+        },
+        Ok(true) => Step::Sleep(schedule.initial_delay),
+        Ok(false) => Step::Sleep(delay),
+    }
+}
+
+/// One connection. `Ok(registered)` when it ends; an `Err` holding a
+/// `Refusal` when the server or the broker ends the login for good.
+async fn run_once(cfg: Config) -> anyhow::Result<bool> {
     let (nick, web_token) = if cfg.guest_mode {
         let nick = cfg
             .bot_nick
@@ -146,7 +184,14 @@ async fn run_once(cfg: Config) -> anyhow::Result<()> {
                 tracing::info!(%did, "pi-bridge authenticated");
             }
             Event::AuthFailed { reason } => {
-                tracing::warn!(%reason, "pi-bridge auth failed");
+                return Err(Refusal::Final(reason).into());
+            }
+            Event::SigningKeyRefused { reason } => {
+                return Err(Refusal::SigningKey(reason).into());
+            }
+            Event::AuthFailedRetry { reason } => {
+                // The SDK ends this connection; the loop tries again.
+                tracing::warn!(%reason, "pi-bridge not checked just now");
             }
             Event::NickChanged { old_nick, new_nick } => {
                 tracing::info!(from = %old_nick, to = %new_nick, "pi-bridge nick changed");
@@ -281,7 +326,7 @@ async fn run_once(cfg: Config) -> anyhow::Result<()> {
         tracing::info!("pi-bridge connection ended");
     }
 
-    Ok(())
+    Ok(registered)
 }
 
 async fn fetch_broker_session(cfg: &Config) -> anyhow::Result<BrokerSessionResponse> {
@@ -293,7 +338,12 @@ async fn fetch_broker_session(cfg: &Config) -> anyhow::Result<BrokerSessionRespo
         .send()
         .await?;
     if !resp.status().is_success() {
+        let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        // A 401 is the broker refusing this login: it will not change.
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(Refusal::Final(format!("broker session failed: {text}")).into());
+        }
         return Err(anyhow::anyhow!("broker session failed: {text}"));
     }
     Ok(resp.json().await?)

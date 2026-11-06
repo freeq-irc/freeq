@@ -534,8 +534,9 @@ export function ConnectScreen() {
     localStorage.setItem(LS_CHANNELS, channels);
     // An explicit sign-in joins what the field says, not where the browser
     // last was — that set is for the reconnect on the next load — and opens
-    // the first of those channels to join when the person named them.
-    connect(server, nick.trim(), typedChannels(channels), false, channelsEdited);
+    // the first of those channels to join when the person named them. A
+    // guest, whatever sign-in is still saved.
+    connect(server, nick.trim(), typedChannels(channels), false, channelsEdited, true);
   };
 
   const connecting = connectionState === 'connecting' || connectionState === 'connected';

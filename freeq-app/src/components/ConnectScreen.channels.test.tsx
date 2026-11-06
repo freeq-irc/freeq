@@ -80,6 +80,15 @@ describe('the channels a connect screen sign-in joins', () => {
     expect(requested()).toBe(true);
   });
 
+  it('asks the bridge for a guest, so a sign-in still saved is not used', async () => {
+    await showScreen();
+    fireEvent.click(screen.getByText('Guest'));
+    fireEvent.change(screen.getByPlaceholderText('your_nick'), { target: { value: 'bob' } });
+    fireEvent.click(screen.getByText('Connect as Guest'));
+    await waitFor(() => expect(seen.connects).toHaveLength(1));
+    expect(seen.connects[0]![5]).toBe(true);
+  });
+
   it('asks for nothing when the guest leaves the channel field alone', async () => {
     // The field is pre-filled with where this browser last was, so pressing
     // Connect without touching it is not a request for that channel.

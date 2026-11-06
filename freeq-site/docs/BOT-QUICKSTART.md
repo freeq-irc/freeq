@@ -67,7 +67,7 @@ That's it. The bot:
 - authenticates to freeq via SASL crypto
 - joins `#bots`
 - responds to `!ping` with `pong`, `!echo <text>` with the text
-- auto-reconnects on disconnect with exponential backoff
+- auto-reconnects on disconnect with exponential backoff, and stops for good when the server refuses its key or its sign-in (`bot.stopped` settles with the server's sentence; a daemon exits 0); once it is in, a nick taken under the default `refuse` policy stops it the same way, with the SDK's words, while a nick already taken at start makes a daemon exit 1
 - graceful shutdown on Ctrl-C (sends `PRESENCE=offline` + `QUIT`, drains the wire)
 
 ### Core concepts
@@ -176,6 +176,7 @@ use anyhow::Result;
 use freeq_sdk::bot::Bot;
 use freeq_sdk::client::{ClientHandle, ConnectConfig, ReconnectConfig, run_with_reconnect};
 use freeq_sdk::event::Event;
+use freeq_sdk::refusal::Refusal;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -219,13 +220,21 @@ async fn main() -> Result<()> {
     };
 
     let bot = Arc::new(bot);
-    run_with_reconnect(config, None, reconnect, move |handle: ClientHandle, event: Event| {
+    let ended = run_with_reconnect(config, None, reconnect, move |handle: ClientHandle, event: Event| {
         let bot = bot.clone();
         Box::pin(async move {
             bot.handle_event(&handle, &event).await;
             Ok(())
         })
-    }).await
+    }).await;
+    // Refused for good: say why and exit 0.
+    match ended {
+        Err(e) if e.downcast_ref::<Refusal>().is_some() => {
+            eprintln!("{e}");
+            Ok(())
+        }
+        other => other,
+    }
 }
 ```
 
@@ -235,7 +244,7 @@ async fn main() -> Result<()> {
 cargo run
 ```
 
-That's it. The bot connects to `irc.freeq.at`, joins `#bots`, and responds to `!ping`, `!echo`, and `!help`. Auto-reconnects on disconnect.
+That's it. The bot connects to `irc.freeq.at`, joins `#bots`, and responds to `!ping`, `!echo`, and `!help`. Auto-reconnects on disconnect, and prints the server's sentence and exits 0 if the server refuses its key or its sign-in.
 
 ### Core concepts
 
@@ -300,7 +309,7 @@ let bot = Bot::new("!", "mybot")
 
 #### Reconnection
 
-`run_with_reconnect` handles the lifecycle:
+`run_with_reconnect` handles the lifecycle. It reconnects after a drop, waiting `initial_delay` and then longer, up to `max_delay`, and starts again from `initial_delay` once the server has let the bot in. A server that cannot check the bot just now is tried again on the same growing wait. When the server refuses the key or the sign-in for good, it returns the `Refusal` as its error instead, and the bot above prints the server's sentence and exits normally, so a supervisor that restarts on failure leaves it down:
 
 ```rust
 let reconnect = ReconnectConfig {

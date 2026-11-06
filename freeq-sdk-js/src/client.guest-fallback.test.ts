@@ -327,9 +327,42 @@ describe('silent guest fallback after stale SASL (regression)', () => {
     ).toBeUndefined();
   });
 
-  it('clears the stale SASL credentials after 904 (no replay on next reconnect)', async () => {
-    // If we don't clear the stale token, the Transport's next auto-reconnect
-    // will send the same dead token again and we'll re-enter this loop forever.
+  it('does not reconnect after a 904, and a later connect() asks for SASL again, never as a guest', async () => {
+    // The refused credentials are not replayed by an automatic reconnect,
+    // because there is none; an app that connects again signs in again.
+    vi.useFakeTimers();
+    try {
+      const { FreeqClient } = await import('./client.js');
+      const client = new FreeqClient({
+        url: 'wss://test/irc',
+        nick: 'chad',
+        skipInitialBrokerRefresh: true,
+      });
+      client.setSaslCredentials({
+        token: 'stale-token',
+        did: 'did:plc:chad',
+        pdsUrl: 'https://pds.example',
+        method: 'pds-session',
+      });
+
+      client.connect();
+      const ws = MockWebSocket.instances[0];
+      await runStaleSaslScenario(ws);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(MockWebSocket.instances).toHaveLength(1);
+
+      client.connect();
+      const again = MockWebSocket.instances[1]!;
+      await flushAsync();
+      again.recv(':srv CAP * LS :message-tags sasl');
+      await flushAsync();
+      expect(again.sent.find((l) => l.startsWith('CAP REQ'))).toContain('sasl');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports the drop once, and writes nothing an authError listener sends', async () => {
     const { FreeqClient } = await import('./client.js');
     const client = new FreeqClient({
       url: 'wss://test/irc',
@@ -342,15 +375,21 @@ describe('silent guest fallback after stale SASL (regression)', () => {
       pdsUrl: 'https://pds.example',
       method: 'pds-session',
     });
+    const states: string[] = [];
+    const drops: string[] = [];
+    client.on('connectionStateChanged', (s) => states.push(s));
+    client.on('disconnected', (r) => drops.push(r));
+    // The socket is still open while the listeners run; the refusal has
+    // already been recorded, so nothing they send reaches the server.
+    client.on('authError', () => client.raw('PRIVMSG #general :from the listener'));
 
     client.connect();
     const ws = MockWebSocket.instances[0];
     await runStaleSaslScenario(ws);
 
-    // Internal state: sasl should be cleared so the next reconnect
-    // doesn't replay the dead token. Use the (private) backing field.
-    const internalSasl = (client as unknown as { sasl: unknown }).sasl;
-    expect(internalSasl).toBeNull();
+    expect(ws.sent).not.toContain('PRIVMSG #general :from the listener');
+    expect(states.filter((s) => s === 'disconnected')).toHaveLength(1);
+    expect(drops).toHaveLength(1);
   });
 });
 
@@ -401,13 +440,33 @@ describe('silent guest fallback via broker-refresh failure (no 904)', () => {
     client.connect();
     // Drive the rejected fetch + its retry backoffs (500ms, 1000ms) to exhaustion.
     await vi.advanceTimersByTimeAsync(5000);
+    // No second socket once every timer has run.
+    await vi.advanceTimersByTimeAsync(60_000);
     vi.useRealTimers();
 
     expect(authErrors.length, 'should surface an auth error').toBeGreaterThan(0);
     expect(authEvents.some((d) => !d), 'must emit authenticated("") so the store clears authDid').toBe(true);
     expect(client.authDid, 'authDid must be cleared').toBeNull();
     expect(registeredAs.find((n) => /^Guest\d+$/.test(n)), 'must not register as a guest').toBeUndefined();
-    expect((client as unknown as { sasl: unknown }).sasl, 'stale creds dropped').toBeNull();
+    expect(MockWebSocket.instances).toHaveLength(1);
+    // Kept, so an app that connects this client again signs in again.
+    expect((client as unknown as { sasl: { did: string } | null }).sasl?.did).toBe('did:plc:chad');
+  });
+
+  it('a failed broker refresh reports the drop once', async () => {
+    vi.useFakeTimers();
+    globalThis.fetch = vi.fn(() => Promise.reject(new Error('network down'))) as any;
+
+    const client = await connectAuthedWithBroker();
+    const states: string[] = [];
+    client.on('connectionStateChanged', (s) => states.push(s));
+
+    client.connect();
+    await vi.advanceTimersByTimeAsync(5000);
+    vi.useRealTimers();
+
+    expect(states.filter((s) => s === 'disconnected')).toHaveLength(1);
+    expect(client.connectionState).toBe('disconnected');
   });
 
   it('a guest-degraded socket must not let sendMessage leak a PRIVMSG', async () => {
@@ -464,3 +523,69 @@ describe('Guest rename detection', () => {
     expect(/^Guest\d+$/.test('chad')).toBe(false);
   });
 });
+
+// ── A bot signs with a signer and no token ────────────────────────
+
+describe('a refusal on a signer-authenticated connection', () => {
+  it('tears the socket down instead of registering as a guest', async () => {
+    vi.useFakeTimers();
+    const { FreeqClient } = await import('./client.js');
+    const client = new FreeqClient({
+      url: 'wss://test/irc',
+      nick: 'helper',
+      skipInitialBrokerRefresh: true,
+    });
+    // How a bot authenticates: its own key signs the challenge, and there
+    // is no web token. Before, the 904 handler read only the token, so a
+    // bot whose access had been withdrawn carried on into registration.
+    client.setSaslCredentials({
+      did: 'did:key:zHelper',
+      method: 'crypto',
+      token: '',
+      pdsUrl: '',
+      signer: async () => 'c2ln',
+    });
+    const errors: string[] = [];
+    const states: string[] = [];
+    client.on('authError', (e) => errors.push(e));
+    client.on('connectionStateChanged', (s) => states.push(s));
+
+    client.connect();
+    await flushAsync();
+    const ws = MockWebSocket.instances[0]!;
+    await runSignerRefusal(ws);
+    // Past the transport's first reconnect (1 s), so that a socket it
+    // opened would be counted below.
+    await vi.advanceTimersByTimeAsync(5000);
+    vi.useRealTimers();
+
+    expect(errors).toHaveLength(1);
+    // It did not go on to register: no CAP END after the 904.
+    expect(ws.sent).not.toContain('CAP END');
+    // The drop is reported once.
+    expect(states.filter((s) => s === 'disconnected')).toHaveLength(1);
+    // The welcome that follows a guest registration must not be taken.
+    expect(client.registered).toBe(false);
+    // And nothing reconnects: the teardown is deliberate.
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+});
+
+/** Drive a signer-authenticated connection to a 904, then have the server
+ *  carry on with a guest welcome as it really does. */
+async function runSignerRefusal(ws: MockWebSocket) {
+  ws.recv(':srv CAP * LS :message-tags server-time batch sasl echo-message');
+  await flushAsync();
+  ws.recv(':srv CAP helper ACK :message-tags server-time batch sasl echo-message');
+  await flushAsync();
+  const challenge = btoa(JSON.stringify({ session_id: 's', nonce: 'n', timestamp: Date.now() }))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+  ws.recv(`AUTHENTICATE ${challenge}`);
+  await flushAsync();
+  ws.recv(':srv 904 helper :SASL authentication failed');
+  await flushAsync();
+  ws.recv(':srv 001 helper :Welcome to freeq, helper (guest)');
+  await flushAsync();
+}

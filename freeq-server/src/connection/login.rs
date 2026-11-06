@@ -106,14 +106,17 @@ pub fn complete_irc_login(state: &Arc<SharedState>, session_id: &str, did: &str,
     // Connect-time allowlist (opt-in). On a restricted instance, reject DIDs
     // that aren't on the allowlist / whose handle domain isn't permitted.
     if !state.did_is_allowed(did, Some(handle)) {
-        let fail = Message::from_server(
-            server_name,
-            irc::ERR_SASLFAIL,
-            vec!["*", "Not authorized to connect to this server"],
+        let text = "Not authorized to connect to this server";
+        super::send_fail(
+            state,
+            session_id,
+            &super::send_to,
+            "LOGIN",
+            freeq_sdk::refusal::NOT_ALLOWED,
+            text,
         );
-        if let Some(tx) = state.connections.lock().get(session_id) {
-            let _ = tx.try_send(format!("{fail}\r\n"));
-        }
+        let fail = Message::from_server(server_name, irc::ERR_SASLFAIL, vec!["*", text]);
+        super::send_to(state, session_id, format!("{fail}\r\n"));
         tracing::warn!(%did, %handle, "connection denied by --allowed-dids/--allowed-did-domains");
         return;
     }

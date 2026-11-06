@@ -35,6 +35,17 @@ class DisconnectNoticeTest {
         assertFalse(n.onDisconnected())
     }
 
+    @Test fun the_drop_after_a_try_again_does_not_replace_its_sentence() {
+        val n = DisconnectNotice()
+        n.onRegistered()
+        n.onTryAgain()
+        assertFalse("the try-again's drop", n.onDisconnected())
+        n.onTryAgain()
+        assertFalse("the next attempt's", n.onDisconnected())
+        n.onRegistered()
+        assertTrue("a later drop shows again", n.onDisconnected())
+    }
+
     @Test fun failed_attempts_before_ever_registering_do_not_show() {
         val n = DisconnectNotice()
         assertFalse(n.onDisconnected())

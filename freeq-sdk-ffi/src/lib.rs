@@ -9,7 +9,8 @@ type SdkKeyLookup = freeq_sdk::key_lookup::KeyLookup<freeq_oauth::SharedClient>;
 /// Install a tracing subscriber that writes to stderr the first time anyone
 /// touches the SDK. iOS captures this in the Xcode console pane while
 /// debugging — invaluable for triaging connect-path hangs. Idempotent: a
-/// second install is a no-op.
+/// second install is a no-op. The lines are written by a thread of their own
+/// ([`log_queue`]), so no thread that logs waits for the console.
 fn install_tracing_subscriber() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -19,11 +20,92 @@ fn install_tracing_subscriber() {
                     tracing_subscriber::EnvFilter::new("freeq_sdk=debug,freeq_sdk_ffi=debug,info")
                 }),
             )
-            .with_writer(trace_writer)
+            .with_writer(log_queue::LogQueue::start(LOG_QUEUE_LINES, trace_writer))
             .with_target(true)
             .with_ansi(false)
             .try_init();
     });
+}
+
+/// How many lines may wait for the log writer before new ones are dropped.
+const LOG_QUEUE_LINES: usize = 1024;
+
+/// A tracing writer that never waits on its sink.
+///
+/// Each formatted line is handed to one thread, `freeq-log`, which writes it
+/// to the sink. A thread that logged used to write to the sink itself and
+/// wait for as long as the sink took: with the console behind during a
+/// history flood, that held the runtime workers on the WebSocket frame
+/// lines, and every app call waiting on a worker with them. When the
+/// writer is `capacity` lines behind, new lines are dropped and counted, and
+/// the writer says how many in a line of its own once it has written the
+/// line it was on.
+mod log_queue {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc::{sync_channel, SyncSender};
+    use std::sync::Arc;
+
+    pub(crate) struct LogQueue {
+        lines: SyncSender<Vec<u8>>,
+        dropped: Arc<AtomicU64>,
+    }
+
+    impl LogQueue {
+        /// Start the writer thread, which writes to the sink `open` makes.
+        /// Should the thread not start, the queue's other end goes with it
+        /// and every line is dropped: logging stops, nothing waits.
+        pub(crate) fn start<W, F>(capacity: usize, open: F) -> Self
+        where
+            W: Write,
+            F: FnOnce() -> W + Send + 'static,
+        {
+            let (lines, queued) = sync_channel::<Vec<u8>>(capacity);
+            let dropped = Arc::new(AtomicU64::new(0));
+            let lost = dropped.clone();
+            let _ = std::thread::Builder::new()
+                .name("freeq-log".into())
+                .spawn(move || {
+                    let mut sink = open();
+                    for line in queued {
+                        let _ = sink.write_all(&line);
+                        let n = lost.swap(0, Ordering::Relaxed);
+                        if n > 0 {
+                            let _ = writeln!(
+                                sink,
+                                "freeq: {n} log lines dropped; the log reader fell behind"
+                            );
+                        }
+                    }
+                });
+            Self { lines, dropped }
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogQueue {
+        type Writer = Handoff<'a>;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            Handoff(self)
+        }
+    }
+
+    /// One event's line on its way to the queue. The formatter writes each
+    /// event's whole line in one call.
+    pub(crate) struct Handoff<'a>(&'a LogQueue);
+
+    impl Write for Handoff<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.0.lines.try_send(buf.to_vec()).is_err() {
+                self.0.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 }
 
 /// Where tracing lines go: stderr, except on Android, where stderr is dropped.
@@ -470,7 +552,15 @@ pub enum FreeqEvent {
     Authenticated {
         did: String,
     },
+    /// The server refused this sign-in for good, or ended the session for
+    /// good (its sentence). `Disconnected` follows; the same credentials will
+    /// not get in.
     AuthFailed {
+        reason: String,
+    },
+    /// The server could not check this client just now (its sentence).
+    /// `Disconnected` follows; the same credentials may get in later.
+    AuthFailedRetry {
         reason: String,
     },
     Joined {
@@ -576,6 +666,12 @@ pub enum FreeqEvent {
     /// This device's key is not published to the account and the app's
     /// session cannot publish it: the user has to sign in again.
     SigningKeyUnpublished,
+    /// The server refused this device's signing key, expired or retired
+    /// (its sentence). The stored key is marked refused; `Disconnected`
+    /// follows, and the client does not reconnect.
+    SigningKeyRefused {
+        reason: String,
+    },
     /// A verdict that was `Pending` when its line arrived, now known.
     Verdict {
         msgid: String,
@@ -1005,91 +1101,24 @@ impl FreeqClient {
     }
 
     pub fn join(&self, channel: String) -> Result<(), FreeqError> {
-        let handle = self
-            .handle
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(FreeqError::NotConnected)?;
-        // Use spawn + oneshot to avoid block_on deadlock
-        let (tx, rx) = std::sync::mpsc::channel();
-        RUNTIME.spawn(async move {
-            let result = handle
-                .join(&channel)
-                .await
-                .map_err(|_| FreeqError::SendFailed);
-            let _ = tx.send(result);
-        });
-        rx.recv().map_err(|_| FreeqError::SendFailed)?
+        self.on_handle(move |h| async move { h.join(&channel).await })
     }
 
     pub fn part(&self, channel: String) -> Result<(), FreeqError> {
-        let handle = self
-            .handle
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(FreeqError::NotConnected)?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        RUNTIME.spawn(async move {
-            let result = handle
-                .raw(&format!("PART {channel}"))
-                .await
-                .map_err(|_| FreeqError::SendFailed);
-            let _ = tx.send(result);
-        });
-        rx.recv().map_err(|_| FreeqError::SendFailed)?
+        self.on_handle(move |h| async move { h.raw(&format!("PART {channel}")).await })
     }
 
     pub fn send_message(&self, target: String, text: String) -> Result<(), FreeqError> {
-        let handle = self
-            .handle
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(FreeqError::NotConnected)?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        RUNTIME.spawn(async move {
-            let result = handle
-                .privmsg(&target, &text)
-                .await
-                .map_err(|_| FreeqError::SendFailed);
-            let _ = tx.send(result);
-        });
-        rx.recv().map_err(|_| FreeqError::SendFailed)?
+        self.on_handle(move |h| async move { h.privmsg(&target, &text).await })
     }
 
     pub fn send_raw(&self, line: String) -> Result<(), FreeqError> {
         tracing::debug!("[FFI] send_raw called: {}", &line);
-        let handle = self
-            .handle
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(FreeqError::NotConnected)?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let line_clone = line.clone();
-        RUNTIME.spawn(async move {
-            let result = handle
-                .raw(&line_clone)
-                .await
-                .map_err(|_| FreeqError::SendFailed);
-            let _ = tx.send(result);
-        });
-        match rx.recv() {
-            Ok(Ok(())) => {
-                tracing::debug!("[FFI] send_raw OK: {}", &line);
-                Ok(())
-            }
-            Ok(Err(e)) => {
-                tracing::error!("[FFI] send_raw failed: {:?}", e);
-                Err(e)
-            }
-            Err(_) => {
-                tracing::error!("[FFI] send_raw channel error");
-                Err(FreeqError::SendFailed)
-            }
+        let result = self.on_handle(move |h| async move { h.raw(&line).await });
+        if let Err(FreeqError::SendFailed) = result {
+            tracing::error!("[FFI] send_raw failed: SendFailed");
         }
+        result
     }
 
     // ── Typed senders ──
@@ -1160,10 +1189,23 @@ impl FreeqClient {
         self.on_handle(move |h| async move { h.whois(&nick).await })
     }
 
-    /// Run `f` against the live client handle on the SDK runtime and wait for
-    /// its result. Spawn-plus-channel rather than `block_on`, because these
-    /// are called from the platform's UI thread, which the runtime may
-    /// already be borrowing.
+    /// Put `f`'s command on the connection's command queue from the calling
+    /// thread, and return.
+    ///
+    /// These are called from the platform's UI thread. All `f` does is build
+    /// a command and push it onto the client's command channel, which takes
+    /// it at once while there is room; so it is polled once here, with a waker
+    /// that does nothing, rather than handed to a runtime worker and waited
+    /// for. A worker stuck writing a log line to a slow console used to hold
+    /// the caller for as long as the write took. Calls from one thread reach
+    /// the channel, and so the wire, in the order they were made, and an
+    /// ended connection is still `SendFailed` at the call.
+    ///
+    /// When the channel is full (the connection not taking commands) the
+    /// send is finished on the runtime and waited for, as every call was
+    /// before, so a later call cannot overtake it.
+    /// `unconstrained`: called from within an event callback, the runtime's
+    /// per-task budget could otherwise turn a send with room into a wait.
     fn on_handle<F, Fut, E>(&self, f: F) -> Result<(), FreeqError>
     where
         F: FnOnce(freeq_sdk::client::ClientHandle) -> Fut + Send + 'static,
@@ -1176,9 +1218,14 @@ impl FreeqClient {
             .unwrap()
             .clone()
             .ok_or(FreeqError::NotConnected)?;
+        let mut send = Box::pin(tokio::task::unconstrained(f(handle)));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if let std::task::Poll::Ready(result) = std::future::Future::poll(send.as_mut(), &mut cx) {
+            return result.map_err(|_| FreeqError::SendFailed);
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         RUNTIME.spawn(async move {
-            let result = f(handle).await.map_err(|_| FreeqError::SendFailed);
+            let result = send.await.map_err(|_| FreeqError::SendFailed);
             let _ = tx.send(result);
         });
         rx.recv().map_err(|_| FreeqError::SendFailed)?
@@ -1217,6 +1264,12 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
         Event::Registered { nick } => FreeqEvent::Registered { nick: nick.clone() },
         Event::Authenticated { did } => FreeqEvent::Authenticated { did: did.clone() },
         Event::AuthFailed { reason } => FreeqEvent::AuthFailed {
+            reason: reason.clone(),
+        },
+        Event::AuthFailedRetry { reason } => FreeqEvent::AuthFailedRetry {
+            reason: reason.clone(),
+        },
+        Event::SigningKeyRefused { reason } => FreeqEvent::SigningKeyRefused {
             reason: reason.clone(),
         },
         Event::Joined { channel, nick, .. } => FreeqEvent::Joined {
@@ -3609,6 +3662,394 @@ mod tests {
         assert_not_connected!(c.request_whois("bob".into()));
     }
 
+    /// A loopback server that registers one client, offering `message-tags`,
+    /// and hands the test every line the client sends after that; or, with
+    /// `hang_up`, closes the connection once the client is registered.
+    fn registering_server(hang_up: bool) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, BufReader, Write};
+        // `connect` turns TLS on for an address containing ":443" or ":6697"
+        // (port 44343 included), and this server speaks plain text.
+        let (listener, addr) = loop {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            if !addr.contains(":443") && !addr.contains(":6697") {
+                break (listener, addr);
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut out = stream.try_clone().unwrap();
+            let mut registered = false;
+            for line in BufReader::new(stream).lines() {
+                let Ok(line) = line else { break };
+                let reply = if line.starts_with("CAP LS") {
+                    ":lab CAP * LS :message-tags\r\n".to_string()
+                } else if let Some(caps) = line.strip_prefix("CAP REQ :") {
+                    format!(":lab CAP * ACK :{caps}\r\n")
+                } else if line == "CAP END" {
+                    registered = true;
+                    if hang_up {
+                        let _ = out.write_all(b":lab 001 tester :Welcome\r\n");
+                        let _ = out.shutdown(std::net::Shutdown::Both);
+                        break;
+                    }
+                    ":lab 001 tester :Welcome\r\n".to_string()
+                } else {
+                    if registered && tx.send(line).is_err() {
+                        break;
+                    }
+                    continue;
+                };
+                if out.write_all(reply.as_bytes()).is_err() {
+                    break;
+                }
+            }
+        });
+        (addr, rx)
+    }
+
+    struct RegisteredSignal(Mutex<Option<std::sync::mpsc::Sender<()>>>);
+    impl EventHandler for RegisteredSignal {
+        fn on_event(&self, event: FreeqEvent) {
+            if let FreeqEvent::Registered { .. } = event {
+                if let Some(tx) = self.0.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+    }
+
+    /// A client registered with [`registering_server`], and the lines that
+    /// server reads from it.
+    fn registered_client(hang_up: bool) -> (FreeqClient, std::sync::mpsc::Receiver<String>) {
+        let (addr, lines) = registering_server(hang_up);
+        let (tx, registered) = std::sync::mpsc::channel();
+        let client = FreeqClient::new(
+            addr,
+            "tester".into(),
+            Box::new(RegisteredSignal(Mutex::new(Some(tx)))),
+        )
+        .unwrap();
+        client.connect().unwrap();
+        registered
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("registered");
+        (client, lines)
+    }
+
+    /// Every sender once, in an order a reordering would break; how long
+    /// each call held the calling thread.
+    fn call_the_thirteen(c: &FreeqClient) -> Vec<std::time::Duration> {
+        let mut took = Vec::new();
+        let mut time = |call: &dyn Fn() -> Result<(), FreeqError>| {
+            let t = std::time::Instant::now();
+            call().expect("handed over");
+            took.push(t.elapsed());
+        };
+        time(&|| c.typing_start("#c".into()));
+        time(&|| c.join("#j".into()));
+        time(&|| c.send_tagged("#c".into(), "one".into(), Vec::new()));
+        time(&|| c.send_message("#c".into(), "plain".into()));
+        time(&|| c.react("#c".into(), "ok".into(), "m1".into()));
+        time(&|| c.unreact("#c".into(), "ok".into(), "m1".into()));
+        time(&|| c.send_raw("NAMES #raw".into()));
+        time(&|| c.delete_message("#c".into(), "m2".into()));
+        time(&|| c.edit_message("#c".into(), "m3".into(), "two".into()));
+        time(&|| c.reply("#c".into(), "m4".into(), "three".into()));
+        time(&|| c.part("#p".into()));
+        time(&|| c.typing_stop("#c".into()));
+        time(&|| c.request_whois("bob".into()));
+        took
+    }
+
+    /// A piece of each line [`call_the_thirteen`] puts on the wire, in call
+    /// order.
+    const THE_THIRTEEN_ON_THE_WIRE: [&str; 13] = [
+        "+typing=active",
+        "JOIN #j",
+        "PRIVMSG #c :one",
+        "PRIVMSG #c :plain",
+        "+react=ok",
+        "+freeq.at/unreact=ok",
+        "NAMES #raw",
+        "+draft/delete=m2",
+        "+draft/edit=m3",
+        "+reply=m4",
+        "PART #p",
+        "+typing=done",
+        "WHOIS bob",
+    ];
+
+    /// The next lines from the server that match `pieces`, which must come
+    /// in that order.
+    fn assert_wire_order(lines: &std::sync::mpsc::Receiver<String>, pieces: &[&str]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen: Vec<String> = Vec::new();
+        while seen.len() < pieces.len() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let line = lines
+                .recv_timeout(left)
+                .unwrap_or_else(|_| panic!("only these arrived: {seen:#?}"));
+            if pieces.iter().any(|p| line.contains(p)) {
+                seen.push(line);
+            }
+        }
+        for (line, piece) in seen.iter().zip(pieces) {
+            assert!(line.contains(piece), "out of order: {seen:#?}");
+        }
+    }
+
+    /// Both of the runtime's workers, held by tasks that block until
+    /// released (or until this is dropped, so a failing test frees them).
+    /// One holder at a time: two would each wait for the other's worker.
+    struct HeldWorkers {
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        _one_at_a_time: std::sync::MutexGuard<'static, ()>,
+    }
+
+    static WORKERS_HELD: Mutex<()> = Mutex::new(());
+
+    impl HeldWorkers {
+        fn hold() -> Self {
+            let one_at_a_time = WORKERS_HELD.lock().unwrap_or_else(|e| e.into_inner());
+            let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let (started_tx, started) = std::sync::mpsc::channel();
+            for _ in 0..2 {
+                let (gate, started_tx) = (gate.clone(), started_tx.clone());
+                RUNTIME.spawn(async move {
+                    let _ = started_tx.send(());
+                    let (open, cv) = &*gate;
+                    let mut open = open.lock().unwrap();
+                    while !*open {
+                        open = cv.wait(open).unwrap();
+                    }
+                });
+            }
+            for _ in 0..2 {
+                started
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("a worker held");
+            }
+            Self {
+                gate,
+                _one_at_a_time: one_at_a_time,
+            }
+        }
+
+        fn release_after(&self, wait: std::time::Duration) {
+            let gate = self.gate.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(wait);
+                *gate.0.lock().unwrap() = true;
+                gate.1.notify_all();
+            });
+        }
+    }
+
+    impl Drop for HeldWorkers {
+        fn drop(&mut self) {
+            *self.gate.0.lock().unwrap() = true;
+            self.gate.1.notify_all();
+        }
+    }
+
+    /// The senders reach the wire in the order they were called: a typing
+    /// notice, joins, parts and raw lines, and messages one after another.
+    #[test]
+    fn senders_reach_the_wire_in_call_order() {
+        let (c, lines) = registered_client(false);
+        call_the_thirteen(&c);
+        assert_wire_order(&lines, &THE_THIRTEEN_ON_THE_WIRE);
+        c.disconnect();
+    }
+
+    /// With both runtime workers busy, as when they are stuck writing log
+    /// lines, every sender still returns at once, and what they sent goes
+    /// out in call order once the workers are free.
+    #[test]
+    fn senders_return_while_the_runtime_is_busy() {
+        let (c, lines) = registered_client(false);
+        let held = HeldWorkers::hold();
+        held.release_after(std::time::Duration::from_secs(2));
+        let took = call_the_thirteen(&c);
+        drop(held);
+        assert!(
+            took.iter()
+                .all(|d| *d < std::time::Duration::from_millis(500)),
+            "a call waited for the runtime: {took:?}"
+        );
+        assert_wire_order(&lines, &THE_THIRTEEN_ON_THE_WIRE);
+        c.disconnect();
+    }
+
+    /// Past a full command queue (256 waiting while the workers are held)
+    /// the calls still reach the wire in the order they were made.
+    #[test]
+    fn typed_senders_keep_order_past_a_full_queue() {
+        let (c, lines) = registered_client(false);
+        let held = HeldWorkers::hold();
+        held.release_after(std::time::Duration::from_millis(300));
+        let mut took = Vec::new();
+        for i in 0..300 {
+            let t = std::time::Instant::now();
+            c.typing_start(format!("#q{i}")).expect("handed over");
+            took.push(t.elapsed());
+        }
+        drop(held);
+        let quick = std::time::Duration::from_millis(100);
+        assert!(took[..200].iter().all(|d| *d < quick), "{took:?}");
+        assert!(
+            took[200..].iter().any(|d| *d >= quick),
+            "the queue never filled, so the wait for room was not tested"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut targets = Vec::new();
+        while targets.len() < 300 {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let line = lines
+                .recv_timeout(left)
+                .unwrap_or_else(|_| panic!("only {} arrived", targets.len()));
+            if let Some((_, target)) = line.split_once(" TAGMSG ") {
+                targets.push(target.to_string());
+            }
+        }
+        let expected: Vec<String> = (0..300).map(|i| format!("#q{i}")).collect();
+        assert_eq!(targets, expected);
+        c.disconnect();
+    }
+
+    /// Once the connection has ended, a typed sender says so at the call
+    /// with `SendFailed`, as it did when it waited for the runtime.
+    #[test]
+    fn typed_senders_report_send_failed_once_the_connection_ends() {
+        let (c, _lines) = registered_client(true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match c.typing_start("#c".into()) {
+                Err(FreeqError::SendFailed) => break,
+                Ok(()) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => panic!("expected SendFailed once the connection ended, got {other:?}"),
+            }
+        }
+        for result in [
+            c.send_tagged("#c".into(), "hi".into(), Vec::new()),
+            c.react("#c".into(), "ok".into(), "m1".into()),
+            c.unreact("#c".into(), "ok".into(), "m1".into()),
+            c.delete_message("#c".into(), "m1".into()),
+            c.edit_message("#c".into(), "m1".into(), "new".into()),
+            c.reply("#c".into(), "m1".into(), "text".into()),
+            c.typing_stop("#c".into()),
+            c.request_whois("bob".into()),
+        ] {
+            assert!(matches!(result, Err(FreeqError::SendFailed)), "{result:?}");
+        }
+    }
+
+    /// A sink that takes nothing until it is opened, then keeps what it is
+    /// given.
+    struct GatedSink {
+        gate: std::sync::mpsc::Receiver<()>,
+        opened: bool,
+        kept: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for GatedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if !self.opened {
+                let _ = self.gate.recv();
+                self.opened = true;
+            }
+            self.kept.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Logging never waits for a sink that is not taking lines. A line that
+    /// finds room in the queue is written, in the order logged, once the sink
+    /// takes it; a line that finds none is dropped and counted in a line of
+    /// its own.
+    #[test]
+    fn a_stuck_log_sink_never_holds_the_thread_that_logs() {
+        let (open, gate) = std::sync::mpsc::channel();
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let sink_kept = kept.clone();
+        let queue = log_queue::LogQueue::start(4, move || GatedSink {
+            gate,
+            opened: false,
+            kept: sink_kept,
+        });
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(queue)
+            .with_ansi(false)
+            .finish();
+        let (done, logged) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            tracing::subscriber::with_default(subscriber, || {
+                for i in 0..100 {
+                    tracing::info!("line {i}");
+                }
+            });
+            let _ = done.send(t.elapsed());
+        });
+        let took = logged
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("logging waited for the sink");
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "logging waited for the sink: {took:?}"
+        );
+        open.send(()).unwrap();
+
+        let count = |text: &str| {
+            let written: Vec<usize> = text
+                .lines()
+                .filter_map(|l| l.split("line ").nth(1)?.parse().ok())
+                .collect();
+            let dropped: u64 = text
+                .lines()
+                .filter_map(|l| {
+                    l.strip_prefix("freeq: ")?
+                        .split(' ')
+                        .next()?
+                        .parse::<u64>()
+                        .ok()
+                })
+                .sum();
+            (written, dropped)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (written, dropped) = loop {
+            let text = String::from_utf8(kept.lock().unwrap().clone()).unwrap();
+            let (written, dropped) = count(&text);
+            if written.len() as u64 + dropped == 100 || std::time::Instant::now() > deadline {
+                break (written, dropped);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(
+            written.len() as u64 + dropped,
+            100,
+            "{written:?} + {dropped}"
+        );
+        assert_eq!(written.first(), Some(&0), "{written:?}");
+        assert!(
+            written.windows(2).all(|w| w[0] < w[1]),
+            "in order: {written:?}"
+        );
+        assert!(
+            written.len() <= 5,
+            "at most the queue and the line being written"
+        );
+    }
+
     /// The FFI layer adds no logic, but a field mix-up in the conversion
     /// would still compile — so one claim crosses the boundary end to end.
     #[test]
@@ -3905,6 +4346,15 @@ mod tests {
         assert!(matches!(
             convert_event(&freeq_sdk::event::Event::SigningKeyUnpublished),
             Some(FreeqEvent::SigningKeyUnpublished)
+        ));
+        let reason = "the server's words".to_string();
+        assert!(matches!(
+            convert_event(&freeq_sdk::event::Event::SigningKeyRefused { reason: reason.clone() }),
+            Some(FreeqEvent::SigningKeyRefused { reason: r }) if r == reason
+        ));
+        assert!(matches!(
+            convert_event(&freeq_sdk::event::Event::AuthFailedRetry { reason: reason.clone() }),
+            Some(FreeqEvent::AuthFailedRetry { reason: r }) if r == reason
         ));
         let verdict = sdk::Verdict {
             state: sdk::VerdictState::Device,

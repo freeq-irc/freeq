@@ -15,7 +15,16 @@ pub enum Event {
     Authenticated {
         did: String,
     },
+    // The server refused this sign-in for good, or ended the session for
+    // good (the server's sentence when it sent one). `Disconnected` follows;
+    // `Registered` never does. (A plain comment: a doc comment here makes
+    // rustfmt reformat every variant of the enum.)
     AuthFailed {
+        reason: String,
+    },
+    /// The server could not check this client just now (its sentence): the
+    /// same credentials may get in later. `Disconnected` follows.
+    AuthFailedRetry {
         reason: String,
     },
 
@@ -279,6 +288,13 @@ pub enum Event {
     /// in again. Sent at most once per connection, after registration, when
     /// the app's `Enrollment` answers `NeedsSignIn`.
     SigningKeyUnpublished,
+
+    /// The server refused this device's signing key, expired or retired (its
+    /// sentence). The stored key is marked refused before this is sent, so
+    /// the next fresh sign-in replaces it. `Disconnected` follows.
+    SigningKeyRefused {
+        reason: String,
+    },
 
     /// A signature's verdict that was `Pending` when its line was delivered,
     /// now known. `msgid` is the id the signature covers — a message's

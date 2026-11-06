@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateDidKey } from "@freeq/sdk";
+import { SignInRefusedError } from "./bot.js";
 import {
   createDaemonCLI,
   readPidIfAlive,
@@ -402,6 +403,113 @@ describe("createDaemonCLI: actorStatusUrl", () => {
     } finally {
       fetchSpy.mockRestore();
     }
+  });
+});
+
+describe("createDaemonCLI: launch, and how it ends", () => {
+  let dir: string;
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let onceSpy: ReturnType<typeof vi.spyOn>;
+  let signals: Map<string, () => void>;
+
+  beforeEach(async () => {
+    dir = await tmp();
+    exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    // The scaffold's signal handlers, kept to be called by hand.
+    signals = new Map();
+    onceSpy = vi.spyOn(process, "once").mockImplementation(((event: string, fn: () => void) => {
+      signals.set(event, fn);
+      return process;
+    }) as never);
+  });
+  afterEach(async () => {
+    exitSpy.mockRestore();
+    logSpy.mockRestore();
+    onceSpy.mockRestore();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const output = () => logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+  const until = async (cond: () => boolean) => {
+    for (let i = 0; i < 400 && !cond(); i++) await new Promise((r) => setTimeout(r, 5));
+  };
+  const pidGone = async (path: string) => {
+    const { stat } = await import("node:fs/promises");
+    await expect(stat(path)).rejects.toThrow();
+  };
+
+  it("exits 0 and removes its pid file when the daemon stops by itself", async () => {
+    const paths = pathsIn(dir);
+    let settle: ((why: string) => void) | undefined;
+    const stops: string[] = [];
+    const cli = createDaemonCLI({
+      name: "testbot",
+      paths,
+      runDaemon: async () => ({
+        stop: async (reason: string) => void stops.push(reason),
+        stopped: new Promise<string>((resolve) => (settle = resolve)),
+      }),
+    });
+    void cli.parseAsync(["node", "testbot", "launch"]);
+    await until(() => settle !== undefined && signals.has("SIGTERM"));
+    expect(await readPidIfAlive(paths.daemonPid)).toBe(process.pid);
+    settle!("the server's words");
+    await until(() => exitSpy.mock.calls.length > 0);
+    expect(exitSpy.mock.calls).toEqual([[0]]);
+    expect(output()).toContain("[refused] shutting down... the server's words");
+    expect(stops).toEqual(["the server's words"]);
+    await pidGone(paths.daemonPid);
+  });
+
+  it("exits 0 and removes its pid file when the server refuses the daemon's sign-in at start", async () => {
+    const paths = pathsIn(dir);
+    const cli = createDaemonCLI({
+      name: "testbot",
+      paths,
+      runDaemon: async () => {
+        throw new SignInRefusedError("the server's words");
+      },
+    });
+    // process.exit is stubbed, so the action runs on past it and rejects;
+    // a real exit ends there.
+    await cli.parseAsync(["node", "testbot", "launch"]).catch(() => {});
+    expect(exitSpy.mock.calls[0]).toEqual([0]);
+    expect(output()).toContain("[refused] shutting down... the server's words");
+    await pidGone(paths.daemonPid);
+  });
+
+  it("removes its pid file and rethrows when the daemon fails to start for another reason", async () => {
+    const paths = pathsIn(dir);
+    const cli = createDaemonCLI({
+      name: "testbot",
+      paths,
+      runDaemon: async () => {
+        throw new Error("boom");
+      },
+    });
+    await expect(cli.parseAsync(["node", "testbot", "launch"])).rejects.toThrow("boom");
+    expect(exitSpy).not.toHaveBeenCalled();
+    await pidGone(paths.daemonPid);
+  });
+
+  it("exits 0 and removes its pid file on SIGTERM, a deferred start included", async () => {
+    // A bot whose start() was deferred has started: its handle stops it.
+    const paths = pathsIn(dir);
+    const stops: string[] = [];
+    const cli = createDaemonCLI({
+      name: "testbot",
+      paths,
+      runDaemon: async () => ({ stop: async (reason: string) => void stops.push(reason), stopped: new Promise<string>(() => {}) }),
+    });
+    void cli.parseAsync(["node", "testbot", "launch"]);
+    await until(() => signals.has("SIGTERM"));
+    signals.get("SIGTERM")!();
+    await until(() => exitSpy.mock.calls.length > 0);
+    expect(exitSpy.mock.calls).toEqual([[0]]);
+    expect(stops).toEqual(["signal SIGTERM"]);
+    await pidGone(paths.daemonPid);
   });
 });
 

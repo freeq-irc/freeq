@@ -570,12 +570,14 @@ pub(super) fn try_complete_registration(
     // Refuse guest (unauthenticated) connections when the instance requires
     // authentication (opt-in --no-guest). Server operators are DID-authenticated
     // anyway, so this only turns away truly anonymous connections.
+    // The refusal is final, and the connection is closed.
     if conn.authenticated_did.is_none() && state.config.no_guest {
-        send(
+        super::close_refused(
             state,
             session_id,
-            "ERROR :This server requires authentication (guest connections disabled)\r\n"
-                .to_string(),
+            send,
+            freeq_sdk::refusal::ACCOUNT_REQUIRED,
+            "This server requires authentication (guest connections disabled)",
         );
         tracing::info!(%session_id, "guest connection refused (--no-guest)");
         return;

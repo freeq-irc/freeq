@@ -20,6 +20,7 @@ use clap::Parser;
 use freeq_sdk::bot::Bot;
 use freeq_sdk::client::{self, ClientHandle, ConnectConfig, ReconnectConfig};
 use freeq_sdk::event::Event;
+use freeq_sdk::refusal::Refusal;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -205,7 +206,7 @@ async fn main() -> Result<()> {
     }
 
     let bot = std::sync::Arc::new(bot);
-    client::run_with_reconnect(
+    let ended = client::run_with_reconnect(
         config,
         None,
         reconnect,
@@ -226,5 +227,14 @@ async fn main() -> Result<()> {
             })
         },
     )
-    .await
+    .await;
+    // The server refused the key or the sign-in for good: say why and exit
+    // 0, so a supervisor that restarts on failure leaves the bot down.
+    match ended {
+        Err(e) if e.downcast_ref::<Refusal>().is_some() => {
+            eprintln!("{e}");
+            Ok(())
+        }
+        other => other,
+    }
 }

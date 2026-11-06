@@ -3085,6 +3085,50 @@ describe('onNickCollision policy', () => {
     expect(retryLines.length).toBeGreaterThan(0);
     expect(retryLines[0]).toMatch(/^NICK alice-\d{4}$/);
   });
+
+  it("'refuse' reports the drop once", async () => {
+    const { FreeqClient } = await import('./client.js');
+    const client = new FreeqClient({
+      url: 'wss://test/irc',
+      nick: 'alice',
+      skipInitialBrokerRefresh: true,
+      onNickCollision: 'refuse',
+    });
+    const states: string[] = [];
+    client.on('connectionStateChanged', (s) => states.push(s));
+    client.connect();
+    await flushAsync();
+    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    ws.recv(':srv 433 * alice :Nickname is already in use');
+    await flushAsync();
+    expect(states.filter((s) => s === 'disconnected')).toHaveLength(1);
+    expect(client.connectionState).toBe('disconnected');
+  });
+
+  it("'random-suffix' gives up after three retries and reports the drop once", async () => {
+    const { FreeqClient } = await import('./client.js');
+    const client = new FreeqClient({
+      url: 'wss://test/irc',
+      nick: 'alice',
+      skipInitialBrokerRefresh: true,
+      onNickCollision: 'random-suffix',
+    });
+    const errors: string[] = [];
+    const states: string[] = [];
+    client.on('authError', (e) => errors.push(e));
+    client.on('connectionStateChanged', (s) => states.push(s));
+    client.connect();
+    await flushAsync();
+    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    for (let i = 0; i < 4; i++) {
+      ws.recv(':srv 433 * alice :Nickname is already in use');
+      await flushAsync();
+    }
+    expect(ws.sent.filter((l) => l.startsWith('NICK alice-'))).toHaveLength(3);
+    expect(errors).toEqual(["exhausted 3 nick collision retries for 'alice'"]);
+    expect(states.filter((s) => s === 'disconnected')).toHaveLength(1);
+    expect(client.connectionState).toBe('disconnected');
+  });
 });
 
   it('a replayed edit row carries its reactions into the collapsed message', async () => {

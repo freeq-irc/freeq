@@ -1330,24 +1330,14 @@ class AppState: ObservableObject {
     /// connect; that disconnect also leaves the reason shown.
     fileprivate var keyRefused = false
 
-    /// Apply a refusal of this device's signing key, as `RefusedKeyNotice`
-    /// decided it.
-    func signOutRefusedKey(_ refusal: RefusedKeyNotice.Refusal) {
-        keyRefused = !refusal.schedulesReconnect
-        // On a connect whose token followed a refused one, the session-expired line.
-        var line = refusal.line
-        if case .signIn(let expired, _) = RefusedLogin.afterConnectRefused(tokenFollowsRefusal: tokenFollowsRefusal) {
-            line = expired
-        }
-        if refusal.clearsSavedLogin { endLogin() }
-        // Queued after endLogin's own reset, which clears the error.
-        DispatchQueue.main.async {
-            self.errorMessage = line
-        }
-    }
+    /// Set by a refusal or a try-again whose sentence is shown, until the
+    /// drop that follows it: the server's sentence stays shown, as on macOS
+    /// and Android, rather than that drop's "Disconnected:" line.
+    fileprivate var sentenceShown = false
 
-    /// End the login after a refusal that must not reconnect, showing `line`.
-    func endRefusedLogin(line: String) {
+    /// The server refused this device's key or its sign-in for good: end the
+    /// login, reconnect nothing, and show the server's sentence.
+    func signOutRefused(line: String) {
         keyRefused = true
         endLogin()
         // Queued after endLogin's own reset, which clears the error.
@@ -2923,22 +2913,6 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
 
         case .registered(let nick):
             print("[freeq.event] .registered nick=\(nick)")
-            // If we expected an authenticated session but got Guest, retry
-            // instead of showing login screen. Token may have been stale.
-            // Checked before `.registered` is set, so the bar never blinks away.
-            if state.authenticatedDID != nil && nick.lowercased().hasPrefix("guest") {
-                // A refusal already ended the login: keep the lists, ask nothing.
-                if state.keyRefused { return }
-                state.disconnect()
-                // Invalidate cached token — it was stale
-                state.cachedWebToken = nil
-                state.cachedWebTokenExpiry = .distantPast
-                state.pendingWebToken = nil
-                state.brokerRetryCount = 0
-                // Retry via broker; the disconnect's own event joins this retry.
-                state.scheduleReconnect(after: 1)
-                return
-            }
             state.connectionState = .registered
             state.reconnectAttempts = 0
             UINotificationFeedbackGenerator().notificationOccurred(.success)
@@ -2985,11 +2959,23 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
             }
 
         case .authFailed(let reason):
-            if case .signIn(let line, _) = RefusedLogin.afterConnectRefused(tokenFollowsRefusal: state.tokenFollowsRefusal) {
-                state.endRefusedLogin(line: line)
+            // In the room: a session the server had let in is ended for good
+            // (a revoke, a final close). The login ends at once, as on every
+            // other client.
+            if state.connectionState == .registered {
+                state.signOutRefused(line: reason)
                 return
             }
-            state.errorMessage = "Auth failed: \(reason)"
+            // At sign-in, the second refusal in a row ends the login with the
+            // server's sentence; the first drops the token and the reconnect
+            // asks the broker for a new one.
+            if case .signIn = RefusedLogin.afterConnectRefused(tokenFollowsRefusal: state.tokenFollowsRefusal) {
+                state.signOutRefused(line: reason)
+                return
+            }
+            // The server's sentence alone, as macOS and Android show it.
+            state.errorMessage = reason
+            state.sentenceShown = true
             // The server refused the web token this connect carried. Drop it
             // and any copy held for the next reconnect, so that one asks the
             // broker instead of offering the same token again.
@@ -3553,10 +3539,18 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                 ch.typingUsers.removeValue(forKey: nick)
             }
 
+        case .authFailedRetry(let reason):
+            // The server could not check this account just now: the drop that
+            // follows reconnects through the broker on its growing wait, and
+            // leaves this sentence shown.
+            state.errorMessage = reason
+            state.sentenceShown = true
+
+        case .signingKeyRefused(let reason):
+            state.signOutRefused(line: reason)
+
         case .notice(let text):
-            if let refusal = RefusedKeyNotice.parse(text) {
-                state.signOutRefusedKey(refusal)
-            } else if text == "MOTD:START" {
+            if text == "MOTD:START" {
                 // MOTD collection
                 state.collectingMotd = true
                 state.motdLines = []
@@ -3634,7 +3628,11 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
 
             print("[freeq.event] .disconnected reason=\(reason)")
             state.connectionState = .disconnected
-            if !state.keyRefused && !reason.isEmpty && !reason.contains("EOF") {
+            // After a refusal or a try-again its sentence stays: the drop
+            // says nothing more.
+            let sentenceShown = state.sentenceShown
+            state.sentenceShown = false
+            if !state.keyRefused && !sentenceShown && !reason.isEmpty && !reason.contains("EOF") {
                 state.errorMessage = "Disconnected: \(reason)"
             }
             // If we were in a call when the IRC connection dropped, tear it

@@ -14,6 +14,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FreeqBot } from "@freeq/bot-kit";
+import { SignInRefusedError } from "@freeq/bot-kit";
 import { FreeqConnection, type BotLike, type ConnectionOptions } from "./connection.js";
 import { PI_HELLO, PI_HELLO_ACK, buildHello, helloTags } from "./discovery.js";
 import { PI_ASK, PI_ASK_REPLY, encodePayload } from "./ask.js";
@@ -70,7 +71,9 @@ class FakeBot implements BotLike {
     if (this.authError) {
       for (const h of this.handlers.get("authError") ?? []) (h as (e: string) => void)(this.authError);
     }
-    if (this.failStart) throw new Error(this.authError ?? "boom");
+    // bot-kit rejects a refused sign-in with SignInRefusedError, anything
+    // else (an unreachable server, a timeout) with a plain error.
+    if (this.failStart) throw this.authError ? new SignInRefusedError(this.authError) : new Error("boom");
     return this;
   }
   async stop(reason?: string): Promise<unknown> {
@@ -135,27 +138,50 @@ describe("connect lifecycle", () => {
     const { conn, bot, notices } = mk();
     bot.failStart = true;
     await expect(conn.start()).resolves.toBeUndefined();
-    expect(conn.state).toBe("error");
+    // Not a verdict: still trying, as a real bot's drop leaves it.
+    expect(conn.state).toBe("connecting");
     expect(conn.lastError).toMatch(/boom/);
     expect(notices.some((n) => /could not connect/.test(n.text))).toBe(true);
   });
 
+  /** A refusal is kept: `error`, the sentence, the bot held, never retried. */
+  async function expectKeptRefusal(conn: FreeqConnection, bot: FakeBot, sentence: string): Promise<void> {
+    expect(conn.state).toBe("error");
+    expect(conn.lastError).toBe(sentence);
+    expect(bot.stopped).toEqual([]);
+    expect(conn.bot).toBe(bot);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(bot.startCalls).toBe(1);
+  }
+
   it("points a refused delegated agent at /freeq authorize", async () => {
-    const { conn, bot, notices } = mk();
-    bot.failStart = true;
-    bot.authError = delegatedRefusal();
-    await conn.start();
-    const auth = notices.find((n) => /authentication failed/.test(n.text))?.text ?? "";
-    expect(auth).toContain("Run /freeq authorize to add this installation as one of your agents.");
+    vi.useFakeTimers();
+    try {
+      const { conn, bot, notices } = mk();
+      bot.failStart = true;
+      bot.authError = delegatedRefusal();
+      await conn.start();
+      const auth = notices.find((n) => /authentication failed/.test(n.text))?.text ?? "";
+      expect(auth).toContain("Run /freeq authorize to add this installation as one of your agents.");
+      await expectKeptRefusal(conn, bot, delegatedRefusal());
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not hint at authorize for an unrelated refusal", async () => {
-    const { conn, bot, notices } = mk();
-    bot.failStart = true;
-    bot.authError = "SASL authentication failed (bad response: response is not JSON)";
-    await conn.start();
-    const auth = notices.find((n) => /authentication failed/.test(n.text))?.text ?? "";
-    expect(auth).not.toContain("/freeq authorize");
+    vi.useFakeTimers();
+    try {
+      const { conn, bot, notices } = mk();
+      bot.failStart = true;
+      bot.authError = "SASL authentication failed (bad response: response is not JSON)";
+      await conn.start();
+      const auth = notices.find((n) => /authentication failed/.test(n.text))?.text ?? "";
+      expect(auth).not.toContain("/freeq authorize");
+      await expectKeptRefusal(conn, bot, "SASL authentication failed (bad response: response is not JSON)");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("discards a half-built bot on failure so a retry cannot double up", async () => {
@@ -198,11 +224,12 @@ describe("transport state handling (the churn regression)", () => {
     expect(conn.state).toBe("connecting"); // recovering, not dead
   });
 
-  it("recovers to online when the transport reconnects", async () => {
+  it("recovers to online when the transport reconnects and the server lets it in", async () => {
     const { conn, bot } = mk();
     await conn.start();
     bot.emit("connectionStateChanged", "disconnected");
     bot.emit("connectionStateChanged", "connected");
+    bot.emit("ready");
     expect(conn.state).toBe("online");
   });
 
@@ -225,6 +252,7 @@ describe("transport state handling (the churn regression)", () => {
 
       const before = bot.sent.filter((s) => s.kind === "join").length;
       bot.emit("connectionStateChanged", "connected");
+      bot.emit("ready");
       await vi.advanceTimersByTimeAsync(4_000);
       const joins = bot.sent.filter((s) => s.kind === "join" && s.target === "#work");
       expect(joins.length).toBe(before + 1);
@@ -240,6 +268,7 @@ describe("transport state handling (the churn regression)", () => {
       await conn.start();
       bot.emit("connectionStateChanged", "disconnected");
       bot.emit("connectionStateChanged", "connected");
+      bot.emit("ready");
       // The server's own auto-rejoin lands inside the grace window.
       bot.emit("channelJoined", "#work");
       await vi.advanceTimersByTimeAsync(20_000);
@@ -259,6 +288,7 @@ describe("transport state handling (the churn regression)", () => {
       bot.emit("joinRejected", "#work", "477", "policy");
       bot.emit("connectionStateChanged", "disconnected");
       bot.emit("connectionStateChanged", "connected");
+      bot.emit("ready");
       await vi.advanceTimersByTimeAsync(20_000);
       expect(bot.sent.filter((s) => s.kind === "join" && s.target === "#work")).toEqual([]);
     } finally {
@@ -273,6 +303,7 @@ describe("transport state handling (the churn regression)", () => {
       await conn.start();
       bot.emit("connectionStateChanged", "disconnected");
       bot.emit("connectionStateChanged", "connected");
+      bot.emit("ready");
       await conn.stop("done");
       await vi.advanceTimersByTimeAsync(20_000);
       expect(bot.sent.filter((s) => s.kind === "join")).toEqual([]);
@@ -293,6 +324,7 @@ describe("transport state handling (the churn regression)", () => {
     await conn.start();
     bot.emit("connectionStateChanged", "disconnected");
     bot.emit("connectionStateChanged", "connected");
+    bot.emit("ready");
     bot.emit("connectionStateChanged", "disconnected");
     expect(notices.filter((n) => /dropped/.test(n.text)).length).toBe(2);
   });
@@ -307,18 +339,81 @@ describe("transport state handling (the churn regression)", () => {
 
   it("reports coming online once per gap, not once per event", async () => {
     // The host resumes assigned work here. bot.start() returning and the
-    // transport's own 'connected' both mean online, and a resume that ran
-    // twice for one connect would re-enter every task twice.
+    // bot's 'ready' both mean online, and a resume that ran twice for one
+    // connect would re-enter every task twice.
     const online: number[] = [];
     const { conn, bot } = mk({ onOnline: () => online.push(1) });
     await conn.start();
-    bot.emit("connectionStateChanged", "connected");
-    bot.emit("connectionStateChanged", "connected");
+    bot.emit("ready");
+    bot.emit("ready");
     expect(online).toHaveLength(1);
 
     bot.emit("connectionStateChanged", "disconnected");
     bot.emit("connectionStateChanged", "connected");
+    expect(online).toHaveLength(1); // a socket is not yet a session
+    bot.emit("ready");
     expect(online).toHaveLength(2); // a real gap closed — resume again
+  });
+
+  it("is not online while sockets open and close before the server lets it in", async () => {
+    // A server that accepts the socket and then refuses the agent before its
+    // welcome: the agent never got in, so the host must not resume work, and
+    // the drop is told once for the whole gap.
+    const online: number[] = [];
+    const { conn, bot, notices } = mk({ onOnline: () => online.push(1) });
+    await conn.start();
+    expect(online).toHaveLength(1);
+    for (let i = 0; i < 3; i++) {
+      bot.emit("connectionStateChanged", "connected");
+      bot.emit("connectionStateChanged", "disconnected");
+    }
+    expect(online).toHaveLength(1);
+    expect(conn.state).toBe("connecting");
+    expect(notices.filter((n) => /connection dropped/.test(n.text))).toHaveLength(1);
+  });
+
+  it("does not come online on a welcome that lands after stop()", async () => {
+    // bot.stop() waits for its send buffer before it disconnects, and a 001
+    // can arrive in that wait.
+    const online: number[] = [];
+    const { conn, bot } = mk({ onOnline: () => online.push(1) });
+    await conn.start();
+    // Stopped while reconnecting, so that a welcome would otherwise be a new
+    // online; it lands inside bot.stop(), while the bot is still held.
+    bot.emit("connectionStateChanged", "disconnected");
+    bot.stop = async (reason?: string) => {
+      bot.stopped.push(reason ?? "");
+      bot.emit("ready");
+      return bot;
+    };
+    await conn.stop("bye");
+    expect(bot.stopped).toEqual(["bye"]);
+    expect(online).toHaveLength(1);
+    expect(conn.state).toBe("offline");
+  });
+
+  it("does not come online on a welcome that lands while a failed start is torn down", async () => {
+    // A failed start discards its bot before stopping it, and bot.stop()
+    // waits for its send buffer before it disconnects: a 001 can arrive in
+    // that wait, from a bot the connection no longer holds.
+    const online: number[] = [];
+    const { conn, bot, notices } = mk({ onOnline: () => online.push(1) });
+    bot.failStart = true;
+    bot.stop = async (reason?: string) => {
+      bot.stopped.push(reason ?? "");
+      bot.emit("ready");
+      bot.emit("connectionStateChanged", "disconnected");
+      return bot;
+    };
+    await conn.start();
+    expect(bot.stopped).toEqual(["discarded"]);
+    expect(online).toHaveLength(0);
+    expect(conn.bot).toBeUndefined();
+    expect(conn.state).not.toBe("online");
+    expect(notices.map((n) => n.text)).toEqual([
+      "freeq: could not connect (boom) — pi continues normally",
+    ]);
+    await conn.stop("done");
   });
 
   it("survives a throwing online handler", async () => {
@@ -330,6 +425,170 @@ describe("transport state handling (the churn regression)", () => {
     await expect(conn.start()).resolves.toBeUndefined();
     expect(conn.state).toBe("online");
     expect(notices.some((n) => /online handler error/.test(n.text))).toBe(true);
+  });
+});
+
+describe("the server's verdicts", () => {
+  const reconnecting = (notices: Array<{ text: string }>) =>
+    notices.filter((n) => /the transport is reconnecting/.test(n.text));
+
+  it("after ready, a refused sign-in and its drop leave error and say nothing is reconnecting", async () => {
+    const { conn, bot, notices } = mk();
+    await conn.start();
+    bot.emit("authError", "Delegation withdrawn");
+    bot.emit("connectionStateChanged", "disconnected");
+    expect(conn.state).toBe("error");
+    expect(conn.lastError).toBe("Delegation withdrawn");
+    expect(reconnecting(notices)).toEqual([]);
+    expect(notices.filter((n) => /authentication failed — Delegation withdrawn/.test(n.text))).toHaveLength(1);
+  });
+
+  it("after ready, a refused key and its drop leave error and say nothing is reconnecting", async () => {
+    const { conn, bot, notices } = mk();
+    await conn.start();
+    bot.emit("signingKeyRefused", "This device was signed out from another device.");
+    bot.emit("connectionStateChanged", "disconnected");
+    expect(conn.state).toBe("error");
+    expect(conn.lastError).toBe("This device was signed out from another device.");
+    expect(reconnecting(notices)).toEqual([]);
+  });
+
+  it("a try-again and its drop: still connecting, one notice saying why, then online at ready", async () => {
+    const online: number[] = [];
+    const { conn, bot, notices } = mk({ onOnline: () => online.push(1) });
+    await conn.start();
+    expect(online).toHaveLength(1);
+    bot.emit("connectionStateChanged", "disconnected");
+    bot.emit("connectionStateChanged", "connected");
+    bot.emit("authErrorRetry", "Your identity could not be checked just now.");
+    bot.emit("connectionStateChanged", "disconnected");
+    bot.emit("connectionStateChanged", "connected");
+    bot.emit("authErrorRetry", "Your identity could not be checked just now.");
+    bot.emit("connectionStateChanged", "disconnected");
+    expect(conn.state).toBe("connecting");
+    expect(notices.filter((n) => /could not check this agent just now/.test(n.text))).toHaveLength(1);
+    // The drop before the try-again was told; none after it.
+    expect(notices.filter((n) => /connection dropped/.test(n.text))).toHaveLength(1);
+
+    bot.emit("connectionStateChanged", "connected");
+    bot.emit("ready");
+    expect(conn.state).toBe("online");
+    expect(online).toHaveLength(2);
+    bot.emit("connectionStateChanged", "disconnected");
+    expect(notices.filter((n) => /connection dropped/.test(n.text))).toHaveLength(2);
+  });
+
+  it("comes online at the ready that follows a start the server deferred, with one notice and no drop line", async () => {
+    const online: number[] = [];
+    const { conn, bot, notices } = mk({ onOnline: () => online.push(1) });
+    bot.start = async () => {
+      bot.startCalls++;
+      // bot-kit's order: the SDK's verdict, then start() resolves.
+      bot.emit("authErrorRetry", "Your identity could not be checked just now.");
+      return "deferred";
+    };
+    await conn.start();
+    bot.emit("connectionStateChanged", "disconnected");
+    expect(conn.state).toBe("connecting");
+    expect(online).toEqual([]);
+    expect(notices.map((n) => n.text)).toEqual([
+      "freeq: the server could not check this agent just now — Your identity could not be checked just now.",
+    ]);
+    bot.emit("connectionStateChanged", "connected");
+    bot.emit("ready");
+    expect(conn.state).toBe("online");
+    expect(online).toHaveLength(1);
+  });
+
+  it("a stopped connection hears no ready, refusal or try-again", async () => {
+    const online: number[] = [];
+    const { conn, bot, notices } = mk({ onOnline: () => online.push(1) });
+    await conn.start();
+    await conn.stop("bye");
+    const before = notices.length;
+    bot.emit("ready");
+    bot.emit("authError", "refused");
+    bot.emit("signingKeyRefused", "refused");
+    bot.emit("authErrorRetry", "later");
+    expect(online).toHaveLength(1);
+    expect(notices.slice(before)).toEqual([]);
+    expect(conn.state).toBe("offline");
+  });
+});
+
+describe("a stop that lands while start() runs", () => {
+  it("tears down a bot that is created after the stop, before it starts", async () => {
+    // stop() stops only the bot it holds, and the bot did not exist yet.
+    let resolveCreate!: (b: BotLike) => void;
+    const online: number[] = [];
+    const { conn, bot, notices } = mk({
+      onOnline: () => online.push(1),
+      botFactory: () => new Promise<BotLike>((r) => (resolveCreate = r)),
+    });
+    const starting = conn.start();
+    await conn.stop("bye");
+    resolveCreate(bot);
+    await starting;
+    expect(bot.startCalls).toBe(0);
+    expect(bot.stopped).toEqual(["discarded"]);
+    expect(online).toEqual([]);
+    expect(notices).toEqual([]);
+    expect(conn.state).toBe("offline");
+    expect(conn.bot).toBeUndefined();
+  });
+
+  it("says nothing and does not retry when the stop makes bot.start() reject", async () => {
+    vi.useFakeTimers();
+    try {
+      const online: number[] = [];
+      const { conn, bot, notices } = mk({ onOnline: () => online.push(1) });
+      let rejectStart!: (e: Error) => void;
+      bot.start = () => {
+        bot.startCalls++;
+        return new Promise((_, reject) => (rejectStart = reject));
+      };
+      bot.stop = async (reason?: string) => {
+        bot.stopped.push(reason ?? "");
+        rejectStart(new Error("disconnected before ready"));
+        return bot;
+      };
+      const starting = conn.start();
+      while (bot.startCalls === 0) await Promise.resolve();
+      await conn.stop("bye");
+      await starting;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(bot.startCalls).toBe(1);
+      expect(bot.stopped).toEqual(["bye"]);
+      expect(notices).toEqual([]);
+      expect(online).toEqual([]);
+      expect(conn.state).toBe("offline");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not come online when bot.start() resolves after the stop", async () => {
+    // bot.stop() waits for its send buffer before it disconnects, and a 001
+    // that arrives in that wait resolves bot.start().
+    const online: number[] = [];
+    const { conn, bot, notices } = mk({ onOnline: () => online.push(1) });
+    let resolveStart!: () => void;
+    bot.start = () => {
+      bot.startCalls++;
+      return new Promise((resolve) => (resolveStart = () => resolve(bot)));
+    };
+    bot.stop = async (reason?: string) => {
+      bot.stopped.push(reason ?? "");
+      resolveStart();
+      return bot;
+    };
+    const starting = conn.start();
+    while (bot.startCalls === 0) await Promise.resolve();
+    await conn.stop("bye");
+    await starting;
+    expect(online).toEqual([]);
+    expect(notices).toEqual([]);
+    expect(conn.state).toBe("offline");
   });
 });
 

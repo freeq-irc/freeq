@@ -124,6 +124,13 @@ pub fn convert_event(event: &freeq_sdk::event::Event) -> DomainEvent {
         Event::AuthFailed { reason } => DomainEvent::AuthFailed {
             reason: reason.clone(),
         },
+        // Shown as the server's sentence; the app's own reconnect logic
+        // takes the drop that follows (no C# change).
+        Event::AuthFailedRetry { reason } | Event::SigningKeyRefused { reason } => {
+            DomainEvent::Notice {
+                text: reason.clone(),
+            }
+        }
         Event::Joined { channel, nick, .. } => DomainEvent::Joined {
             channel: channel.clone(),
             nick: nick.clone(),

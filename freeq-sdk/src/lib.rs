@@ -46,6 +46,7 @@ pub mod oauth;
 pub mod p2p;
 pub mod pds;
 pub mod ratchet;
+pub mod refusal;
 pub mod sigtag;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

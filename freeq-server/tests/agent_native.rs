@@ -302,8 +302,21 @@ async fn did_key_auth_wrong_key_fails() {
     )
     .await;
 
-    // Should get SASL failure (904), not success
-    expect_raw_line(&mut events, 2000, "904", "SASL failure").await;
+    // A final refusal: the server's code, then the client's event.
+    expect_raw_line(
+        &mut events,
+        2000,
+        "FAIL AUTHENTICATE SIGNATURE_INVALID",
+        "the FAIL line",
+    )
+    .await;
+    expect_event(
+        &mut events,
+        2000,
+        |e| matches!(e, Event::AuthFailed { .. }),
+        "AuthFailed",
+    )
+    .await;
 
     server_handle.abort();
 }
@@ -1395,12 +1408,31 @@ async fn governance_revoke_disconnects() {
     // Op revokes the bot
     op_handle.revoke_agent("revbot", Some("bye")).await.unwrap();
 
-    // Bot should receive ERROR (force disconnect)
+    // The bot is refused for good: the code, then the SDK's final refusal
+    // with the server's sentence, then the drop.
     expect_raw_line(
         &mut bot_events,
         2000,
-        "ERROR",
-        "Bot receives ERROR/disconnect",
+        "FAIL * AGENT_REVOKED :Revoked by revoker: bye",
+        "the FAIL line",
+    )
+    .await;
+    let refused = expect_event(
+        &mut bot_events,
+        2000,
+        |e| matches!(e, Event::AuthFailed { .. }),
+        "AuthFailed",
+    )
+    .await;
+    assert!(
+        matches!(&refused, Event::AuthFailed { reason } if reason == "Revoked by revoker: bye"),
+        "{refused:?}"
+    );
+    expect_event(
+        &mut bot_events,
+        2000,
+        |e| matches!(e, Event::Disconnected { .. }),
+        "Disconnected",
     )
     .await;
 

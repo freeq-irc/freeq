@@ -1,7 +1,24 @@
 {
-  "_comment": "The 904 a server sends a delegated agent it does not admit. harness-kit matches it to point the owner at /freeq authorize; both test against this file.",
+  "_comment": "The refusals a freeq server sends. delegated_refusal is the 904 a server sends a delegated agent it does not admit; harness-kit matches it to point the owner at /freeq authorize, and the server's and harness-kit's tests read it. codes is every code the server sends in FAIL AUTHENTICATE before a 904, in FAIL * before an ERROR, or in FAIL MSGSIG for a refused signing key, with its kind: try_again (the same credentials may get in later), final, or signing_key. Any AUTHENTICATE or * code not listed is final too. freeq_sdk::refusal's tests read codes.",
   "delegated_refusal": {
     "owner": "did:plc:owner",
     "text": "Not authorized to connect to this server: the agent records of {owner} do not admit this agent"
-  }
+  },
+  "codes": [
+    { "command": "AUTHENTICATE", "code": "TEMPORARILY_UNAVAILABLE", "kind": "try_again" },
+    { "command": "AUTHENTICATE", "code": "NOT_ALLOWED", "kind": "final" },
+    { "command": "AUTHENTICATE", "code": "SIGNATURE_INVALID", "kind": "final" },
+    { "command": "AUTHENTICATE", "code": "IDENTITY_INVALID", "kind": "final" },
+    { "command": "AUTHENTICATE", "code": "TOKEN_INVALID", "kind": "final" },
+    { "command": "AUTHENTICATE", "code": "BAD_RESPONSE", "kind": "final" },
+    { "command": "AUTHENTICATE", "code": "MECHANISM_UNSUPPORTED", "kind": "final" },
+    { "command": "AUTHENTICATE", "code": "ABORTED", "kind": "final" },
+    { "command": "*", "code": "ACCOUNT_REQUIRED", "kind": "final" },
+    { "command": "*", "code": "IDENTITY_INVALID", "kind": "final" },
+    { "command": "*", "code": "AGENT_REVOKED", "kind": "final" },
+    { "command": "*", "code": "NOT_ALLOWED", "kind": "final" },
+    { "command": "*", "code": "TEMPORARILY_UNAVAILABLE", "kind": "try_again" },
+    { "command": "MSGSIG", "code": "KEY_EXPIRED", "kind": "signing_key" },
+    { "command": "MSGSIG", "code": "KEY_RETIRED", "kind": "signing_key" }
+  ]
 }

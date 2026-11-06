@@ -522,7 +522,7 @@ describe('a stored key the account has retired', () => {
     const store = new MemoryDeviceKeyStore(stored);
     const { client } = await clientReading(store, await repoHolding(record));
     const heard: (boolean | undefined)[] = [];
-    client.on('serverFail', () => heard.push((store as unknown as { key: StoredDeviceKey }).key.refused));
+    client.on('signingKeyRefused', () => heard.push((store as unknown as { key: StoredDeviceKey }).key.refused));
     const ws = await login(client);
     ws.recv(`:srv FAIL MSGSIG KEY_EXPIRED :${EXPIRED_WORDS}`);
     await until(() => heard.length > 0);
@@ -544,7 +544,7 @@ describe('a stored key the account has retired', () => {
     const store = new MemoryDeviceKeyStore(stored);
     const first = await clientReading(store, repo);
     const heard: (boolean | undefined)[] = [];
-    first.client.on('serverFail', () => heard.push((store as unknown as { key: StoredDeviceKey }).key.refused));
+    first.client.on('signingKeyRefused', () => heard.push((store as unknown as { key: StoredDeviceKey }).key.refused));
     const ws = await login(first.client);
     ws.recv(`:srv FAIL MSGSIG KEY_RETIRED :${RETIRED_WORDS}`);
     await until(() => heard.length > 0);
@@ -579,7 +579,7 @@ describe('a stored key the account has retired', () => {
     };
     const { client } = await clientReading(store, await repoHolding(record));
     let heard = false;
-    client.on('serverFail', () => (heard = true));
+    client.on('signingKeyRefused', () => (heard = true));
     const ws = await login(client);
     expect(msgsigOf(ws)).not.toBe(await rawPublicB64(stored.keyPair));
     ws.recv(`:srv FAIL MSGSIG KEY_EXPIRED :${EXPIRED_WORDS}`);

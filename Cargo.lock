@@ -2936,6 +2936,7 @@ dependencies = [
  "freeq-oauth",
  "freeq-sdk",
  "futures",
+ "futures-util",
  "hex",
  "hmac",
  "iroh",

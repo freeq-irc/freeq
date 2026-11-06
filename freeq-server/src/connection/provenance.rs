@@ -430,6 +430,7 @@ pub(super) fn apply_link(
             close_delegated_sessions(
                 state,
                 key,
+                freeq_sdk::refusal::NOT_ALLOWED,
                 "Delegation withdrawn: the owner's agent record no longer names this bot",
             );
         }
@@ -518,6 +519,7 @@ pub(crate) async fn recheck_agent_links(
                 close_delegated_sessions(
                     state,
                     &(owner_did.clone(), bot_did.clone()),
+                    freeq_sdk::refusal::NOT_ALLOWED,
                     "Delegation withdrawn: the owner is no longer allowed here",
                 );
             }
@@ -539,6 +541,7 @@ pub(crate) async fn recheck_agent_links(
                             close_delegated_sessions(
                                 state,
                                 &(owner_did.clone(), bot_did.clone()),
+                                freeq_sdk::refusal::TEMPORARILY_UNAVAILABLE,
                                 "Delegation unverifiable: the owner's agent records could not be read",
                             );
                         }
@@ -584,6 +587,7 @@ fn recheck_one(
     close_delegated_sessions(
         state,
         &key,
+        freeq_sdk::refusal::NOT_ALLOWED,
         "Delegation withdrawn: the owner's agent record no longer names this bot",
     );
     let verified_reason = record_outcome(&uri).reason;
@@ -623,10 +627,13 @@ fn has_delegated_sessions_of(state: &crate::server::SharedState, owner_did: &str
 }
 
 /// Close every connection the allowlist admitted on the (owner, bot) link
-/// `key`, telling it `reason`.
+/// `key`, telling it `reason` under the refusal `code`: `NOT_ALLOWED` for a
+/// withdrawn delegation, the answer a reconnect would get, and
+/// `TEMPORARILY_UNAVAILABLE` for records that could not be read.
 fn close_delegated_sessions(
     state: &std::sync::Arc<crate::server::SharedState>,
     key: &(String, String),
+    code: &str,
     reason: &str,
 ) {
     let sessions: Vec<String> = state
@@ -637,8 +644,8 @@ fn close_delegated_sessions(
         .map(|(session_id, _)| session_id.clone())
         .collect();
     for session_id in sessions {
-        super::close_session(state, &session_id, reason);
-        tracing::info!(owner = %key.0, bot = %key.1, %session_id, %reason, "Closed a delegated connection");
+        super::close_refused(state, &session_id, &super::send_to, code, reason);
+        tracing::info!(owner = %key.0, bot = %key.1, %session_id, %code, %reason, "Closed a delegated connection");
     }
 }
 

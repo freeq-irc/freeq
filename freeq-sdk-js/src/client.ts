@@ -10,6 +10,7 @@
 import { EventEmitter } from './events.js';
 import { parse, prefixNick, format } from './parser.js';
 import { Transport } from './transport.js';
+import { refusalOf } from './refusal.js';
 import * as signing from './signing.js';
 import * as e2ee from './e2ee.js';
 import type { ChannelCipher } from './channel-cipher.js';
@@ -602,6 +603,10 @@ export class FreeqClient extends EventEmitter {
 
   /** Whether IRC registration is complete (001 received). */
   get registered(): boolean { return this._registered; }
+  /** Whether the server refused this connection's sign-in: set before the
+   *  refusal's events fire, cleared when a new socket opens. A nick taken
+   *  under a `refuse` policy leaves it false. */
+  get saslFailed(): boolean { return this._saslFailed; }
   /** The server's own name, from this connection's welcome; null before it. */
   get serverName(): string | null { return this._serverName; }
 
@@ -629,6 +634,13 @@ export class FreeqClient extends EventEmitter {
     } catch {
       return '';
     }
+  }
+
+  /** Whether this client holds a way to answer a SASL challenge: a
+   *  pre-issued token or a signer. One test for every place that asks,
+   *  so that none of them can disagree about whether a connection signs in. */
+  private get hasSaslCredentials(): boolean {
+    return !!(this.sasl?.token || this.sasl?.signer);
   }
 
   // ── Connection ──
@@ -672,8 +684,7 @@ export class FreeqClient extends EventEmitter {
     // start them, and a line left pending is persisted pending by a client
     // that caches the settled verdict.
     this.endOpenBatches();
-    this.transport?.disconnect();
-    this.transport = null;
+    this.stopTransport();
     this._nick = '';
     this._authDid = null;
     this._apiBearer = null;
@@ -726,8 +737,7 @@ export class FreeqClient extends EventEmitter {
   /** Force an immediate reconnect. */
   reconnect(): void {
     if (!this.opts.url || !this.opts.nick) return;
-    this.transport?.disconnect();
-    this.transport = null;
+    this.stopTransport();
     const channels = [...this._joinedChannels];
     this.autoJoinChannels = channels;
     this._nick = this.opts.nick;
@@ -1472,22 +1482,29 @@ export class FreeqClient extends EventEmitter {
    * in place (verified badge next to a Guest nick), and let PRIVMSGs leak under
    * the guest identity.
    *
-   * Mirror the 904 teardown: drop the dead credentials, mark `_saslFailed` so
-   * any in-flight 001 is suppressed and outgoing PRIVMSGs are blocked, notify
-   * the app (so its store clears `authDid` and surfaces "session expired"), and
-   * tear the socket down so the next user action is an explicit re-auth.
+   * The same teardown as a final sign-in refusal, which ends here too (a
+   * `FAIL AUTHENTICATE` or `FAIL *` with a final code, or a 904 with no such
+   * line before it): mark `_saslFailed` so any in-flight 001 is suppressed
+   * and outgoing PRIVMSGs are blocked, drop the identity and the bearer,
+   * notify the app (so its store clears `authDid` and shows the reason), and
+   * tear the socket down without reconnecting. `sasl` is kept, so a later
+   * connect() on this client signs in again and is never a guest.
    */
-  private failReconnectAuth(reason: string): void {
-    this.sasl = null;
+  private failSignIn(reason: string): void {
     this._authDid = null;
     this._apiBearer = null;
     this._saslFailed = true;
     this.emit('authError', reason);
     this.emit('authenticated', '', reason);
+    this.stopTransport();
+  }
+
+  /** End this connection on purpose. `Transport.disconnect()` sends QUIT,
+   *  closes without reconnecting and reports the drop through
+   *  `onTransportStateChange`; that is the only report, so callers add none. */
+  private stopTransport(): void {
     this.transport?.disconnect();
     this.transport = null;
-    this._connectionState = 'disconnected';
-    this.emit('connectionStateChanged', 'disconnected');
   }
 
   private onTransportStateChange(state: TransportState): void {
@@ -1518,6 +1535,9 @@ export class FreeqClient extends EventEmitter {
     }
 
     if (state === 'connected') {
+      // A new socket: a refusal on the last one does not hold here. A
+      // try-again verdict keeps the transport, which opens this socket.
+      this._saslFailed = false;
       this.ackedCaps.clear();
       this.clearNickResume();
       this.enrollmentEpoch++;
@@ -1533,7 +1553,7 @@ export class FreeqClient extends EventEmitter {
 
       const sendRegistration = (token?: string) => {
         // A late broker resolution can fire after we've already torn the
-        // socket down (failReconnectAuth nulls `transport`). Don't register
+        // socket down (failSignIn nulls `transport`). Don't register
         // onto a dead/replaced transport.
         if (registrationSent || !this.transport) return;
         registrationSent = true;
@@ -1552,7 +1572,7 @@ export class FreeqClient extends EventEmitter {
         if (registrationSent) return;
         // The user authenticated: refuse to silently downgrade to a guest.
         if (this.sasl?.did) {
-          this.failReconnectAuth('Could not re-establish your session (timed out). Please sign in again.');
+          this.failSignIn('Could not re-establish your session (timed out). Please sign in again.');
           return;
         }
         log.warn('[freeq-sdk] Registration safety timeout — sending as guest');
@@ -1566,7 +1586,7 @@ export class FreeqClient extends EventEmitter {
       // Skip broker refresh when we have token-based credentials (the
       // broker would re-mint them anyway) OR when we have a signer
       // (did:key auth: no broker needed, no token to refresh).
-      if (this.skipBrokerRefresh && (this.sasl?.token || this.sasl?.signer)) {
+      if (this.skipBrokerRefresh && this.hasSaslCredentials) {
         this.skipBrokerRefresh = false;
         clearTimeout(safetyTimer);
         sendRegistration();
@@ -1620,7 +1640,7 @@ export class FreeqClient extends EventEmitter {
               // Authenticated user, broker refresh failed, no token to fall
               // back on: refuse to register as a guest. Surface + teardown so
               // the app re-auths instead of silently posting as GuestNNNNN.
-              this.failReconnectAuth('Could not refresh your session. Please sign in again.');
+              this.failSignIn('Could not refresh your session. Please sign in again.');
             } else {
               this.sasl = null;
               sendRegistration();
@@ -3551,26 +3571,29 @@ export class FreeqClient extends EventEmitter {
         // credentials and intentionally tear the socket down so the
         // app can re-auth (or explicitly choose guest mode) instead of
         // racing the next reconnect with the same dead token.
+        // A FAIL before it on this socket has already decided (the FAIL arm).
+        if (this._saslFailed) break;
         const reason = msg.params[msg.params.length - 1] || 'SASL failed';
-        const hadSaslAttempt = !!this.sasl?.token;
-        this.sasl = null;
-        this._authDid = null;
-        this._apiBearer = null;
-        this.emit('authError', reason);
-        // Mirror the wire identity to the app: did is now empty.
-        this.emit('authenticated', '', reason);
+        // Whether this connection asked to authenticate at all, the same
+        // test the cap negotiation uses: a bot signs with a signer and no
+        // token, and reading only the token sent it on to register as a
+        // guest after its access had been withdrawn.
+        const hadSaslAttempt = this.hasSaslCredentials;
         if (hadSaslAttempt) {
           // Refuse to register as a guest on a connection where SASL
-          // was requested. Mark _saslFailed so any in-flight 001 from
-          // the server is suppressed (the WS may still deliver buffered
-          // lines for a moment after close), and tear down the socket
-          // so the next user action is an explicit re-auth.
-          this._saslFailed = true;
-          this.transport?.disconnect();
-          this.transport = null;
-          this._connectionState = 'disconnected';
-          this.emit('connectionStateChanged', 'disconnected');
+          // was requested. _saslFailed is marked before the app hears,
+          // so any in-flight 001 from the server (the WS may still
+          // deliver buffered lines for a moment after close) and
+          // anything a listener sends are dropped; then the socket is
+          // torn down so the next user action is an explicit re-auth.
+          this.failSignIn(reason);
         } else {
+          this.sasl = null;
+          this._authDid = null;
+          this._apiBearer = null;
+          this.emit('authError', reason);
+          // Mirror the wire identity to the app: did is now empty.
+          this.emit('authenticated', '', reason);
           this.raw('CAP END');
         }
         break;
@@ -3595,6 +3618,9 @@ export class FreeqClient extends EventEmitter {
         // from the server. We've already torn the socket down; do not
         // let the app think we registered as the assigned Guest nick.
         if (this._saslFailed) break;
+        // The server has let this connection in, so the wait between
+        // reconnects starts again from 1 s.
+        this.transport?.resetBackoff();
         this.guestFallbackCount = 0;
         this._nick = serverNick;
         this._registered = true;
@@ -3672,18 +3698,12 @@ export class FreeqClient extends EventEmitter {
         const policy = this.opts.onNickCollision ?? 'auto-suffix';
         if (policy === 'refuse') {
           this.emit('authError', `nick '${this._nick}' is already taken`);
-          this.transport?.disconnect();
-          this.transport = null;
-          this._connectionState = 'disconnected';
-          this.emit('connectionStateChanged', 'disconnected');
+          this.stopTransport();
         } else if (policy === 'random-suffix') {
           const MAX_RETRIES = 3;
           if (this._nickCollisionRetries >= MAX_RETRIES) {
             this.emit('authError', `exhausted ${MAX_RETRIES} nick collision retries for '${this.opts.nick}'`);
-            this.transport?.disconnect();
-            this.transport = null;
-            this._connectionState = 'disconnected';
-            this.emit('connectionStateChanged', 'disconnected');
+            this.stopTransport();
             break;
           }
           this._nickCollisionRetries++;
@@ -3981,13 +4001,34 @@ export class FreeqClient extends EventEmitter {
         // that target stays one behind for the rest of the connection and
         // every later batch is labelled with the request before it.
         if (msg.params[0] === 'CHATHISTORY') this.dropRefusedHistoryRequest(msg.params);
-        // The server refused this device's key as expired or retired. The
-        // stored key is marked first, so the next fresh sign-in replaces it
-        // whatever its dates and the account's records say: an app
-        // disconnects as soon as it hears of this.
-        if (msg.params[0] === 'MSGSIG' && (msg.params[1] === 'KEY_EXPIRED' || msg.params[1] === 'KEY_RETIRED')) {
-          const text = msg.params.join(' ');
-          void this.markDeviceKeyRefused().finally(() => this.emit('serverFail', text));
+        // The server's verdict on this client being let in (refusal.ts).
+        const refusal = refusalOf(msg.params);
+        if (refusal?.kind === 'signingKey') {
+          // This device's key is refused, expired or retired: no reconnect
+          // will get in with it. The socket is detached at once, so the
+          // server's close finds nothing to reconnect from however long the
+          // store takes; the stored key is marked before the app hears, so
+          // the next fresh sign-in replaces it; the drop is reported after
+          // the verdict, as for the other two.
+          this.transport?.detach();
+          this.transport = null;
+          void this.markDeviceKeyRefused().finally(() => {
+            this.emit('signingKeyRefused', refusal.reason);
+            this.onTransportStateChange('disconnected');
+          });
+          break;
+        }
+        if (refusal?.kind === 'final') {
+          this.failSignIn(refusal.reason);
+          break;
+        }
+        if (refusal?.kind === 'tryAgain') {
+          // Not yet: the 904 behind this is not believed (_saslFailed), the
+          // listeners hear why before the drop, and the transport opens the
+          // next socket on its growing wait.
+          this._saslFailed = true;
+          this.emit('authErrorRetry', refusal.reason);
+          this.transport?.restart();
           break;
         }
         // IRCv3 FAIL — surface to the app. A silent server rejection is
@@ -4781,7 +4822,7 @@ export class FreeqClient extends EventEmitter {
       // either a pre-issued token (pds-session/pds-oauth) OR a signer
       // callback (crypto / did:key). Previously only the token branch
       // qualified, so JS bots using did:key never reached SASL.
-      const wantsSasl = (this.sasl?.token || this.sasl?.signer) && available.includes('sasl');
+      const wantsSasl = this.hasSaslCredentials && available.includes('sasl');
       if (wantsSasl) {
         wantedCaps.push('sasl');
       }
@@ -4793,7 +4834,7 @@ export class FreeqClient extends EventEmitter {
     } else if (sub === 'ACK') {
       const caps = msg.params.slice(2).join(' ');
       for (const c of caps.split(' ')) this.ackedCaps.add(c);
-      const canSasl = this.ackedCaps.has('sasl') && (this.sasl?.token || this.sasl?.signer);
+      const canSasl = this.ackedCaps.has('sasl') && this.hasSaslCredentials;
       if (canSasl) {
         this.raw('AUTHENTICATE ATPROTO-CHALLENGE');
       } else {

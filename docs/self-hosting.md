@@ -177,8 +177,8 @@ freeq-server --config /etc/freeq/server.toml
 | `GITHUB_CLIENT_SECRET` | GitHub OAuth secret |
 | `--allowed-dids` / `FREEQ_ALLOWED_DIDS` | Restrict authentication to these DIDs |
 | `--allowed-did-domains` / `FREEQ_ALLOWED_DID_DOMAINS` | Restrict authentication to DIDs whose handle is under one of the listed domains |
-| `--no-guest` / `FREEQ_NO_GUEST` | Refuse guest connections |
-| `--allow-delegated-agents` / `FREEQ_ALLOW_DELEGATED_AGENTS` | Admit a `did:key` agent not on the allowlist when it's listed in an allowed owner's `at.freeq.agentKey` records. Removing the record refuses its next connect and closes a live session at the next re-read (`--record-cache-secs`); records unreadable for three re-read periods close it too |
+| `--no-guest` / `FREEQ_NO_GUEST` | Refuse guest connections: a guest is told `FAIL * ACCOUNT_REQUIRED` and disconnected |
+| `--allow-delegated-agents` / `FREEQ_ALLOW_DELEGATED_AGENTS` | Admit a `did:key` agent not on the allowlist when it's listed in an allowed owner's `at.freeq.agentKey` records. Removing the record refuses its next connect and closes a live session at the next re-read (`--record-cache-secs`); records unreadable for three re-read periods close it too. A refused or removed agent stops trying; after the unreadable-records close it tries once more and, while the records still cannot be read, stops until it is restarted |
 
 ### Federation
 

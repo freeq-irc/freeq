@@ -586,14 +586,10 @@ impl Transport {
 /// restart with `--reauth` that signs in again.
 pub const KEY_UNPUBLISHED_LINE: &str = "Your signing key is not published to your account yet. Restart freeq-tui with --reauth to sign in again and publish it.";
 
-/// What the TUI shows when the server refuses this device's key because the
-/// account signed the device out.
-pub const KEY_RETIRED_LINE: &str = "This device was signed out from another device. Restart freeq-tui with --reauth to sign in again.";
-
-/// What the TUI shows when the server refuses this device's key because it
-/// has expired. Only a fresh sign-in replaces it.
-pub const KEY_EXPIRED_LINE: &str =
-    "This device's signing key has expired. Restart freeq-tui with --reauth to sign in again.";
+/// What the TUI adds, after the server's sentence, when the server has
+/// refused the key or the sign-in of a TUI that signed in with a handle,
+/// where restarting with `--reauth` signs in again.
+pub const REAUTH_LINE: &str = "Restart freeq-tui with --reauth to sign in again.";
 
 pub struct App {
     /// Per-channel E2EE keys, keyed by lowercase channel name.
@@ -643,9 +639,22 @@ pub struct App {
     /// published. The SDK offers the key again on every connect, so the line
     /// is said once and not per reconnect.
     pub told_key_unpublished: bool,
-    /// The server refused this device's key: the account signed the device
-    /// out, and a disconnect no longer schedules a reconnect.
+    /// The server refused this device's key or its sign-in for good: a
+    /// disconnect no longer schedules a reconnect.
     pub signed_out: bool,
+    /// Whether the server's try-again sentence has been said since the TUI
+    /// was last let in. Said once, not at every attempt; `Registered` clears
+    /// it.
+    pub told_retry: bool,
+    /// Whether restarting with `--reauth` signs this TUI in again (it signed
+    /// in with a handle): a refusal then says so.
+    pub reauth_helps: bool,
+    /// Set by a verdict whose sentence the TUI has shown, until the drop
+    /// that follows it: that drop adds no "Disconnected:" line repeating it.
+    pub sentence_shown: bool,
+    /// Set when a reconnect's socket opens, until the server lets the TUI
+    /// in, where it says "Reconnected!": the socket opening is not that.
+    pub reconnecting: bool,
     /// Cache of fetched images for inline rendering.
     pub image_cache: ImageCache,
     /// Image protocol picker (detects terminal capabilities).
@@ -792,13 +801,17 @@ impl App {
             should_quit: false,
             reconnect_pending: false,
             reconnect_at: None,
-            reconnect_delay: Duration::from_secs(1),
+            reconnect_delay: freeq_sdk::client::ReconnectConfig::default().initial_delay,
             history: Vec::new(),
             history_pos: None,
             history_saved: String::new(),
             media_uploader: None,
             told_key_unpublished: false,
             signed_out: false,
+            told_retry: false,
+            reauth_helps: false,
+            sentence_shown: false,
+            reconnecting: false,
             image_cache: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "inline-images")]
             picker: None,
@@ -1000,6 +1013,13 @@ impl App {
         }
         self.told_key_unpublished = true;
         Some(KEY_UNPUBLISHED_LINE)
+    }
+
+    /// Whether to say the server's try-again sentence: the first time since
+    /// the TUI was last let in; `false` every time after, until `Registered`
+    /// clears `told_retry`.
+    pub fn note_retry(&mut self) -> bool {
+        !std::mem::replace(&mut self.told_retry, true)
     }
 
     /// Push a chat message to the appropriate buffer.
@@ -1728,13 +1748,17 @@ mod tests {
             should_quit: false,
             reconnect_pending: false,
             reconnect_at: None,
-            reconnect_delay: Duration::from_secs(1),
+            reconnect_delay: freeq_sdk::client::ReconnectConfig::default().initial_delay,
             history: Vec::new(),
             history_pos: None,
             history_saved: String::new(),
             media_uploader: None,
             told_key_unpublished: false,
             signed_out: false,
+            told_retry: false,
+            reauth_helps: false,
+            sentence_shown: false,
+            reconnecting: false,
             image_cache: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "inline-images")]
             picker: None,

@@ -2740,50 +2740,9 @@ impl Server {
                             }
                         }
 
-                        // Identity re-verification (offboarding). SAFE: only acts
-                        // when a DID resolves successfully but has NO valid auth
-                        // key; never disconnects on a resolution error (outage).
+                        // Identity re-verification (offboarding).
                         if reverify_mins > 0 && ticks.is_multiple_of(reverify_mins) {
-                            let did_sessions: std::collections::HashMap<String, Vec<String>> = {
-                                let sd = maint_state.session_dids.lock();
-                                let mut m: std::collections::HashMap<String, Vec<String>> =
-                                    std::collections::HashMap::new();
-                                for (sid, did) in sd.iter() {
-                                    m.entry(did.clone()).or_default().push(sid.clone());
-                                }
-                                m
-                            };
-                            for (did, sids) in did_sessions {
-                                match maint_state.did_resolver.resolve(&did).await {
-                                    Ok(doc) if doc.authentication_keys().is_empty() => {
-                                        tracing::warn!(
-                                            %did,
-                                            "identity re-verify: DID has no valid auth key — disconnecting sessions"
-                                        );
-                                        for sid in sids {
-                                            if let Some(tx) =
-                                                maint_state.connections.lock().get(&sid)
-                                            {
-                                                let _ = tx.try_send(
-                                                    "ERROR :Identity no longer valid (deactivated or key removed)\r\n"
-                                                        .to_string(),
-                                                );
-                                            }
-                                            if let Some(kill) =
-                                                maint_state.session_kill.lock().get(&sid).cloned()
-                                            {
-                                                kill.notify_one();
-                                            }
-                                        }
-                                    }
-                                    Ok(_) => {}
-                                    Err(e) => tracing::debug!(
-                                        %did,
-                                        error = %e,
-                                        "identity re-verify: resolve failed (transient) — keeping session"
-                                    ),
-                                }
-                            }
+                            reverify_identities(&maint_state).await;
                         }
                     }
                 });
@@ -3325,6 +3284,47 @@ impl Server {
 static S2S_RATE_LIMITS: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, (u64, u32)>>> =
     std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 const S2S_MAX_EVENTS_PER_SEC: u32 = 100;
+
+/// Identity re-verification (offboarding): close, for good, every session of
+/// a DID that resolves but names no key it can sign in with (the account was
+/// deactivated, or its key removed), with `FAIL * IDENTITY_INVALID` before
+/// the `ERROR`. SAFE: a resolution error (an outage) keeps the session.
+pub(crate) async fn reverify_identities(state: &Arc<SharedState>) {
+    let did_sessions: std::collections::HashMap<String, Vec<String>> = {
+        let sd = state.session_dids.lock();
+        let mut m: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (sid, did) in sd.iter() {
+            m.entry(did.clone()).or_default().push(sid.clone());
+        }
+        m
+    };
+    for (did, sids) in did_sessions {
+        match state.did_resolver.resolve(&did).await {
+            Ok(doc) if doc.authentication_keys().is_empty() => {
+                tracing::warn!(
+                    %did,
+                    "identity re-verify: DID has no valid auth key — disconnecting sessions"
+                );
+                for sid in sids {
+                    crate::connection::close_refused(
+                        state,
+                        &sid,
+                        &crate::connection::send_to,
+                        freeq_sdk::refusal::IDENTITY_INVALID,
+                        "Identity no longer valid (deactivated or key removed)",
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!(
+                %did,
+                error = %e,
+                "identity re-verify: resolve failed (transient) — keeping session"
+            ),
+        }
+    }
+}
 
 /// Strip characters that could enable IRC protocol injection (\r, \n, \0) from
 /// S2S-provided strings. Truncates to `max_len` to prevent memory abuse.
@@ -9534,7 +9534,7 @@ mod s2s_adversarial_tests {
         let record_cache = crate::record_cache::RecordCache::new(db.clone(), &config);
         Arc::new(SharedState {
             server_name: config.server_name.clone(),
-            challenge_store: crate::sasl::ChallengeStore::new(60),
+            challenge_store: crate::sasl::ChallengeStore::new(config.challenge_timeout_secs),
             key_lookup: crate::peer_keys::key_lookup(
                 resolver.clone(),
                 crate::peer_keys::LookupClients::Plain(freeq_oauth::SharedClient(

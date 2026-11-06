@@ -11,7 +11,7 @@
  *   process.once('SIGTERM', () => bot.stop('SIGTERM').then(() => process.exit(0)));
  */
 
-export { FreeqBot } from "./bot.js";
+export { FreeqBot, SignInRefusedError } from "./bot.js";
 export type {
   ProvenanceVerdict,
   ActorClass,

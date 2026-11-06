@@ -46,6 +46,7 @@ import { FabroApi } from "./fabro-api.js";
 import { launchWithGoal, listWorkflows } from "./launch.js";
 import { findRunPr } from "./pr.js";
 import { createRelay } from "./relay.js";
+import { run } from "./run.js";
 
 function env(name: string, fallback?: string): string {
   const v = process.env[name]?.trim() || fallback;
@@ -105,9 +106,6 @@ bot.on("systemMessage", (_target, text) => {
   if (/polic/i.test(text)) log(`server: ${text}`);
 });
 bot.on("serverFail", (text) => log(`server FAIL: ${text}`));
-
-await bot.start();
-log(`connected as ${bot.client.nick} (${bot.identity.did})`);
 
 // Read per call so a rotated token needs no restart.
 const api = new FabroApi(fabroUrl, async () => (await readFile(tokenFile, "utf8")).trim());
@@ -186,37 +184,39 @@ async function describeGate(runId: string): Promise<string | undefined> {
   return undefined;
 }
 
-const relay = createRelay({
-  post: (line) => {
-    try {
-      bot.client.sendMessage(channel, line);
-      log(`posted: ${line}`);
-    } catch (err) {
-      log(`post failed (${String(err)}): ${line}`);
-    }
+// Starting, opening the relay once the bot is in, and shutting down on a
+// signal or a refusal (exit 0 either way) are run()'s, which tests drive.
+await run({
+  bot,
+  startRelay: () => {
+    const relay = createRelay({
+      post: (line) => {
+        try {
+          bot.client.sendMessage(channel, line);
+          log(`posted: ${line}`);
+        } catch (err) {
+          log(`post failed (${String(err)}): ${line}`);
+        }
+      },
+      // Owner DMs are addressed by DID; the server routes them to whichever
+      // session the owner is signed in on.
+      postOwner: (line) => {
+        try {
+          bot.client.sendMessage(ownerDid, line);
+          log(`sent owner: ${line}`);
+        } catch (err) {
+          log(`owner DM failed (${String(err)}): ${line}`);
+        }
+      },
+      findPr: (runId) => findRunPr(runId, { repo, token: process.env.GITHUB_TOKEN }),
+      describeGate,
+      webUrl,
+      log,
+    });
+    relay.listen(port, "127.0.0.1", () => log(`listening on 127.0.0.1:${port}/hook`));
+    return relay;
   },
-  // Owner DMs are addressed by DID; the server routes them to whichever
-  // session the owner is signed in on.
-  postOwner: (line) => {
-    try {
-      bot.client.sendMessage(ownerDid, line);
-      log(`sent owner: ${line}`);
-    } catch (err) {
-      log(`owner DM failed (${String(err)}): ${line}`);
-    }
-  },
-  findPr: (runId) => findRunPr(runId, { repo, token: process.env.GITHUB_TOKEN }),
-  describeGate,
-  webUrl,
+  exit: (code) => process.exit(code),
   log,
+  onSignal: (signal, fn) => void process.on(signal, fn),
 });
-relay.listen(port, "127.0.0.1", () => log(`listening on 127.0.0.1:${port}/hook`));
-
-const shutdown = async (signal: string): Promise<void> => {
-  log(`${signal} — shutting down`);
-  relay.close();
-  await bot.stop("freeq-fabro stopping");
-  process.exit(0);
-};
-process.on("SIGTERM", () => void shutdown("SIGTERM"));
-process.on("SIGINT", () => void shutdown("SIGINT"));

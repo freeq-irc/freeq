@@ -272,6 +272,13 @@ export class AgentRuntime {
    */
   readonly #inFlight = new Set<Promise<unknown>>();
 
+  /**
+   * The connect() that is building a connection, as its result, until it
+   * settles. A login for the same owner waits for it instead of starting
+   * again, and a connect that another one replaced returns that one's result.
+   */
+  #connecting: Promise<string> | undefined;
+
   constructor(
     readonly harness: Harness,
     options: RuntimeOptions = {},
@@ -1456,8 +1463,11 @@ export class AgentRuntime {
       return;
     }
     // Deliberate use of freeq is the reason a dormant project connects.
-    // 'off' is exempt: turning it off must not first turn it on.
-    if (sub !== "off") await this.wake();
+    // 'off' is exempt: turning it off must not first turn it on. 'login' and
+    // 'on' are exempt because each connects itself and ends the dormancy
+    // itself: waking first would connect once, and the command would then
+    // connect again.
+    if (sub !== "off" && sub !== "login" && sub !== "on") await this.wake();
     const cfg = await this.ensureConfig();
 
     switch (sub) {
@@ -1470,20 +1480,45 @@ export class AgentRuntime {
           );
           return;
         }
-        // A new server means the open connection is to the wrong place:
-        // close it so connect() opens one to the new server.
         const moved = server !== undefined && server !== cfg.server;
+        const same = did === cfg.ownerDid && !moved;
+        // Online already, for this owner on this server: nothing to change.
+        if (same && this.conn?.state === "online") {
+          this.notify(
+            `freeq: already online as ${this.conn.nick} for ${did} on ${cfg.server}`,
+            "info",
+          );
+          return;
+        }
+        // A connect for this owner and server is still running: wait for it
+        // rather than stop it and start again. The session start and wake()
+        // tell a result that is not online themselves, and the connection
+        // tells a refusal in its own notice, so the login tells only an
+        // online one, and the outcome is told once.
+        if (same && this.#connecting) {
+          this.notify(`freeq: a connect for ${did} on ${cfg.server} is already under way; waiting for it`, "info");
+          const message = await this.#connecting;
+          if (this.conn?.state === "online") this.notify(message, "info");
+          return;
+        }
         cfg.ownerDid = did;
         if (server) cfg.server = server;
         cfg.install ??= deriveInstallSlug();
         cfg.nick ??= defaultNick(cfg.install, this.names.name);
         await saveConfig(this.agentDir, cfg);
-        if (moved && this.conn) {
-          await this.conn.stop("server changed");
-          this.conn = undefined;
-        }
+        this.dormant = false;
         this.notify(`freeq: owner set to ${did}${server ? `, server ${server}` : ""}; connecting…`, "info");
-        this.notify(await this.connect(), this.conn?.state === "online" ? "info" : "warning");
+        // Any held connection is to the wrong place, for the wrong owner, or
+        // has ended: connect() stops it, and waits for it, before the fresh
+        // one, which is then the only one. A connect still running is replaced
+        // the same way and returns this one's result to its own caller; the
+        // session start and wake() tell a result that is not online, so, as
+        // when waiting above, the login then tells only an online one.
+        const replacedRunning = this.#connecting !== undefined;
+        const message = await this.connect(moved ? "server changed" : "login");
+        const online = this.conn?.state === "online";
+        if (online || !replacedRunning) this.#tellConnect(message, online ? "info" : "warning");
+        this.stateChanged();
         return;
       }
 
@@ -1497,21 +1532,16 @@ export class AgentRuntime {
         }
         if (rest[0] === "verify") {
           this.notify("freeq: reconnecting to ask the server…", "info");
-          await this.conn?.stop("re-presenting delegation");
-          this.conn = undefined;
-          await this.connect();
-          // `conn` is reassigned inside connect(); TS narrowed it to
-          // undefined from the line above, so read it through a fresh
-          // binding.
-          const live = (): FreeqConnection | undefined => this.conn as FreeqConnection | undefined;
-          // A connect refused at SASL never sends a provenance notice.
-          if (live()?.state === "error") {
-            this.notify(`freeq: the server refused this installation: ${live()?.lastError}`, "warning");
-            return;
-          }
+          // connect() stops the held connection, and waits for it, before
+          // the fresh one; a connect still running is replaced through it.
+          await this.connect("re-presenting delegation");
+          // A connect refused at SASL never sends a provenance notice, and
+          // the connection has told the refusal in its own notice, as
+          // #tellConnect leaves it on every other connect path.
+          if (this.conn?.state === "error") return;
           // An unverified reply comes first; a verified one follows once
           // the server has read the owner's records.
-          const notice = await waitForProvenance(() => live()?.provenanceNotice, {
+          const notice = await waitForProvenance(() => this.conn?.provenanceNotice, {
             timeoutMs: 20_000,
             pollMs: 250,
           });
@@ -1546,7 +1576,10 @@ export class AgentRuntime {
           return;
         }
         // The DID is this project's identity, minted on its first connect.
-        if (!this.conn?.did) await this.connect();
+        // Only connect when nothing is held: a held connection, refused or
+        // still trying, already names its DID or left it in the key file, and
+        // connecting again would replace it.
+        if (!this.conn || this.conn.state === "offline") await this.connect();
         const bot = (this.conn as FreeqConnection | undefined)?.bot;
         const onDisk = this.conn?.did && bot?.stateDir ? undefined : await this.#identityOnDisk(cfg);
         const botDid = (this.conn as FreeqConnection | undefined)?.did ?? onDisk?.did;
@@ -1632,10 +1665,10 @@ export class AgentRuntime {
         await this.lock.takeOver(this.harness.cwd());
         // Force a fresh claim by clearing any stale in-memory state.
         this.lock = new ConnectionLock(ConnectionLock.pathFor(this.agentDir, takeoverMeta.project));
-        await this.conn?.stop("takeover");
-        this.conn = undefined;
-        const message = await this.connect();
-        this.notify(message, this.conn ? "info" : "warning");
+        // connect() stops the held connection, and waits for it, before the
+        // fresh one; a connect still running is replaced through it.
+        const message = await this.connect("takeover");
+        this.#tellConnect(message, this.conn ? "info" : "warning");
         return;
       }
 
@@ -1682,13 +1715,15 @@ export class AgentRuntime {
       case "on":
       case "off": {
         cfg.enabled = sub === "on";
+        // 'on' skipped wake(), so it ends the dormancy, as login does.
+        if (cfg.enabled) this.dormant = false;
         await saveConfig(this.agentDir, cfg);
         if (!cfg.enabled) {
           await this.conn?.stop("disabled");
           this.conn = undefined;
           this.notify("freeq: disabled", "info");
         } else {
-          this.notify(await this.connect(), "info");
+          this.#tellConnect(await this.connect(), "info");
         }
         return;
       }
@@ -2184,8 +2219,24 @@ export class AgentRuntime {
     }
   }
 
+  /** The first config load while it runs, shared by every call that comes
+   *  before it ends. */
+  #configLoad?: Promise<FreeqConfig>;
+
   async ensureConfig(): Promise<FreeqConfig> {
     if (this.config) return this.config;
+    // Two first calls at once (the session start and a command typed while
+    // it reads the config) share one load. With a load each, the one that
+    // finished last replaced `config`, and what the other call had changed
+    // in its copy, such as a login's new owner, was lost. A load that fails
+    // is not kept, so the next call reads the file again.
+    this.#configLoad ??= this.#loadConfig().finally(() => {
+      this.#configLoad = undefined;
+    });
+    return this.#configLoad;
+  }
+
+  async #loadConfig(): Promise<FreeqConfig> {
     this.agentDir = this.harness.agentDir;
     const loaded = await loadConfig({
       agentDir: this.agentDir,
@@ -2358,22 +2409,69 @@ export class AgentRuntime {
     const cfg = await this.ensureConfig();
     if (!cfg.enabled || !isDid(cfg.ownerDid)) return;
     this.notify("freeq: first use in this project — minting its identity", "info");
-    const msg = await this.connect();
-    if (this.conn?.state !== "online") this.notify(msg, "warning");
+    this.#tellUnlessOnline(await this.connect());
     this.stateChanged();
   }
 
-  async connect(): Promise<string> {
+  /** What the session start and wake() say after their connect: nothing
+   *  when it is online, else as #tellConnect. */
+  #tellUnlessOnline(message: string): void {
+    if (this.conn?.state === "online") return;
+    this.#tellConnect(message, "warning");
+  }
+
+  /**
+   * Tell a connect's result, except a refusal or a try-again: a connection
+   * in `error`, or one the server could not check and not yet in, has
+   * already told the server's sentence in its own notice, and the result's
+   * line would say it a second time.
+   */
+  #tellConnect(message: string, level: NoticeLevel): void {
+    if (this.conn?.state === "error" || this.conn?.deferred) return;
+    this.notify(message, level);
+  }
+
+  /**
+   * Connect, replacing a held connection that is not online. Given
+   * `replacing`, the reason its stop is sent with, a held online one is
+   * replaced too.
+   */
+  async connect(replacing?: string): Promise<string> {
     const cfg = await this.ensureConfig();
     if (!cfg.enabled) return `freeq is disabled (\`${this.names.hint("on")}\` to enable)`;
     if (!isDid(cfg.ownerDid)) return `freeq: not logged in — run \`${this.names.hint("login")} <did:plc:…>\``;
-    if (this.conn && this.conn.state !== "offline") return `freeq: already ${this.conn.state}`;
-    // An existing-but-offline connection still owns a bot and possibly a
-    // socket the transport is retrying. Replacing it without stopping it
-    // leaks a session, which is how one process ended up holding three
-    // connections and answering every mention three times.
+    if (!replacing && this.conn?.state === "online") return `freeq: ${this.conn.describe()}`;
+    // From here this call builds the connection, and it is the running
+    // connect until it settles. It is recorded before it stops anything, so
+    // the connect it replaces already finds it when that one's start returns.
+    const running: Promise<string> = this.#connectFresh(
+      cfg,
+      cfg.ownerDid,
+      replacing ?? "replaced",
+      () => this.#connecting === running,
+    );
+    this.#connecting = running;
+    try {
+      return await running;
+    } finally {
+      if (this.#connecting === running) this.#connecting = undefined;
+    }
+  }
+
+  async #connectFresh(
+    cfg: FreeqConfig,
+    ownerDid: string,
+    reason: string,
+    current: () => boolean,
+  ): Promise<string> {
+    // The held connection, if any, is replaced: connect() came here because
+    // it is not online (offline, refused, or still trying), or because the
+    // caller asked to replace it. It still owns a bot and possibly a socket
+    // the transport is retrying. Replacing it without stopping it leaks a
+    // session, which is how one process ended up holding three connections
+    // and answering every mention three times.
     if (this.conn) {
-      await this.conn.stop("replaced");
+      await this.conn.stop(reason);
       this.conn = undefined;
     }
 
@@ -2414,7 +2512,7 @@ export class AgentRuntime {
     }
 
     const conn = new FreeqConnection({
-      ownerDid: cfg.ownerDid,
+      ownerDid,
       server: cfg.server,
       slug: cfg.install ?? deriveInstallSlug(),
       root: BOTS_ROOT,
@@ -2629,9 +2727,15 @@ export class AgentRuntime {
         );
       },
     });
+    // Another connect() replaced this one, here before it stored its
+    // connection or below while it started. Its result is this call's: wait
+    // for it if it is still running, or describe the connection it left.
+    // Checked here too, so a replaced call never builds a second bot.
+    if (!current()) return this.#connecting ?? `freeq: ${(this.conn ?? conn).describe()}`;
     this.conn = conn;
 
     await conn.start();
+    if (!current()) return this.#connecting ?? `freeq: ${(this.conn ?? conn).describe()}`;
     this.#startMaintenance(cfg);
     return `freeq: ${conn.describe()}`;
   }
@@ -2658,8 +2762,7 @@ export class AgentRuntime {
       this.stateChanged();
       return;
     }
-    const msg = await this.connect();
-    if (this.conn?.state !== "online") this.notify(msg, "warning");
+    this.#tellUnlessOnline(await this.connect());
 
     // Surface work that arrived while this installation was offline. The
     // server replays channel history on join, so offers made overnight land

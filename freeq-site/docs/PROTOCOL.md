@@ -50,6 +50,11 @@ The client responds with base64url-encoded JSON:
 }
 ```
 
+An agent may add `owner_did`, the DID of the account it acts for. A server
+with a connect allowlist that does not know the agent's own DID may admit it
+when that account is allowed and its `at.freeq.agentKey` records name the
+agent (`--allow-delegated-agents`).
+
 ### Verification Methods
 
 1. **`crypto`** — Client signs the raw challenge bytes with a key listed in
@@ -62,6 +67,51 @@ The client responds with base64url-encoded JSON:
 
 3. **`pds-oauth`** — Client provides a DPoP-bound OAuth access token.
    Server constructs a DPoP proof and calls `getSession` on the PDS.
+
+### Refusals
+
+A sign-in the server refuses carries a standard reply just before its `904`:
+
+```
+FAIL AUTHENTICATE <code> :<sentence>
+904 <nick> :<sentence>
+```
+
+The server does not close the connection on a `904`; the reference clients,
+having asked to sign in, end it themselves rather than stay on as a guest. A session the server ends for a
+reason of the client's own carries `FAIL * <code> :<sentence>` (the `*`
+because it answers no command the client sent), then `ERROR :<sentence>`,
+and the server closes the connection. A refused signing key carries
+`FAIL MSGSIG KEY_EXPIRED` or `FAIL MSGSIG KEY_RETIRED`, and the connection is
+closed.
+
+Only `TEMPORARILY_UNAVAILABLE` means try again: the server could not get an
+answer it needs, or the challenge expired, so the same credentials may get in
+later. Every other code is final, so a client that comes back with the same
+credentials is refused again. A `904` with no `FAIL` before it, or an unknown
+code, is final too. `spec/sasl-refusals.json` lists every code with its kind.
+
+A browser sign-in through `LOGIN` that the server refuses carries
+`FAIL LOGIN NOT_ALLOWED :<sentence>` before its `904`. The SDKs do not count
+`FAIL LOGIN` as a refusal, so the `904` behind it is read as a bare one, and
+is final.
+
+| Reply | Code | Kind | When |
+|---|---|---|---|
+| `FAIL AUTHENTICATE` | `TEMPORARILY_UNAVAILABLE` | try again | the DID document, the handle behind an allowed domain or the PDS could not be checked, or the challenge expired |
+| `FAIL AUTHENTICATE` | `NOT_ALLOWED` | final | the connect allowlist refuses this DID and no delegation admits it |
+| `FAIL AUTHENTICATE` | `SIGNATURE_INVALID` | final | the signature verifies against none of the DID's keys |
+| `FAIL AUTHENTICATE` | `IDENTITY_INVALID` | final | the DID document cannot be used to sign in |
+| `FAIL AUTHENTICATE` | `TOKEN_INVALID` | final | the sign-in token was not accepted |
+| `FAIL AUTHENTICATE` | `BAD_RESPONSE` | final | the response cannot be read, or answers no challenge this connection holds |
+| `FAIL AUTHENTICATE` | `MECHANISM_UNSUPPORTED` | final | a mechanism other than `ATPROTO-CHALLENGE` |
+| `FAIL AUTHENTICATE` | `ABORTED` | final | the client sent `AUTHENTICATE *` |
+| `FAIL *` | `ACCOUNT_REQUIRED` | final | a guest on a server started with `--no-guest` |
+| `FAIL *` | `IDENTITY_INVALID` | final | the identity re-check found the DID with no key left (deactivated, or its key removed) |
+| `FAIL *` | `NOT_ALLOWED` | final | a delegated agent's owner withdrew it, or is no longer allowed |
+| `FAIL *` | `TEMPORARILY_UNAVAILABLE` | try again | a delegated agent's owner's records could not be read for three re-read periods |
+| `FAIL *` | `AGENT_REVOKED` | final | an op's or a server operator's `AGENT REVOKE` |
+| `FAIL MSGSIG` | `KEY_EXPIRED`, `KEY_RETIRED` | signing key | this device's signing key ran past its lifetime, or was retired |
 
 ### Security Properties
 

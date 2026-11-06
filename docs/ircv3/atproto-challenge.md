@@ -580,6 +580,18 @@ intended behavior; this section records reality.
 9. **Key rotation.** Sessions are not revalidated on DID-document key
    changes; the SHOULD in Security considerations is aspirational and
    noted there as an open consideration.
+10. **Refusal codes.** The reference server sends an IRCv3 standard reply,
+    `FAIL AUTHENTICATE <code> :<sentence>`, just before each failure `904`.
+    Before the `ERROR` of a session it ends for a reason of the client's own
+    (a guest on a server that admits none, an identity with no key left, a
+    withdrawn or unverifiable delegation, an operator's revoke) it sends
+    `FAIL * <code> :<sentence>`, and it then closes that connection. Only
+    `TEMPORARILY_UNAVAILABLE` says the same credentials may succeed later;
+    every other code, and a `904` with no `FAIL` before it, is final. The
+    server still does not end the connection on a `904`, as this draft
+    requires; the reference clients, having asked to sign in, end it
+    themselves rather than complete registration unauthenticated. The
+    project's protocol notes and `spec/sasl-refusals.json` list the codes.
 
 ## Implementations
 

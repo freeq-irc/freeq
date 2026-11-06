@@ -110,7 +110,9 @@ The SDK uses a typed event emitter. Every state change is delivered as an event 
 | `ready` | `()` | Fully connected and channels joined |
 | `nickChanged` | `(nick: string)` | Our nickname changed |
 | `authenticated` | `(did: string, message: string)` | SASL authentication succeeded |
-| `authError` | `(error: string)` | SASL authentication failed |
+| `authError` | `(error: string)` | The server refused this sign-in, or ended the session (the server's sentence); the client does not reconnect |
+| `authErrorRetry` | `(reason: string)` | The server could not check this client just now (its sentence); the client keeps trying |
+| `signingKeyRefused` | `(reason: string)` | The server refused this device's signing key, expired or retired (its sentence); the stored key is marked refused and the client does not reconnect |
 | `error` | `(message: string)` | Server ERROR received |
 
 ### Message Events
@@ -555,7 +557,7 @@ client.joinedChannels;    // Set<string> of channel names (lowercase)
 
 ## Reconnection
 
-The SDK automatically reconnects with exponential backoff (1s → 2s → 4s → ... → 30s max). You can also force a reconnect:
+The SDK automatically reconnects with exponential backoff (1s → 2s → 4s → ... → 30s max). The wait starts again at 1s once the server has welcomed the client (`001`), and the SDK does not reconnect after a refused key or a final sign-in refusal. You can also force a reconnect:
 
 ```typescript
 client.reconnect();  // Disconnect and immediately reconnect

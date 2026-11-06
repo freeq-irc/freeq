@@ -324,43 +324,7 @@ async fn main() -> Result<()> {
             .clone();
 
         // Wait for registration + channel join to complete
-        let mut registered = false;
-        let mut joined = false;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-
-        while !joined {
-            tokio::select! {
-                event = events.recv() => {
-                    match event {
-                        Some(Event::Registered { .. }) => {
-                            registered = true;
-                            eprintln!("  registered");
-                        }
-                        Some(Event::NamesEnd { channel })
-                            if channel.eq_ignore_ascii_case(&target_channel) => {
-                                joined = true;
-                                eprintln!("  joined {channel}");
-                            }
-                        Some(Event::AuthFailed { reason }) => {
-                            anyhow::bail!("Authentication failed: {reason}");
-                        }
-                        Some(Event::Disconnected { reason }) => {
-                            anyhow::bail!("Disconnected: {reason}");
-                        }
-                        None => {
-                            anyhow::bail!("Connection closed unexpectedly");
-                        }
-                        _ => {}
-                    }
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    if registered && !joined {
-                        anyhow::bail!("Timed out waiting to join {target_channel} (registered but couldn't join — check channel policy)");
-                    }
-                    anyhow::bail!("Timed out waiting for registration");
-                }
-            }
-        }
+        wait_to_send(&mut events, &target_channel, Duration::from_secs(15)).await?;
 
         // Send the message
         handle
@@ -413,6 +377,8 @@ async fn main() -> Result<()> {
         app.picker = picker;
     }
 
+    // Whether a refusal says to restart with --reauth.
+    app.reauth_helps = reauth_helps(resolved.handle.as_deref(), signer.is_some());
     let mut reconnect_info = Some(ReconnectInfo {
         config: reconnect_config(&connect_config),
         signer: signer.clone(),
@@ -886,6 +852,12 @@ async fn run_app(
                 if let Some(ri) = reconnect_info.as_ref() {
                     app.status_msg("Reconnecting...");
                     app.connection_state = "connecting".to_string();
+                    // The wait grows at every attempt, the SDK's schedule,
+                    // so a server that takes the socket and then refuses or
+                    // defers the sign-in is not tried every second; it
+                    // starts again once the server lets the TUI in.
+                    app.reconnect_delay =
+                        client::ReconnectConfig::default().next_delay(app.reconnect_delay);
 
                     match client::establish_connection(&ri.config).await {
                         Ok(conn) => {
@@ -910,14 +882,12 @@ async fn run_app(
                                 }
                             }
 
-                            app.reconnect_delay = Duration::from_secs(1);
                             app.connected_at = Some(std::time::Instant::now());
-                            app.status_msg("Reconnected!");
+                            // Said at Registered, once the server has let
+                            // the TUI in; it may yet refuse or defer it.
+                            app.reconnecting = true;
                         }
                         Err(e) => {
-                            // Exponential backoff: 1s, 2s, 4s, 8s, ... capped at 60s
-                            app.reconnect_delay =
-                                (app.reconnect_delay * 2).min(Duration::from_secs(60));
                             let secs = app.reconnect_delay.as_secs();
                             app.connection_state = format!("reconnecting in {secs}s");
                             app.status_msg(&format!(
@@ -973,6 +943,72 @@ fn process_p2p_event(app: &mut App, event: freeq_sdk::p2p::P2pEvent) {
     }
 }
 
+/// The one-shot send's wait, within `timeout`: for the server to let it in,
+/// through the SDK's shared wait, whose error on a refusal or a try-again is
+/// the server's sentence (a one-shot command cannot wait for the server),
+/// and then for the join of `channel` to complete.
+async fn wait_to_send(
+    events: &mut tokio::sync::mpsc::Receiver<Event>,
+    channel: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    client::wait_for_registration(events, timeout).await?;
+    eprintln!("  registered");
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                match event {
+                    Some(Event::NamesEnd { channel: joined })
+                        if joined.eq_ignore_ascii_case(channel) => {
+                            eprintln!("  joined {joined}");
+                            return Ok(());
+                        }
+                    Some(Event::AuthFailed { reason } | Event::SigningKeyRefused { reason }) => {
+                        anyhow::bail!("{reason}");
+                    }
+                    Some(Event::Disconnected { reason }) => {
+                        anyhow::bail!("Disconnected: {reason}");
+                    }
+                    None => {
+                        anyhow::bail!("Connection closed unexpectedly");
+                    }
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                anyhow::bail!("Timed out waiting to join {channel} (registered but couldn't join — check channel policy)");
+            }
+        }
+    }
+}
+
+/// Whether restarting with `--reauth` can sign this TUI in again: it signed
+/// in with a handle, in a browser or with an app password. `--reauth` drops
+/// the cached browser session, and an app password signs in afresh at each
+/// start; a key-file or generated-key sign-in has nothing to sign in again,
+/// and a guest none.
+fn reauth_helps(handle: Option<&str>, signs_in: bool) -> bool {
+    signs_in && handle.is_some()
+}
+
+/// The server refused this TUI's key or its sign-in for good: a reconnect
+/// would be refused again, so the TUI stays down (`signed_out` keeps the
+/// disconnect that follows from scheduling one) and says why, once. A TUI
+/// that signed in with a handle is told how to sign in again; any other gets
+/// the sentence alone, which already says what the server requires.
+fn refused(app: &mut App, reason: &str) {
+    app.signed_out = true;
+    app.sentence_shown = true;
+    let reauth_helps = app.reauth_helps;
+    let active = app.active_buffer.clone();
+    let buf = app.buffer_mut(&active);
+    buf.push_system(reason);
+    if reauth_helps {
+        buf.push_system(crate::app::REAUTH_LINE);
+    }
+}
+
 fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle) {
     match event {
         // Nick<->DID binding learned. Adopted in the TUI's DID-DM pass;
@@ -991,15 +1027,32 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
         }
         Event::Registered { nick } => {
             app.connection_state = "registered".to_string();
+            // Let in: the next reconnect starts the wait from the beginning,
+            // and a later try-again is said again.
+            app.reconnect_delay = client::ReconnectConfig::default().initial_delay;
+            app.told_retry = false;
             app.nick = nick.clone();
+            if std::mem::take(&mut app.reconnecting) {
+                app.status_msg("Reconnected!");
+            }
             app.status_msg(&format!("Registered as {nick}"));
         }
         Event::Authenticated { did } => {
             app.authenticated_did = Some(did.clone());
             app.status_msg(&format!("Authenticated as {did}"));
         }
-        Event::AuthFailed { reason } => {
-            app.status_msg(&format!("Authentication failed: {reason}"));
+        Event::AuthFailed { reason } | Event::SigningKeyRefused { reason } => {
+            refused(app, &reason);
+        }
+        Event::AuthFailedRetry { reason } => {
+            // The SDK has ended this connection; the TUI's loop reconnects on
+            // its growing wait. Said once until the server lets the TUI in,
+            // as the web does, not at every attempt.
+            app.sentence_shown = true;
+            if app.note_retry() {
+                let active = app.active_buffer.clone();
+                app.buffer_mut(&active).push_system(&reason);
+            }
         }
         Event::Joined { channel, nick, .. } => {
             let cloak = app
@@ -1515,21 +1568,6 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
             }
         }
         Event::ServerNotice { text } => {
-            // The server refused this device's key. A reconnect would offer
-            // the same key, so the next disconnect stays down.
-            let refused = if text.starts_with("MSGSIG KEY_RETIRED") {
-                Some(crate::app::KEY_RETIRED_LINE)
-            } else if text.starts_with("MSGSIG KEY_EXPIRED") {
-                Some(crate::app::KEY_EXPIRED_LINE)
-            } else {
-                None
-            };
-            if let Some(line) = refused {
-                app.signed_out = true;
-                let active = app.active_buffer.clone();
-                app.buffer_mut(&active).push_system(line);
-                return;
-            }
             // Swallow the failure of a speculative "fetch history on view"
             // (maybe_fetch_history): a DM with a guest peer, or a not-yet-
             // persisted conversation, answers CHATHISTORY with INVALID_TARGET/
@@ -1553,7 +1591,10 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
         }
         Event::Disconnected { reason } => {
             app.connection_state = "disconnected".to_string();
-            app.status_msg(&format!("Disconnected: {reason}"));
+            // After a verdict the reason is its sentence, already shown.
+            if !std::mem::take(&mut app.sentence_shown) {
+                app.status_msg(&format!("Disconnected: {reason}"));
+            }
             // Don't quit — reconnection is handled by the main loop, unless
             // the device was signed out.
             app.reconnect_pending = !app.signed_out;
@@ -2886,8 +2927,8 @@ async fn process_input(app: &mut App, handle: &client::ClientHandle, input: &str
             }
             "/reconnect" => {
                 app.status_msg("Forcing reconnect...");
+                // Now, without resetting the wait the next attempts take.
                 app.reconnect_pending = true;
-                app.reconnect_delay = Duration::from_secs(0);
                 app.reconnect_at = Some(std::time::Instant::now());
             }
             "/history" => {
@@ -3560,12 +3601,100 @@ mod tests {
         assert!(!super::reconnect_config(&config).fresh_sign_in);
     }
 
-    /// A refused key reaches the TUI after registration as the notice
-    /// `MSGSIG KEY_RETIRED <reason>`. The TUI says the device was signed out,
-    /// and the disconnect that follows schedules no reconnect.
+    /// The one-shot send's wait on `events`, in the order the SDK sends
+    /// them, for `#chan`.
+    async fn waited_to_send(events: Vec<freeq_sdk::event::Event>) -> anyhow::Result<()> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        for event in events {
+            tx.send(event).await.unwrap();
+        }
+        super::wait_to_send(&mut rx, "#chan", std::time::Duration::from_millis(500)).await
+    }
+
+    /// Each refusal, and a try-again, ends the send with its Refusal, whose
+    /// text is the server's sentence alone.
     #[tokio::test]
-    async fn a_refused_key_shows_the_signed_out_line_and_does_not_reconnect() {
+    async fn a_refusal_or_a_try_again_ends_the_send_with_the_sentence() {
         use freeq_sdk::event::Event;
+        use freeq_sdk::refusal::Refusal;
+        let words = "The server's sentence.";
+        for (verdict, want) in [
+            (
+                Event::SigningKeyRefused {
+                    reason: words.into(),
+                },
+                Refusal::SigningKey(words.into()),
+            ),
+            (
+                Event::AuthFailed {
+                    reason: words.into(),
+                },
+                Refusal::Final(words.into()),
+            ),
+            (
+                Event::AuthFailedRetry {
+                    reason: words.into(),
+                },
+                Refusal::TryAgain(words.into()),
+            ),
+        ] {
+            let drop = Event::Disconnected {
+                reason: words.into(),
+            };
+            let err = waited_to_send(vec![verdict, drop]).await.unwrap_err();
+            assert_eq!(err.downcast_ref::<Refusal>(), Some(&want));
+            assert_eq!(err.to_string(), words);
+        }
+    }
+
+    /// A drop is a plain error, before the server lets the send in and
+    /// while it waits for the join.
+    #[tokio::test]
+    async fn a_drop_ends_the_send_with_an_error() {
+        use freeq_sdk::event::Event;
+        let drop = || Event::Disconnected {
+            reason: "Connection reset".into(),
+        };
+        let err = waited_to_send(vec![drop()]).await.unwrap_err();
+        assert!(err.downcast_ref::<freeq_sdk::refusal::Refusal>().is_none());
+        assert!(err.to_string().contains("Connection reset"), "{err}");
+        let registered = Event::Registered { nick: "me".into() };
+        let err = waited_to_send(vec![registered, drop()]).await.unwrap_err();
+        assert_eq!(err.to_string(), "Disconnected: Connection reset");
+    }
+
+    /// A key or sign-in refused while the send waits for the join ends it
+    /// with the server's sentence alone, not the drop that follows.
+    #[tokio::test]
+    async fn a_refusal_during_the_join_wait_ends_the_send_with_the_sentence() {
+        use freeq_sdk::event::Event;
+        let words = "The server's sentence.";
+        let registered = Event::Registered { nick: "me".into() };
+        let refused = Event::SigningKeyRefused {
+            reason: words.into(),
+        };
+        let drop = Event::Disconnected {
+            reason: words.into(),
+        };
+        let err = waited_to_send(vec![registered, refused, drop])
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), words);
+    }
+
+    /// Let in, and the channel joined: the send goes ahead.
+    #[tokio::test]
+    async fn the_send_goes_ahead_once_the_channel_is_joined() {
+        use freeq_sdk::event::Event;
+        let registered = Event::Registered { nick: "me".into() };
+        let joined = Event::NamesEnd {
+            channel: "#Chan".into(),
+        };
+        assert!(waited_to_send(vec![registered, joined]).await.is_ok());
+    }
+
+    /// A handle for process_irc_event, on a socket nothing reads.
+    async fn idle_handle() -> freeq_sdk::client::ClientHandle {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -3575,82 +3704,308 @@ mod tests {
             freeq_sdk::client::ConnectConfig::default(),
             None,
         );
+        handle
+    }
+
+    fn app_in_room(reauth_helps: bool) -> crate::app::App {
         let mut app = crate::app::App::new("me", false);
+        app.reauth_helps = reauth_helps;
         app.buffer_mut("#room");
         app.active_buffer = "#room".to_string();
+        app
+    }
+
+    fn last_lines(app: &crate::app::App, n: usize) -> Vec<String> {
+        let room = &app.buffers["#room"].messages;
+        room.iter()
+            .skip(room.len().saturating_sub(n))
+            .map(|l| l.text.clone())
+            .collect()
+    }
+
+    /// A refused key reaches the TUI as the SDK reports it: the verdict with
+    /// the server's sentence, then the drop. A TUI that signed in shows the
+    /// sentence and how to sign in again, and stays down.
+    #[tokio::test]
+    async fn a_refused_key_shows_the_sentence_and_the_reauth_line_and_does_not_reconnect() {
+        use freeq_sdk::event::Event;
+        let handle = idle_handle().await;
+        let mut app = app_in_room(true);
+        let words = "This device was signed out from another device. Sign in again to continue.";
         for event in [
             Event::Registered { nick: "me".into() },
-            Event::ServerNotice {
-                text: "MSGSIG KEY_RETIRED This device was signed out from another device. Sign in again to continue.".into(),
+            Event::SigningKeyRefused {
+                reason: words.into(),
             },
             Event::Disconnected {
-                reason: "Signing key retired".into(),
+                reason: words.into(),
             },
         ] {
             super::process_irc_event(&mut app, event, &handle);
         }
-
         assert!(!app.reconnect_pending, "no reconnect is scheduled");
-        let room = &app.buffers["#room"];
         assert_eq!(
-            room.messages.back().map(|l| l.text.as_str()),
-            Some(
-                "This device was signed out from another device. Restart freeq-tui with --reauth to sign in again."
-            )
-        );
-        assert!(
-            app.buffers
-                .values()
-                .flat_map(|b| b.messages.iter())
-                .all(|l| !l.text.contains("KEY_RETIRED")),
-            "the raw notice is not shown"
+            last_lines(&app, 2),
+            vec![words.to_string(), crate::app::REAUTH_LINE.to_string()]
         );
     }
 
-    /// An expired key reaches the TUI as `MSGSIG KEY_EXPIRED <reason>`. The
-    /// TUI says so with its own line, and stays down.
+    /// A final sign-in refusal is the same: the sentence, the reauth line,
+    /// no reconnect.
     #[tokio::test]
-    async fn an_expired_key_shows_the_expired_line_and_does_not_reconnect() {
+    async fn a_refused_sign_in_shows_the_sentence_and_the_reauth_line_and_does_not_reconnect() {
         use freeq_sdk::event::Event;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (handle, _events) = freeq_sdk::client::connect_with_stream(
-            freeq_sdk::client::EstablishedConnection::Plain(stream),
-            freeq_sdk::client::ConnectConfig::default(),
-            None,
-        );
-        let mut app = crate::app::App::new("me", false);
-        app.buffer_mut("#room");
-        app.active_buffer = "#room".to_string();
+        let handle = idle_handle().await;
+        let mut app = app_in_room(true);
+        let words = "This sign-in token is not valid.";
         for event in [
-            Event::Registered { nick: "me".into() },
-            Event::ServerNotice {
-                text: "MSGSIG KEY_EXPIRED This device's signing key has expired. Sign in again to continue.".into(),
+            Event::AuthFailed {
+                reason: words.into(),
             },
             Event::Disconnected {
-                reason: "Signing key expired".into(),
+                reason: words.into(),
             },
         ] {
             super::process_irc_event(&mut app, event, &handle);
         }
-
         assert!(!app.reconnect_pending, "no reconnect is scheduled");
-        let room = &app.buffers["#room"];
         assert_eq!(
-            room.messages.back().map(|l| l.text.as_str()),
-            Some(
-                "This device's signing key has expired. Restart freeq-tui with --reauth to sign in again."
-            )
+            last_lines(&app, 2),
+            vec![words.to_string(), crate::app::REAUTH_LINE.to_string()]
         );
+    }
+
+    /// A guest the server refuses never signed in: the sentence alone, which
+    /// already says what the server requires.
+    #[tokio::test]
+    async fn a_refused_guest_shows_the_sentence_alone() {
+        use freeq_sdk::event::Event;
+        let handle = idle_handle().await;
+        let mut app = app_in_room(false);
+        let words = "This server requires authentication.";
+        for event in [
+            Event::AuthFailed {
+                reason: words.into(),
+            },
+            Event::Disconnected {
+                reason: words.into(),
+            },
+        ] {
+            super::process_irc_event(&mut app, event, &handle);
+        }
+        assert!(!app.reconnect_pending, "no reconnect is scheduled");
+        assert_eq!(last_lines(&app, 1), vec![words.to_string()]);
         assert!(
             app.buffers
                 .values()
                 .flat_map(|b| b.messages.iter())
-                .all(|l| !l.text.contains("KEY_EXPIRED")),
-            "the raw notice is not shown"
+                .all(|l| l.text != crate::app::REAUTH_LINE),
+            "a guest is not told to sign in again"
         );
+    }
+
+    /// A try-again shows the sentence and keeps reconnecting; once the server
+    /// lets the TUI in, the wait starts again at the SDK's first one.
+    #[tokio::test]
+    async fn a_try_again_reconnects_and_registration_resets_the_wait() {
+        use freeq_sdk::event::Event;
+        let first = freeq_sdk::client::ReconnectConfig::default().initial_delay;
+        let handle = idle_handle().await;
+        let mut app = app_in_room(true);
+        assert_eq!(app.reconnect_delay, first, "the first wait is the SDK's");
+        app.reconnect_delay = std::time::Duration::from_secs(16);
+        let words = "Your identity could not be checked just now. Try again shortly.";
+        for event in [
+            Event::AuthFailedRetry {
+                reason: words.into(),
+            },
+            Event::Disconnected {
+                reason: words.into(),
+            },
+        ] {
+            super::process_irc_event(&mut app, event, &handle);
+        }
+        assert!(app.reconnect_pending, "it reconnects");
+        assert!(!app.signed_out);
+        assert_eq!(last_lines(&app, 1), vec![words.to_string()]);
+        assert_eq!(
+            app.reconnect_delay,
+            std::time::Duration::from_secs(16),
+            "the wait is kept"
+        );
+        super::process_irc_event(&mut app, Event::Registered { nick: "me".into() }, &handle);
+        assert_eq!(app.reconnect_delay, first);
+    }
+
+    /// The try-again sentence is said once, not at every attempt, until the
+    /// server lets the TUI in; a try-again after that is said again.
+    #[tokio::test]
+    async fn a_try_again_is_said_once_until_the_tui_is_let_in() {
+        use freeq_sdk::event::Event;
+        let handle = idle_handle().await;
+        let mut app = app_in_room(true);
+        let words = "Your identity could not be checked just now. Try again shortly.";
+        let said = |app: &crate::app::App| {
+            app.buffers["#room"]
+                .messages
+                .iter()
+                .filter(|l| l.text == words)
+                .count()
+        };
+        let attempt = |app: &mut crate::app::App| {
+            for event in [
+                Event::AuthFailedRetry {
+                    reason: words.into(),
+                },
+                Event::Disconnected {
+                    reason: words.into(),
+                },
+            ] {
+                super::process_irc_event(app, event, &handle);
+            }
+        };
+        for _ in 0..3 {
+            attempt(&mut app);
+        }
+        assert_eq!(said(&app), 1, "three attempts, one line");
+        assert!(app.reconnect_pending, "it keeps reconnecting");
+        super::process_irc_event(&mut app, Event::Registered { nick: "me".into() }, &handle);
+        attempt(&mut app);
+        assert_eq!(said(&app), 2, "said again after the TUI was let in");
+    }
+
+    /// At sign-in the TUI is in its status buffer, where the drop after each
+    /// verdict wrote "Disconnected: <sentence>". The sentence is said once:
+    /// three try-agains add it once, and a refusal after them once more,
+    /// with no "Disconnected:" line repeating either.
+    #[tokio::test]
+    async fn the_status_buffer_says_each_sentence_once() {
+        use freeq_sdk::event::Event;
+        let handle = idle_handle().await;
+        let mut app = crate::app::App::new("me", false);
+        assert_eq!(app.active_buffer, "status");
+        let retry = "Your identity could not be checked just now. Try again shortly.";
+        let refusal = "This sign-in token is not valid. Sign in again to continue.";
+        for _ in 0..3 {
+            super::process_irc_event(
+                &mut app,
+                Event::AuthFailedRetry {
+                    reason: retry.into(),
+                },
+                &handle,
+            );
+            super::process_irc_event(
+                &mut app,
+                Event::Disconnected {
+                    reason: retry.into(),
+                },
+                &handle,
+            );
+        }
+        super::process_irc_event(
+            &mut app,
+            Event::AuthFailed {
+                reason: refusal.into(),
+            },
+            &handle,
+        );
+        super::process_irc_event(
+            &mut app,
+            Event::Disconnected {
+                reason: refusal.into(),
+            },
+            &handle,
+        );
+        let lines: Vec<&str> = app.buffers["status"]
+            .messages
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(
+            lines.iter().filter(|l| l.contains(retry)).count(),
+            1,
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.contains(refusal)).count(),
+            1,
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.starts_with("Disconnected:")),
+            "{lines:?}"
+        );
+        // A drop with no verdict before it still says so.
+        super::process_irc_event(
+            &mut app,
+            Event::Disconnected {
+                reason: "EOF".into(),
+            },
+            &handle,
+        );
+        assert_eq!(
+            app.buffers["status"]
+                .messages
+                .back()
+                .map(|l| l.text.as_str()),
+            Some("Disconnected: EOF")
+        );
+    }
+
+    /// `--reauth` signs a TUI in again only when it signed in with a handle;
+    /// a key-file or generated-key sign-in, and a guest, get the sentence
+    /// alone.
+    #[test]
+    fn only_a_handle_sign_in_is_told_to_restart_with_reauth() {
+        assert!(super::reauth_helps(Some("alice.bsky.social"), true));
+        assert!(
+            !super::reauth_helps(None, true),
+            "a key file or a generated key"
+        );
+        assert!(!super::reauth_helps(None, false), "a guest");
+    }
+
+    /// A reconnect's socket opening is not being back: "Reconnected!" waits
+    /// for the server to let the TUI in, so attempts it refuses or defers
+    /// say nothing of the kind.
+    #[tokio::test]
+    async fn reconnected_is_said_only_once_the_server_lets_the_tui_in() {
+        use freeq_sdk::event::Event;
+        let handle = idle_handle().await;
+        let mut app = crate::app::App::new("me", false);
+        let retry = "Your identity could not be checked just now. Try again shortly.";
+        let reconnected = |app: &crate::app::App| {
+            app.buffers["status"]
+                .messages
+                .iter()
+                .filter(|l| l.text == "Reconnected!")
+                .count()
+        };
+        for _ in 0..3 {
+            // What the reconnect loop does when the socket opens.
+            app.reconnecting = true;
+            super::process_irc_event(
+                &mut app,
+                Event::AuthFailedRetry {
+                    reason: retry.into(),
+                },
+                &handle,
+            );
+            super::process_irc_event(
+                &mut app,
+                Event::Disconnected {
+                    reason: retry.into(),
+                },
+                &handle,
+            );
+        }
+        assert_eq!(reconnected(&app), 0, "the server deferred every attempt");
+        app.reconnecting = true;
+        super::process_irc_event(&mut app, Event::Registered { nick: "me".into() }, &handle);
+        assert_eq!(reconnected(&app), 1);
+        // A later registration that was no reconnect says nothing more.
+        super::process_irc_event(&mut app, Event::Registered { nick: "me".into() }, &handle);
+        assert_eq!(reconnected(&app), 1);
     }
 
     fn tags(pairs: &[(&str, &str)]) -> HashMap<String, String> {

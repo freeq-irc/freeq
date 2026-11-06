@@ -24,6 +24,7 @@ import { Command } from "commander";
 import { spawn, execSync } from "node:child_process";
 import { mkdir, open, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { SignInRefusedError } from "./bot.js";
 import { loadDelegation } from "./delegation.js";
 import { loadOrCreateIdentity } from "./identity.js";
 
@@ -55,6 +56,10 @@ export interface DaemonPaths {
 export interface DaemonHandle {
   /** Called by the scaffold on SIGINT/SIGTERM. Should shut down cleanly. */
   stop(reason: string): Promise<void>;
+  /** Settles with the reason when the daemon has stopped by itself, as a
+   *  bot does when the server refuses its key or its sign-in (`bot.stopped`).
+   *  The scaffold then exits 0, as it does on a signal. */
+  stopped?: Promise<string>;
 }
 
 /** What the launch action passes to runDaemon after preflight finishes. */
@@ -183,28 +188,45 @@ function registerLaunch<O extends DaemonOpts>(
       mode: 0o600,
     });
 
-    const handle = await opts.runDaemon(daemonOpts);
-
-    // Signal handlers: scaffold owns these so the bot doesn't have to.
-    let stopping = false;
-    const shutdown = async (sig: string): Promise<void> => {
-      if (stopping) return;
-      stopping = true;
-      console.log(`\n[${sig}] shutting down...`);
-      try {
-        await handle.stop(`signal ${sig}`);
-      } catch (err) {
-        console.error(`[${sig}] stop failed: ${(err as Error).message}`);
-      }
+    const removePid = async (): Promise<void> => {
       try {
         await unlink(opts.paths.daemonPid);
       } catch {
         // already gone
       }
+    };
+
+    // A refused sign-in is a stop on purpose, not a fault: exit 0, so a
+    // supervisor that restarts on failure leaves it down. Anything else is
+    // a fault, and goes on to exit 1 as before.
+    let handle: DaemonHandle;
+    try {
+      handle = await opts.runDaemon(daemonOpts);
+    } catch (err) {
+      await removePid();
+      if (!(err instanceof SignInRefusedError)) throw err;
+      console.log(`\n[refused] shutting down... ${err.reason}`);
+      process.exit(0);
+    }
+
+    // Signal handlers: scaffold owns these so the bot doesn't have to.
+    // A daemon that stops by itself (refused) ends the same way.
+    let stopping = false;
+    const shutdown = async (label: string, reason?: string): Promise<void> => {
+      if (stopping) return;
+      stopping = true;
+      console.log(`\n[${label}] shutting down...${reason ? ` ${reason}` : ""}`);
+      try {
+        await handle.stop(reason ?? `signal ${label}`);
+      } catch (err) {
+        console.error(`[${label}] stop failed: ${(err as Error).message}`);
+      }
+      await removePid();
       process.exit(0);
     };
     process.once("SIGINT", () => void shutdown("SIGINT"));
     process.once("SIGTERM", () => void shutdown("SIGTERM"));
+    void handle.stopped?.then((why) => shutdown("refused", why));
 
     // Block forever — shutdown is driven by signals.
     await new Promise<void>(() => {});
