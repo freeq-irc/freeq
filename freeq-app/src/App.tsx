@@ -28,6 +28,7 @@ import { OnboardingTour } from './components/OnboardingTour';
 import { BookmarksPanel } from './components/BookmarksPanel';
 import { MotdBanner } from './components/MotdBanner';
 import { CallPanel } from './components/CallPanel';
+import { loadPendingRoom } from './lib/room-link';
 
 const SIDEBAR_OPEN_KEY = 'freeq-sidebar-open';
 const MEMBERS_OPEN_KEY = 'freeq-members-open';
@@ -150,6 +151,17 @@ export default function App() {
       import('./irc/client').then(({ joinChannel }) => {
         joinChannel(ch);
         setActive(ch);
+      });
+    }
+    // An instant-room invite (`/r/<name>#<token>`, parked by main.tsx): the
+    // token is the JOIN key. It is cleared on channelJoined, so a refused
+    // join (a guest's 477) keeps it for the sign-in that follows.
+    const room = loadPendingRoom();
+    if (room) {
+      import('./irc/client').then(({ joinChannel }) => {
+        useStore.getState().setRoomState(room.channel, { isRoom: true, inviteToken: room.token });
+        joinChannel(room.channel, room.token ?? undefined);
+        setActive(room.channel);
       });
     }
   }, [registered, setActive]);

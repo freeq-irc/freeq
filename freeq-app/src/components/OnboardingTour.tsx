@@ -1,7 +1,25 @@
 import { useState, useEffect } from 'react';
 import { useStore } from '../store';
+import { isRoomGuest } from '../irc/client';
 
 const LS_KEY = 'freeq-onboarding-done';
+/** Its own key: a guest who later signs in still gets the regular tour once. */
+const LS_GUEST_KEY = 'freeq-onboarding-room-guest-done';
+
+/** For someone who joined a room from its link with no account: they have an
+ *  identity (this browser's did:key), just not a Bluesky one. */
+const GUEST_STEPS = [
+  {
+    title: "You're in 🔒",
+    body: "This room is end-to-end encrypted. You joined as a guest — no account needed: your browser made its own key, so what you say here is signed and provably yours.",
+    icon: '🔑',
+  },
+  {
+    title: 'Keep it, or sign in',
+    body: "Your guest key lives in this browser — come back here and you're still you. To use your Bluesky identity instead, choose “Sign in as yourself” at the top: you keep the room, and what you said as a guest gets a verified link to your account.",
+    icon: '🦋',
+  },
+];
 
 const STEPS = [
   {
@@ -35,23 +53,31 @@ export function OnboardingTour() {
   const registered = useStore((s) => s.registered);
   const [step, setStep] = useState(0);
   const [show, setShow] = useState(false);
+  const [guest, setGuest] = useState(false);
 
   useEffect(() => {
-    if (registered && !localStorage.getItem(LS_KEY)) {
+    if (!registered) return;
+    const asGuest = isRoomGuest();
+    if (!localStorage.getItem(asGuest ? LS_GUEST_KEY : LS_KEY)) {
       // Delay slightly so user sees the app first
-      const t = setTimeout(() => setShow(true), 1500);
+      const t = setTimeout(() => {
+        setGuest(asGuest);
+        setStep(0);
+        setShow(true);
+      }, 1500);
       return () => clearTimeout(t);
     }
   }, [registered]);
 
   if (!show) return null;
 
-  const current = STEPS[step];
-  const isLast = step === STEPS.length - 1;
+  const steps = guest ? GUEST_STEPS : STEPS;
+  const current = steps[step];
+  const isLast = step === steps.length - 1;
 
   const finish = () => {
     setShow(false);
-    localStorage.setItem(LS_KEY, '1');
+    localStorage.setItem(guest ? LS_GUEST_KEY : LS_KEY, '1');
   };
 
   return (
@@ -59,7 +85,7 @@ export function OnboardingTour() {
       <div className="bg-bg-secondary border border-border rounded-2xl shadow-2xl w-[420px] max-w-[92vw] overflow-hidden animate-fadeIn">
         {/* Progress dots */}
         <div className="flex justify-center gap-1.5 pt-5">
-          {STEPS.map((_, i) => (
+          {steps.map((_, i) => (
             <div key={i} className={`w-2 h-2 rounded-full transition-colors ${
               i === step ? 'bg-accent' : i < step ? 'bg-accent/40' : 'bg-border'
             }`} />

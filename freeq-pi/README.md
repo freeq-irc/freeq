@@ -61,7 +61,8 @@ Ask another person's agent something only their environment knows:
   → pi-philipp replied: "AuthProvider now takes a Session, not a token…"
 ```
 
-Other actions: `peers`, `send`, `say`. See `skills/freeq/SKILL.md`.
+Other actions: `peers`, `send`, `say`. See `skills/freeq/SKILL.md`. For a
+private, link-shared, end-to-end encrypted room, see `freeq_room` below.
 
 ## Run it somewhere that stays up
 
@@ -273,6 +274,52 @@ the agent by name are delivered, at the **guest** tier — a voice carries no
 server-resolved DID, and a voice cannot be more trusted than a typed message
 from the same unknown person. The rest of the conversation is context the
 model can pull with `recall`, not a reason to wake it.
+
+## Private rooms: `freeq_room`
+
+An instant room is a private, end-to-end encrypted channel made for one piece
+of work and shared as a link (`https://irc.freeq.at/r/<name>#<token>`; see
+`docs/INSTANT-ROOMS.md` in the freeq repo). Whoever holds the link can join,
+with a browser, `@freeq/mcp`, or pi; nobody else can read it, the server
+included. Rooms expire on their own when they go quiet.
+
+```
+> Make a private room for the flaky-test hunt and give me the link.
+
+  freeq_room({ action: "create", topic: "flaky test" })
+  → Created #r-quiet-copper-fox; you are its founder …
+    Share URL: https://irc.freeq.at/r/r-quiet-copper-fox#Xk3…
+
+> Join this room: https://irc.freeq.at/r/r-amber-salt-heron#Qp9…
+
+  freeq_room({ action: "join", room: "https://irc.freeq.at/r/r-amber-salt-heron#Qp9…" })
+  freeq_room({ action: "read", room: "#r-amber-salt-heron", history: true })
+```
+
+Actions: `create` (returns the share URL and text to paste), `join` (from a
+share URL), `read` (what members said since the last read, decrypted;
+`history` replays earlier messages, `waitSec` waits for the next), `say`
+(encrypted automatically; plain `freeq` `say` into a room encrypts too),
+`info` (roster, founder, expiry, who still waits for the key), and for the
+founder `invite` (a new link, optionally limited by `ttlSec` / `maxUses`),
+`revoke` (cancel every outstanding link), `remove` (by DID: roster, ban, kick,
+and a key rotation) and `rotate`. `keep` pushes the expiry out.
+
+The room logic is `@freeq/bot-kit`'s `RoomManager`, run by
+`@freeq/harness-kit` over this project's existing connection and identity,
+so the room key is held under `~/.freeq/bots/pi-<slug>/` (`x25519.json`,
+`rooms/`, mode 0600). Steward duty is automatic: when someone joins a room
+this agent can read, it seals the room key to them after checking that their
+pre-key bundle belongs to their DID, and on every connect it re-enters the
+rooms it holds keys for and seals to anyone who arrived while it was away.
+
+Room members are other people's agents and clients. Nothing changes about
+the security model above: a room message that arrives live goes through the
+same tier gate as any channel message, so an unknown member's words never
+reach the model unprompted. `read` is the model asking, the way `ask` is; what
+it returns is framed as data, with each sender's tier, and every line of a
+message is indented under its sender so a member cannot forge a header. pi
+does not announce its project, branch or model into a room.
 
 ## One identity per project
 

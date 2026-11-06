@@ -15,6 +15,7 @@
 import { openDB, type IDBPDatabase } from 'idb';
 import * as ratchet from './ratchet.js';
 import * as x3dh from './x3dh.js';
+import type { X25519Secret } from './e2ee_group.js';
 import { log } from "./log.js";
 
 // ── Constants ──
@@ -62,6 +63,14 @@ let publishOrigin: string | null = null;
 let bundlePublished = false;
 const sessions = new Map<string, RatchetSession>();
 let initialized = false;
+/** The DID an `initialize` in progress (or done) is for. */
+let initializingDid: string | null = null;
+/** The identity's own key was supplied (a did:key guest): it signs the bundle,
+ *  and a device key does not replace it. */
+let ownSigner = false;
+/** A signed-in account's device key, which signs the bundle in place of a
+ *  random key; see `useBundleSigningKey`. */
+let deviceSigner: { did: string; pair: CryptoKeyPair } | null = null;
 
 // Channel passphrase keys
 const channelKeys = new Map<string, Uint8Array>();
@@ -129,8 +138,19 @@ export async function getSafetyNumber(remoteDid: string): Promise<string | null>
   return digits.join(' ');
 }
 
-/** Initialize E2EE for an authenticated user. */
-export async function initialize(did: string, serverOrigin: string): Promise<void> {
+/** Initialize E2EE for an authenticated user.
+ *
+ *  `signingKey`: the identity's own Ed25519 key, when this client holds it
+ *  (a browser that minted a did:key). The pre-key bundle is then signed with
+ *  it, which is what lets a peer bind the bundle to a did:key; without it,
+ *  instant-room members refuse to seal a room key to that DID. */
+export async function initialize(
+  did: string,
+  serverOrigin: string,
+  opts: { signingKey?: CryptoKeyPair } = {},
+): Promise<void> {
+  initializingDid = did;
+  ownSigner = !!opts.signingKey;
   if (typeof indexedDB === 'undefined') {
     // Node / non-browser runtimes don't have IndexedDB. E2EE is browser-only
     // (DM key store, session state). Bail silently — bots and headless agents
@@ -195,6 +215,9 @@ export async function initialize(did: string, serverOrigin: string): Promise<voi
     await db.put('identity', toStore, did);
   }
 
+  const signer = opts.signingKey ?? (deviceSigner?.did === did ? deviceSigner.pair : undefined);
+  if (signer) await adoptSigningKey(identityKeys, signer);
+
   const allSessions: RatchetSession[] = await db.getAll('sessions');
   for (const s of allSessions) sessions.set(s.remoteDid, s);
 
@@ -209,8 +232,39 @@ export async function initialize(did: string, serverOrigin: string): Promise<voi
   initialized = true;
 }
 
+/** Sign the signed pre-key with `pair` and make it the bundle's signing key.
+ *  Not persisted: the caller supplies it on every initialize. */
+async function adoptSigningKey(keys: IdentityKeys, pair: CryptoKeyPair): Promise<void> {
+  const pub = new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey));
+  const sig = new Uint8Array(await crypto.subtle.sign('Ed25519', pair.privateKey, keys.spkPublic as BufferSource));
+  keys.signingKey = pair;
+  keys.signingPublic = pub;
+  keys.spkSignature = sig;
+}
+
+/**
+ * Sign the pre-key bundle of `did` with this device's key — the Ed25519 key
+ * the account publishes as an `at.freeq.deviceKey` record in its own PDS —
+ * and publish it again if it is already out. That record is what lets a room
+ * member bind a did:plc bundle to the DID without taking the freeq host's
+ * word for it. The client learns the device key once SASL succeeds, which
+ * may be before or after `initialize`; either order ends with a bundle signed
+ * by it. A key for another DID than the one initialized is kept for that DID
+ * only, and an identity that supplied its own key (a did:key) keeps it.
+ * Not persisted.
+ */
+export async function useBundleSigningKey(did: string, pair: CryptoKeyPair): Promise<void> {
+  deviceSigner = { did, pair };
+  if (!identityKeys || initializingDid !== did || ownSigner) return;
+  await adoptSigningKey(identityKeys, pair);
+  if (initialized && publishOrigin && ownDid === did) await publishPreKeyBundle(publishOrigin);
+}
+
 /** Shut down E2EE and clear state. */
 export function shutdown(): void {
+  initializingDid = null;
+  ownSigner = false;
+  deviceSigner = null;
   initialized = false;
   identityKeys = null;
   ownDid = null;
@@ -398,6 +452,17 @@ export async function decryptChannel(channel: string, wire: string): Promise<str
     }
     return null;
   }
+}
+
+/**
+ * The X25519 identity pair this browser publishes as `identity_key` in its
+ * pre-key bundle, in the raw form `e2ee_group.openSealed` accepts — so the
+ * web app can open a group key a room steward sealed to it. `null` until
+ * `initialize` has run (Node, or before login).
+ */
+export function getIdentityX25519Secret(): X25519Secret | null {
+  if (!identityKeys) return null;
+  return { secret: identityKeys.secretKey, publicKey: identityKeys.publicKey };
 }
 
 /** Fetch a pre-key bundle for a remote user. */

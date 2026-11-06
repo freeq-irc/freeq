@@ -26,6 +26,10 @@
 // Main client
 export { FreeqClient } from './client.js';
 
+// App-owned per-channel encryption (instant rooms). Install with
+// `client.setChannelCipher(channel, makeGroupCipher(() => states))`.
+export type { ChannelCipher } from './channel-cipher.js';
+
 // Event types
 export type { FreeqEvents } from './events.js';
 
@@ -151,6 +155,16 @@ export type {
   RecordReader,
 } from './key-lookup.js';
 
+// Whether a pre-key bundle belongs to its DID: a did:key's own key, or a
+// device key the account published in its own PDS (never the freeq host's word).
+export {
+  verifyBundleBinding,
+  PdsDeviceKeys,
+  DEVICE_KEYS_TTL_MS,
+  DEVICE_KEYS_RELIST_MS,
+} from './bundle-binding.js';
+export type { BindingResult, BindableBundle, DeviceKeySource } from './bundle-binding.js';
+
 // A device's own signing key, kept across connects
 export {
   MemoryDeviceKeyStore,
@@ -170,8 +184,12 @@ export {
   createGroup, rotate, encryptGroup, decryptGroup,
   sealFor, openSealed, sealedToWire, sealedFromWire,
   sealBatch, openBest, isGroupEncrypted, parseEpoch,
+  makeGroupCipher,
 } from './e2ee_group.js';
 export type { GroupState, SealedGroupKey, X25519Secret } from './e2ee_group.js';
+// The browser e2ee identity's X25519 pair, in `openSealed` form (null in
+// Node or before login). The rest of the e2ee module stays on `@freeq/sdk/e2ee`.
+export { getIdentityX25519Secret } from './e2ee.js';
 
 // What a client can honestly say about who someone is — one rule, shared
 // byte-for-byte with the Rust SDK via spec/identity-claims.json.
@@ -194,3 +212,5 @@ export type {
 // neither knows a verb — which verbs a kind allows is `spec/act-transitions.json`'s
 // business. Send them with `FreeqClient.sendAct`.
 export { actTags, actLine, msgidTimestampMs } from './signing.js';
+// The key id a signature names: the first 16 bytes of the key's SHA-256, base64url.
+export { deriveKid } from './signing.js';

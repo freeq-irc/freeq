@@ -6,7 +6,7 @@
  * caller keeps working. Nothing here throws into pi's event loop.
  */
 
-import { FreeqBot, matchMention } from "@freeq/bot-kit";
+import { FreeqBot, matchMention, type RoomLink } from "@freeq/bot-kit";
 import type {
   ActEventPayload,
   CoordinationEventPayload,
@@ -32,6 +32,15 @@ import {
   PI_HELLO_ACK,
 } from "./discovery.js";
 import { scrubOutbound } from "./scrub.js";
+import {
+  defaultRoomsFactory,
+  httpOriginFor,
+  RoomBuffer,
+  roomLineOf,
+  type RoomLine,
+  type RoomsFactory,
+  type RoomsLike,
+} from "./rooms.js";
 import { PI_NAMES, type HarnessNames } from "./names.js";
 import { firstSignedCertificateWarning, signedCertificateLine } from "./owner-key.js";
 import {
@@ -56,6 +65,8 @@ export type ConnState = "offline" | "connecting" | "online" | "error";
  */
 export interface BotLike {
   on(event: string, handler: (...args: never[]) => void): unknown;
+  /** Remove a handler; bot-kit has it, a fake may not (history then skips). */
+  off?(event: string, handler: (...args: never[]) => void): unknown;
   start(): Promise<unknown>;
   stop(reason?: string): Promise<unknown>;
   setState(state: string, status?: string, task?: string): void;
@@ -74,6 +85,8 @@ export interface BotLike {
       opts?: { humanText?: string; taskId?: string },
     ): Promise<string>;
     readonly signing: { getPublicKey(): string | null };
+    /** CHATHISTORY; answered by a `historyBatch` event. Used by room reads. */
+    requestHistory?(opts: { target: string; mode: "latest"; count?: number }): void;
   };
   /** The server's latest answer to PROVENANCE, from bot-kit. */
   readonly provenance: { verified: boolean; reason: string; text: string } | null;
@@ -152,6 +165,11 @@ export interface ConnectionOptions {
   onMessage?: (channel: string, msg: Message) => void;
   /** Override how the bot is created. Tests inject a fake; production omits it. */
   botFactory?: BotFactory;
+  /**
+   * How the bot's room manager is built (docs/INSTANT-ROOMS.md). Default:
+   * bot-kit's `RoomManager` over the bot. Tests inject a fake.
+   */
+  roomsFactory?: RoomsFactory;
   /** How long to wait for the session signing key. Shortened in tests. */
   signingKeyTimeoutMs?: number;
   /**
@@ -233,6 +251,16 @@ export class FreeqConnection {
   #asks = new AskRegistry((reason) => this.#opts.onNotice?.(`freeq ask: ${reason}`, "warning"));
   /** Coordination handlers still running; what `settled()` waits on. */
   readonly #inFlight = new Set<Promise<unknown>>();
+  /** bot-kit's room manager for this bot, when it has one. */
+  #rooms: RoomsLike | undefined;
+  /**
+   * Channels known to be instant rooms (lowercase): created or joined here,
+   * or held keys for. Wanted for good, and never announced into — a hello
+   * carries project metadata, and a room's members are whoever has its link.
+   */
+  readonly #roomChannels = new Set<string>();
+  /** Decrypted room messages the model has not read yet. */
+  readonly #roomBuffer = new RoomBuffer();
 
   constructor(opts: ConnectionOptions) {
     // The configured list is the initial intent; join()/leave() keep it live.
@@ -337,6 +365,7 @@ export class FreeqConnection {
         logProvenance: false,
       });
       this.#bot = bot;
+      this.#rooms = this.#buildRooms(bot);
       // Signed certificates will stop counting in a later release. Said once per
       // process: a retry or `authorize verify` builds a new bot and a new
       // connection, and `#notice`'s set belongs to this one.
@@ -359,6 +388,9 @@ export class FreeqConnection {
 
       bot.on("message", (channel: string, msg: Message) => {
         if (msg.isSelf) return;
+        // Kept for the room tool's `read`, as well as handed on below: a room
+        // message still goes through the host's inbound gate like any other.
+        if (this.isRoom(channel)) this.#roomBuffer.push(channel, roomLineOf(msg));
         try {
           this.#opts.onMessage?.(channel, msg);
         } catch (err) {
@@ -412,7 +444,7 @@ export class FreeqConnection {
           return;
         }
         this.#refused.delete(channel.toLowerCase());
-        this.#announce(channel, PI_HELLO);
+        if (!this.isRoom(channel)) this.#announce(channel, PI_HELLO);
       });
 
       bot.on("channelLeft", (channel: string) => {
@@ -455,6 +487,9 @@ export class FreeqConnection {
           this.#joined.clear();
           this.#channelsChanged();
           this.#scheduleRejoin();
+          // Rooms rejoin with the rest (they are wanted); stewarding is a
+          // REST pass, owed to anyone who arrived while we were away.
+          this.#enterRooms(false);
         } else if (s === "connecting") {
           if (this.#state === "online") this.#state = "connecting";
         } else if (s === "disconnected" && !this.#stopped) {
@@ -483,6 +518,9 @@ export class FreeqConnection {
       await bot.start();
       this.#goOnline();
       this.#retry = RECONNECT_INITIAL_MS;
+      // bot-kit joins the configured channels; rooms we hold keys for are
+      // ours to re-enter.
+      this.#enterRooms(true);
     } catch (err) {
       // Only the INITIAL connect is retried here. Once a bot exists, the
       // transport owns reconnection (see connectionStateChanged above).
@@ -679,8 +717,9 @@ export class FreeqConnection {
       seen: Date.now(),
     });
 
-    // Answer a hello so the newcomer learns about us; never ack an ack.
-    if (e.eventType === PI_HELLO && e.channel.startsWith("#")) {
+    // Answer a hello so the newcomer learns about us; never ack an ack, and
+    // never into a room (see #roomChannels).
+    if (e.eventType === PI_HELLO && e.channel.startsWith("#") && !this.isRoom(e.channel)) {
       this.#announce(e.channel, PI_HELLO_ACK);
     }
   }
@@ -810,6 +849,8 @@ export class FreeqConnection {
   setWantedChannels(channels: string[]): void {
     this.#wanted.clear();
     for (const c of channels) if (c.trim()) this.#wanted.add(c.trim().toLowerCase());
+    // Rooms are not configured channels; changing those must not drop them.
+    for (const c of this.#roomChannels) this.#wanted.add(c);
   }
 
   /** Channels the server has CONFIRMED we are in, not the ones we asked for. */
@@ -858,6 +899,9 @@ export class FreeqConnection {
 
   send(target: string, text: string): boolean {
     if (!this.#bot || this.#state !== "online") return false;
+    // A room we hold no key for cannot be written to: the SDK would drop the
+    // send rather than leak plaintext, and report nothing to us.
+    if (this.isRoom(target) && !this.hasRoomKey(target)) return false;
     this.#bot.client.sendMessage(target, this.#clean(text, target));
     return true;
   }
@@ -890,6 +934,193 @@ export class FreeqConnection {
       this.#asks.deliver({ req, err: `send failed: ${(err as Error).message}` }, to);
     }
     return promise;
+  }
+
+  // ── Instant rooms ─────────────────────────────────────────────────────
+
+  /** The room manager, when this bot has one (a did:key bot with a state dir). */
+  get rooms(): RoomsLike | undefined {
+    return this.#rooms;
+  }
+
+  /** A room we know of: created or joined here, or holding its key. */
+  isRoom(channel: string): boolean {
+    const ch = channel.toLowerCase();
+    return this.#roomChannels.has(ch) || !!this.#rooms?.isRoom(ch);
+  }
+
+  /** Do we hold a key for this room, i.e. can we read and write it? */
+  hasRoomKey(channel: string): boolean {
+    return !!this.#rooms?.isRoom(channel.toLowerCase());
+  }
+
+  /** Has the server confirmed we are in this channel? */
+  inChannel(channel: string): boolean {
+    return this.#joined.has(channel.toLowerCase());
+  }
+
+  /** Mint a room and enter it as its founder. Throws when rooms are unavailable. */
+  async createRoom(opts: { topic?: string } = {}): Promise<{
+    channel: string;
+    invite: string;
+    url: string;
+    expiresAt: number;
+  }> {
+    const rooms = this.#requireRooms();
+    const made = await rooms.create({
+      topic: opts.topic === undefined ? undefined : this.#clean(opts.topic, "a new room"),
+      // Wanted before the JOIN goes out, or the unexpected-channel guard
+      // would part the room the moment the server confirmed it.
+      beforeJoin: (channel) => this.#noteRoom(channel),
+    });
+    this.#noteRoom(made.channel);
+    return made;
+  }
+
+  /** Enter a room from a link. `ready: false` means no key is sealed to us yet. */
+  async joinRoom(link: RoomLink): Promise<{ channel: string; ready: boolean }> {
+    const rooms = this.#requireRooms();
+    const ch = link.channel.toLowerCase();
+    const known = this.isRoom(ch);
+    this.#noteRoom(ch);
+    this.#refused.delete(ch);
+    try {
+      return await rooms.join(link);
+    } catch (err) {
+      if (!known && !rooms.isRoom(ch)) {
+        this.#roomChannels.delete(ch);
+        this.#wanted.delete(ch);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Seal the room key to members who lack it, if we hold it. Never throws:
+   * stewarding is a courtesy to others and must not break the caller's own
+   * read. Returns who was sealed to; members we would not seal to are
+   * reported as notices.
+   */
+  async stewardRoom(channel: string): Promise<string[]> {
+    const ch = channel.toLowerCase();
+    const rooms = this.#rooms;
+    if (!rooms || !rooms.isRoom(ch)) return [];
+    try {
+      const pass = await rooms.stewardPass(ch);
+      for (const s of pass.skipped) {
+        this.#notice(`freeq: ${ch}: not sealing the room key to ${s.did} — ${s.reason}`, "warning");
+      }
+      return pass.sealed;
+    } catch (err) {
+      this.#notice(`freeq: steward pass for ${ch} failed — ${(err as Error).message}`, "warning");
+      return [];
+    }
+  }
+
+  /** Room messages that arrived since the last call, newest `limit`. */
+  takeRoomMessages(channel: string, limit = 50): RoomLine[] {
+    return this.#roomBuffer.take(channel, limit);
+  }
+
+  /** Wait (bounded) for a room message to arrive. */
+  waitForRoomMessage(channel: string, ms: number): Promise<boolean> {
+    return this.#roomBuffer.wait(channel, ms);
+  }
+
+  /**
+   * The latest stored messages of a room, over CHATHISTORY; the SDK decrypts
+   * them on the way in. Empty when the bot cannot ask or nothing answers in
+   * time.
+   */
+  roomHistory(channel: string, count: number, timeoutMs = 5_000): Promise<RoomLine[]> {
+    const bot = this.#bot;
+    const ch = channel.toLowerCase();
+    if (!bot?.client.requestHistory || !bot.off) return Promise.resolve([]);
+    return new Promise((resolve) => {
+      const handler = (target: string, messages: Message[]): void => {
+        if (target.toLowerCase() !== ch) return;
+        done(messages.map(roomLineOf));
+      };
+      const done = (rows: RoomLine[]): void => {
+        clearTimeout(timer);
+        bot.off?.("historyBatch", handler as (...a: never[]) => void);
+        resolve(rows);
+      };
+      const timer = setTimeout(() => done([]), timeoutMs);
+      timer.unref?.();
+      bot.on("historyBatch", handler as (...a: never[]) => void);
+      try {
+        bot.client.requestHistory!({ target: ch, mode: "latest", count });
+      } catch {
+        done([]);
+      }
+    });
+  }
+
+  #requireRooms(): RoomsLike {
+    if (!this.#bot || this.#state !== "online") throw new Error("freeq is offline");
+    if (!this.#rooms) {
+      throw new Error("rooms are unavailable: this connection has no did:key identity to hold room keys with");
+    }
+    return this.#rooms;
+  }
+
+  #noteRoom(channel: string): void {
+    const ch = channel.toLowerCase();
+    this.#roomChannels.add(ch);
+    this.#wanted.add(ch);
+  }
+
+  #buildRooms(bot: BotLike): RoomsLike | undefined {
+    try {
+      const make = this.#opts.roomsFactory ?? defaultRoomsFactory;
+      const rooms = make(bot, {
+        origin: httpOriginFor(this.#opts.server),
+        log: (m) => this.#notice(`freeq: ${m.replace(/^\[rooms\]\s*/, "")}`, "warning"),
+      });
+      for (const ch of rooms?.channels() ?? []) this.#noteRoom(ch);
+      return rooms;
+    } catch (err) {
+      this.#notice(`freeq: rooms unavailable — ${(err as Error).message}`, "warning", "rooms");
+      return undefined;
+    }
+  }
+
+  /**
+   * Re-enter the rooms we hold keys for, publish our pre-key so a steward can
+   * seal to us, and steward each room. bot-kit's steward only fires on a JOIN
+   * it witnesses, so a member who arrived while we were away is sealed to
+   * here. `join` is false after a reconnect, where the rejoin sweep owns
+   * JOINs. Fire and forget; nothing here throws.
+   */
+  #enterRooms(join: boolean): void {
+    const rooms = this.#rooms;
+    if (!rooms) return;
+    const held = rooms.channels();
+    if (join) {
+      for (const ch of held) {
+        if (this.#joined.has(ch)) continue;
+        try {
+          this.#bot?.client.join(ch);
+        } catch {
+          /* the socket went; the reconnect sweep rejoins */
+        }
+      }
+    }
+    this.#track(
+      (async () => {
+        try {
+          await rooms.ensurePreKeyPublished();
+        } catch (err) {
+          this.#notice(
+            `freeq: could not publish this agent's room pre-key (${(err as Error).message}) — members cannot seal room keys to it until it is`,
+            "warning",
+            "prekey",
+          );
+        }
+        for (const ch of held) await this.stewardRoom(ch);
+      })(),
+    );
   }
 
   /** Answer an inbound ask. Safe to call once per ask. */

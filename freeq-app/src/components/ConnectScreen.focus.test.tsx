@@ -10,6 +10,8 @@ import { render, cleanup, fireEvent, screen } from '@testing-library/react';
 vi.mock('../irc/client', () => ({
   connect: () => {},
   setSaslCredentials: () => {},
+  connectAsRoomGuest: () => {},
+  savedRoomGuestSession: () => null,
 }));
 
 beforeEach(() => {
