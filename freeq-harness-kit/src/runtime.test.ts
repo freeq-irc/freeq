@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentRuntime, httpOriginFor, type RuntimeOptions } from "./runtime.js";
+import { HandoffStore } from "./handoff.js";
 import { SignInRefusedError } from "@freeq/bot-kit";
 import type { BotLike } from "./connection.js";
 import type { Delivery, Harness, NoticeLevel } from "./harness.js";
@@ -145,6 +146,26 @@ describe("AgentRuntime: config", () => {
     await expect(rt.ensureConfig()).rejects.toThrow(/cannot read config/);
     writeConfig(h.agentDir);
     await expect(rt.ensureConfig()).resolves.toMatchObject({ ownerDid: OWNER });
+  });
+});
+
+describe("AgentRuntime: handoff store and offer queue", () => {
+  it("shares one load of the handoff store between two first calls at once", async () => {
+    // The session start and the resume that runs when it comes online: with
+    // a load each, the last to finish replaced the other's copy.
+    const h = fakeHarness();
+    const rt = new AgentRuntime(h.harness);
+    const [a, b] = await Promise.all([rt.ensureHandoffs(), rt.ensureHandoffs()]);
+    expect(a).toBe(b);
+    expect(rt.handoffs).toBe(a);
+  });
+
+  it("shares one load of the offer queue between two first calls at once", async () => {
+    const h = fakeHarness();
+    const rt = new AgentRuntime(h.harness);
+    const [a, b] = await Promise.all([rt.ensureOffers(), rt.ensureOffers()]);
+    expect(a).toBe(b);
+    expect(rt.offers).toBe(a);
   });
 });
 
@@ -397,6 +418,44 @@ describe("AgentRuntime: handoffs", () => {
     for (let i = 0; i < 50 && rt.handoffs?.get("01JC")?.state !== "expired"; i++) await tick();
     expect(rt.handoffs?.get("01JC")?.state).toBe("expired");
     expect(fetched.filter((u) => u.includes("/api/v1/signing-keys/")), "no key fetched by the kit").toEqual([]);
+  });
+
+  it("keeps a task event applied while the online resume is still loading the store", async () => {
+    // The start and the online resume both make a first call for the store.
+    // With a load each, holding the second until the offer is applied made
+    // that load land last and replace the copy holding the task.
+    const load = HandoffStore.prototype.load;
+    let calls = 0;
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const spy = vi.spyOn(HandoffStore.prototype, "load").mockImplementation(async function (this: HandoffStore) {
+      const n = calls++;
+      await load.call(this);
+      if (n === 1) await held;
+    });
+    try {
+      const { bot, rt } = await started({ trust: { "did:plc:boss": "handoff" } });
+      bot.emit("actEvent", act("offer", "01JC", {}, { "act-to": "did:plc:other", "act-title": "t", "act-home": "did:web:referee.test" }));
+      await tick();
+      release();
+      await tick();
+      bot.emit("actEvent", act("expire", "01JC", { did: "did:web:referee.test", from: "referee.test", eventId: "01JC-expire", ruling: "counts" }));
+      for (let i = 0; i < 50 && rt.handoffs?.get("01JC")?.state !== "expired"; i++) await tick();
+      expect(rt.handoffs?.get("01JC")?.state).toBe("expired");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("loads the store once when the start and the online resume both ask for it", async () => {
+    const spy = vi.spyOn(HandoffStore.prototype, "load");
+    try {
+      await started();
+      await tick();
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("queues a trusted offer while busy", async () => {

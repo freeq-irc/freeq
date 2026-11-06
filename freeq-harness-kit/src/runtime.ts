@@ -418,16 +418,43 @@ export class AgentRuntime {
 
   // ── stores ──────────────────────────────────────────────────────────────
 
+  /** The first handoff store load while it runs, shared by every call that
+   *  comes before it ends. */
+  #handoffsLoad?: Promise<HandoffStore>;
+
   async ensureHandoffs(): Promise<HandoffStore> {
     if (this.handoffs) return this.handoffs;
+    // Two first calls at once (the session start and the resume that runs
+    // when it comes online) share one load. With a load each, the one that
+    // finished last replaced `handoffs`, and a task event the other call had
+    // applied to its copy was lost.
+    this.#handoffsLoad ??= this.#loadHandoffs().finally(() => {
+      this.#handoffsLoad = undefined;
+    });
+    return this.#handoffsLoad;
+  }
+
+  async #loadHandoffs(): Promise<HandoffStore> {
     const store = new HandoffStore(HandoffStore.pathFor(this.agentDir));
     await store.load();
     this.handoffs = store;
     return store;
   }
 
+  /** The first offer queue load while it runs, shared by every call that
+   *  comes before it ends. */
+  #offersLoad?: Promise<OfferQueue>;
+
   async ensureOffers(): Promise<OfferQueue> {
     if (this.offers) return this.offers;
+    // Shared for the same reason as the handoff store's load.
+    this.#offersLoad ??= this.#loadOffers().finally(() => {
+      this.#offersLoad = undefined;
+    });
+    return this.#offersLoad;
+  }
+
+  async #loadOffers(): Promise<OfferQueue> {
     const q = new OfferQueue(OfferQueue.pathFor(this.agentDir));
     await q.load();
     this.offers = q;
