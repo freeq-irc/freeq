@@ -1596,8 +1596,12 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                 app.status_msg(&format!("Disconnected: {reason}"));
             }
             // Don't quit — reconnection is handled by the main loop, unless
-            // the device was signed out.
-            app.reconnect_pending = !app.signed_out;
+            // the device was signed out. Only ever set here: a /reconnect
+            // already scheduled is not cancelled by the old connection's
+            // own drop arriving after it.
+            if !app.signed_out {
+                app.reconnect_pending = true;
+            }
         }
         // The TUI prints WHOIS lines as they arrive and has nothing waiting on
         // the answer being complete, so the end of one is not news here.
@@ -2927,6 +2931,10 @@ async fn process_input(app: &mut App, handle: &client::ClientHandle, input: &str
             }
             "/reconnect" => {
                 app.status_msg("Forcing reconnect...");
+                // Close the connection this handle has, as the web's reconnect
+                // does, or it stays open beside the new one. An error means it
+                // has already gone and there is nothing to close.
+                let _ = handle.quit(Some("Reconnecting")).await;
                 // Now, without resetting the wait the next attempts take.
                 app.reconnect_pending = true;
                 app.reconnect_at = Some(std::time::Instant::now());
@@ -4006,6 +4014,127 @@ mod tests {
         // A later registration that was no reconnect says nothing more.
         super::process_irc_event(&mut app, Event::Registered { nick: "me".into() }, &handle);
         assert_eq!(reconnected(&app), 1);
+    }
+
+    /// A handle on a loopback socket the test has accepted and holds, with
+    /// the handle's events. Nothing is sent to it, so the connection stays
+    /// unregistered.
+    async fn unregistered_handle() -> (
+        freeq_sdk::client::ClientHandle,
+        tokio::sync::mpsc::Receiver<freeq_sdk::event::Event>,
+        tokio::net::TcpStream,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_end, _) = listener.accept().await.unwrap();
+        let (handle, events) = freeq_sdk::client::connect_with_stream(
+            freeq_sdk::client::EstablishedConnection::Plain(stream),
+            freeq_sdk::client::ConnectConfig::default(),
+            None,
+        );
+        (handle, events, server_end)
+    }
+
+    /// What /reconnect asks for: a reconnect, due now.
+    fn reconnect_due_now(app: &crate::app::App) -> bool {
+        app.reconnect_pending
+            && app
+                .reconnect_at
+                .is_some_and(|at| at <= std::time::Instant::now())
+    }
+
+    /// /reconnect closes the connection it has: QUIT goes out on it, here
+    /// before the server has let it in, and the reconnect is due at once.
+    #[tokio::test]
+    async fn reconnect_quits_the_live_connection_and_reconnects_at_once() {
+        use tokio::io::AsyncReadExt;
+        let (handle, _events, mut server_end) = unregistered_handle().await;
+        let mut app = crate::app::App::new("me", false);
+        super::process_input(&mut app, &handle, "/reconnect")
+            .await
+            .unwrap();
+        assert!(reconnect_due_now(&app));
+        assert!(!app.should_quit);
+        // A quit before registration ends the connection, so the socket reads
+        // to its end: what the SDK wrote on connecting, then the QUIT.
+        let mut got = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server_end.read_to_string(&mut got),
+        )
+        .await
+        .expect("the connection ends")
+        .unwrap();
+        assert_eq!(
+            got.lines().collect::<Vec<_>>(),
+            vec![
+                "CAP LS 302",
+                "NICK user",
+                "USER user 0 * :IRC AT SDK User",
+                "QUIT :Reconnecting",
+            ]
+        );
+    }
+
+    /// On a connection that has already gone, /reconnect has nothing to
+    /// close: it does not end the TUI, and it reconnects.
+    #[tokio::test]
+    async fn reconnect_on_a_gone_connection_keeps_the_tui_and_reconnects() {
+        let (handle, mut events, server_end) = unregistered_handle().await;
+        drop(server_end);
+        // The connection reads its end and stops; its events close with it.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while events.recv().await.is_some() {}
+        })
+        .await
+        .expect("the connection ends");
+        assert!(handle.quit(None).await.is_err(), "the handle is dead");
+        let mut app = crate::app::App::new("me", false);
+        super::process_input(&mut app, &handle, "/reconnect")
+            .await
+            .unwrap();
+        assert!(reconnect_due_now(&app));
+        assert!(!app.should_quit);
+    }
+
+    /// A device the server signed out stays down after a drop, but
+    /// /reconnect is the user asking: it reconnects.
+    #[tokio::test]
+    async fn reconnect_reconnects_a_signed_out_device() {
+        let handle = idle_handle().await;
+        let mut app = crate::app::App::new("me", false);
+        app.signed_out = true;
+        super::process_input(&mut app, &handle, "/reconnect")
+            .await
+            .unwrap();
+        assert!(reconnect_due_now(&app));
+    }
+
+    /// The old connection's own drop can reach the TUI after /reconnect: its
+    /// events are replaced only once the new socket opens, and kept when that
+    /// fails. On a signed-out device the drop neither cancels the reconnect
+    /// nor moves it.
+    #[tokio::test]
+    async fn the_old_connections_drop_does_not_cancel_reconnect_on_a_signed_out_device() {
+        use freeq_sdk::event::Event;
+        let handle = idle_handle().await;
+        let mut app = crate::app::App::new("me", false);
+        app.signed_out = true;
+        super::process_input(&mut app, &handle, "/reconnect")
+            .await
+            .unwrap();
+        let due = app.reconnect_at;
+        super::process_irc_event(
+            &mut app,
+            Event::Disconnected {
+                reason: "EOF".into(),
+            },
+            &handle,
+        );
+        assert!(app.reconnect_pending, "the reconnect stands");
+        assert_eq!(app.reconnect_at, due, "and is not moved");
     }
 
     fn tags(pairs: &[(&str, &str)]) -> HashMap<String, String> {
