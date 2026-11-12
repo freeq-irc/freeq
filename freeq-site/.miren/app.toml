@@ -19,5 +19,14 @@ key = "FREEQ_BLOG_PUBLICATION"
 value = "at://did:plc:4qsyxmnsblo4luuycm3572bq/site.standard.publication/3mri2ajri7c2w"
 
 [services.web]
-command = "gunicorn --bind 0.0.0.0:8000 --workers 2 app:app"
+# gthread: two sync workers meant 2 requests at a time, so a ~1,200-request
+# scanner burst (2026-11-11 13:30Z) starved the pool and real visitors got
+# "no sandbox became available within 120 seconds" for ~2 min.
+# --graceful-timeout must stay under shutdown_timeout, or miren SIGKILLs the
+# container on every idle-out (it did, on every single one).
+command = "gunicorn --bind 0.0.0.0:8000 --workers 2 --worker-class gthread --threads 8 --graceful-timeout 5 app:app"
 port = 8000
+
+[services.web.concurrency]
+mode = "auto"
+shutdown_timeout = "15s"
