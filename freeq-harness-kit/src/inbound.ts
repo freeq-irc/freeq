@@ -36,6 +36,8 @@ export interface InboundEvent {
   mode: Mode;
   /** Authority tier resolved for `did`. */
   tier: Tier;
+  /** This agent's own nick, so the model can tell which mention is itself. */
+  selfNick?: string;
 }
 
 export type InboundAction =
@@ -111,22 +113,119 @@ const REPLY_CARE =
   "If you cannot answer, say so plainly.";
 
 /**
+ * The closing text that means "this needs no answer": a turn that ends with
+ * exactly this sends nothing, and the message counts as answered. Without it
+ * an agent cannot end an exchange — two agents DMing each other each answer
+ * the other's "got it" with a "got it" of their own, forever.
+ */
+export const NO_REPLY = "NO_REPLY";
+
+/** Whether a turn's closing text is the no-reply sentinel (case, quotes,
+ *  backticks and a trailing period aside). */
+export function isNoReply(text: string): boolean {
+  return /^[`"'*]*no_reply[`"'*]*\.?$/i.test(text.trim());
+}
+
+/**
+ * Whether `did` is an agent's. A did:key has no PDS behind it, so no person
+ * signs in with one; on freeq it is always a bot. (An agent on did:web is not
+ * caught here — it still gets the automatic reply, and `NO_REPLY` ends it.)
+ */
+export function isAgentDid(did: string | null | undefined): boolean {
+  return !!did && did.startsWith("did:key:");
+}
+
+/**
+ * Whether the turn's closing text goes back to the sender when the model
+ * sends nothing itself. Always for an ask (it is a question waiting on an
+ * answer) and for a person; never for another agent's DM. Between agents the
+ * automatic reply is what turns every acknowledgement into the next turn on
+ * the other side, so there a reply has to be sent on purpose.
+ */
+export function closingTextReplies(ev: Pick<InboundEvent, "kind" | "channel" | "did">): boolean {
+  if (ev.kind === "ask") return true;
+  return ev.channel.startsWith("#") || !isAgentDid(ev.did);
+}
+
+const NO_REPLY_HOW =
+  `If it needs no answer (an acknowledgement, a thread closing), end with exactly ${NO_REPLY} ` +
+  `and nothing is sent. `;
+
+/**
  * How the answer goes back. An ask is answered with the turn's text. A DM or
  * a mention is answered by what the agent sends with the freeq tool; its
- * closing text goes back only if it sent nothing.
+ * closing text goes back only if it sent nothing — and never to an agent's DM.
  */
 function replyHow(ev: InboundEvent): string {
   if (ev.kind === "ask") return `Your next reply will be sent back to ${ev.from} over freeq. `;
   if (ev.channel.startsWith("#")) {
     return (
       `To answer, use the freeq tool: 'say' in ${ev.channel}. If you post nothing there, ` +
-      `your closing text is posted to ${ev.channel} instead, addressed to ${ev.from}. `
+      `your closing text is posted to ${ev.channel} instead, addressed to ${ev.from}. ` +
+      NO_REPLY_HOW
+    );
+  }
+  if (!closingTextReplies(ev)) {
+    return (
+      `${ev.from} is an agent. Nothing goes back to it unless you use the freeq tool: ` +
+      `'send' to ${ev.from}. Send only if you have something new to say; do not answer ` +
+      `an acknowledgement, and do not send it what you wrote for your operator. `
     );
   }
   return (
     `To answer ${ev.from}, use the freeq tool: 'send' to ${ev.from}. If you send nothing, ` +
-    `your closing text is sent to ${ev.from} instead. `
+    `your closing text is sent to ${ev.from} instead. ` +
+    NO_REPLY_HOW
   );
+}
+
+/**
+ * The other parties a channel message names with `@nick`, in order, without
+ * repeats (ignoring case). Only the `@` form counts: a leading "word:" is as
+ * often "Note:" as a nick, and this agent's own `nick:` was already matched
+ * upstream (that is what made the message addressed).
+ */
+export function mentionedNicks(text: string): string[] {
+  const out: string[] = [];
+  for (const m of text.matchAll(/(?:^|[\s(,])@([A-Za-z_\[\]\\`^{}|][\w\-\[\]\\`^{}|]*)/g)) {
+    const nick = m[1]!;
+    if (!out.some((o) => o.toLowerCase() === nick.toLowerCase())) out.push(nick);
+  }
+  return out;
+}
+
+/**
+ * Who a channel message is addressed to, from where this agent stands.
+ *
+ * A message often names several agents at once ("@pi-a @cc-b review this").
+ * Each agent must see that it is one of the addressees, not that the message
+ * was for "the other one": so the model is told its own nick, and the text
+ * reaches it with every mention left in place.
+ */
+function addressing(ev: InboundEvent): string {
+  if (!ev.channel.startsWith("#") || !ev.selfNick) return "";
+  const self = ev.selfNick.toLowerCase();
+  const named = mentionedNicks(ev.text);
+  const others = named.filter((n) => n.toLowerCase() !== self).map((n) => `@${n}`);
+  const you = `You are @${ev.selfNick} in this room.`;
+  if (!ev.addressed) {
+    return others.length
+      ? `${you} This message is addressed to ${list(others)}, not to you. ` +
+          `Speak only if you have something to add that they cannot.`
+      : `${you} This message is not addressed to anyone in particular.`;
+  }
+  if (!others.length) return `${you} This message is addressed to you.`;
+  return (
+    `${you} This message is addressed to you AND to ${list(others)}: it is for each of ` +
+    `you, not only for the others. Do the part asked of you (if it gives one instruction ` +
+    `to everyone, that includes you); leave what is asked of the others to them, and ` +
+    `do not answer on their behalf.`
+  );
+}
+
+function list(items: string[]): string {
+  if (items.length <= 1) return items.join("");
+  return `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
 }
 
 /**
@@ -139,7 +238,8 @@ function replyHow(ev: InboundEvent): string {
 export function frameInbound(ev: InboundEvent, opts?: { expectsReply?: boolean }): string {
   const who = `${ev.from}${ev.did ? ` (${ev.did})` : " (unauthenticated)"}`;
   const venue = ev.channel.startsWith("#") ? `in ${ev.channel}` : "in a direct message";
-  const header = `[freeq — ${headerFor(ev, who, venue)}]`;
+  const addr = addressing(ev);
+  const header = `[freeq — ${headerFor(ev, who, venue)}]${addr ? `\n[${addr}]` : ""}`;
 
   const footer = opts?.expectsReply ? `\n\n[${replyHow(ev)}${REPLY_CARE}]` : "";
 

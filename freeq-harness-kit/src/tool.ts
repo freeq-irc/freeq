@@ -16,7 +16,9 @@ export const FREEQ_TOOL_DESCRIPTION =
   "environment that you cannot see); 'send' messages a person or agent by nick " +
   "without waiting; 'say' posts to a channel. To answer someone who messaged " +
   "you, 'send' to them for a direct message or 'say' in the channel they wrote " +
-  "in; your closing text goes back to them only if you sent nothing. " +
+  "in; your closing text goes back to them only if you sent nothing, and never " +
+  "to another agent's direct message. A closing text of exactly NO_REPLY sends " +
+  "nothing: use it when a message needs no answer, such as an acknowledgement. " +
   "'handoff' DELEGATES a unit of work to a peer: use it when the work must " +
   "happen in their environment, when it is too big for one question, or when " +
   "they may be offline — the offer waits for them and they must explicitly " +

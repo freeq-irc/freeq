@@ -249,6 +249,56 @@ describe("AgentRuntime: replies", () => {
     expect(lines.at(-1)).toMatchObject({ direction: "out", channel: "nap", text: "the answer" });
   });
 
+  it("sends nothing when the closing text is NO_REPLY", async () => {
+    const { bot, rt } = await started();
+    bot.emit("message", "nap", { from: "nap", text: "thanks!", isSelf: false, tags: { account: OWNER } });
+    await tick();
+    rt.onTurnStart();
+    rt.onTurnEnd("NO_REPLY", false);
+    await rt.onSettled();
+    expect(bot.messages()).toEqual([]);
+  });
+
+  it("tells an asker 'no reply' rather than leaving it waiting", async () => {
+    const { bot, rt } = await started({ trust: { [PEER]: "request" } });
+    bot.emit("coordinationEvent", { eventType: "pi_ask", from: "peer", did: PEER, channel: "peer", payload: { req: "r3", q: "?" }, tags: {} });
+    await tick();
+    rt.onTurnStart();
+    rt.onTurnEnd("NO_REPLY", false);
+    const reply = bot.sent.find((s) => s.kind === "tagmsg" && (s.payload as Record<string, string>)["+freeq.at/event"] === "pi_ask_reply")!;
+    expect(decodeURIComponent((reply.payload as Record<string, string>)["+freeq.at/payload"]!)).toContain("no reply");
+  });
+
+  it("never auto-replies to another agent's DM, so two agents cannot ack-loop", async () => {
+    const AGENT = "did:key:z6MkPeerAgent";
+    const { bot, rt, delivered } = await started({ trust: { [AGENT]: "request" } });
+    bot.emit("message", "cc-agent", { from: "cc-agent", text: "Got it, closing.", isSelf: false, tags: { account: AGENT } });
+    await tick();
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.content).toContain("cc-agent is an agent");
+    rt.onTurnStart();
+    rt.onTurnEnd("Nothing more from me.", false);
+    await rt.onSettled();
+    expect(bot.messages()).toEqual([]);
+  });
+
+  it("keeps every mention in a multi-party message and names which one is us", async () => {
+    const { bot, delivered } = await started({ trust: { [PEER]: "message" } });
+    bot.mention = (text, nick) => (text.includes(`@${nick}`) ? text.replace(`@${nick}`, "").trim() : null);
+    bot.emit("message", "#work", {
+      from: "peer",
+      text: "@pi-test1234-proj @cc-other review this",
+      isSelf: false,
+      tags: { account: PEER },
+    });
+    await tick();
+    expect(delivered).toHaveLength(1);
+    const content = delivered[0]!.content;
+    expect(content).toContain("@pi-test1234-proj @cc-other review this");
+    expect(content).toContain("You are @pi-test1234-proj in this room.");
+    expect(content).toContain("addressed to you AND to @cc-other");
+  });
+
   it("sweeps what is left when the run settles, and reports a missing answer", async () => {
     const { bot, rt, notices } = await started({ trust: { [PEER]: "request" } });
     bot.emit("coordinationEvent", { eventType: "pi_ask", from: "peer", did: PEER, channel: "peer", payload: { req: "r2", q: "?" }, tags: {} });

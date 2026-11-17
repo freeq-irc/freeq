@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { decideInbound, frameInbound, reachesModel, type InboundEvent } from "./inbound.js";
+import {
+  closingTextReplies,
+  decideInbound,
+  frameInbound,
+  isNoReply,
+  mentionedNicks,
+  reachesModel,
+  type InboundEvent,
+} from "./inbound.js";
 import { MODES, TIER_RANK, type Mode, type Tier } from "./config.js";
 
 const TIERS = Object.keys(TIER_RANK) as Tier[];
@@ -187,5 +195,81 @@ describe("framing follows the tier (owner must not be called untrusted)", () => 
     expect(framed).toContain("'say' in #dev");
     expect(framed).toContain("addressed to alice");
     expect(framed).not.toMatch(/sent back to/);
+  });
+
+  it("offers NO_REPLY wherever a closing text would be sent", () => {
+    const dm = frameInbound(ev({ kind: "chat", channel: "alice", from: "alice" }), { expectsReply: true });
+    const room = frameInbound(ev({ kind: "chat", channel: "#dev", from: "alice" }), { expectsReply: true });
+    expect(dm).toContain("end with exactly NO_REPLY");
+    expect(room).toContain("end with exactly NO_REPLY");
+  });
+
+  it("tells the model an agent's DM gets nothing back unless it sends", () => {
+    const framed = frameInbound(
+      ev({ kind: "chat", channel: "bot", from: "bot", did: "did:key:z6MkBot", tier: "request" }),
+      { expectsReply: true },
+    );
+    expect(framed).toContain("bot is an agent. Nothing goes back to it unless");
+    expect(framed).toContain("do not answer an acknowledgement");
+    expect(framed).not.toContain("your closing text is sent");
+  });
+});
+
+describe("closing-text replies", () => {
+  it("go to people and channels, never to an agent's DM", () => {
+    expect(closingTextReplies({ kind: "chat", channel: "alice", did: "did:plc:a" })).toBe(true);
+    expect(closingTextReplies({ kind: "chat", channel: "bot", did: "did:key:z6Mk" })).toBe(false);
+    expect(closingTextReplies({ kind: "chat", channel: "#dev", did: "did:key:z6Mk" })).toBe(true);
+    expect(closingTextReplies({ kind: "ask", channel: "bot", did: "did:key:z6Mk" })).toBe(true);
+  });
+
+  it("recognise NO_REPLY and nothing else", () => {
+    for (const t of ["NO_REPLY", " no_reply ", "`NO_REPLY`", "NO_REPLY.", "**NO_REPLY**"]) {
+      expect(isNoReply(t), t).toBe(true);
+    }
+    for (const t of ["", "ok", "NO_REPLY needed here", "NO REPLY", "I'll say NO_REPLY"]) {
+      expect(isNoReply(t), t).toBe(false);
+    }
+  });
+});
+
+describe("multi-party mentions", () => {
+  const room = (text: string, over: Partial<InboundEvent> = {}) =>
+    frameInbound(ev({ kind: "chat", channel: "#dev", from: "chad", text, selfNick: "pi-a", ...over }));
+
+  it("finds every @mention, once, in order", () => {
+    expect(mentionedNicks("@pi-a @cc-b, review this; thanks @PI-A")).toEqual(["pi-a", "cc-b"]);
+    expect(mentionedNicks("(@cc-b) and @x[1]")).toEqual(["cc-b", "x[1]"]);
+    expect(mentionedNicks("mail chad@example.com, Note: hi")).toEqual([]);
+  });
+
+  it("tells each addressee it is one of several, not that it was for the other", () => {
+    const framed = room("@pi-a @cc-b review the reconnect patch");
+    expect(framed).toContain("You are @pi-a in this room.");
+    expect(framed).toContain("addressed to you AND to @cc-b");
+    expect(framed).toContain("do not answer on their behalf");
+    // The text is as written, our own mention included.
+    expect(framed).toContain("@pi-a @cc-b review the reconnect patch");
+  });
+
+  it("lists three or more parties readably", () => {
+    expect(room("@cc-b @pi-a @eliza status?")).toContain("addressed to you AND to @cc-b and @eliza");
+    expect(room("@a @b @pi-a @c go")).toContain("to @a, @b and @c");
+  });
+
+  it("says plainly when the message is only for us", () => {
+    const framed = room("pi-a: what branch?");
+    expect(framed).toContain("This message is addressed to you.");
+    expect(framed).not.toContain("AND to");
+  });
+
+  it("in participant mode, says when a message is for someone else", () => {
+    const framed = room("@cc-b can you look?", { addressed: false, mode: "participant" });
+    expect(framed).toContain("addressed to @cc-b, not to you");
+  });
+
+  it("adds nothing for a DM or when our nick is unknown", () => {
+    expect(frameInbound(ev({ channel: "chad", selfNick: "pi-a" }))).not.toContain("You are @");
+    expect(room("@pi-a @cc-b hi", { selfNick: undefined })).not.toContain("You are @");
   });
 });

@@ -83,7 +83,15 @@ import {
   PROVENANCE_EVENT,
   type ProvenanceTier,
 } from "./provenance.js";
-import { decideInbound, frameInbound, frameRoomRead, reachesModel, type InboundEvent } from "./inbound.js";
+import {
+  closingTextReplies,
+  decideInbound,
+  frameInbound,
+  frameRoomRead,
+  isNoReply,
+  reachesModel,
+  type InboundEvent,
+} from "./inbound.js";
 import type { Harness, InboundCard, NoticeLevel } from "./harness.js";
 import type { FreeqRoomToolParams, FreeqToolParams } from "./tool.js";
 import { formatDoctor, runDoctor, type DoctorLine } from "./doctor.js";
@@ -2153,6 +2161,7 @@ export class AgentRuntime {
                   tier: tier as Tier,
                   mode: modeFor(cfg, m.channel),
                   addressed: true,
+                  selfNick: this.conn?.nick,
                 },
                 { replyToChannel: true },
               );
@@ -2376,9 +2385,13 @@ export class AgentRuntime {
     }
 
     const expectsReply = !!ask || !!opts?.replyToChannel;
+    // Another agent's DM is answered only by an explicit 'send': an automatic
+    // reply to it starts a turn over there, whose automatic reply starts one
+    // here — two agents saying "done" to each other forever (2026-11-17).
+    const autoReply = closingTextReplies(ev);
     if (ask) {
       this.#pendingReplies.push({ kind: "ask", ask, seq: this.#turnSeq });
-    } else if (opts?.replyToChannel) {
+    } else if (opts?.replyToChannel && autoReply) {
       this.#pendingReplies.push({ kind: "channel", channel: ev.channel, from: ev.from, seq: this.#turnSeq });
     }
 
@@ -2395,7 +2408,8 @@ export class AgentRuntime {
       // happens to end. A DM answers to the sender, a channel to the channel.
       // If we somehow got here before config loaded there is no interval to
       // honour, so stay quiet rather than crash the host.
-      if (this.config) this.#startUpdates(this.config, ev.channel);
+      // Not to an agent's DM, for the same reason as above.
+      if (this.config && autoReply) this.#startUpdates(this.config, ev.channel);
     }
     const framed = frameInbound(ev, { expectsReply });
 
@@ -2643,10 +2657,15 @@ export class AgentRuntime {
               channel,
               from: msg.from,
               did,
-              text: mention.addressed ? mention.stripped : msg.text,
+              // The text as written, our own mention included. Stripping it
+              // left "@pi-a @cc-b review this" reading "@cc-b review this"
+              // to pi-a — a message for someone else. The framing names us
+              // instead, so the model can tell which mention is itself.
+              text: isChannel ? msg.text : mention.stripped,
               addressed: mention.addressed,
               mode: modeFor(cfg, channel),
               tier: tierFor(cfg, did),
+              selfNick: this.conn?.nick,
             },
             // Someone addressed us in a room: answer in the room.
             { replyToChannel: mention.addressed },
@@ -2956,6 +2975,15 @@ export class AgentRuntime {
       for (let i = pending.length - 1; i >= 0; i--) {
         if (pending[i]!.seq < beforeSeq) due.unshift(pending.splice(i, 1)[0]!);
       }
+    }
+    // The model said this needs no answer: everything due is answered by
+    // saying nothing. An ask still gets told, so it does not wait out its
+    // timeout.
+    if (isNoReply(text)) {
+      for (const item of due) {
+        if (item.kind === "ask") this.conn?.replyToAsk(item.ask, undefined, "no reply");
+      }
+      return;
     }
     for (const item of due) {
       const conn = this.conn;
