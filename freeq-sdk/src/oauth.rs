@@ -335,13 +335,35 @@ pub async fn login(handle: &str, scope: &str) -> Result<OAuthSession> {
     )
     .await?;
 
-    // 6. Open browser
-    eprintln!("\nOpening browser for authorization...");
-    eprintln!("If the browser doesn't open, visit:\n  {auth_url}\n");
-    let _ = open::that(&auth_url);
+    // 6. Open browser. On a remote/headless machine (SSH, no display) the
+    //    browser that approves runs somewhere else, and its redirect to
+    //    127.0.0.1 lands on *that* machine, not this one. So there we also
+    //    accept the redirect URL pasted back into the terminal.
+    let headless = is_headless();
+    let opened = !headless && open::that(&auth_url).is_ok();
+    let paste = headless || !opened;
+    if paste {
+        eprintln!("\nOpen this URL in a browser on any device to authorize:\n  {auth_url}\n");
+        eprintln!(
+            "After you approve, the browser is sent to http://127.0.0.1:{port}/callback?...\n\
+             which won't load if that browser isn't on this machine. That's expected:\n\
+             copy the full URL from the address bar and paste it here, then press Enter."
+        );
+        eprint!("Redirect URL: ");
+    } else {
+        eprintln!("\nOpening browser for authorization...");
+        eprintln!("If the browser doesn't open, visit:\n  {auth_url}\n");
+    }
 
-    // 7. Wait for callback
-    let auth_code = wait_for_callback(listener, &state).await?;
+    // 7. Wait for the callback (or, when pasting, whichever comes first)
+    let auth_code = if paste {
+        tokio::select! {
+            r = wait_for_callback(listener, &state) => r?,
+            r = read_pasted_callback(&state) => r?,
+        }
+    } else {
+        wait_for_callback(listener, &state).await?
+    };
     eprintln!("Authorization received. Exchanging token...");
 
     // 8. Exchange code for tokens
@@ -439,6 +461,104 @@ async fn push_authorization_request(
         urlencod(client_id),
         urlencod(&par.request_uri),
     ))
+}
+
+/// Whether the browser that authorizes is likely on another machine: an SSH
+/// session, or a Linux/BSD box with no display server. `FREEQ_OAUTH_PASTE=1`
+/// forces paste mode; `FREEQ_OAUTH_PASTE=0` disables it.
+fn is_headless() -> bool {
+    match std::env::var("FREEQ_OAUTH_PASTE").as_deref() {
+        Ok("1") | Ok("true") => return true,
+        Ok("0") | Ok("false") => return false,
+        _ => {}
+    }
+    let set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    if set("SSH_CONNECTION") || set("SSH_TTY") {
+        return true;
+    }
+    cfg!(all(unix, not(target_os = "macos"))) && !set("DISPLAY") && !set("WAYLAND_DISPLAY")
+}
+
+/// Read the redirect URL the user pasted into the terminal and pull the
+/// authorization code out of it. Lines that don't parse are reported and
+/// another is read. If stdin closes, never resolves (the HTTP callback can
+/// still arrive, e.g. through an `ssh -L` tunnel).
+async fn read_pasted_callback(expected_state: &str) -> Result<String> {
+    use tokio::io::AsyncBufReadExt;
+    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        let Ok(Some(line)) = lines.next_line().await else {
+            return std::future::pending().await;
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match parse_pasted_callback(line, expected_state) {
+            Ok(code) => return Ok(code),
+            Err(e) => {
+                eprintln!("{e:#}");
+                eprint!("Redirect URL: ");
+            }
+        }
+    }
+}
+
+/// Parse a pasted redirect URL (or just its query string) into the
+/// authorization code, checking `state` and surfacing an `error`.
+fn parse_pasted_callback(input: &str, expected_state: &str) -> Result<String> {
+    let query = match input.split_once('?') {
+        Some((_, q)) => q,
+        None if input.contains("code=") || input.contains("error=") => input,
+        None => {
+            bail!("That doesn't look like the redirect URL (no ?code=...). Paste the whole URL.")
+        }
+    };
+    let query = query.split('#').next().unwrap_or(query);
+    let params: HashMap<String, String> = query
+        .split('&')
+        .filter_map(|p| {
+            let (k, v) = p.split_once('=')?;
+            Some((percent_decode(k), percent_decode(v)))
+        })
+        .collect();
+    if let Some(error) = params.get("error") {
+        let desc = params
+            .get("error_description")
+            .map(String::as_str)
+            .unwrap_or("Unknown error");
+        bail!("Authorization failed: {error}: {desc}");
+    }
+    let (Some(code), Some(state)) = (params.get("code"), params.get("state")) else {
+        bail!("The pasted URL has no code/state. Paste the whole URL from the address bar.");
+    };
+    if state != expected_state {
+        bail!("State mismatch: that URL is from a different sign-in attempt.");
+    }
+    Ok(code.clone())
+}
+
+/// Decode `%XX` escapes and `+` in a URL query component.
+fn percent_decode(s: &str) -> String {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < bytes.len() => match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push(h << 4 | l);
+                    i += 2;
+                }
+                _ => out.push(b'%'),
+            },
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Wait for the OAuth callback on the local HTTP server.
@@ -589,6 +709,45 @@ fn urlencod(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pasted_callback_full_url() {
+        let url = "http://127.0.0.1:54321/callback?iss=https%3A%2F%2Fbsky.social&state=abc&code=cod-e%2B1";
+        assert_eq!(parse_pasted_callback(url, "abc").unwrap(), "cod-e+1");
+    }
+
+    #[test]
+    fn pasted_callback_bare_query_and_fragment() {
+        assert_eq!(parse_pasted_callback("code=x&state=s", "s").unwrap(), "x");
+        assert_eq!(
+            parse_pasted_callback("http://h/cb?code=x&state=s#frag", "s").unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn pasted_callback_rejects_bad_input() {
+        assert!(
+            parse_pasted_callback("http://127.0.0.1:1/callback?code=x&state=other", "s").is_err()
+        );
+        assert!(parse_pasted_callback("hello", "s").is_err());
+        assert!(parse_pasted_callback("http://h/cb?state=s", "s").is_err());
+        let err = parse_pasted_callback(
+            "http://h/cb?error=access_denied&error_description=no+thanks",
+            "s",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("access_denied: no thanks"), "{err}");
+    }
+
+    #[test]
+    fn percent_decode_edges() {
+        assert_eq!(percent_decode("a%2Fb"), "a/b");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz%4"), "%zz%4");
+        assert_eq!(percent_decode("%C3%A9"), "é");
+    }
     use super::*;
     use axum::Router;
     use axum::extract::Form;

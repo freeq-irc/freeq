@@ -56,6 +56,16 @@ naming the bot. `register` writes those records:
    each record's URI. `--name` names the bot in your Agents list; it takes
    one DID. A bot registered without a name is listed by its DID.
 
+**On a remote server** (SSH, or no display), the browser that approves is
+on another machine, and its redirect to `http://127.0.0.1:<port>/callback`
+lands there, not on the server. `register` detects this, prints the sign-in
+URL, and waits for you to paste back the redirect URL: open the link on your
+laptop, approve, then copy the full URL from the address bar (the page itself
+won't load, which is expected) and paste it into the terminal. Force this mode
+with `FREEQ_OAUTH_PASTE=1`, or turn it off with `FREEQ_OAUTH_PASTE=0`. An
+`ssh -L <port>:127.0.0.1:<port>` tunnel also works, since the local callback
+listener stays up.
+
 The sign-in is not saved: nothing that can write to your account is left on
 the machine after the run. Nothing is written on the bot's machine either;
 the bot keeps presenting the same unsigned certificate. The web app's
