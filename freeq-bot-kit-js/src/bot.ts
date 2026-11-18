@@ -523,8 +523,12 @@ export class FreeqBot {
    *  A `respond` result records "now" as the channel's last-respond
    *  timestamp before returning, so the next addressed message on the
    *  same channel within `cooldownMs` returns `cooldown`. Different
-   *  channels have independent cooldowns. */
-  checkMention(channel: string, text: string): MentionResult {
+   *  channels have independent cooldowns.
+   *
+   *  `opts.cooldown: false` answers `respond` inside the window too (and
+   *  still records the time): the cooldown stops two agents mentioning each
+   *  other forever, and a person talking to the bot is not that. */
+  checkMention(channel: string, text: string, opts: { cooldown?: boolean } = {}): MentionResult {
     const nick = this.client.nick;
     if (!nick) return { kind: "ignore" };
     const stripped = this.#mentionMatcher(text, nick);
@@ -532,7 +536,7 @@ export class FreeqBot {
 
     const key = channel.toLowerCase();
     const now = Date.now();
-    if (this.#mentionCooldownMs > 0) {
+    if (this.#mentionCooldownMs > 0 && opts.cooldown !== false) {
       const last = this.#mentionLastRespond.get(key);
       if (last !== undefined) {
         const remainingMs = last + this.#mentionCooldownMs - now;

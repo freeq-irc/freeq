@@ -70,7 +70,7 @@ export interface BotLike {
   start(): Promise<unknown>;
   stop(reason?: string): Promise<unknown>;
   setState(state: string, status?: string, task?: string): void;
-  checkMention(channel: string, text: string): { kind: string; stripped?: string };
+  checkMention(channel: string, text: string, opts?: { cooldown?: boolean }): { kind: string; stripped?: string };
   resolveSenderDid(msg: { from: string; tags?: Record<string, string> }): Promise<string | null>;
   readonly identity: { did: string };
   readonly client: {
@@ -1217,8 +1217,12 @@ export class FreeqConnection {
    * also applies a per-channel cooldown — that cooldown is what stops two
    * agents that mention each other from ping-ponging forever.
    */
-  checkMention(channel: string, text: string): { addressed: boolean; stripped: string; cooling: boolean } {
-    const r = this.#bot?.checkMention(channel, text);
+  checkMention(
+    channel: string,
+    text: string,
+    opts: { cooldown?: boolean } = {},
+  ): { addressed: boolean; stripped: string; cooling: boolean } {
+    const r = this.#bot?.checkMention(channel, text, opts);
     if (!r) return { addressed: false, stripped: text, cooling: false };
     // `stripped` is only meaningful on a 'respond'; fall back to the raw text
     // rather than trusting the shape (a fake or a future bot-kit may omit it).
