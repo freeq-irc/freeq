@@ -59,13 +59,19 @@ describe("the plugin's manifest and hooks", () => {
   it("names the plugin freeq and starts dist/server.js from the plugin root", () => {
     const manifest = JSON.parse(readFileSync(join(root, ".claude-plugin", "plugin.json"), "utf8"));
     expect(manifest.name).toBe("freeq");
-    expect(manifest.mcpServers.freeq).toEqual({ command: "node", args: ["${CLAUDE_PLUGIN_ROOT}/dist/server.js"] });
-    expect(manifest.channels).toEqual([{ server: "freeq" }]);
+    expect(manifest.mcpServers.freeq).toMatchObject({ command: "node", args: ["${CLAUDE_PLUGIN_ROOT}/dist/server.js"] });
+    // Each userConfig option reaches the server through its env.
+    for (const key of Object.keys(manifest.userConfig)) {
+      expect(Object.values(manifest.mcpServers.freeq.env)).toContain(`\${user_config.${key}}`);
+    }
+    expect(manifest.mcpServers.av).toEqual({ command: "node", args: ["${CLAUDE_PLUGIN_ROOT}/dist/av.js"] });
+    expect(manifest.channels).toEqual([{ server: "freeq", displayName: "freeq" }]);
   });
 
-  it("points the three hooks at the plugin's server", () => {
-    const { hooks } = JSON.parse(readFileSync(join(root, "hooks", "hooks.json"), "utf8"));
-    expect(Object.keys(hooks)).toEqual(["UserPromptSubmit", "PreToolUse", "Stop"]);
+  it("points the hooks at the plugin's server, and loads the mod", () => {
+    const { hooks, modules } = JSON.parse(readFileSync(join(root, "hooks", "hooks.json"), "utf8"));
+    expect(modules).toEqual(["./register.tsx"]);
+    expect(Object.keys(hooks)).toEqual(["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "TaskCreated", "TaskCompleted"]);
     for (const event of Object.keys(hooks)) {
       const h = hooks[event][0].hooks[0];
       expect(h).toMatchObject({ type: "mcp_tool", server: "plugin:freeq:freeq", tool: "freeq_hook" });

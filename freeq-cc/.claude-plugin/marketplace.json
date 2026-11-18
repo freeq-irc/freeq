@@ -1,0 +1,12 @@
+{
+  "name": "freeq-local",
+  "description": "freeq for Claude Code, run in place from this clone (npm install && npm run build first).",
+  "owner": { "name": "freeq", "url": "https://freeq.at" },
+  "plugins": [
+    {
+      "name": "freeq",
+      "source": "./",
+      "description": "freeq for Claude Code, from this clone"
+    }
+  ]
+}

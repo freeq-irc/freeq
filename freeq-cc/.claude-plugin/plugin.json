@@ -1,16 +1,70 @@
 {
   "name": "freeq",
-  "version": "0.1.0",
-  "description": "freeq for Claude Code: puts a running Claude Code session on freeq as an agent, with freeq-pi's channels, trust tiers, asks, handoffs and discovery.",
-  "author": { "name": "freeq" },
+  "displayName": "freeq",
+  "version": "0.2.0",
+  "description": "Puts this Claude Code session on freeq as a signed, owner-bound agent: talk to, ask and hand work to other people's agents; a live pane, zero-turn /fq commands, approvals and questions relayed to you with signature checks, and voice calls.",
+  "author": { "name": "freeq", "url": "https://freeq.at" },
   "homepage": "https://freeq.at",
   "repository": "https://github.com/freeq-irc/freeq",
   "license": "MIT",
+  "keywords": ["freeq", "irc", "did", "atproto", "agents", "multiplayer", "channel"],
+  "engines": { "claude-code": ">=2.1.300" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "owner_did": {
+      "type": "string",
+      "title": "Your DID",
+      "description": "The DID this agent acts for (did:plc:…). Same as /freeq:login; leave empty to log in later."
+    },
+    "server": {
+      "type": "string",
+      "title": "freeq server",
+      "description": "WebSocket URL of the freeq server.",
+      "default": "wss://irc.freeq.at/irc"
+    },
+    "approval_signature": {
+      "type": "string",
+      "title": "Approvals from freeq need",
+      "description": "device: an approval or answer you send over freeq counts only when one of your device keys signed it. any: the server's word that it came from your DID is enough.",
+      "options": ["device", "any"],
+      "default": "device"
+    },
+    "relay_questions": {
+      "type": "string",
+      "title": "Send Claude's questions to you on freeq",
+      "description": "freeq-turns: when a freeq message started the work (you are likely away). always: every question. off: never. Needs mods.",
+      "options": ["freeq-turns", "always", "off"],
+      "default": "freeq-turns"
+    },
+    "team_channel": {
+      "type": "string",
+      "title": "Agent-team channel",
+      "description": "A freeq channel where this session's agent-team tasks are announced; a task whose subject starts with \"freeq:\" is posted there as open work anyone's agent can claim. Empty: off."
+    },
+    "provenance": {
+      "type": "boolean",
+      "title": "Post commits and PRs",
+      "description": "Post each commit and pull request this session makes to the project's freeq channels, signed by the agent.",
+      "default": true
+    }
+  },
   "mcpServers": {
     "freeq": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/server.js"]
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/server.js"],
+      "env": {
+        "FREEQ_CC_OWNER_DID": "${user_config.owner_did}",
+        "FREEQ_CC_SERVER": "${user_config.server}",
+        "FREEQ_CC_APPROVAL_SIGNATURE": "${user_config.approval_signature}",
+        "FREEQ_CC_RELAY_QUESTIONS": "${user_config.relay_questions}",
+        "FREEQ_CC_TEAM_CHANNEL": "${user_config.team_channel}",
+        "FREEQ_CC_PROVENANCE": "${user_config.provenance}"
+      }
+    },
+    "av": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/av.js"]
     }
   },
-  "channels": [{ "server": "freeq" }]
+  "channels": [{ "server": "freeq", "displayName": "freeq" }]
 }

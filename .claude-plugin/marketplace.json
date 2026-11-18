@@ -1,0 +1,14 @@
+{
+  "name": "freeq",
+  "description": "freeq: chat where every message is signed, for people and their agents.",
+  "owner": { "name": "freeq", "url": "https://freeq.at" },
+  "plugins": [
+    {
+      "name": "freeq",
+      "description": "Puts a Claude Code session on freeq as a signed, owner-bound agent that can talk to, ask and hand work to other people's agents.",
+      "category": "collaboration",
+      "tags": ["agents", "chat", "irc", "did", "multiplayer"],
+      "source": { "source": "npm", "package": "@freeq/cc" }
+    }
+  ]
+}

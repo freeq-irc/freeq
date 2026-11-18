@@ -40,9 +40,10 @@ describe("freeq-cc: permission relay", () => {
     await h.dm("nap", OWNER, "yes abcde");
     expect(h.verdicts).toEqual([{ request_id: "abcde", behavior: "allow" }]);
     expect(h.events).toEqual([]);
-    // No reply is owed for a verdict.
+    // The owner gets a receipt naming what they allowed; no reply is owed beyond it.
+    expect(h.bot.messages()[1]).toMatch(/^did:plc:owner ✓ allowed Bash \(verdict: unsigned\)$/);
     await h.hook({ hook_event_name: "Stop", last_assistant_message: "ran the tests" });
-    expect(h.bot.messages()).toHaveLength(1);
+    expect(h.bot.messages()).toHaveLength(2);
     await h.close();
   });
 
@@ -77,6 +78,33 @@ describe("freeq-cc: permission relay", () => {
     await h.dm("nap", OWNER, "yes abcde");
     expect(h.verdicts).toEqual([]);
     expect(h.bot.messages()).toEqual([]);
+    await h.close();
+  });
+
+  it("under the device policy, refuses an unsigned answer and tells the owner why", async () => {
+    const h = await startChannel({ config: baseConfig(), settings: { approvalSignature: "device" } });
+    await permissionRequest(h);
+    expect(h.bot.messages()[0]).toContain("(from a client that signs your messages)");
+    await h.dm("nap", OWNER, "yes abcde");
+    expect(h.verdicts).toEqual([]);
+    expect(h.bot.messages()[1]).toContain('Not applied: "yes abcde" did not count because it carried no signature');
+    const snap = JSON.parse(await h.ui({ action: "snapshot" }));
+    expect(snap.audit).toMatchObject([
+      { kind: "permission", request: "abcde", subject: "Bash", answer: "allow", did: OWNER, verdict: "unsigned", applied: false },
+    ]);
+    // Still pending: the terminal can answer it.
+    expect(snap.approvals.map((a: { requestId: string }) => a.requestId)).toEqual(["abcde"]);
+    await h.close();
+  });
+
+  it("keeps every answer in the audit file", async () => {
+    const h = await startChannel({ config: baseConfig() });
+    await permissionRequest(h);
+    await h.dm("nap", OWNER, "no abcde");
+    const { readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const lines = readFileSync(join(h.agentDir, "approvals.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(lines).toMatchObject([{ kind: "permission", answer: "deny", applied: true }]);
     await h.close();
   });
 });
