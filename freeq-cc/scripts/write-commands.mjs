@@ -3,7 +3,7 @@
  * Write the plugin's command files, `commands/<name>.md`, one per `/freeq`
  * subcommand, from `dist/commands.js` (so `npm run build` comes first;
  * `npm run commands` does both). Removes a file whose subcommand is gone.
- * `test/commands.test.ts` checks the files match.
+ * `test/commands.spec.ts` checks the files match.
  */
 import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";

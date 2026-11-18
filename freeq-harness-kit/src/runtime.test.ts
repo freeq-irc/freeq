@@ -1258,7 +1258,7 @@ describe("AgentRuntime: messages the harness takes", () => {
     await rt.start();
     bot.emit("message", "nap", { from: "nap", text: "yes abcde", isSelf: false, tags: { account: OWNER } });
     await tick();
-    expect(taken).toEqual([{ channel: "nap", from: "nap", did: OWNER, text: "yes abcde" }]);
+    expect(taken).toMatchObject([{ channel: "nap", from: "nap", did: OWNER, text: "yes abcde" }]);
     expect(h.delivered).toEqual([]);
     // Nothing is owed for it: a settled run sends nothing back.
     await rt.onSettled();

@@ -99,7 +99,16 @@ export interface Harness {
    * sender's server-resolved DID, before the gate; `true` means taken: it
    * is not delivered and no reply is owed for it.
    */
-  intercept?(msg: { channel: string; from: string; did: string | null; text: string }): boolean;
+  intercept?(msg: {
+    channel: string;
+    from: string;
+    did: string | null;
+    text: string;
+    /** The message's id (its IRCv3 `msgid`), when it has one. */
+    msgid?: string;
+    /** The message's IRCv3 tags as received, signature included. */
+    tags?: Record<string, string>;
+  }): boolean;
   /**
    * The harness's own lines for `/freeq doctor`, after the kit's common
    * checks: what only the harness knows about its setup.

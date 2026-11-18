@@ -11,7 +11,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { ClientCapabilities } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
-import { createChannel } from "../src/channel.js";
+import { createChannel, type PluginSettings } from "../src/channel.js";
 import { FakeBot } from "./fake-bot.js";
 
 export const OWNER = "did:plc:owner";
@@ -54,6 +54,8 @@ export interface StartOptions {
   capabilities?: ClientCapabilities;
   /** Declared by the client as its experimental capabilities too. */
   experimental?: Record<string, object>;
+  /** The plugin's settings; by default an owner's answer needs no signature, as the fake bot signs nothing. */
+  settings?: Partial<PluginSettings>;
 }
 
 export async function startChannel(opts: StartOptions = {}) {
@@ -74,6 +76,7 @@ export async function startChannel(opts: StartOptions = {}) {
       return bot;
     },
     log: (line) => logs.push(line),
+    settings: { approvalSignature: "any", relayQuestions: "freeq-turns", provenance: true, ...opts.settings },
   });
 
   const client = new Client(
@@ -128,6 +131,12 @@ export async function startChannel(opts: StartOptions = {}) {
         tags: { account: did },
       });
       await settle();
+    },
+    /** Call the mod's `freeq_ui` tool and return its text (JSON). */
+    async ui(args: Record<string, unknown>): Promise<string> {
+      const r = await client.callTool({ name: "freeq_ui", arguments: args });
+      await settle();
+      return text(r);
     },
     /** Call the `freeq` tool and return its text. */
     async tool(args: Record<string, unknown>): Promise<string> {

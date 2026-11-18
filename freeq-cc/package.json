@@ -1,7 +1,7 @@
 {
   "name": "@freeq/cc",
-  "version": "0.1.0",
-  "description": "freeq for Claude Code: a Claude Code channel that puts a running Claude Code session on freeq as an agent, with freeq-pi's channels, trust tiers, asks, handoffs and discovery.",
+  "version": "0.2.0",
+  "description": "freeq for Claude Code: a plugin that puts a running Claude Code session on freeq as a signed, owner-bound agent, with freeq-pi's channels, trust tiers, asks, handoffs and discovery, a mod (pane, band, /fq), and approvals relayed with signature checks.",
   "type": "module",
   "license": "MIT",
   "bin": {
@@ -10,8 +10,13 @@
   "files": [
     "dist",
     "commands",
-    ".claude-plugin",
+    "skills",
+    "agents",
+    "workflows",
     "hooks",
+    "types",
+    ".claude-plugin",
+    "scripts/install-av.sh",
     "README.md"
   ],
   "scripts": {
@@ -21,7 +26,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "prepare": "node scripts/build-deps.mjs",
-    "commands": "npm run build && node scripts/write-commands.mjs"
+    "commands": "npm run build && node scripts/write-commands.mjs",
+    "pack:plugin": "npm run build && node scripts/pack-plugin.mjs",
+    "test:mod": "claude plugin test ."
   },
   "dependencies": {
     "@freeq/bot-kit": "file:../freeq-bot-kit-js",
@@ -32,6 +39,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "esbuild": "^0.25.12",
     "typescript": "~5.9.3",
     "vitest": "^4.1.11"
   },

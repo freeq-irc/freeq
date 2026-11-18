@@ -442,3 +442,20 @@ async function serverVerdict(signed: Signed, key: Uint8Array): Promise<Verdict> 
   const state: VerdictState = ok === true ? 'server' : ok === false ? 'invalid' : 'unverifiable';
   return { state, kid: signed.kid };
 }
+
+/**
+ * The verdict on one received line, checked now: what a client with
+ * `checkLines` on delivers once the line has settled. For a caller that reads
+ * most lines unchecked and must check one, such as an owner's reply that
+ * approves a tool call. Twin of nothing yet in Rust.
+ */
+export async function verifyLine(line: Line, lookup: KeyLookup): Promise<Verdict> {
+  const look = await firstLook(line);
+  if (look.kind === 'unsigned') return { state: 'unsigned' };
+  if (look.kind === 'unverifiable') return look.kid ? { state: 'unverifiable', kid: look.kid } : { state: 'unverifiable' };
+  try {
+    return await new SignatureChecker(lookup).resolve(look.signed);
+  } catch {
+    return { state: 'unverifiable', kid: look.signed.kid };
+  }
+}

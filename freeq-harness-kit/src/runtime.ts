@@ -2605,7 +2605,7 @@ export class AgentRuntime {
         this.#track((async () => {
           const did = await this.conn!.resolveSenderDid(msg);
           try {
-            if (this.harness.intercept?.({ channel, from: msg.from, did, text: msg.text })) return;
+            if (this.harness.intercept?.({ channel, from: msg.from, did, text: msg.text, msgid: msg.id, tags: msg.tags })) return;
           } catch (err) {
             this.notify(`freeq: could not check a message: ${(err as Error).message}`, "error");
           }

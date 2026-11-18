@@ -13,7 +13,7 @@ describe("freeq-cc: the server Claude Code starts", () => {
     expect(caps?.tools).toBeDefined();
     expect(caps?.prompts).toBeUndefined();
     const tools = (await h.client.listTools()).tools.map((t) => t.name);
-    expect(tools).toEqual(["freeq", "freeq_hook"]);
+    expect(tools).toEqual(["freeq", "freeq_hook", "freeq_ui"]);
     expect(h.client.getInstructions()).toContain('<channel source="plugin:freeq:freeq"');
     await h.close();
   });

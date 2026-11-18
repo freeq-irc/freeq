@@ -30,8 +30,17 @@ describe("/freeq:doctor", () => {
     expect(text).toContain("freeq doctor");
     expect(ccLines(text)).toEqual([
       "✓ hooks: from the plugin; this session so far: UserPromptSubmit; not yet: PreToolUse, Stop",
-      "✓ permission relay: on — tool approvals go to did:plc:owner by DM",
+      "✓ permission relay: on — tool approvals go to did:plc:owner by DM; any answer from the owner's DID counts (approval_signature = any)",
     ]);
+    await h.close();
+  });
+
+  it("says when an approval needs the owner's device signature", async () => {
+    const h = await startChannel({ config: baseConfig(), settings: { approvalSignature: "device" } });
+    const lines = await h.channel.runtime.doctor();
+    expect(lines.find((l) => l.name === "permission relay")?.detail).toBe(
+      "on — tool approvals go to did:plc:owner by DM; an answer counts only when signed by one of the owner's device keys",
+    );
     await h.close();
   });
 
