@@ -2613,8 +2613,14 @@ export class AgentRuntime {
           // bot-kit's mention check also enforces a per-channel cooldown,
           // which is what stops two agents that mention each other from
           // ping-ponging forever.
+          //
+          // The cooldown is for agents. A person (a did:plc or did:web, never
+          // a did:key) talking to this agent is a conversation, and dropping
+          // every line they send within a minute of the last answer is the
+          // agent ignoring them.
+          const person = !!did && !did.startsWith("did:key:");
           const mention = isChannel
-            ? this.conn!.checkMention(channel, msg.text)
+            ? this.conn!.checkMention(channel, msg.text, { cooldown: !person })
             : { addressed: true, stripped: msg.text, cooling: false };
 
           if (mention.cooling) {

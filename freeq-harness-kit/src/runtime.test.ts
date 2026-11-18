@@ -49,9 +49,13 @@ class FakeBot implements BotLike {
   setState(state: string, status?: string, task?: string): void {
     this.states.push({ state, status, task });
   }
-  checkMention(_channel: string, text: string): { kind: string; stripped?: string } {
+  /** Stands for bot-kit's per-channel window after an answer. */
+  cooling = false;
+  checkMention(_channel: string, text: string, opts: { cooldown?: boolean } = {}): { kind: string; stripped?: string } {
     const s = this.mention?.(text, this.nickValue ?? "") ?? null;
-    return s === null ? { kind: "ignore" } : { kind: "respond", stripped: s };
+    if (s === null) return { kind: "ignore" };
+    if (this.cooling && opts.cooldown !== false) return { kind: "cooldown" };
+    return { kind: "respond", stripped: s };
   }
   async resolveSenderDid(msg: { tags?: Record<string, string> }): Promise<string | null> {
     return msg.tags?.account ?? null;
@@ -215,6 +219,18 @@ describe("AgentRuntime: delivery", () => {
     await tick();
     expect(delivered).toHaveLength(1);
     expect(delivered[0]!.interrupt).toBe(false);
+  });
+
+  it("a person is never held by the mention cooldown; an agent is", async () => {
+    const AGENT = "did:key:z6MkAgent";
+    const { bot, delivered, lines } = await started({ trust: { [PEER]: "message", [AGENT]: "message" } });
+    bot.mention = (text, nick) => (text.startsWith(`${nick}: `) ? text.slice(nick.length + 2) : null);
+    bot.cooling = true;
+    bot.emit("message", "#work", { from: "peer", text: "pi-test1234-proj: and now?", isSelf: false, tags: { account: PEER } });
+    bot.emit("message", "#work", { from: "bot", text: "pi-test1234-proj: thanks!", isSelf: false, tags: { account: AGENT } });
+    await tick();
+    expect(delivered.map((d) => d.card.from)).toEqual(["peer"]);
+    expect(lines.find((l) => l.from === "bot")).toMatchObject({ note: "rate-limited · not answered" });
   });
 
   it("answers an ask it cannot deliver", async () => {

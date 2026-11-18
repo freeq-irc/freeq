@@ -620,6 +620,23 @@ describe("FreeqBot.checkMention", () => {
     if (r2.kind === "cooldown") expect(r2.remainingMs).toBeGreaterThan(0);
   });
 
+  it("cooldown: false answers inside the window (a person, not an agent)", async () => {
+    const { FreeqBot } = await import("./bot.js");
+    const bot = await FreeqBot.create({
+      name: "mb-person",
+      ownerDid: "did:plc:owner",
+      nick: "yokota",
+      url: "wss://test/irc",
+      root,
+      mention: { cooldownMs: 60_000 },
+    });
+    (bot.client as unknown as { _nick: string })._nick = "yokota";
+
+    expect(bot.checkMention("#foo", "@yokota first").kind).toBe("respond");
+    expect(bot.checkMention("#foo", "@yokota second", { cooldown: false })).toMatchObject({ kind: "respond", stripped: "second" });
+    expect(bot.checkMention("#foo", "@yokota third").kind).toBe("cooldown");
+  });
+
   it("different channels have independent cooldowns", async () => {
     const { FreeqBot } = await import("./bot.js");
     const bot = await FreeqBot.create({
