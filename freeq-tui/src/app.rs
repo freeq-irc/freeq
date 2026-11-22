@@ -592,6 +592,12 @@ pub const KEY_UNPUBLISHED_LINE: &str = "Your signing key is not published to you
 pub const REAUTH_LINE: &str = "Restart freeq-tui with --reauth to sign in again.";
 
 pub struct App {
+    /// Nicks (lowercase) the server has said are agents: from the roster's
+    /// actor classes, or because they published agent presence.
+    pub agents: HashSet<String>,
+    /// What each agent was last said to be doing (lowercase nick), so a
+    /// status refresh that only moved the elapsed clock prints nothing.
+    pub agent_doing: HashMap<String, String>,
     /// Per-channel E2EE keys, keyed by lowercase channel name.
     /// Derived from passphrase via HKDF-SHA256.
     pub channel_keys: HashMap<String, [u8; 32]>,
@@ -783,6 +789,8 @@ impl App {
         let mode = if vi_mode { Mode::Vi } else { Mode::Emacs };
 
         Self {
+            agents: HashSet::new(),
+            agent_doing: HashMap::new(),
             channel_keys: HashMap::new(),
             buffers,
             batches: HashMap::new(),
@@ -1730,6 +1738,8 @@ mod tests {
         b.history_in_flight = true;
         buffers.insert("#test".to_string(), b);
         let mut app = App {
+            agents: HashSet::new(),
+            agent_doing: HashMap::new(),
             channel_keys: HashMap::new(),
             buffers,
             batches: HashMap::new(),

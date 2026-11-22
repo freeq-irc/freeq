@@ -108,7 +108,12 @@ struct MemberInfo: Identifiable, Equatable {
     /// carries a label teaches people to stop reading it.
     var activityLabel: String? {
         guard isAgent else { return nil }
-        if let status = presenceStatus, !status.isEmpty { return status }
+        if let status = presenceStatus, !status.isEmpty {
+            // Agents send `key=value` pairs; show what it is doing, decoded.
+            // A status in no known form is shown as it came.
+            guard let agent = AgentStatus.parse(status) else { return status }
+            if let doing = agent.doing { return doing }
+        }
         switch presenceState {
         case "executing": return "working"
         case "waiting_for_input": return "waiting for input"

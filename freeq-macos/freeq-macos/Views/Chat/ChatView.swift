@@ -323,7 +323,7 @@ struct TopBarView: View {
                     AvatarView(nick: dmNick, size: 30)
                         .overlay(alignment: .bottomTrailing) {
                             Circle()
-                                .fill(isOnline ? (awayMsg != nil ? Theme.warning : Theme.success) : Theme.textTertiary.opacity(0.45))
+                                .fill(isOnline ? headerStatusColor : Theme.textTertiary.opacity(0.45))
                                 .frame(width: 9, height: 9)
                                 .overlay(Circle().strokeBorder(Theme.surface, lineWidth: 1.5))
                         }
@@ -332,9 +332,12 @@ struct TopBarView: View {
                         Text(dmNick)
                             .font(.headline.weight(.semibold))
                             .foregroundStyle(Theme.textPrimary)
-                        Text(isOnline ? (awayMsg != nil ? "away" : "online") : "offline")
+                        Text(isOnline ? headerStatusText : "offline")
                             .font(.caption2)
-                            .foregroundStyle(isOnline ? (awayMsg != nil ? Theme.warning : Theme.success) : Theme.textTertiary)
+                            .foregroundStyle(isOnline ? headerStatusColor : Theme.textTertiary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .help(isOnline ? headerStatusText : "offline")
                     }
                 }
 
@@ -444,6 +447,18 @@ struct TopBarView: View {
     private var awayMsg: String? {
         guard let name = channel?.name else { return nil }
         return appState.awayStatus(for: appState.displayNameForKey(name))
+    }
+
+    /// "online", "away", or — for an agent at work — what it is doing.
+    private var headerStatusText: String {
+        guard let awayMsg else { return "online" }
+        if let agent = AgentStatus.parse(awayMsg) { return agent.summary ?? "Working" }
+        return "away"
+    }
+
+    private var headerStatusColor: Color {
+        guard let awayMsg else { return Theme.success }
+        return AgentStatus.parse(awayMsg) != nil ? Theme.blue : Theme.warning
     }
 
     private var encryptedBadge: some View {

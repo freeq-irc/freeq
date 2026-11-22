@@ -603,15 +603,25 @@ fn draw_nicklist(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 Color::Cyan
             };
-            Line::from(vec![
+            // Agents are marked, so a room's bots never pass for people.
+            let is_agent = app.agents.contains(&name.to_lowercase());
+            let mut spans = vec![
                 Span::styled(
                     prefix,
                     Style::default()
                         .fg(prefix_color)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(name),
-            ])
+                if is_agent {
+                    Span::styled(name, Style::default().fg(Color::Blue))
+                } else {
+                    Span::raw(name)
+                },
+            ];
+            if is_agent {
+                spans.push(Span::styled(" ⚙", Style::default().fg(Color::Blue)));
+            }
+            Line::from(spans)
         })
         .collect();
 

@@ -12,6 +12,13 @@ pub struct MemberInfo {
     pub is_voiced: bool,
 }
 
+/// One member's actor class (`agent` / `external_agent` / `human`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ActorClassEntry {
+    pub nick: String,
+    pub actor_class: String,
+}
+
 /// An IRC message with parsed tag metadata.
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageData {
@@ -92,7 +99,29 @@ pub enum DomainEvent {
     },
     AwayChanged {
         nick: String,
+        /// The AWAY reason as sent (None = back).
         away_msg: Option<String>,
+        /// What to show for it: an agent's `key=value` status decoded
+        /// ("Working · answering chad in #phoenix"), anyone else's verbatim.
+        away_text: Option<String>,
+        /// The reason is an agent status: the agent is working, not away.
+        is_agent_status: bool,
+    },
+    /// Structured agent presence. Only agents publish one.
+    Presence {
+        nick: String,
+        state: String,
+        /// Raw status text (usually `key=value` pairs).
+        status: Option<String>,
+        task: Option<String>,
+        /// One display line: "Working · answering chad in #phoenix".
+        status_text: Option<String>,
+    },
+    /// Which members of a channel are agents. Humans are omitted, so absent
+    /// stays human.
+    ActorClasses {
+        channel: String,
+        classes: Vec<ActorClassEntry>,
     },
     UserQuit {
         nick: String,
@@ -250,40 +279,37 @@ pub fn convert_event(event: &freeq_sdk::event::Event) -> DomainEvent {
         Event::AwayChanged { nick, away_msg } => DomainEvent::AwayChanged {
             nick: nick.clone(),
             away_msg: away_msg.clone(),
+            away_text: crate::agent_status::display_away(away_msg.as_deref()),
+            is_agent_status: away_msg
+                .as_deref()
+                .and_then(crate::agent_status::AgentStatus::parse)
+                .is_some(),
         },
         // Structured agent presence carries what AWAY cannot: a status for an
-        // *active* agent, and the task the work belongs to. This surface has
-        // no richer shape to put it in yet, so it rides the away channel with
-        // the status as its message — which is what a reader wants to see —
-        // and the task id appended when the agent named one.
+        // *active* agent. It used to ride the away channel, which painted an
+        // available agent as away; now it is its own event, decoded.
         Event::Presence {
             nick,
             state,
             status,
             task,
-        } => DomainEvent::AwayChanged {
+        } => DomainEvent::Presence {
             nick: nick.clone(),
-            away_msg: Some(match (status, task) {
-                (Some(s), Some(t)) => format!("{state}: {s} [{t}]"),
-                (Some(s), None) => format!("{state}: {s}"),
-                (None, Some(t)) => format!("{state} [{t}]"),
-                (None, None) => state.clone(),
-            }),
+            state: state.clone(),
+            status: status.clone(),
+            task: task.clone(),
+            status_text: crate::agent_status::display_presence(state, status.as_deref()),
         },
-        // Who in the room is not a person. Absent means human, so an empty
-        // list says nothing and produces an empty notice like NamesEnd does.
-        Event::ActorClasses { channel, classes } => DomainEvent::Notice {
-            text: match classes.is_empty() {
-                true => String::new(),
-                false => format!(
-                    "{channel}: {}",
-                    classes
-                        .iter()
-                        .map(|(nick, class)| format!("{nick} is an {class}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            },
+        // Who in the room is not a person: badged in the member list.
+        Event::ActorClasses { channel, classes } => DomainEvent::ActorClasses {
+            channel: channel.clone(),
+            classes: classes
+                .iter()
+                .map(|(nick, class)| ActorClassEntry {
+                    nick: nick.clone(),
+                    actor_class: class.clone(),
+                })
+                .collect(),
         },
         Event::UserQuit { nick, reason } => DomainEvent::UserQuit {
             nick: nick.clone(),
@@ -430,6 +456,61 @@ mod tests {
         let domain = convert_event(&event);
         let json = serde_json::to_value(&domain).unwrap();
         assert_eq!(json["type"], "connected");
+    }
+
+    #[test]
+    fn test_agent_away_is_decoded_and_flagged() {
+        let event = freeq_sdk::event::Event::AwayChanged {
+            nick: "bot".into(),
+            away_msg: Some("executing: project=phoenix doing=answering+chad".into()),
+        };
+        let json = serde_json::to_value(convert_event(&event)).unwrap();
+        assert_eq!(json["type"], "away_changed");
+        assert_eq!(json["data"]["away_text"], "Working · answering chad");
+        assert_eq!(json["data"]["is_agent_status"], true);
+        assert_eq!(
+            json["data"]["away_msg"],
+            "executing: project=phoenix doing=answering+chad"
+        );
+    }
+
+    #[test]
+    fn test_person_away_is_left_alone() {
+        let event = freeq_sdk::event::Event::AwayChanged {
+            nick: "carol".into(),
+            away_msg: Some("lunch".into()),
+        };
+        let json = serde_json::to_value(convert_event(&event)).unwrap();
+        assert_eq!(json["data"]["away_text"], "lunch");
+        assert_eq!(json["data"]["is_agent_status"], false);
+    }
+
+    #[test]
+    fn test_presence_is_its_own_event() {
+        let event = freeq_sdk::event::Event::Presence {
+            nick: "bot".into(),
+            state: "active".into(),
+            status: Some("project=freeq doing=reviewing+a+PR".into()),
+            task: Some("01JQ".into()),
+        };
+        let json = serde_json::to_value(convert_event(&event)).unwrap();
+        assert_eq!(json["type"], "presence");
+        assert_eq!(json["data"]["state"], "active");
+        assert_eq!(json["data"]["status_text"], "Available · reviewing a PR");
+        assert_eq!(json["data"]["task"], "01JQ");
+    }
+
+    #[test]
+    fn test_actor_classes_are_structured() {
+        let event = freeq_sdk::event::Event::ActorClasses {
+            channel: "#lobby".into(),
+            classes: vec![("worker".into(), "agent".into())],
+        };
+        let json = serde_json::to_value(convert_event(&event)).unwrap();
+        assert_eq!(json["type"], "actor_classes");
+        assert_eq!(json["data"]["channel"], "#lobby");
+        assert_eq!(json["data"]["classes"][0]["nick"], "worker");
+        assert_eq!(json["data"]["classes"][0]["actor_class"], "agent");
     }
 
     #[test]

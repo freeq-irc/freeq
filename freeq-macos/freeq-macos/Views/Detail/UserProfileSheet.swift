@@ -45,6 +45,16 @@ struct UserProfileSheet: View {
     private var isSelf: Bool {
         nick.lowercased() == appState.nick.lowercased()
     }
+    /// What this agent is doing and where, from its live presence, else its
+    /// AWAY reason. Nil for a person, and for an agent with nothing to say.
+    private var agentStatus: AgentStatus? {
+        guard let member = appState.memberInfo(for: nick), member.isAgent else { return nil }
+        if let raw = member.presenceStatus, var s = AgentStatus.parse(raw) {
+            s.state = s.state ?? member.presenceState
+            return s
+        }
+        return AgentStatus.parse(member.awayMsg)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -160,6 +170,13 @@ struct UserProfileSheet: View {
                             .multilineTextAlignment(.center)
                             .padding(.horizontal, 24)
                             .padding(.top, 8)
+                    }
+
+                    // An agent's live work: what, for how long, and where.
+                    if let agent = agentStatus {
+                        AgentActivityCard(status: agent)
+                            .padding(.horizontal, 24)
+                            .padding(.top, 12)
                     }
 
                     // Stats

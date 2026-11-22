@@ -3540,7 +3540,22 @@ where
                                     .send(Event::MemberDid { nick: nick.clone(), did: did.to_string() })
                                     .await;
                             }
-                            let _ = event_tx.send(Event::Joined { channel, nick, account }).await;
+                            // A joiner's class rides the JOIN as a tag. Passed on
+                            // as an ActorClasses event, after the Joined, so a
+                            // client already in the room badges an agent that
+                            // joins after it (674 only covers those there first).
+                            let class = msg.tags.get("+freeq.at/actor-class")
+                                .or_else(|| msg.tags.get("freeq.at/actor-class"))
+                                .filter(|c| c.as_str() == "agent" || c.as_str() == "external_agent")
+                                .cloned();
+                            let _ = event_tx
+                                .send(Event::Joined { channel: channel.clone(), nick: nick.clone(), account })
+                                .await;
+                            if let Some(class) = class {
+                                let _ = event_tx
+                                    .send(Event::ActorClasses { channel, classes: vec![(nick, class)] })
+                                    .await;
+                            }
                         }
                         "PART" => {
                             let channel = msg.params.first().cloned().unwrap_or_default();
@@ -10400,6 +10415,43 @@ mod irc_loop_tests {
     }
 
     // ── extended-join account field ───────────────────────────────────────────
+
+    /// A JOIN tagged with an agent actor class is followed by an
+    /// ActorClasses event for the joiner, so a client already in the room
+    /// badges it. A human-tagged or untagged JOIN emits none.
+    #[tokio::test]
+    async fn tagged_join_emits_actor_class_after_joined() {
+        let (mut server, mut events, _cmd) = start_run_irc("host16b").await;
+        server
+            .write_all(b"@+freeq.at/actor-class=human :carol!u@h JOIN #lobby * :Carol\r\n")
+            .await
+            .unwrap();
+        server
+            .write_all(b"@+freeq.at/actor-class=agent :bot!u@h JOIN #lobby did:key:z6Mk :Bot\r\n")
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+
+        let got = tokio::time::timeout(tokio::time::Duration::from_millis(400), async {
+            let mut seen = Vec::new();
+            while let Some(ev) = events.recv().await {
+                match ev {
+                    Event::Joined { nick, .. } => seen.push(format!("join:{nick}")),
+                    Event::ActorClasses { channel, classes } => {
+                        for (n, c) in classes {
+                            seen.push(format!("class:{channel}:{n}={c}"));
+                        }
+                        return seen;
+                    }
+                    _ => {}
+                }
+            }
+            seen
+        })
+        .await
+        .unwrap_or_default();
+        assert_eq!(got, vec!["join:carol", "join:bot", "class:#lobby:bot=agent"]);
+    }
 
     /// Extended JOIN with a DID account field emits Event::Joined with
     /// account = Some(did).

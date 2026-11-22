@@ -30,6 +30,10 @@ struct MemberListView: View {
     private var ops: [MemberInfo] { filtered.filter(\.isOp).sorted { $0.nick < $1.nick } }
     private var voiced: [MemberInfo] { filtered.filter { !$0.isOp && $0.isVoiced }.sorted { $0.nick < $1.nick } }
     private var regular: [MemberInfo] { filtered.filter { !$0.isOp && !$0.isVoiced }.sorted { $0.nick < $1.nick } }
+    /// Agents get their own section, so a room's people and its bots are
+    /// never one undifferentiated list. Ops and voiced keep their rank.
+    private var people: [MemberInfo] { regular.filter { !$0.isAgent } }
+    private var agents: [MemberInfo] { regular.filter(\.isAgent) }
 
     private var filtered: [MemberInfo] {
         let base = channel.uniqueMembers(resolveDid: { ProfileCache.shared.did(for: $0) })
@@ -75,14 +79,22 @@ struct MemberListView: View {
                     if !voiced.isEmpty {
                         memberSection("Voiced — \(voiced.count)", members: voiced)
                     }
-                    if !regular.isEmpty {
-                        memberSection("Online — \(regular.count)", members: regular)
+                    if !people.isEmpty {
+                        memberSection("Online — \(people.count)", members: people)
+                    }
+                    if !agents.isEmpty {
+                        memberSection("Agents — \(agents.count)", members: agents)
                     }
                 }
                 .padding(.vertical, 4)
             }
         }
         .background(Theme.detailBackground)
+    }
+
+    private func rowIdentity(_ m: MemberInfo) -> String {
+        [m.nick, m.actorClass ?? "", m.presenceState ?? "", m.presenceStatus ?? "",
+         m.awayMsg ?? "\u{0}", m.isOp ? "o" : "", m.isVoiced ? "v" : ""].joined(separator: "|")
     }
 
     @ViewBuilder
@@ -97,6 +109,12 @@ struct MemberListView: View {
 
         ForEach(members) { member in
             MemberRow(member: member, channelName: channel.name)
+                // In a LazyVStack a row updated in place does not reliably
+                // repaint: an agent whose class or status arrived after its
+                // row was drawn kept a plain, badge-less row until relaunch
+                // (seen 2026-11-17). Keying the row on what it shows makes a
+                // change a new row.
+                .id(rowIdentity(member))
         }
     }
 }
@@ -133,13 +151,21 @@ struct MemberRow: View {
         )).showsMark
     }
 
+    /// An agent at work: it says so in presence, or its AWAY is an agent
+    /// status rather than a person's away message.
+    private var isWorking: Bool {
+        guard member.isAgent else { return false }
+        if member.presenceState == "executing" { return true }
+        return member.presenceState == nil && AgentStatus.parse(member.awayMsg) != nil
+    }
+
     var body: some View {
         HStack(spacing: 8) {
             // Avatar with presence indicator
             AvatarView(nick: member.nick, size: 28)
                 .overlay(alignment: .bottomTrailing) {
                     Circle()
-                        .fill(member.isAway ? Theme.warning : Theme.success)
+                        .fill(isWorking ? Theme.blue : (member.isAway ? Theme.warning : Theme.success))
                         .frame(width: 8, height: 8)
                         .overlay(
                             Circle().strokeBorder(Theme.detailBackground, lineWidth: 1.5)
@@ -186,14 +212,24 @@ struct MemberRow: View {
                     // Agent badge. Only shown when the server actually said so
                     // — an unlabelled member is a person, as before.
                     if member.isAgent {
-                        Image(systemName: "cpu")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(Theme.blue)
-                            .help(member.actorClass == "external_agent"
-                                  ? "External agent" : "Agent")
+                        HStack(spacing: 2) {
+                            Image(systemName: "cpu")
+                                .font(.system(size: 8, weight: .bold))
+                            Text(member.actorClass == "external_agent" ? "EXT AGENT" : "AGENT")
+                                .font(.system(size: 8, weight: .bold))
+                        }
+                        .foregroundStyle(Theme.blue)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Theme.blue.opacity(0.14))
+                        .clipShape(RoundedRectangle(cornerRadius: 3))
+                        .help(member.actorClass == "external_agent" ? "External agent" : "Agent")
+                        .accessibilityLabel(member.actorClass == "external_agent" ? "External agent" : "Agent")
                     }
 
-                    if member.isAway {
+                    // An agent's AWAY means it is working, not gone: the blue
+                    // dot and the activity line say that; "Away" would not.
+                    if member.isAway && !isWorking {
                         Text("Away")
                             .font(.system(size: 9, weight: .semibold))
                             .foregroundStyle(Theme.warning)
@@ -215,19 +251,22 @@ struct MemberRow: View {
                             .font(.system(size: 8))
                         Text(activity)
                             .lineLimit(1)
+                            .truncationMode(.tail)
                     }
                     .font(.caption2)
                     .foregroundStyle(Theme.blue)
+                    .help(activity)
                 } else if let handle = profile?.handle {
                     Text("@\(handle)")
                         .font(.caption2)
                         .foregroundStyle(Theme.textTertiary)
                         .lineLimit(1)
-                } else if member.isAway, let away = member.awayMsg {
+                } else if member.isAway, let away = AgentStatus.displayAway(member.awayMsg) {
                     Text(away)
                         .font(.caption2)
                         .foregroundStyle(Theme.textTertiary)
                         .lineLimit(1)
+                        .help(away)
                 }
             }
             Spacer()
@@ -314,7 +353,13 @@ struct DMProfilePanel: View {
     }
     private var statusText: String {
         if !isOnline { return "Offline - messages saved" }
-        if let awayMsg, !awayMsg.isEmpty { return "Away: \(awayMsg)" }
+        if let awayMsg, !awayMsg.isEmpty {
+            // An agent's AWAY is its work, decoded: "Working · answering …".
+            if let agent = AgentStatus.parse(awayMsg) {
+                return AgentStatus.label(forState: agent.state) ?? "Working"
+            }
+            return "Away: \(awayMsg)"
+        }
         return "Online"
     }
     private var statusIcon: String {
@@ -323,6 +368,7 @@ struct DMProfilePanel: View {
     }
     private var statusColor: Color {
         if !isOnline { return Theme.textTertiary }
+        if AgentStatus.parse(awayMsg) != nil { return Theme.blue }
         return awayMsg == nil ? Theme.success : Theme.warning
     }
 
@@ -395,6 +441,10 @@ struct DMProfilePanel: View {
                         }
                     }
 
+                    if let agent = agentStatus {
+                        AgentActivityCard(status: agent)
+                    }
+
                     if isP2p {
                         Label("Direct P2P available", systemImage: "point.3.connected.trianglepath.dotted")
                             .font(.caption.weight(.medium))
@@ -462,6 +512,18 @@ struct DMProfilePanel: View {
             appState.sendWhois(nick, display: false)
             ProfileCache.shared.fetchProfileIfPossible(nick: nick)
         }
+    }
+
+    /// The DM peer's agent status, decoded: from its live presence when it
+    /// publishes one, else from its AWAY reason. Nil for a person.
+    private var agentStatus: AgentStatus? {
+        let member = appState.memberInfo(for: nick)
+        if let member, member.isAgent, let raw = member.presenceStatus,
+           var s = AgentStatus.parse(raw) {
+            s.state = s.state ?? member.presenceState
+            return s
+        }
+        return AgentStatus.parse(awayMsg)
     }
 
     private var statusPill: some View {
@@ -600,5 +662,63 @@ private struct DMProfileBanner: View {
             startPoint: .topLeading,
             endPoint: .bottomTrailing
         )
+    }
+}
+
+
+/// What an agent is doing, as a sentence with a live "for 3m", then where it
+/// works — wrapped, never cut off, each value selectable so a long branch can
+/// be copied. Shown wherever a person looks at an agent: the DM panel and the
+/// profile sheet a member row opens.
+struct AgentActivityCard: View {
+    let status: AgentStatus
+
+    var body: some View {
+        let facts = status.facts
+        if status.doing != nil || !facts.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Label("Activity", systemImage: "gearshape.2")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Theme.textTertiary)
+                    if let state = AgentStatus.label(forState: status.state) {
+                        Text(state)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Theme.blue)
+                    }
+                }
+                if let doing = status.doing {
+                    // Counted here from when the work began: what was sent is
+                    // never a stale "· 0s".
+                    TimelineView(.periodic(from: .now, by: 10)) { ctx in
+                        (Text(doing).foregroundStyle(Theme.textPrimary)
+                         + Text(status.since.map { " · for \(AgentStatus.elapsed(since: $0, now: ctx.date))" } ?? "")
+                            .foregroundStyle(Theme.textTertiary))
+                            .font(.callout)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+                    }
+                }
+                if !facts.isEmpty {
+                    Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 3) {
+                        ForEach(facts, id: \.0) { k, v in
+                            GridRow {
+                                Text(k)
+                                    .font(.caption)
+                                    .foregroundStyle(Theme.textTertiary)
+                                Text(v)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(Theme.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Theme.blue.opacity(0.07)))
+        }
     }
 }

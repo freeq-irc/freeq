@@ -339,7 +339,9 @@ class AppState {
                 if m.did == nil {
                     ch.members[idx] = MemberInfo(
                         nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop,
-                        isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: did)
+                        isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: did,
+                        actorClass: m.actorClass, presenceState: m.presenceState,
+                        presenceStatus: m.presenceStatus)
                 }
             }
         }
@@ -1553,6 +1555,15 @@ class AppState {
         }
     }
 
+    /// The member record for `nick` in any channel we share, if any.
+    func memberInfo(for nick: String) -> MemberInfo? {
+        let lower = nick.lowercased()
+        for ch in channels {
+            if let m = ch.members.first(where: { $0.nick.lowercased() == lower }) { return m }
+        }
+        return nil
+    }
+
     func awayStatus(for nick: String) -> String? {
         let lower = nick.lowercased()
         for ch in channels {
@@ -2368,10 +2379,10 @@ extension AppState {
                 switch mode {
                 case "+o": ch.members[idx] = MemberInfo(nick: m.nick, isOp: true, isHalfop: m.isHalfop, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: m.did, actorClass: m.actorClass, presenceState: m.presenceState, presenceStatus: m.presenceStatus)
                 case "-o": ch.members[idx] = MemberInfo(nick: m.nick, isOp: false, isHalfop: m.isHalfop, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: m.did, actorClass: m.actorClass, presenceState: m.presenceState, presenceStatus: m.presenceStatus)
-                case "+h": ch.members[idx] = MemberInfo(nick: m.nick, isOp: m.isOp, isHalfop: true, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: m.did)
-                case "-h": ch.members[idx] = MemberInfo(nick: m.nick, isOp: m.isOp, isHalfop: false, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: m.did)
-                case "+v": ch.members[idx] = MemberInfo(nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop, isVoiced: true, awayMsg: m.awayMsg, did: m.did)
-                case "-v": ch.members[idx] = MemberInfo(nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop, isVoiced: false, awayMsg: m.awayMsg, did: m.did)
+                case "+h": ch.members[idx] = MemberInfo(nick: m.nick, isOp: m.isOp, isHalfop: true, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: m.did, actorClass: m.actorClass, presenceState: m.presenceState, presenceStatus: m.presenceStatus)
+                case "-h": ch.members[idx] = MemberInfo(nick: m.nick, isOp: m.isOp, isHalfop: false, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: m.did, actorClass: m.actorClass, presenceState: m.presenceState, presenceStatus: m.presenceStatus)
+                case "+v": ch.members[idx] = MemberInfo(nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop, isVoiced: true, awayMsg: m.awayMsg, did: m.did, actorClass: m.actorClass, presenceState: m.presenceState, presenceStatus: m.presenceStatus)
+                case "-v": ch.members[idx] = MemberInfo(nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop, isVoiced: false, awayMsg: m.awayMsg, did: m.did, actorClass: m.actorClass, presenceState: m.presenceState, presenceStatus: m.presenceStatus)
                 default: break
                 }
             }
@@ -2420,7 +2431,7 @@ extension AppState {
             for ch in allBuffers {
                 if let idx = ch.members.firstIndex(where: { $0.nick.lowercased() == oldNick.lowercased() }) {
                     let old = ch.members[idx]
-                    ch.members[idx] = MemberInfo(nick: newNick, isOp: old.isOp, isHalfop: old.isHalfop, isVoiced: old.isVoiced, awayMsg: old.awayMsg, did: old.did)
+                    ch.members[idx] = MemberInfo(nick: newNick, isOp: old.isOp, isHalfop: old.isHalfop, isVoiced: old.isVoiced, awayMsg: old.awayMsg, did: old.did, actorClass: old.actorClass, presenceState: old.presenceState, presenceStatus: old.presenceStatus)
                 }
             }
 

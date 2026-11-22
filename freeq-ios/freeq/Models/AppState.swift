@@ -510,7 +510,9 @@ class AppState: ObservableObject {
                ch.members[idx].did == nil {
                 let m = ch.members[idx]
                 ch.members[idx] = MemberInfo(nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop,
-                                             isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: did)
+                                             isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: did,
+                                             actorClass: m.actorClass, presenceState: m.presenceState,
+                                             presenceStatus: m.presenceStatus)
             }
         }
     }
@@ -2801,7 +2803,7 @@ class AppState: ObservableObject {
         for ch in channels {
             if let idx = ch.members.firstIndex(where: { $0.nick.lowercased() == oldNick.lowercased() }) {
                 let m = ch.members[idx]
-                ch.members[idx] = MemberInfo(nick: newNick, isOp: m.isOp, isHalfop: m.isHalfop, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: m.did)
+                ch.members[idx] = MemberInfo(nick: newNick, isOp: m.isOp, isHalfop: m.isHalfop, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: m.did, actorClass: m.actorClass, presenceState: m.presenceState, presenceStatus: m.presenceStatus)
             }
             if let ts = ch.typingUsers.removeValue(forKey: oldNick) {
                 ch.typingUsers[newNick] = ts
@@ -3250,11 +3252,16 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
             let ch = state.getOrCreateChannel(channel)
             // Deduplicate by lowercased nick (server may send same nick with different cases)
             var seen = Set<String>()
+            // NAMES carries no actor class or presence: keep what we knew per
+            // nick, or every roster refresh un-badges the room's agents.
+            let prior = Dictionary(ch.members.map { ($0.nick.lowercased(), $0) }, uniquingKeysWith: { a, _ in a })
             ch.members = members.compactMap { m -> MemberInfo? in
                 let key = m.nick.lowercased()
                 guard !seen.contains(key) else { return nil }
                 seen.insert(key)
-                return MemberInfo(nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: nil)
+                let p = prior[key]
+                return MemberInfo(nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: p?.did,
+                                  actorClass: p?.actorClass, presenceState: p?.presenceState, presenceStatus: p?.presenceStatus)
             }
             // Prefetch avatars for all channel members
             let nicks = members.map { $0.nick }
@@ -3273,12 +3280,12 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
             if let idx = ch.members.firstIndex(where: { $0.nick.lowercased() == nick.lowercased() }) {
                 let member = ch.members[idx]
                 switch mode {
-                case "+o": ch.members[idx] = MemberInfo(nick: member.nick, isOp: true, isHalfop: false, isVoiced: member.isVoiced, awayMsg: member.awayMsg, did: member.did)
-                case "-o": ch.members[idx] = MemberInfo(nick: member.nick, isOp: false, isHalfop: member.isHalfop, isVoiced: member.isVoiced, awayMsg: member.awayMsg, did: member.did)
-                case "+h": ch.members[idx] = MemberInfo(nick: member.nick, isOp: member.isOp, isHalfop: true, isVoiced: member.isVoiced, awayMsg: member.awayMsg, did: member.did)
-                case "-h": ch.members[idx] = MemberInfo(nick: member.nick, isOp: member.isOp, isHalfop: false, isVoiced: member.isVoiced, awayMsg: member.awayMsg, did: member.did)
-                case "+v": ch.members[idx] = MemberInfo(nick: member.nick, isOp: member.isOp, isHalfop: member.isHalfop, isVoiced: true, awayMsg: member.awayMsg, did: member.did)
-                case "-v": ch.members[idx] = MemberInfo(nick: member.nick, isOp: member.isOp, isHalfop: member.isHalfop, isVoiced: false, awayMsg: member.awayMsg, did: member.did)
+                case "+o": ch.members[idx] = MemberInfo(nick: member.nick, isOp: true, isHalfop: false, isVoiced: member.isVoiced, awayMsg: member.awayMsg, did: member.did, actorClass: member.actorClass, presenceState: member.presenceState, presenceStatus: member.presenceStatus)
+                case "-o": ch.members[idx] = MemberInfo(nick: member.nick, isOp: false, isHalfop: member.isHalfop, isVoiced: member.isVoiced, awayMsg: member.awayMsg, did: member.did, actorClass: member.actorClass, presenceState: member.presenceState, presenceStatus: member.presenceStatus)
+                case "+h": ch.members[idx] = MemberInfo(nick: member.nick, isOp: member.isOp, isHalfop: true, isVoiced: member.isVoiced, awayMsg: member.awayMsg, did: member.did, actorClass: member.actorClass, presenceState: member.presenceState, presenceStatus: member.presenceStatus)
+                case "-h": ch.members[idx] = MemberInfo(nick: member.nick, isOp: member.isOp, isHalfop: false, isVoiced: member.isVoiced, awayMsg: member.awayMsg, did: member.did, actorClass: member.actorClass, presenceState: member.presenceState, presenceStatus: member.presenceStatus)
+                case "+v": ch.members[idx] = MemberInfo(nick: member.nick, isOp: member.isOp, isHalfop: member.isHalfop, isVoiced: true, awayMsg: member.awayMsg, did: member.did, actorClass: member.actorClass, presenceState: member.presenceState, presenceStatus: member.presenceStatus)
+                case "-v": ch.members[idx] = MemberInfo(nick: member.nick, isOp: member.isOp, isHalfop: member.isHalfop, isVoiced: false, awayMsg: member.awayMsg, did: member.did, actorClass: member.actorClass, presenceState: member.presenceState, presenceStatus: member.presenceStatus)
                 default: break
                 }
             }

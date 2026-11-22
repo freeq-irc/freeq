@@ -31,6 +31,7 @@
 		2638BD02F7EB739F42DCB80B /* FreeqLogo.swift in Sources */ = {isa = PBXBuildFile; fileRef = B46D635B8FB436FDCECA93FE /* FreeqLogo.swift */; };
 		2750E2A554136E50881B2E2E /* UserProfileSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95D94CB373FB8CFD1EAD366F /* UserProfileSheet.swift */; };
 		29A01537002089A232C6A1CB /* MemberListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39851CF7C369A289DB8E3E93 /* MemberListView.swift */; };
+		2A66204814ED9CC6E0D18274 /* AgentStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = A61A2D4749E3E613045649E2 /* AgentStatus.swift */; };
 		2ACA35D908CFA2C3F6A1B064 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = CAB74C30074754BEE8F190DE /* PrivacyInfo.xcprivacy */; };
 		2BE87DF57370DD8D23D5857C /* MessageActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = C24850A65B3ED49F5C323EEA /* MessageActions.swift */; };
 		2DAA75F33F0F0DF1E697A19A /* WatchSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 893A3A695627ED14710AD125 /* WatchSession.swift */; };
@@ -51,7 +52,6 @@
 		4BC265FF53A0BB0A3BFECD1A /* FreeqCommands.swift in Sources */ = {isa = PBXBuildFile; fileRef = 883DBC919B347571BC792852 /* FreeqCommands.swift */; };
 		4D5006848D66CA9FF16B2680 /* DmHistoryOnOpen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6ED301BD44C5DB63F6430B53 /* DmHistoryOnOpen.swift */; };
 		4D812AA5D08CF45A2F27BF72 /* IntelligenceService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25A01703D21F0BCF9963E1B8 /* IntelligenceService.swift */; };
-		4F096EDDDC00CEA18281B088 /* RefusedLogin.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC795A5BDF4DC3999132F232 /* RefusedLogin.swift */; };
 		4F32549F7429803BCF26DE25 /* VideoFeedView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AF979D760370C0C44E53D1C /* VideoFeedView.swift */; };
 		590DB15E36CC6FECFC8FB1B6 /* ActivityKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5402990427FB4D600E4D9BA6 /* ActivityKit.framework */; };
 		5B1B81D53A3DE4767C2A498B /* PhoneWatchBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A31629FF3AFE028388F95C8 /* PhoneWatchBridge.swift */; };
@@ -113,6 +113,7 @@
 		C188CB44680B51C598EEDA18 /* BlueskyGraph.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5C23A0B4E13C09B1E12EA8F /* BlueskyGraph.swift */; };
 		CC7494A98A8946A1FE98FA17 /* WatchConnectivity.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0CFEA027394A64C46A1780F5 /* WatchConnectivity.framework */; };
 		CE133BCB1C065B2B2EEEB0B2 /* PeopleView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88F30B75033F6333978D7F0E /* PeopleView.swift */; };
+		CE584A5DD1EEF40ABD0BCAA6 /* RefusedLogin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4242F4AFAE2D15BD5FF07135 /* RefusedLogin.swift */; };
 		D0209F9328C9586D5B2849DE /* ConnectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5623F20307924888306278FF /* ConnectView.swift */; };
 		D0358591360DD63CE1830E92 /* MarkdownText.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE51C9015AF7D1E917C5BFC0 /* MarkdownText.swift */; };
 		D2420E065B9554030542DE6E /* Jumbomoji.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1553940F560E15659B1C240D /* Jumbomoji.swift */; };
@@ -210,6 +211,7 @@
 		3A59A5F928CAB65BE2BEF71E /* LinkPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LinkPreview.swift; sourceTree = "<group>"; };
 		3E5226D9C982E6895916387C /* FavoritesSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FavoritesSync.swift; sourceTree = "<group>"; };
 		40EA2E012985430B01C97EBC /* CallControlIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CallControlIntents.swift; sourceTree = "<group>"; };
+		4242F4AFAE2D15BD5FF07135 /* RefusedLogin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RefusedLogin.swift; sourceTree = "<group>"; };
 		427121549BC7B078C6A911D1 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		4601D5B9F9DC30C03EDC4344 /* freeqWatch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = freeqWatch.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		471DB6E8285B3DE882A52E79 /* YouTubeThumb.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YouTubeThumb.swift; sourceTree = "<group>"; };
@@ -272,11 +274,11 @@
 		9DFC6E8F6927C989B299B239 /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
 		9E160E4F6AA98C972AA5B794 /* ComposeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposeView.swift; sourceTree = "<group>"; };
 		A5770C0CB2F73315874C61C7 /* MotdSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MotdSheet.swift; sourceTree = "<group>"; };
+		A61A2D4749E3E613045649E2 /* AgentStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentStatus.swift; sourceTree = "<group>"; };
 		A725C856D7878BE6382208F3 /* CallLiveActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CallLiveActivity.swift; sourceTree = "<group>"; };
 		A8B3ACAA832092748A58D823 /* freeq.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = freeq.entitlements; sourceTree = "<group>"; };
 		A968D5C7244372A54881C91E /* ServerConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerConfig.swift; sourceTree = "<group>"; };
 		ABCDE5D7A00E6A7790E2960E /* OnboardingSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingSheet.swift; sourceTree = "<group>"; };
-		AC795A5BDF4DC3999132F232 /* RefusedLogin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RefusedLogin.swift; sourceTree = "<group>"; };
 		B28D17294C06F964661A5E97 /* KeychainHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainHelper.swift; sourceTree = "<group>"; };
 		B3200A9C4EB97C507BCBA97D /* AvSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AvSessionTests.swift; sourceTree = "<group>"; };
 		B43788F5890429BF64CC12CC /* freeqLiveActivity.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = freeqLiveActivity.appex; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -471,6 +473,7 @@
 				19D92C71419A1910A54E824B /* ActFacts.swift */,
 				63ACD9737CE3436EDC7981E3 /* ActTasks.swift */,
 				C02A75EDE43369E820B756D3 /* ActVerbs.swift */,
+				A61A2D4749E3E613045649E2 /* AgentStatus.swift */,
 				00D21A39BF3823FEA1457075 /* ApiAuth.swift */,
 				DB66829DE40DA60667ECBB43 /* AppState.swift */,
 				6D03D34D14D46D454A451066 /* AppState+Navigation.swift */,
@@ -508,7 +511,7 @@
 				0ACC23EC3E2A6AC3B1FCBA6E /* OutboundSend.swift */,
 				7A31629FF3AFE028388F95C8 /* PhoneWatchBridge.swift */,
 				0E8A7FC2E15A5CEC8160244E /* PresenceLines.swift */,
-				AC795A5BDF4DC3999132F232 /* RefusedLogin.swift */,
+				4242F4AFAE2D15BD5FF07135 /* RefusedLogin.swift */,
 				74C635E269C7A5993F613F3B /* RowSignatureMark.swift */,
 				B848E491B8944927766305C4 /* SelfPartResolve.swift */,
 				A968D5C7244372A54881C91E /* ServerConfig.swift */,
@@ -786,6 +789,7 @@
 				24966DD9E147C1C19F6DCEAF /* ActFacts.swift in Sources */,
 				C00258A4E4341822944BB1BA /* ActTasks.swift in Sources */,
 				FA6D882199A4F05F0985C181 /* ActVerbs.swift in Sources */,
+				2A66204814ED9CC6E0D18274 /* AgentStatus.swift in Sources */,
 				A27FE79FCF2981CFC8D03D80 /* ApiAuth.swift in Sources */,
 				7EDFB2CF1E3DC0E8E4861C4E /* AppState+Navigation.swift in Sources */,
 				95571CB3A530D8A2555D2BE3 /* AppState.swift in Sources */,
@@ -858,7 +862,7 @@
 				F09302BFFFB8EAEBFFECBE57 /* PresenceDot.swift in Sources */,
 				4A7801D5F001F1C838BFCF83 /* PresenceLines.swift in Sources */,
 				DF1C8C4E7B84DAD909DCA71B /* QuickSwitcherSheet.swift in Sources */,
-				4F096EDDDC00CEA18281B088 /* RefusedLogin.swift in Sources */,
+				CE584A5DD1EEF40ABD0BCAA6 /* RefusedLogin.swift in Sources */,
 				AE483CC317887C7C9A75B9D5 /* RowSignatureMark.swift in Sources */,
 				E51D087B116EE63A4FA6AAF9 /* Safety.swift in Sources */,
 				B792746D241CB91D4B15E377 /* SearchSheet.swift in Sources */,

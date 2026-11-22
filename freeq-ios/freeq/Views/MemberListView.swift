@@ -22,6 +22,10 @@ struct MemberListView: View {
         dedupedMembers.filter { !$0.isOp && !$0.isHalfop && !$0.isVoiced }.sorted { $0.nick.lowercased() < $1.nick.lowercased() }
     }
 
+    /// Agents get their own section, apart from the room's people.
+    private var people: [MemberInfo] { regular.filter { !$0.isAgent } }
+    private var agents: [MemberInfo] { regular.filter(\.isAgent) }
+
     var body: some View {
         VStack(spacing: 0) {
             // Header
@@ -52,8 +56,11 @@ struct MemberListView: View {
                     if !voiced.isEmpty {
                         memberSection("VOICED — \(voiced.count)", members: voiced)
                     }
-                    if !regular.isEmpty {
-                        memberSection("MEMBERS — \(regular.count)", members: regular)
+                    if !people.isEmpty {
+                        memberSection("MEMBERS — \(people.count)", members: people)
+                    }
+                    if !agents.isEmpty {
+                        memberSection("AGENTS — \(agents.count)", members: agents)
                     }
                 }
                 .padding(.vertical, 4)
@@ -92,6 +99,13 @@ struct MemberListView: View {
         }
     }
 
+    /// An agent at work: presence says so, or its AWAY is an agent status.
+    private func isWorking(_ member: MemberInfo) -> Bool {
+        guard member.isAgent else { return false }
+        if member.presenceState == "executing" { return true }
+        return member.presenceState == nil && AgentStatus.parse(member.awayMsg) != nil
+    }
+
     private func memberRow(_ member: MemberInfo) -> some View {
         Button(action: { profileNick = member.nick }) {
             HStack(spacing: 10) {
@@ -99,7 +113,7 @@ struct MemberListView: View {
                 UserAvatar(nick: member.nick, size: 32)
                     .overlay(
                         Circle()
-                            .fill(member.isAway ? Theme.warning : Theme.success)
+                            .fill(isWorking(member) ? Theme.accent : (member.isAway ? Theme.warning : Theme.success))
                             .frame(width: 10, height: 10)
                             .overlay(
                                 Circle()
@@ -139,7 +153,23 @@ struct MemberListView: View {
                             VerifiedBadge(size: 11)
                         }
 
-                        if member.isAway {
+                        if member.isAgent {
+                            HStack(spacing: 2) {
+                                Image(systemName: "cpu")
+                                    .font(.system(size: 9, weight: .bold))
+                                Text("AGENT")
+                                    .font(.system(size: 9, weight: .bold))
+                            }
+                            .foregroundColor(Theme.accent)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Theme.accent.opacity(0.15))
+                            .cornerRadius(6)
+                            .accessibilityLabel("Agent")
+                        }
+
+                        // An agent's AWAY means it is working, not gone.
+                        if member.isAway && !isWorking(member) {
                             Text("Away")
                                 .font(.fqCaption2.weight(.semibold))
                                 .foregroundColor(Theme.warning)
@@ -149,11 +179,18 @@ struct MemberListView: View {
                                 .cornerRadius(6)
                         }
                     }
-                    if member.isAway, let away = member.awayMsg {
+                    if let activity = member.activityLabel {
+                        Text(activity)
+                            .font(.fqCaption2)
+                            .foregroundColor(Theme.accent)
+                            .lineLimit(2)
+                            .truncationMode(.tail)
+                    } else if member.isAway, let away = AgentStatus.displayAway(member.awayMsg) {
                         Text(away)
                             .font(.fqCaption2)
                             .foregroundColor(Theme.textMuted)
-                            .lineLimit(1)
+                            .lineLimit(2)
+                            .truncationMode(.tail)
                     }
                 }
 

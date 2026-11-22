@@ -136,18 +136,47 @@ struct UserProfileSheet: View {
                             }
 
                             if let away = appState.awayMessage(for: nick) {
-                                HStack(spacing: 6) {
-                                    Circle()
-                                        .fill(Theme.warning)
-                                        .frame(width: 8, height: 8)
-                                    Text("Away")
-                                        .font(.fqCaption.weight(.semibold))
-                                        .foregroundColor(Theme.warning)
-                                }
-                                if !away.isEmpty {
-                                    Text(away)
-                                        .font(.fqFootnote)
-                                        .foregroundColor(Theme.textMuted)
+                                if let agent = AgentStatus.parse(away) {
+                                    // An agent's AWAY is its work: say what it
+                                    // is doing and where, decoded and wrapped.
+                                    HStack(spacing: 6) {
+                                        Circle()
+                                            .fill(Theme.accent)
+                                            .frame(width: 8, height: 8)
+                                        Text(AgentStatus.label(forState: agent.state) ?? "Working")
+                                            .font(.fqCaption.weight(.semibold))
+                                            .foregroundColor(Theme.accent)
+                                    }
+                                    if let doing = agent.doing {
+                                        Text(doing)
+                                            .font(.fqFootnote)
+                                            .foregroundColor(Theme.textPrimary)
+                                            .multilineTextAlignment(.center)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                            .textSelection(.enabled)
+                                    }
+                                    if let context = agent.context {
+                                        Text(context)
+                                            .font(.fqCaption2.monospaced())
+                                            .foregroundColor(Theme.textMuted)
+                                            .multilineTextAlignment(.center)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                            .textSelection(.enabled)
+                                    }
+                                } else {
+                                    HStack(spacing: 6) {
+                                        Circle()
+                                            .fill(Theme.warning)
+                                            .frame(width: 8, height: 8)
+                                        Text("Away")
+                                            .font(.fqCaption.weight(.semibold))
+                                            .foregroundColor(Theme.warning)
+                                    }
+                                    if !away.isEmpty {
+                                        Text(away)
+                                            .font(.fqFootnote)
+                                            .foregroundColor(Theme.textMuted)
+                                    }
                                 }
                             }
 

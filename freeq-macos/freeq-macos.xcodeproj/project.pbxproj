@@ -98,6 +98,7 @@
 		CAF04BC63962B2AD1BCB86FE /* FreeqAppIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99635569CD2711503B3DCF7E /* FreeqAppIntents.swift */; };
 		CB1EC774D4444A86144B5263 /* DmResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49F502D18AE018377ED62923 /* DmResolver.swift */; };
 		CCD46F07817FFF1625133C74 /* Jumbomoji.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06D79754C3E6C19E87D67F6E /* Jumbomoji.swift */; };
+		CFF3B07A6089CBB2A8E52714 /* AgentStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B3D72C0861F59A37D67BA3E /* AgentStatus.swift */; };
 		D0330D3B94FAB33F96D04BE8 /* ThreadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53A3EEB6BC19DB7746A55502 /* ThreadView.swift */; };
 		D20651B63332FC9534E8BF08 /* SendPathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9711A6474348D203111AC49 /* SendPathTests.swift */; };
 		D29F998C6DF599EA13C38C85 /* ConnectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 313F00E499C37E94C9855F4F /* ConnectView.swift */; };
@@ -214,6 +215,7 @@
 		68D19F735EC72757A61B1D6C /* DetailPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DetailPanel.swift; sourceTree = "<group>"; };
 		69D7F8C4D262E9181F0888CF /* ApiAuth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ApiAuth.swift; sourceTree = "<group>"; };
 		6AD26F0F8B6173EE7643F964 /* NotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationManager.swift; sourceTree = "<group>"; };
+		6B3D72C0861F59A37D67BA3E /* AgentStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentStatus.swift; sourceTree = "<group>"; };
 		6D0D657E5F637E5EFD232E19 /* KeychainHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainHelper.swift; sourceTree = "<group>"; };
 		71D02469D6C6FADFE295A523 /* ReconnectPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReconnectPolicy.swift; sourceTree = "<group>"; };
 		7244978703DC2ECAD43DFEB1 /* SelfPartResolve.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfPartResolve.swift; sourceTree = "<group>"; };
@@ -437,6 +439,7 @@
 				75222B6AD422CC6E2435F600 /* ActFacts.swift */,
 				AC100BDE977036018B6D8873 /* ActTasks.swift */,
 				E5A3CB043C6B1897ECD7E6EF /* ActVerbs.swift */,
+				6B3D72C0861F59A37D67BA3E /* AgentStatus.swift */,
 				69D7F8C4D262E9181F0888CF /* ApiAuth.swift */,
 				59A3EE3A6E9D8B6CCE8D4940 /* AppDelegate.swift */,
 				932AFF9B3AF0BCF257A2DCE2 /* AppState.swift */,
@@ -672,6 +675,7 @@
 				D8710A03D5096C7FDD800769 /* ActFacts.swift in Sources */,
 				8318D6CBA44856BE605795E3 /* ActTasks.swift in Sources */,
 				E9D804C750ACFB7EDA49E40F /* ActVerbs.swift in Sources */,
+				CFF3B07A6089CBB2A8E52714 /* AgentStatus.swift in Sources */,
 				F32E9C6E2C26DC15931F9430 /* ApiAuth.swift in Sources */,
 				9A656A1FED0DA78997CD68B4 /* App.swift in Sources */,
 				E5D568CFB88348DD107086ED /* AppDelegate.swift in Sources */,

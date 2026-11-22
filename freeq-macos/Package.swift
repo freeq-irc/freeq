@@ -45,6 +45,7 @@ let package = Package(
                 "Validation.swift",
                 "ServerConfig.swift",
                 "ChatMessage.swift",
+                "AgentStatus.swift",
                 "ChannelState.swift",
                 "DidDisplay.swift",
                 "ChannelPolicy.swift",

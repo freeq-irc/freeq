@@ -3,6 +3,7 @@
 //! Exposes a C ABI (`extern "C"`) surface that a C# app can call via P/Invoke.
 //! Internally manages a static tokio runtime and a global handle table of `AppCore` instances.
 
+pub mod agent_status;
 pub mod bridge;
 pub mod core;
 pub mod error;

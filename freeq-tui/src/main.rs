@@ -1,3 +1,4 @@
+mod agent_status;
 mod app;
 mod config;
 mod editor;
@@ -1659,14 +1660,40 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
         // working" every heartbeat would bury the conversation it is supposed
         // to annotate. Dropped deliberately, not by omission; the roster and
         // the task's own lifecycle events already carry this for a reader.
-        Event::Presence { .. } => {}
-        // Likewise: which members are agents is roster decoration, and this
-        // client draws its roster from NAMES.
-        Event::ActorClasses { .. } => {}
+        // It does mark the nick as an agent, for the nick list.
+        Event::Presence { nick, .. } => {
+            app.agents.insert(nick.to_lowercase());
+        }
+        // Which members are agents: the nick list marks them.
+        Event::ActorClasses { classes, .. } => {
+            for (nick, _) in classes {
+                app.agents.insert(nick.to_lowercase());
+            }
+        }
         Event::AwayChanged { nick, away_msg } => {
-            let msg = match &away_msg {
-                Some(reason) => format!("{nick} is now away: {reason}"),
-                None => format!("{nick} is no longer away"),
+            let key = nick.to_lowercase();
+            let agent = away_msg.as_deref().and_then(agent_status::AgentStatus::parse);
+            let msg = match (&away_msg, agent) {
+                // An agent's AWAY is its work status, refreshed every ~45s
+                // with a new elapsed time. Print it decoded, and only when
+                // what it is doing changed: raw, every refresh, it was a
+                // wall of "away: executing: project=… doing=…+·+0s".
+                (_, Some(status)) => {
+                    app.agents.insert(key.clone());
+                    let line = status.describe();
+                    if app.agent_doing.get(&key) == Some(&line) {
+                        return;
+                    }
+                    app.agent_doing.insert(key, line.clone());
+                    format!("{nick} {line}")
+                }
+                // An agent back from work is just idle again: not news.
+                (None, None) if app.agents.contains(&key) => {
+                    app.agent_doing.remove(&key);
+                    return;
+                }
+                (Some(reason), None) => format!("{nick} is now away: {reason}"),
+                (None, None) => format!("{nick} is no longer away"),
             };
             // Show in all shared buffers (channels where this nick might be)
             let buf_names: Vec<String> = app
