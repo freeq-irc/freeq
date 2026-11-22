@@ -26,6 +26,8 @@ export interface FreeqEvents {
 
   /** Fired when our nick changes (server-assigned or NICK command). */
   nickChanged: (nick: string) => void;
+  /** A NICK change asked for after registration was refused (433); the nick is unchanged. */
+  nickInUse: (wanted: string) => void;
 
   /** Fired on successful SASL authentication. */
   authenticated: (did: string, message: string) => void;

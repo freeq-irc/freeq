@@ -3681,6 +3681,14 @@ export class FreeqClient extends EventEmitter {
 
       case '433': {
         // 433 ERR_NICKNAMEINUSE.
+        // Once registered, a 433 answers a NICK change we asked for: the
+        // server kept our current nick, and so do we. The collision policy
+        // is for getting IN — applying it here renamed a registered client
+        // to `<current>_` because the name it asked for was taken.
+        if (this._welcomed) {
+          this.emit('nickInUse', msg.params[1] ?? '');
+          break;
+        }
         // On an automatic reconnect the nick in use is usually our own,
         // still held by the previous session the server hasn't reaped yet.
         // Ask for it again on a short backoff before renaming ourselves —

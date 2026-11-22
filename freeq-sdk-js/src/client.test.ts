@@ -3049,6 +3049,25 @@ describe('onNickCollision policy', () => {
     expect(ws.sent).toContain('NICK alice_');
   });
 
+  it('a 433 after registration keeps the current nick and reports nickInUse', async () => {
+    const { FreeqClient } = await import('./client.js');
+    const client = new FreeqClient({ url: 'wss://test/irc', nick: 'alice', skipInitialBrokerRefresh: true });
+    const inUse: string[] = [];
+    client.on('nickInUse', (n: string) => inUse.push(n));
+    client.connect();
+    await flushAsync();
+    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    ws.recv(':srv 001 alice :Welcome');
+    await flushAsync();
+    ws.sent.length = 0;
+    // We asked to become bob; bob is taken.
+    ws.recv(':srv 433 alice bob :Nickname is already in use');
+    await flushAsync();
+    expect(client.nick).toBe('alice');
+    expect(ws.sent.filter((l) => l.startsWith('NICK'))).toEqual([]);
+    expect(inUse).toEqual(['bob']);
+  });
+
   it("'refuse' emits authError and disconnects", async () => {
     const { FreeqClient } = await import('./client.js');
     const client = new FreeqClient({
