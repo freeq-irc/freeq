@@ -28,6 +28,12 @@ describe('AgentStatusDetail', () => {
     expect(screen.getByText('github.com/chad/writing')).toBeTruthy();
   });
 
+  it('shows the stage and the latest action under what it is doing', () => {
+    render(<AgentStatusDetail status="doing=answering+chad+in+#x step=Running+the+tests tool=bash:+npm+test" />);
+    expect(screen.getByTestId('agent-step').textContent).toBe('Running the tests');
+    expect(screen.getByTestId('agent-tool').textContent).toBe('bash: npm test');
+  });
+
   it('shows an older agent without its frozen "· 0s"', () => {
     render(<AgentStatusDetail status="project=writing doing=answering+chad+in+#x+·+0s" />);
     expect(screen.getByTestId('agent-doing').textContent).toBe('answering chad in #x');

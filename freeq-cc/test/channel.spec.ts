@@ -171,6 +171,43 @@ describe("freeq-cc: the freeq tool", () => {
 });
 
 describe("freeq-cc: activity from hooks", () => {
+  it("publishes the to-do item in progress as the stage, under the anchor", async () => {
+    const h = await startChannel({ config: baseConfig() });
+    const rt = h.channel.runtime;
+    await h.hook({ hook_event_name: "UserPromptSubmit", prompt: "ship the release" });
+    await h.hook({
+      hook_event_name: "PreToolUse",
+      tool_name: "TodoWrite",
+      tool_input: {
+        todos: [
+          { content: "Bump the version", activeForm: "Bumping the version", status: "completed" },
+          { content: "Write the changelog", activeForm: "Writing the changelog", status: "in_progress" },
+          { content: "Tag it", activeForm: "Tagging it", status: "pending" },
+        ],
+      },
+    });
+    expect(rt.step).toMatchObject({ phrase: "ship the release", detail: "Writing the changelog" });
+    // The to-do list is bookkeeping, never shown as the latest action.
+    expect(rt.step?.tool).toBeUndefined();
+    await h.close();
+  });
+
+  it("follows Claude Code's task tools: a task started names the stage", async () => {
+    const h = await startChannel({ config: baseConfig() });
+    const rt = h.channel.runtime;
+    await h.hook({ hook_event_name: "UserPromptSubmit", prompt: "ship the release" });
+    await h.hook({ hook_event_name: "TaskCreated", task_id: "3", task_subject: "Run the test suite" });
+    await h.hook({ hook_event_name: "PreToolUse", tool_name: "TaskUpdate", tool_input: { taskId: "3", status: "in_progress" } });
+    expect(rt.step?.detail).toBe("Run the test suite");
+    await h.hook({
+      hook_event_name: "PreToolUse",
+      tool_name: "TaskUpdate",
+      tool_input: { taskId: "4", status: "in_progress", activeForm: "Tagging the release" },
+    });
+    expect(rt.step?.detail).toBe("Tagging the release");
+    await h.close();
+  });
+
   it("is busy from a prompt or a tool call until Stop", async () => {
     const h = await startChannel({ config: baseConfig() });
     const rt = h.channel.runtime;

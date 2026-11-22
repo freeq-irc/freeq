@@ -48,6 +48,10 @@ import {
 import { parseVerbositySteer } from "./steer.js";
 import { scrubSeverity } from "./scrub.js";
 import { gistOf, renderDoing, renderStatus, toolDetail } from "./status.js";
+
+/** Tool calls that are the agent keeping notes, not acting: talking over
+ *  freeq, or its to-do list. Not shown as its latest action. */
+const BOOKKEEPING_TOOLS = /^(freeq|freeq_room|TodoWrite|Task(Create|Update|List|Get|Output|Stop))$/;
 import { rosterLines, type RoomLineInput } from "./ui.js";
 import { WithheldBuffer, withheldSummary } from "./withheld.js";
 import { resumePreamble, summarizeTurn, type TaskNote } from "./journal.js";
@@ -234,11 +238,13 @@ export class AgentRuntime {
    * Set by beginStep (typed prompts, freeq triggers, handoffs, the model's
    * own `status` action), cleared when the run settles.
    */
-  step: { phrase: string; since: number; tool?: string } | undefined;
+  step: { phrase: string; since: number; tool?: string; detail?: string } | undefined;
   /** Task id we're working, if this turn came from a handoff. */
   workTask: string | undefined;
   /** Coalesce rapid tool-call updates — presence is not a debug log. */
   #lastStatusPush = 0;
+  /** The push a throttled update is owed, sent when the window ends. */
+  #trailingPush: NodeJS.Timeout | undefined;
 
   /** Accumulates this turn's consequences for the provenance log. */
   readonly turn = new TurnRecorder();
@@ -368,18 +374,57 @@ export class AgentRuntime {
 
   endStep(): void {
     this.step = undefined;
+    if (this.#trailingPush) {
+      clearTimeout(this.#trailingPush);
+      this.#trailingPush = undefined;
+    }
   }
 
-  /** What presence says the agent is doing: the label without elapsed time. */
+  /** What presence says the agent is doing: the anchor phrase alone. The
+   *  stage and the latest action ride as their own fields. */
   #doing(): string | undefined {
-    return this.step ? renderDoing(this.step) : undefined;
+    return this.step ? renderDoing({ phrase: this.step.phrase, since: this.step.since }) : undefined;
+  }
+
+  /**
+   * Name the stage of the current work ("Running the tests") so a watcher can
+   * follow it, without replacing the anchor ("answering chad in #x"). Fed by
+   * the agent's to-do list and its own `status`. With no step yet, the stage
+   * becomes the step.
+   */
+  noteProgress(text: string): void {
+    const phrase = gistOf(text, 48);
+    if (!phrase) return;
+    if (!this.step) {
+      this.beginStep(phrase);
+      return;
+    }
+    const clean = this.conn ? this.conn.scrubForWire(phrase, "presence") : phrase;
+    if (this.step.detail === clean) return;
+    this.step.detail = clean;
+    this.pushStatus("executing", this.#doing(), this.workTask, true);
   }
 
   pushStatus(state: string, label?: string, task?: string, force = false): void {
     const conn = this.conn;
     if (!conn || conn.state !== "online") return;
     const now = Date.now();
-    if (!force && now - this.#lastStatusPush < 2500) return;
+    if (!force && now - this.#lastStatusPush < 2500) {
+      // Throttled, not dropped: the latest state goes out when the window
+      // ends, or a burst of tool calls left the card on the first of them.
+      if (!this.#trailingPush) {
+        this.#trailingPush = setTimeout(() => {
+          this.#trailingPush = undefined;
+          if (this.step) this.pushStatus("executing", this.#doing(), this.workTask, true);
+        }, 2500 - (now - this.#lastStatusPush));
+        this.#trailingPush.unref?.();
+      }
+      return;
+    }
+    if (this.#trailingPush) {
+      clearTimeout(this.#trailingPush);
+      this.#trailingPush = undefined;
+    }
     this.#lastStatusPush = now;
     this.stateChanged();
     // The label is derived from prompts and message text, so it goes through
@@ -389,6 +434,12 @@ export class AgentRuntime {
       label ? conn.scrubForWire(label, "presence") : label,
       task,
       state === "executing" ? this.step?.since : undefined,
+      state === "executing" && this.step
+        ? {
+            step: this.step.detail,
+            tool: this.step.tool ? conn.scrubForWire(this.step.tool, "presence") : undefined,
+          }
+        : undefined,
     );
   }
 
@@ -1359,7 +1410,9 @@ export class AgentRuntime {
         // source there is, because it chooses what is safe to publish.
         const phrase = gistOf(params.message ?? params.title ?? "");
         if (!phrase) return text("status requires 'message' — a short present-tense phrase.");
-        this.beginStep(phrase);
+        // Under an anchor ("answering chad"), it names the stage; with none,
+        // it is the step.
+        this.noteProgress(phrase);
         return text(`Status published: ${phrase}`);
       }
 
@@ -2907,7 +2960,7 @@ export class AgentRuntime {
     if (!toolName) return;
     // The tool is a suffix on the current phrase, never the headline —
     // "bash" alone is exactly the contentless status this replaces.
-    if (this.step) this.step.tool = toolDetail(toolName, input);
+    if (this.step && !BOOKKEEPING_TOOLS.test(toolName)) this.step.tool = toolDetail(toolName, input);
     this.pushStatus("executing", this.#doing() ?? toolName, this.workTask);
     const config = this.config;
     if (config?.provenance) {

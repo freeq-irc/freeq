@@ -12,8 +12,13 @@
 export interface AgentStatus {
   /** Presence state when the text carried one (`executing`, …). */
   state?: string;
-  /** What the agent is doing right now, as prose. */
+  /** What the agent is doing right now, as prose: the anchor (who it is
+   *  answering, what it was asked). */
   doing?: string;
+  /** The stage within that ("Running the tests"). */
+  step?: string;
+  /** The latest action ("bash: npm test"). */
+  tool?: string;
   project?: string;
   branch?: string;
   repo?: string;
@@ -22,7 +27,7 @@ export interface AgentStatus {
   since?: number;
 }
 
-const KNOWN = new Set(['project', 'branch', 'repo', 'model', 'session', 'doing', 'since']);
+const KNOWN = new Set(['project', 'branch', 'repo', 'model', 'session', 'doing', 'since', 'step', 'tool']);
 
 /** The elapsed count agents before `since` baked onto `doing` (" · 0s").
  *  It was the age when sent and stayed on screen unchanged, so it is
@@ -54,6 +59,7 @@ export function parseAgentStatus(raw: string | null | undefined): AgentStatus | 
     known++;
     if (!v) continue;
     if (k === 'doing') out.doing = v.replace(/\+/g, ' ').replace(BAKED_AGE, '');
+    else if (k === 'step' || k === 'tool') out[k] = v.replace(/\+/g, ' ');
     else if (k === 'since') {
       if (/^\d{9,11}$/.test(v)) out.since = Number(v) * 1000;
     } else if (k !== 'session') (out as Record<string, string>)[k] = v;

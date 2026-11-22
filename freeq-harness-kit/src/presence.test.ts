@@ -152,3 +152,13 @@ describe("what a peer is doing", () => {
     expect(formatStatus({ project: "two words", doing: "ok" })).not.toContain("project=");
   });
 });
+
+describe("prose fields", () => {
+  it("round-trips doing, step and tool, whose spaces ride as '+'", () => {
+    const meta = { project: "p", doing: "answering chad in #x", step: "Running the tests", tool: "bash: npm test" };
+    const wire = formatStatus(meta);
+    expect(wire).toContain("step=Running+the+tests");
+    expect(wire).toContain("tool=bash:+npm+test");
+    expect(parseStatus(wire)).toMatchObject(meta);
+  });
+});

@@ -870,7 +870,13 @@ export class FreeqConnection {
    * `task` is an act task id, so a channel can tie a working agent to the
    * handoff it accepted.
    */
-  setWorkState(state: string, status?: string, task?: string, since?: number): void {
+  setWorkState(
+    state: string,
+    status?: string,
+    task?: string,
+    since?: number,
+    more?: { step?: string; tool?: string },
+  ): void {
     if (!this.#bot || this.#state !== "online") return;
     try {
       // One presence slot, two things that wanted it: the session metadata
@@ -885,6 +891,8 @@ export class FreeqConnection {
         ...this.#meta,
         doing: status,
         since: status && since ? String(Math.floor(since / 1000)) : undefined,
+        step: status ? more?.step : undefined,
+        tool: status ? more?.tool : undefined,
       });
       this.#bot.setState(state, composed, task);
     } catch {

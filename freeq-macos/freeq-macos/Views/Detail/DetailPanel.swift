@@ -675,7 +675,7 @@ struct AgentActivityCard: View {
 
     var body: some View {
         let facts = status.facts
-        if status.doing != nil || !facts.isEmpty {
+        if status.doing != nil || status.step != nil || !facts.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 6) {
                     Label("Activity", systemImage: "gearshape.2")
@@ -698,6 +698,28 @@ struct AgentActivityCard: View {
                             .fixedSize(horizontal: false, vertical: true)
                             .textSelection(.enabled)
                     }
+                }
+                if status.step != nil || status.tool != nil {
+                    HStack(alignment: .top, spacing: 8) {
+                        RoundedRectangle(cornerRadius: 1)
+                            .fill(Theme.blue.opacity(0.4))
+                            .frame(width: 2)
+                        VStack(alignment: .leading, spacing: 2) {
+                            if let step = status.step {
+                                Text(step)
+                                    .font(.callout)
+                                    .foregroundStyle(Theme.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            if let tool = status.tool {
+                                Text(tool)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(Theme.textTertiary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
                 }
                 if !facts.isEmpty {
                     Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 3) {

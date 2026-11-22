@@ -17,6 +17,14 @@ describe('parseAgentStatus', () => {
     expect(parseAgentStatus('doing=fixing+the+·+separator')?.doing).toBe('fixing the · separator');
   });
 
+  it('reads the stage and the latest action beside the anchor', () => {
+    expect(parseAgentStatus('doing=answering+chad+in+#x step=Running+the+tests tool=bash:+npm+test')).toEqual({
+      doing: 'answering chad in #x',
+      step: 'Running the tests',
+      tool: 'bash: npm test',
+    });
+  });
+
   it('reads when the work began, so a client can count up live', () => {
     expect(parseAgentStatus('doing=answering+chad since=1790769600')).toEqual({
       doing: 'answering chad',

@@ -279,6 +279,16 @@ export function AgentStatusDetail({ status }: { status?: string }) {
           )}
         </div>
       )}
+      {(s.step || s.tool) && (
+        <div className="border-l-2 border-accent/40 pl-2 space-y-0.5">
+          {s.step && (
+            <div className="text-xs text-fg-muted leading-snug break-words" data-testid="agent-step">{s.step}</div>
+          )}
+          {s.tool && (
+            <div className="text-[10px] text-fg-dim font-mono break-all" data-testid="agent-tool">{s.tool}</div>
+          )}
+        </div>
+      )}
       {facts.length > 0 && (
         <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-[10px]">
           {facts.map(([k, v]) => (

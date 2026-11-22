@@ -19,8 +19,12 @@ struct AgentStatus: Equatable {
     var model: String?
     /// When the current work began, so the elapsed time can count up live.
     var since: Date?
+    /// The stage within `doing` ("Running the tests").
+    var step: String?
+    /// The latest action ("bash: npm test").
+    var tool: String?
 
-    private static let known: Set<String> = ["project", "branch", "repo", "model", "session", "doing", "since"]
+    private static let known: Set<String> = ["project", "branch", "repo", "model", "session", "doing", "since", "step", "tool"]
 
     /// Agents before `since` baked the age onto `doing` (" · 0s"). It was the
     /// age when sent and stayed on screen unchanged, so it is dropped.
@@ -61,6 +65,8 @@ struct AgentStatus: Equatable {
             guard !value.isEmpty else { continue }
             switch key {
             case "doing": out.doing = dropBakedAge(value.replacingOccurrences(of: "+", with: " "))
+            case "step": out.step = value.replacingOccurrences(of: "+", with: " ")
+            case "tool": out.tool = value.replacingOccurrences(of: "+", with: " ")
             case "since":
                 if (9...11).contains(value.count), value.allSatisfy({ $0.isASCII && $0.isNumber }), let secs = TimeInterval(value) {
                     out.since = Date(timeIntervalSince1970: secs)

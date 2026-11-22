@@ -45,7 +45,18 @@ export interface SessionMeta {
    * is sent.
    */
   since?: string;
+  /**
+   * The stage of the work right now, in words — "Running the tests". From
+   * the agent's to-do list or its own `status`; `doing` stays the anchor
+   * (who it is answering, what it was asked).
+   */
+  step?: string;
+  /** The latest action, short: "bash: npm test", "edit: runtime.ts". */
+  tool?: string;
 }
+
+/** Fields that are prose: spaces ride as '+', and each is capped. */
+const PROSE = new Set(["doing", "step", "tool"]);
 
 async function git(cwd: string, args: string[]): Promise<string | undefined> {
   try {
@@ -122,7 +133,7 @@ export function formatStatus(meta: SessionMeta): string {
     // spaces; they ride as '+' and are decoded on the way back in. Every
     // other field is an identifier and a space in one means something is
     // wrong, so those are still dropped.
-    const v = k === "doing" ? v0.trim().replace(/\s+/g, "+").slice(0, 60) : v0;
+    const v = PROSE.has(k) ? v0.trim().replace(/\s+/g, "+").slice(0, 60) : v0;
     if (/[\s;]/.test(v)) continue;
     if (looksLikePath(v)) continue; // paranoia: never leak local disk layout
     parts.push(`${k}=${v}`);
@@ -157,8 +168,8 @@ export function parseStatus(status: string | undefined): SessionMeta {
     if (!v) continue;
     if (k === "session" || k === "project" || k === "repo" || k === "branch" || k === "model" || k === "since") {
       meta[k] = v;
-    } else if (k === "doing") {
-      meta.doing = v.replace(/\+/g, " ");
+    } else if (k === "doing" || k === "step" || k === "tool") {
+      meta[k] = v.replace(/\+/g, " ");
     }
   }
   return meta;

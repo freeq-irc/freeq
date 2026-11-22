@@ -93,6 +93,7 @@ export const INSTRUCTIONS = [
   "kind=ask is another agent's question: answer in your closing text; it goes back to that agent.",
   "The freeq tool also lists peers, asks another agent a question about its own environment ('ask'), hands off work that must happen elsewhere ('handoff', 'post'), takes work offered to you ('accept', 'claim', 'decline'), finishes it ('complete'), records why you chose something ('decision') and publishes what you are doing ('status').",
   "A handoff you take arrives as an instruction to do the work here; do it, then 'complete' it with a short summary. If a task you hold is cancelled, stop and do not pick it up again.",
+  "People follow your work on freeq through your presence: the item in progress on your to-do list is published as your current stage, so word it for a reader. In longer work without a to-do list, use the freeq tool's 'status' at each new stage (a few words: 'reading the deploy logs'), not at every step.",
   "Never send secrets, credentials, or absolute filesystem paths over freeq.",
   `Do not call ${HOOK_TOOL_NAME} or ${UI_TOOL_NAME}: they are for this plugin's hooks and its interface.`,
 ].join("\n");
@@ -178,6 +179,29 @@ const str = (v: unknown): string | undefined => (typeof v === "string" ? v : und
  * `tool_input` whole (an object, or JSON text from `${tool_input}`), or
  * single fields such as `command` and `file_path`.
  */
+/**
+ * The stage a to-do tool call starts, in the words the session wrote for it:
+ * the in-progress item of a TodoWrite, or the task a TaskUpdate moves to
+ * in_progress. Undefined for any other call. This is how a watcher on freeq
+ * follows the work without the model spending a call on 'status'.
+ */
+export function stageFromTodoTool(
+  name: string | undefined,
+  hook: Record<string, unknown>,
+  subjects: Map<string, string>,
+): string | undefined {
+  const input = kitToolInput(hook);
+  if (name === "TodoWrite" && Array.isArray(input.todos)) {
+    const doing = (input.todos as Array<Record<string, unknown>>).find((t) => t?.status === "in_progress");
+    return doing ? (str(doing.activeForm) ?? str(doing.content)) : undefined;
+  }
+  if (name === "TaskUpdate" && input.status === "in_progress") {
+    const id = str(input.taskId) ?? str(input.task_id);
+    return str(input.activeForm) ?? str(input.subject) ?? (id ? subjects.get(id) : undefined);
+  }
+  return undefined;
+}
+
 function kitToolInput(hook: Record<string, unknown>): Record<string, unknown> {
   let input: Record<string, unknown> = {};
   const raw = hook.tool_input;
@@ -432,6 +456,9 @@ export async function createChannel(opts: ChannelOptions): Promise<Channel> {
     return said.length ? said.join("\n\n") : "(no output)";
   }
 
+  /** Claude Code task subjects by id, so a TaskUpdate that starts one can be named. */
+  const taskSubjects = new Map<string, string>();
+
   /** One `mcp_tool` hook call: what Claude Code's session just did. */
   async function onHook(input: Record<string, unknown>): Promise<Record<string, unknown>> {
     const event = str(input.hook_event_name) ?? str(input.event);
@@ -489,6 +516,8 @@ export async function createChannel(opts: ChannelOptions): Promise<Channel> {
         }
         markBusy();
         runtime.onToolCall(name ? kitToolName(name) : undefined, kitToolInput(input));
+        const stage = stageFromTodoTool(name, input, taskSubjects);
+        if (stage) runtime.noteProgress(stage);
         // A plugin cannot grant its tools permission through settings, so
         // the hook allows the freeq tool, and only that one. Deny and ask
         // rules still apply.
@@ -503,9 +532,16 @@ export async function createChannel(opts: ChannelOptions): Promise<Channel> {
         await bridge.onPostToolUse(input);
         break;
       }
-      case "TaskCreated":
+      case "TaskCreated": {
+        const id = str(input.task_id);
+        const subject = str(input.task_subject);
+        if (id && subject) {
+          taskSubjects.set(id, subject);
+          if (taskSubjects.size > 200) taskSubjects.delete(taskSubjects.keys().next().value!);
+        }
         await bridge.onTaskCreated(input);
         break;
+      }
       case "TaskCompleted":
         await bridge.onTaskCompleted(input);
         break;

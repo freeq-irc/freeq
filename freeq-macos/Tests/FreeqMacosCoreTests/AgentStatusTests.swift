@@ -67,4 +67,16 @@ final class AgentStatusTests: XCTestCase {
         let b = AgentStatus.parse("project=site repo=github.com/chad/chadfowler.com model=opus")!
         XCTAssertEqual(b.facts.map { $0.0 }, ["Project", "Repo", "Model"])
     }
+
+    func testReadsStageAndLatestAction() {
+        let s = AgentStatus.parse("doing=answering+chad+in+#x step=Running+the+tests tool=bash:+npm+test")
+        XCTAssertEqual(s?.doing, "answering chad in #x")
+        XCTAssertEqual(s?.step, "Running the tests")
+        XCTAssertEqual(s?.tool, "bash: npm test")
+        var m = MemberInfo(nick: "bot", isOp: false, isHalfop: false, isVoiced: false, awayMsg: nil, did: nil)
+        m.actorClass = "agent"
+        m.presenceStatus = "doing=answering+chad step=Running+the+tests"
+        // The row shows what moves.
+        XCTAssertEqual(m.activityLabel, "Running the tests")
+    }
 }

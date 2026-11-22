@@ -31,6 +31,8 @@ export interface StepStatus {
   since: number;
   /** Current tool detail ("bash: npm test"), refreshed per tool call. */
   tool?: string;
+  /** The stage within the step ("Running the tests"), from the to-do list or `status`. */
+  detail?: string;
 }
 
 /**
@@ -52,7 +54,7 @@ export function gistOf(text: string, max = PHRASE_MAX): string {
  * mode this module exists to fix, so bash shows its command and file tools
  * show the basename: "bash: npm test", "edit: ui.ts".
  */
-export function toolDetail(name: string, input: Record<string, unknown> | undefined, max = 18): string {
+export function toolDetail(name: string, input: Record<string, unknown> | undefined, max = 32): string {
   const raw =
     typeof input?.command === "string"
       ? `bash: ${input.command.split("\n")[0]!.trim()}`

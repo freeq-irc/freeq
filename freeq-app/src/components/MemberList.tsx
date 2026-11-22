@@ -448,7 +448,9 @@ function MemberItem({ member, onClick, inCall }: MemberItemProps) {
   const color = nickColor(member.nick);
   const isAgent = member.actorClass === 'agent' || member.actorClass === 'external_agent';
   // What a working agent is doing, one line under its name (full text on hover).
-  const doing = isAgent ? parseAgentStatus(member.presence?.status ?? member.away)?.doing : undefined;
+  // The stage ("Running the tests") when it names one: that is what moves.
+  const agentStatus = isAgent ? parseAgentStatus(member.presence?.status ?? member.away) : null;
+  const doing = agentStatus ? (agentStatus.step ?? agentStatus.doing) : undefined;
 
   return (
     <button

@@ -1,4 +1,5 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
+import { parseStatus } from "./presence.js";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -326,6 +327,51 @@ describe("AgentRuntime: replies", () => {
 });
 
 describe("AgentRuntime: presence", () => {
+  it("follows the work: the anchor, the current stage and the latest action as separate fields", async () => {
+    vi.useFakeTimers();
+    try {
+      const { rt, bot } = await started();
+      const last = () => parseStatus(bot.states.at(-1)!.status);
+      rt.onUserPrompt("look at the reconnect bug");
+      rt.onToolCall("bash", { command: "npm test" });
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(last()).toMatchObject({ doing: "look at the reconnect bug", tool: "bash: npm test" });
+      // A stage the agent names does not replace who or what it is working on.
+      rt.noteProgress("Running the reconnect tests");
+      expect(last()).toMatchObject({ doing: "look at the reconnect bug", step: "Running the reconnect tests" });
+      // Bookkeeping is not an action worth showing.
+      rt.onToolCall("freeq", { action: "say" });
+      rt.onToolCall("TodoWrite", {});
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(last().tool).toBe("bash: npm test");
+      await rt.onSettled();
+      expect(last().step).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the model's status names the stage when there is already an anchor", async () => {
+    const { rt, bot } = await started();
+    rt.onUserPrompt("ship the release");
+    await rt.runTool({ action: "status", message: "writing the changelog" });
+    expect(parseStatus(bot.states.at(-1)!.status)).toMatchObject({ doing: "ship the release", step: "writing the changelog" });
+  });
+
+  it("a throttled update still lands, so the card never sits on an old action", async () => {
+    vi.useFakeTimers();
+    try {
+      const { rt, bot } = await started();
+      rt.onUserPrompt("look at the reconnect bug");
+      rt.onToolCall("bash", { command: "npm test" });
+      rt.onToolCall("edit", { path: "src/a/runtime.ts" });
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(parseStatus(bot.states.at(-1)!.status).tool).toBe("edit: runtime.ts");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("publishes what it is doing and since when, never a frozen elapsed count", async () => {
     vi.useFakeTimers();
     try {

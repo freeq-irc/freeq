@@ -112,7 +112,8 @@ struct MemberInfo: Identifiable, Equatable {
             // Agents send `key=value` pairs; show what it is doing, decoded.
             // A status in no known form is shown as it came.
             guard let agent = AgentStatus.parse(status) else { return status }
-            if let doing = agent.doing { return doing }
+            // The stage when it names one: that is what moves.
+            if let step = agent.step ?? agent.doing { return step }
         }
         switch presenceState {
         case "executing": return "working"
