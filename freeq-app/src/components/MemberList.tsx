@@ -5,7 +5,7 @@ import { UserPopover, AgentBadge, AgentPresenceAndProvenance } from './UserPopov
 import { useActorInfo } from '../hooks/useActorInfo';
 import { sendWhois, getClient, dmPeerDid } from '../irc/client';
 import { SpeakerIcon } from './SessionIndicator';
-import { parseAwayStatus } from '../lib/status';
+import { parseAgentStatus, parseAwayStatus } from '../lib/status';
 import { isDid, resolveIdentityName, findMemberByKey } from '../lib/identity';
 import { claimForPerson, claimForSender, type PersonLookup } from '@freeq/sdk';
 import { displayNameForKey } from '../lib/display-name';
@@ -271,10 +271,16 @@ function DMProfilePanel({ nick, channel }: { nick: string; channel: { members: M
         <div className="text-xs text-fg-dim mt-1">
           {presence.online ? (
             presence.away ? (
-              <span className="text-warning">Away{(() => {
-                const status = parseAwayStatus(presence.away);
-                return status ? `: ${status}` : '';
-              })()}</span>
+              parseAgentStatus(presence.away) ? (
+                // An agent's status: "Working · answering chad in #phoenix",
+                // not "Away: executing: project=…".
+                <span className="text-accent break-words">{parseAwayStatus(presence.away)}</span>
+              ) : (
+                <span className="text-warning break-words">Away{(() => {
+                  const status = parseAwayStatus(presence.away);
+                  return status ? `: ${status}` : '';
+                })()}</span>
+              )
             ) : (
               <span className="text-success">Online</span>
             )
@@ -428,6 +434,7 @@ interface MemberItemProps {
     away?: string | null;
     typing?: boolean;
     actorClass?: 'human' | 'agent' | 'external_agent';
+    presence?: { state: string; status?: string };
   };
   onClick: (nick: string, did: string | undefined, e: React.MouseEvent) => void;
   inCall?: boolean;
@@ -439,6 +446,9 @@ function MemberItem({ member, onClick, inCall }: MemberItemProps) {
   const isSelf = member.nick.toLowerCase() === nick.toLowerCase();
   const effectiveDid = member.did || (isSelf ? authDid : undefined) || undefined;
   const color = nickColor(member.nick);
+  const isAgent = member.actorClass === 'agent' || member.actorClass === 'external_agent';
+  // What a working agent is doing, one line under its name (full text on hover).
+  const doing = isAgent ? parseAgentStatus(member.presence?.status ?? member.away)?.doing : undefined;
 
   return (
     <button
@@ -450,11 +460,13 @@ function MemberItem({ member, onClick, inCall }: MemberItemProps) {
         <MiniAvatar nick={member.nick} did={effectiveDid} color={color} />
         {/* Presence dot */}
         <span className={`absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-bg-secondary ${
-          member.away ? 'bg-warning' : 'bg-success'
+          doing || (isAgent && member.presence?.state === 'executing') ? 'bg-accent'
+            : member.away ? 'bg-warning' : 'bg-success'
         }`} />
       </div>
 
-      <div className="min-w-0 flex-1 flex items-center gap-1">
+      <div className="min-w-0 flex-1">
+      <div className="min-w-0 flex items-center gap-1">
         {member.isOp && <span className="text-success text-xs font-bold">@</span>}
         {!member.isOp && member.isHalfop && <span className="text-accent text-xs font-bold">%</span>}
         {!member.isOp && !member.isHalfop && member.isVoiced && <span className="text-warning text-xs font-bold">+</span>}
@@ -483,6 +495,10 @@ function MemberItem({ member, onClick, inCall }: MemberItemProps) {
         {member.typing && (
           <span className="text-accent text-xs ml-auto animate-pulse">typing</span>
         )}
+      </div>
+      {doing && (
+        <div className="text-[11px] text-accent/80 truncate text-left" title={doing}>{doing}</div>
+      )}
       </div>
     </button>
   );

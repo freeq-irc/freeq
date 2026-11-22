@@ -1,4 +1,5 @@
 import { useEffect, useRef, useCallback, useState, useMemo, useLayoutEffect, memo } from 'react';
+import { parseAgentStatus, parseAwayStatus } from '../lib/status';
 import { createPortal } from 'react-dom';
 import { Virtualizer, type VirtualizerHandle } from 'virtua';
 import { useStore, uniqueMemberCount, MESSAGE_WINDOW, type Message, type PinnedMessage } from '../store';
@@ -965,9 +966,12 @@ function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
           )}
           {isFederated && <ViaBadge origin={origin!} line={rowClaim.line} />}
           {rowMark(verdict, (e) => setVerifyPanel({ x: e.clientX, y: e.clientY }))}
-          {member?.away != null && (
+          {member?.away != null && (parseAgentStatus(member.away) ? (
+            // An agent "away" is an agent at work, not a person gone.
+            <span className="text-xs bg-accent/10 text-accent px-1.5 py-0.5 rounded" title={parseAwayStatus(member.away) ?? undefined}>working</span>
+          ) : (
             <span className="text-xs text-fg-dim bg-warning/10 text-warning px-1.5 py-0.5 rounded">away</span>
-          )}
+          ))}
           <span className="text-xs text-fg-dim whitespace-nowrap cursor-default" title={msg.timestamp.toLocaleString([], { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })}>{formatTime(msg.timestamp)}</span>
           {msg.isStreaming && <span className="text-xs text-blue-400 animate-pulse">streaming…</span>}
           {msg.editOf && !msg.isStreaming && (

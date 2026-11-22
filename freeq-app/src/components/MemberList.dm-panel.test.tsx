@@ -147,7 +147,7 @@ describe('the DM side panel for an agent', () => {
 
     expect(await screen.findByText('🤖 Agent')).toBeTruthy();
     expect(screen.getByText('Presence')).toBeTruthy();
-    expect(screen.getByText('active')).toBeTruthy();
+    expect(screen.getByText('Available')).toBeTruthy();
     expect(screen.getByText('reading the brief')).toBeTruthy();
     expect(screen.getByText('Provenance')).toBeTruthy();
     expect(await screen.findByText('nap')).toBeTruthy();
@@ -182,18 +182,18 @@ describe('the DM side panel for an agent', () => {
     const f = stubFetch({ [actorUrl(AGENT_DID)]: () => ok(AGENT_ANSWER) });
 
     openDm(AGENT_DID);
-    expect(await screen.findByText('active')).toBeTruthy();
+    expect(await screen.findByText('Available')).toBeTruthy();
     expect(callsTo(f, actorUrl(AGENT_DID))).toBe(1);
 
     act(() => s().setUserPresence(AGENT_NICK, { state: 'executing', status: 'cargo test' }));
-    expect(await screen.findByText('executing')).toBeTruthy();
+    expect(await screen.findByText('Working')).toBeTruthy();
     expect(screen.getByText('cargo test')).toBeTruthy();
     await waitFor(() => expect(callsTo(f, actorUrl(AGENT_DID))).toBe(2));
 
     // The same state again is no change: no new request.
     act(() => s().setUserPresence(AGENT_NICK, { state: 'executing', status: 'cargo test' }));
     act(() => s().setUserPresence(AGENT_NICK, { state: 'idle' }));
-    expect(await screen.findByText('idle')).toBeTruthy();
+    expect(await screen.findByText('Idle')).toBeTruthy();
     expect(screen.queryByText('cargo test')).toBeNull();
     await waitFor(() => expect(callsTo(f, actorUrl(AGENT_DID))).toBe(3));
   });

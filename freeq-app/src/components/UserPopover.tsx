@@ -4,7 +4,8 @@ import { fetchProfile, type ATProfile } from '../lib/profiles';
 import { useStore, type Member } from '../store';
 import { sendWhois, getNick } from '../irc/client';
 import { REPORT_REASONS, reportUser } from '../lib/safety';
-import { parseAwayStatus } from '../lib/status';
+import { agentContext, agentFacts, elapsedSince, parseAgentStatus, parseAwayStatus, stateLabel } from '../lib/status';
+import { useNow } from '../hooks/useNow';
 import { isDid } from '../lib/identity';
 import { claimForSender, type PersonLookup } from '@freeq/sdk';
 import { displayNameForKey } from '../lib/display-name';
@@ -236,11 +237,9 @@ export function AgentPresenceAndProvenance({ actorInfo, live }: {
                 sandboxed: '📦', rate_limited: '🚦', revoked: '🚫', offline: '⚫',
               }[presence.state] || '•'
             }</span>
-            <span>{presence.state}</span>
+            <span>{stateLabel(presence.state)}</span>
           </div>
-          {presence.status && (
-            <div className="text-[10px] text-fg-dim mt-0.5">{presence.status}</div>
-          )}
+          <AgentStatusDetail status={presence.status} />
         </div>
       )}
 
@@ -249,6 +248,51 @@ export function AgentPresenceAndProvenance({ actorInfo, live }: {
         <ProvenanceBlock provenance={actorInfo.provenance} />
       )}
     </>
+  );
+}
+
+/**
+ * An agent's status, decoded: what it is doing as a sentence, then where
+ * (project, branch, model) as small labelled facts. A status that is not the
+ * agent `key=value` form (free text) is shown as it is. Everything wraps —
+ * a long task name or branch never runs off the card.
+ */
+export function AgentStatusDetail({ status }: { status?: string }) {
+  const s = parseAgentStatus(status);
+  // Counted here from when the work began, so it is never a stale "· 0s".
+  const now = useNow(10_000, !!s?.since);
+  if (!status) return null;
+  if (!s) {
+    return <div className="text-xs text-fg-muted mt-1 break-words whitespace-pre-wrap">{status}</div>;
+  }
+  const facts = agentFacts(s);
+  const age = elapsedSince(s.since, now);
+  return (
+    <div className="mt-1 space-y-1.5">
+      {s.doing && (
+        <div className="text-xs text-fg leading-snug break-words" data-testid="agent-doing">
+          {s.doing}
+          {age && (
+            <span className="text-fg-dim tabular-nums" title={new Date(s.since!).toLocaleString()}>
+              {' '}· for {age}
+            </span>
+          )}
+        </div>
+      )}
+      {facts.length > 0 && (
+        <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-[10px]">
+          {facts.map(([k, v]) => (
+            <div key={k} className="contents">
+              <dt className="text-fg-dim">{k}</dt>
+              <dd className="text-fg-muted font-mono break-all" title={v}>{v}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+      {!s.doing && !facts.length && agentContext(s) && (
+        <div className="text-[10px] text-fg-dim">{agentContext(s)}</div>
+      )}
+    </div>
   );
 }
 
@@ -429,8 +473,10 @@ export function UserPopover({ nick, did, origin, evidence, position, onClose }: 
           )}
 
           {/* Away / custom status */}
-          {away != null && (
-            <div className="text-xs text-warning mt-1 truncate" title={awayStatus ?? undefined}>
+          {/* An agent's status is shown, decoded, in its Presence card below:
+              repeating it here as "Away: executing: …" only added noise. */}
+          {away != null && !(parseAgentStatus(away) && member?.presence) && (
+            <div className="text-xs text-warning mt-1 break-words line-clamp-2" title={awayStatus ?? undefined}>
               Away{awayStatus ? `: ${awayStatus}` : ''}
             </div>
           )}
