@@ -15,6 +15,9 @@ public enum ConnectionState
 
 public record IrcMessage(string? Prefix, string Command, string[] Params, Dictionary<string, string> Tags);
 
+/// <summary>An agent's last structured PRESENCE: its state, and the status text it published.</summary>
+public record AgentPresence(string State, string? Status);
+
 public class IrcClient : IDisposable
 {
     private ClientWebSocket? _ws;
@@ -48,6 +51,8 @@ public class IrcClient : IDisposable
     public event Action<string, List<string>>? NamesReceived; // channel, nicks
     public event Action<string, string>? NickChanged; // oldNick, newNick
     public event Action<string, string?>? AccountChanged; // nick, account (null = logged out)
+    /// <summary>A member's actor class or structured presence changed ("*" = several at once).</summary>
+    public event Action<string>? ActorInfoChanged; // nick
     public event Action<string>? RawReceived;
     public event Action<string>? ErrorReceived;
     /// <summary>Fired for each RPL_LIST (322) entry: channel, memberCount, topic.</summary>
@@ -61,6 +66,12 @@ public class IrcClient : IDisposable
 
     // Nick → account (DID) mapping, populated from extended-join and ACCOUNT messages
     private readonly ConcurrentDictionary<string, string> _accounts = new(StringComparer.OrdinalIgnoreCase);
+
+    // Nick → actor class ("agent" / "external_agent"). Absent means human.
+    // Learned from the JOIN tag, the 674 roster numeric, WHOIS 673 and PRESENCE.
+    private readonly ConcurrentDictionary<string, string> _actorClasses = new(StringComparer.OrdinalIgnoreCase);
+    // Nick → last structured PRESENCE (agents only publish one).
+    private readonly ConcurrentDictionary<string, AgentPresence> _presence = new(StringComparer.OrdinalIgnoreCase);
 
     // Caps matching freeq-app/src/irc/client.ts
     private static readonly string[] WantedCaps =
@@ -81,6 +92,48 @@ public class IrcClient : IDisposable
 
     public string? GetAccount(string nick) =>
         _accounts.TryGetValue(nick, out var account) ? account : null;
+
+    /// <summary>"agent" / "external_agent", or null for a person (or unknown).</summary>
+    public string? GetActorClass(string nick) =>
+        _actorClasses.TryGetValue(nick, out var c) ? c : null;
+
+    public AgentPresence? GetPresence(string nick) =>
+        _presence.TryGetValue(nick, out var p) ? p : null;
+
+    /// <summary>Record a member's class. "human" (or anything unknown) clears it: absent means human.</summary>
+    private bool SetActorClass(string nick, string? actorClass)
+    {
+        if (string.IsNullOrEmpty(nick)) return false;
+        if (actorClass is "agent" or "external_agent")
+        {
+            var changed = !_actorClasses.TryGetValue(nick, out var old) || old != actorClass;
+            _actorClasses[nick] = actorClass;
+            return changed;
+        }
+        if (actorClass == "human")
+            return _actorClasses.TryRemove(nick, out _);
+        return false;
+    }
+
+    /// <summary>
+    /// Parse a PRESENCE payload (<c>state=…;status=…;task=…</c>). Null without a
+    /// state. The status may itself contain '=' (it is usually key=value pairs),
+    /// so each part splits on its first '=' only. Mirrors freeq-sdk parse_presence.
+    /// </summary>
+    internal static AgentPresence? ParsePresence(string raw)
+    {
+        string? state = null, status = null;
+        foreach (var part in raw.Split(';'))
+        {
+            var eq = part.IndexOf('=');
+            if (eq < 0) continue;
+            var key = part[..eq].Trim();
+            var value = part[(eq + 1)..];
+            if (key == "state") state = value.Trim();
+            else if (key == "status" && value.Length > 0) status = value;
+        }
+        return string.IsNullOrEmpty(state) ? null : new AgentPresence(state, status);
+    }
 
     public void SetSaslCredentials(string token, string did, string pdsUrl, string method)
     {
@@ -186,6 +239,8 @@ public class IrcClient : IDisposable
         Did = null;
         _ackedCaps.Clear();
         _accounts.Clear();
+        _actorClasses.Clear();
+        _presence.Clear();
         _motdLines.Clear();
         _cts?.Cancel();
         _ws?.Dispose();
@@ -279,7 +334,7 @@ public class IrcClient : IDisposable
         OAuthLog.Write($"ReceiveLoop exited: cancelled={ct.IsCancellationRequested} wsState={_ws?.State}");
     }
 
-    private void ProcessLine(string line)
+    internal void ProcessLine(string line)
     {
         if (string.IsNullOrWhiteSpace(line)) return;
 
@@ -317,6 +372,12 @@ public class IrcClient : IDisposable
                         _accounts[nick] = msg.Params[1];
                         AccountChanged?.Invoke(nick, msg.Params[1]);
                     }
+                    // A joiner's class rides the JOIN as a tag (674 only covers
+                    // members already there). Recorded before JoinReceived so the
+                    // member list built for the join already badges it.
+                    if (msg.Tags.TryGetValue("+freeq.at/actor-class", out var joinClass)
+                        || msg.Tags.TryGetValue("freeq.at/actor-class", out joinClass))
+                        SetActorClass(nick, joinClass);
                     JoinReceived?.Invoke(msg.Params[0], nick);
                 }
                 break;
@@ -355,6 +416,9 @@ public class IrcClient : IDisposable
             {
                 var nick = msg.Prefix?.Split('!')[0] ?? "unknown";
                 var reason = msg.Params.Length >= 1 ? msg.Params[0] : "";
+                // Gone from the network: a person reusing the nick is not this agent.
+                _actorClasses.TryRemove(nick, out _);
+                _presence.TryRemove(nick, out _);
                 QuitReceived?.Invoke(nick, reason);
                 break;
             }
@@ -387,6 +451,44 @@ public class IrcClient : IDisposable
                 }
                 break;
             }
+
+            case "PRESENCE":
+            {
+                // Structured agent presence: :nick!u@h PRESENCE :state=…;status=…;task=…
+                // Unlike AWAY it carries a status for every state, including the
+                // active ones where "back from away" is parameterless.
+                var pNick = msg.Prefix?.Split('!')[0] ?? "";
+                if (!string.IsNullOrEmpty(pNick) && msg.Params.Length >= 1
+                    && ParsePresence(msg.Params[^1]) is { } presence)
+                {
+                    _presence[pNick] = presence;
+                    // Only agents publish presence, so it also proves the class.
+                    _actorClasses.TryAdd(pNick, "agent");
+                    ActorInfoChanged?.Invoke(pNick);
+                }
+                break;
+            }
+
+            case "674": // freeq RPL_ACTORCLASSES: <me> <channel> :nick=agent nick2=external_agent …
+                if (msg.Params.Length >= 3)
+                {
+                    foreach (var entry in msg.Params[2].Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        var eq = entry.LastIndexOf('=');
+                        if (eq <= 0 || eq == entry.Length - 1) continue;
+                        SetActorClass(entry[..eq], entry[(eq + 1)..]);
+                    }
+                    ActorInfoChanged?.Invoke("*");
+                }
+                break;
+
+            case "673": // freeq WHOIS actor class: <me> <nick> :actor_class=agent
+                if (msg.Params.Length >= 3 && msg.Params[2].StartsWith("actor_class=", StringComparison.Ordinal))
+                {
+                    if (SetActorClass(msg.Params[1], msg.Params[2]["actor_class=".Length..]))
+                        ActorInfoChanged?.Invoke(msg.Params[1]);
+                }
+                break;
 
             case "332": // RPL_TOPIC
                 if (msg.Params.Length >= 3)
@@ -454,6 +556,11 @@ public class IrcClient : IDisposable
                 // Transfer account mapping to new nick
                 if (_accounts.TryRemove(oldNick, out var acct))
                     _accounts[newNick] = acct;
+                // …and the actor class and presence: a renamed agent is still an agent.
+                if (_actorClasses.TryRemove(oldNick, out var cls))
+                    _actorClasses[newNick] = cls;
+                if (_presence.TryRemove(oldNick, out var pres))
+                    _presence[newNick] = pres;
                 NickChanged?.Invoke(oldNick, newNick);
                 if (oldNick.Equals(Nick, StringComparison.OrdinalIgnoreCase))
                     Nick = newNick;

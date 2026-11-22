@@ -6,6 +6,101 @@
     xmlns:local="using:Freeq.WinUI.Controls"
     xmlns:models="using:Freeq.WinUI.Models">
 
+    <UserControl.Resources>
+        <Style x:Key="MemberItemStyle" TargetType="ListViewItem">
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="MinHeight" Value="0" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+        </Style>
+
+        <!-- One row for every section: avatar + presence dot, role, nick,
+             AGENT badge, and a one-line status (agent activity decoded, or a
+             person's away message) ellipsised with the full text in a tooltip. -->
+        <DataTemplate x:Key="MemberRowTemplate" x:DataType="models:MemberModel">
+            <Grid Padding="8,5" Margin="0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <!-- Mini Avatar: nick-colored -->
+                <Grid Grid.Column="0" Margin="0,0,8,0" VerticalAlignment="Center">
+                    <Border Width="32" Height="32" CornerRadius="16"
+                            Background="{x:Bind AvatarBackgroundBrush}">
+                        <TextBlock Text="{x:Bind NickInitial}" FontSize="12" FontWeight="Bold"
+                                   Foreground="{x:Bind NickBrush}"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Border>
+                    <!-- Presence dot: blue = agent working, amber = away, green = online -->
+                    <Ellipse Width="10" Height="10"
+                             Fill="{x:Bind PresenceDotBrush}"
+                             HorizontalAlignment="Right" VerticalAlignment="Bottom"
+                             Stroke="{StaticResource BgSecondaryBrush}" StrokeThickness="2" />
+                </Grid>
+
+                <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="1">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+
+                        <!-- Role badge (empty for regular members) -->
+                        <TextBlock Grid.Column="0" Text="{x:Bind RoleBadge}"
+                                   FontSize="12" FontWeight="Bold"
+                                   Foreground="{x:Bind RoleBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,4,0" />
+
+                        <!-- Nick: hash-colored -->
+                        <TextBlock Grid.Column="1" Text="{x:Bind Nick}"
+                                   FontSize="{StaticResource BodyFontSize}"
+                                   Foreground="{x:Bind NickBrush}"
+                                   VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+
+                        <!-- Agent badge: only when the server said so — an
+                             unlabelled member is a person. -->
+                        <Border Grid.Column="2" Margin="4,0,0,0" Padding="4,1"
+                                CornerRadius="3" VerticalAlignment="Center"
+                                Background="{StaticResource BlueDimBrush}"
+                                ToolTipService.ToolTip="{x:Bind AgentBadgeTooltip}"
+                                AutomationProperties.Name="{x:Bind AgentBadgeTooltip}"
+                                Visibility="{x:Bind local:MemberList.BoolToVis(IsAgent)}">
+                            <TextBlock Text="{x:Bind AgentBadge}" FontSize="9" FontWeight="Bold"
+                                       CharacterSpacing="40"
+                                       Foreground="{StaticResource BlueBrush}" />
+                        </Border>
+                    </Grid>
+
+                    <!-- Status line: "Working · answering chad in #phoenix" -->
+                    <TextBlock Text="{x:Bind StatusLine}" FontSize="11"
+                               Foreground="{x:Bind StatusLineBrush}"
+                               TextTrimming="CharacterEllipsis" TextWrapping="NoWrap" MaxLines="1"
+                               ToolTipService.ToolTip="{x:Bind StatusLine}"
+                               Visibility="{x:Bind local:MemberList.BoolToVis(HasStatusLine)}" />
+                </StackPanel>
+
+                <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center"
+                            Margin="4,0,0,0">
+                    <!-- A working agent is not "away": its status line says what it is doing. -->
+                    <TextBlock Text="away" FontSize="10" Foreground="{StaticResource WarningBrush}"
+                               VerticalAlignment="Center"
+                               Visibility="{x:Bind local:MemberList.BoolToVis(ShowsAway)}" />
+                    <!-- Verified: teal circle badge -->
+                    <Border Width="16" Height="16" CornerRadius="8"
+                            Background="{StaticResource AccentDimBrush}"
+                            VerticalAlignment="Center"
+                            Visibility="{x:Bind local:MemberList.BoolToVis(IsVerified)}">
+                        <TextBlock Text="&#x2713;" FontSize="9" FontWeight="SemiBold"
+                                   Foreground="{StaticResource AccentBrush}"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Border>
+                </StackPanel>
+            </Grid>
+        </DataTemplate>
+    </UserControl.Resources>
+
     <Grid Background="{StaticResource BgSecondaryBrush}" Width="208"
           BorderBrush="{StaticResource BorderBrush}" BorderThickness="1,0,0,0">
         <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="8,12">
@@ -16,69 +111,9 @@
                     <TextBlock x:Name="OpsHeader" FontSize="{StaticResource SectionHeaderFontSize}"
                                FontWeight="Bold" Foreground="{StaticResource FgDimBrush}"
                                Padding="8,4,8,6" CharacterSpacing="120" />
-                    <ListView x:Name="OpsList" SelectionMode="None" IsItemClickEnabled="True" ItemClick="OnMemberClick">
-                        <ListView.ItemContainerStyle>
-                            <Style TargetType="ListViewItem">
-                                <Setter Property="Padding" Value="0" />
-                                <Setter Property="MinHeight" Value="0" />
-                                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-                            </Style>
-                        </ListView.ItemContainerStyle>
-                        <ListView.ItemTemplate>
-                            <DataTemplate x:DataType="models:MemberModel">
-                                <Grid Padding="8,5" Margin="0">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto" />
-                                        <ColumnDefinition Width="Auto" />
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="Auto" />
-                                    </Grid.ColumnDefinitions>
-
-                                    <!-- Mini Avatar: nick-colored -->
-                                    <Grid Grid.Column="0" Margin="0,0,8,0">
-                                        <Border Width="32" Height="32" CornerRadius="16"
-                                                Background="{x:Bind AvatarBackgroundBrush}">
-                                            <TextBlock Text="{x:Bind NickInitial}" FontSize="12" FontWeight="Bold"
-                                                       Foreground="{x:Bind NickBrush}"
-                                                       HorizontalAlignment="Center" VerticalAlignment="Center" />
-                                        </Border>
-                                        <!-- Online dot -->
-                                        <Ellipse Width="10" Height="10"
-                                                 Fill="{StaticResource SuccessBrush}"
-                                                 HorizontalAlignment="Right" VerticalAlignment="Bottom"
-                                                 Stroke="{StaticResource BgSecondaryBrush}" StrokeThickness="2" />
-                                    </Grid>
-
-                                    <!-- Role badge -->
-                                    <TextBlock Grid.Column="1" Text="{x:Bind RoleBadge}"
-                                               FontSize="12" FontWeight="Bold"
-                                               Foreground="{StaticResource SuccessBrush}"
-                                               VerticalAlignment="Center" Margin="0,0,4,0" />
-
-                                    <!-- Nick: hash-colored -->
-                                    <TextBlock Grid.Column="2" Text="{x:Bind Nick}"
-                                               FontSize="{StaticResource BodyFontSize}"
-                                               Foreground="{x:Bind NickBrush}"
-                                               VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
-
-                                    <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
-                                        <TextBlock Text="away" FontSize="10" Foreground="{StaticResource WarningBrush}"
-                                                   Visibility="{x:Bind local:MemberList.AwayToVisibility(Status)}" />
-                                    <!-- Verified: teal circle badge -->
-                                    <Border
-                                            Width="16" Height="16" CornerRadius="8"
-                                            Background="{StaticResource AccentDimBrush}"
-                                            VerticalAlignment="Center"
-                                            Visibility="{x:Bind local:MemberList.BoolToVis(IsVerified)}">
-                                        <TextBlock Text="&#x2713;" FontSize="9" FontWeight="SemiBold"
-                                                   Foreground="{StaticResource AccentBrush}"
-                                                   HorizontalAlignment="Center" VerticalAlignment="Center" />
-                                    </Border>
-                                    </StackPanel>
-                                </Grid>
-                            </DataTemplate>
-                        </ListView.ItemTemplate>
-                    </ListView>
+                    <ListView x:Name="OpsList" SelectionMode="None" IsItemClickEnabled="True" ItemClick="OnMemberClick"
+                              ItemContainerStyle="{StaticResource MemberItemStyle}"
+                              ItemTemplate="{StaticResource MemberRowTemplate}" />
                 </StackPanel>
 
                 <!-- Voiced Section -->
@@ -86,60 +121,9 @@
                     <TextBlock x:Name="VoicedHeader" FontSize="{StaticResource SectionHeaderFontSize}"
                                FontWeight="Bold" Foreground="{StaticResource FgDimBrush}"
                                Padding="8,4,8,6" CharacterSpacing="120" />
-                    <ListView x:Name="VoicedList" SelectionMode="None" IsItemClickEnabled="True" ItemClick="OnMemberClick">
-                        <ListView.ItemContainerStyle>
-                            <Style TargetType="ListViewItem">
-                                <Setter Property="Padding" Value="0" />
-                                <Setter Property="MinHeight" Value="0" />
-                                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-                            </Style>
-                        </ListView.ItemContainerStyle>
-                        <ListView.ItemTemplate>
-                            <DataTemplate x:DataType="models:MemberModel">
-                                <Grid Padding="8,5">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto" />
-                                        <ColumnDefinition Width="Auto" />
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="Auto" />
-                                    </Grid.ColumnDefinitions>
-                                    <Grid Grid.Column="0" Margin="0,0,8,0">
-                                        <Border Width="32" Height="32" CornerRadius="16"
-                                                Background="{x:Bind AvatarBackgroundBrush}">
-                                            <TextBlock Text="{x:Bind NickInitial}" FontSize="12" FontWeight="Bold"
-                                                       Foreground="{x:Bind NickBrush}"
-                                                       HorizontalAlignment="Center" VerticalAlignment="Center" />
-                                        </Border>
-                                        <Ellipse Width="10" Height="10"
-                                                 Fill="{StaticResource SuccessBrush}"
-                                                 HorizontalAlignment="Right" VerticalAlignment="Bottom"
-                                                 Stroke="{StaticResource BgSecondaryBrush}" StrokeThickness="2" />
-                                    </Grid>
-                                    <TextBlock Grid.Column="1" Text="{x:Bind RoleBadge}"
-                                               FontSize="12" FontWeight="Bold"
-                                               Foreground="{StaticResource WarningBrush}"
-                                               VerticalAlignment="Center" Margin="0,0,4,0" />
-                                    <TextBlock Grid.Column="2" Text="{x:Bind Nick}"
-                                               FontSize="{StaticResource BodyFontSize}"
-                                               Foreground="{x:Bind NickBrush}"
-                                               VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
-                                    <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
-                                    <TextBlock Text="away" FontSize="10" Foreground="{StaticResource WarningBrush}"
-                                               Visibility="{x:Bind local:MemberList.AwayToVisibility(Status)}" />
-                                    <Border
-                                            Width="16" Height="16" CornerRadius="8"
-                                            Background="{StaticResource AccentDimBrush}"
-                                            VerticalAlignment="Center"
-                                            Visibility="{x:Bind local:MemberList.BoolToVis(IsVerified)}">
-                                        <TextBlock Text="&#x2713;" FontSize="9" FontWeight="SemiBold"
-                                                   Foreground="{StaticResource AccentBrush}"
-                                                   HorizontalAlignment="Center" VerticalAlignment="Center" />
-                                    </Border>
-                                    </StackPanel>
-                                </Grid>
-                            </DataTemplate>
-                        </ListView.ItemTemplate>
-                    </ListView>
+                    <ListView x:Name="VoicedList" SelectionMode="None" IsItemClickEnabled="True" ItemClick="OnMemberClick"
+                              ItemContainerStyle="{StaticResource MemberItemStyle}"
+                              ItemTemplate="{StaticResource MemberRowTemplate}" />
                 </StackPanel>
 
                 <!-- Members Section -->
@@ -147,55 +131,19 @@
                     <TextBlock x:Name="MembersHeader" FontSize="{StaticResource SectionHeaderFontSize}"
                                FontWeight="Bold" Foreground="{StaticResource FgDimBrush}"
                                Padding="8,4,8,6" CharacterSpacing="120" />
-                    <ListView x:Name="MembersList" SelectionMode="None" IsItemClickEnabled="True" ItemClick="OnMemberClick">
-                        <ListView.ItemContainerStyle>
-                            <Style TargetType="ListViewItem">
-                                <Setter Property="Padding" Value="0" />
-                                <Setter Property="MinHeight" Value="0" />
-                                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-                            </Style>
-                        </ListView.ItemContainerStyle>
-                        <ListView.ItemTemplate>
-                            <DataTemplate x:DataType="models:MemberModel">
-                                <Grid Padding="8,5">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto" />
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="Auto" />
-                                    </Grid.ColumnDefinitions>
-                                    <Grid Grid.Column="0" Margin="0,0,8,0">
-                                        <Border Width="32" Height="32" CornerRadius="16"
-                                                Background="{x:Bind AvatarBackgroundBrush}">
-                                            <TextBlock Text="{x:Bind NickInitial}" FontSize="12" FontWeight="Bold"
-                                                       Foreground="{x:Bind NickBrush}"
-                                                       HorizontalAlignment="Center" VerticalAlignment="Center" />
-                                        </Border>
-                                        <Ellipse Width="10" Height="10"
-                                                 Fill="{StaticResource SuccessBrush}"
-                                                 HorizontalAlignment="Right" VerticalAlignment="Bottom"
-                                                 Stroke="{StaticResource BgSecondaryBrush}" StrokeThickness="2" />
-                                    </Grid>
-                                    <TextBlock Grid.Column="1" Text="{x:Bind Nick}"
-                                               FontSize="{StaticResource BodyFontSize}"
-                                               Foreground="{x:Bind NickBrush}"
-                                               VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
-                                    <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
-                                    <TextBlock Text="away" FontSize="10" Foreground="{StaticResource WarningBrush}"
-                                               Visibility="{x:Bind local:MemberList.AwayToVisibility(Status)}" />
-                                    <Border
-                                            Width="16" Height="16" CornerRadius="8"
-                                            Background="{StaticResource AccentDimBrush}"
-                                            VerticalAlignment="Center"
-                                            Visibility="{x:Bind local:MemberList.BoolToVis(IsVerified)}">
-                                        <TextBlock Text="&#x2713;" FontSize="9" FontWeight="SemiBold"
-                                                   Foreground="{StaticResource AccentBrush}"
-                                                   HorizontalAlignment="Center" VerticalAlignment="Center" />
-                                    </Border>
-                                    </StackPanel>
-                                </Grid>
-                            </DataTemplate>
-                        </ListView.ItemTemplate>
-                    </ListView>
+                    <ListView x:Name="MembersList" SelectionMode="None" IsItemClickEnabled="True" ItemClick="OnMemberClick"
+                              ItemContainerStyle="{StaticResource MemberItemStyle}"
+                              ItemTemplate="{StaticResource MemberRowTemplate}" />
+                </StackPanel>
+
+                <!-- Agents Section: regular-rank agents, after the people -->
+                <StackPanel x:Name="AgentsSection" Visibility="Collapsed" Margin="0,8,0,0">
+                    <TextBlock x:Name="AgentsHeader" FontSize="{StaticResource SectionHeaderFontSize}"
+                               FontWeight="Bold" Foreground="{StaticResource FgDimBrush}"
+                               Padding="8,4,8,6" CharacterSpacing="120" />
+                    <ListView x:Name="AgentsList" SelectionMode="None" IsItemClickEnabled="True" ItemClick="OnMemberClick"
+                              ItemContainerStyle="{StaticResource MemberItemStyle}"
+                              ItemTemplate="{StaticResource MemberRowTemplate}" />
                 </StackPanel>
 
             </StackPanel>

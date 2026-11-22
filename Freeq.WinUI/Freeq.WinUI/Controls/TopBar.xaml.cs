@@ -40,6 +40,7 @@ public sealed partial class TopBar : UserControl
         vm.Operators.CollectionChanged += (s, e) => UpdateMemberCount();
         vm.Voiced.CollectionChanged += (s, e) => UpdateMemberCount();
         vm.Members.CollectionChanged += (s, e) => UpdateMemberCount();
+        vm.Agents.CollectionChanged += (s, e) => UpdateMemberCount();
     }
 
     private void UpdateChannel(ChannelModel? channel)

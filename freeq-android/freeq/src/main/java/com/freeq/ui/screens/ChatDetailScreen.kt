@@ -11,8 +11,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.freeq.model.AgentStatus
 import com.freeq.model.ChatMessage
 import com.freeq.model.AppState
 import com.freeq.ui.components.ChannelSettingsSheet
@@ -22,6 +24,7 @@ import com.freeq.ui.components.MessageList
 import com.freeq.ui.components.PinnedMessagesSheet
 import com.freeq.ui.components.SearchSheet
 import com.freeq.ui.components.UserProfileSheet
+import com.freeq.ui.theme.FreeqColors
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -91,6 +94,23 @@ fun ChatDetailScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 fontWeight = FontWeight.Normal
                             )
+                        }
+                        // A DM with an agent: what it is doing, decoded, on
+                        // one line ("Working · answering chad in #phoenix").
+                        if (!isChannel) {
+                            val peer = appState.memberInfo(channelName)
+                            val agentLine = peer?.agentStatus?.summary
+                                ?: peer?.takeIf { it.isAgent }?.let { AgentStatus.label(it.presenceState) }
+                            if (agentLine != null) {
+                                Text(
+                                    agentLine,
+                                    fontSize = 12.sp,
+                                    color = FreeqColors.accent,
+                                    fontWeight = FontWeight.Normal,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
                         }
                     }
                 },

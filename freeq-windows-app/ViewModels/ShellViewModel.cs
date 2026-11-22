@@ -745,6 +745,14 @@ public partial class ShellViewModel : ObservableObject, IDisposable
                 HandleAwayChanged(envelope);
                 break;
 
+            case "presence":
+                HandlePresence(envelope);
+                break;
+
+            case "actor_classes":
+                HandleActorClasses(envelope);
+                break;
+
             case "batch_start":
                 HandleBatchStart(envelope);
                 break;
@@ -1209,16 +1217,64 @@ public partial class ShellViewModel : ObservableObject, IDisposable
     {
         var nick = e.GetDataString("nick") ?? "";
         var awayMsg = e.GetDataStringOrNull("away_msg");
+        // Decoded by the core: an agent's key=value status reads as
+        // "Working · answering chad in #phoenix", a person's as sent.
+        var awayText = e.GetDataStringOrNull("away_text") ?? awayMsg;
+        var isAgentStatus = e.GetDataBool("is_agent_status");
 
         foreach (var ch in Channels)
         {
             var member = ch.FindMember(nick);
             if (member != null)
             {
+                // Mutate in place: the actor class and presence ride along.
                 member.AwayMsg = awayMsg;
+                member.AwayText = awayText;
+                member.AwayIsAgentStatus = awayMsg != null && isAgentStatus;
                 ch.RefreshMembers();
             }
         }
+    }
+
+    private void HandlePresence(EventEnvelope e)
+    {
+        var nick = e.GetDataString("nick") ?? "";
+        var state = e.GetDataStringOrNull("state");
+        var statusText = e.GetDataStringOrNull("status_text");
+        if (string.IsNullOrEmpty(nick) || state == null) return;
+
+        // Live agent state applies in every channel we share with them.
+        foreach (var ch in Channels)
+        {
+            var member = ch.FindMember(nick);
+            if (member == null) continue;
+            member.PresenceState = state;
+            member.PresenceText = statusText;
+            // Only agents publish presence, so it is also proof of the class.
+            member.ActorClass ??= "agent";
+            ch.RefreshMembers();
+        }
+    }
+
+    private void HandleActorClasses(EventEnvelope e)
+    {
+        if (e.EventData is not JsonElement d) return;
+        var channel = d.TryGetProperty("channel", out var c) ? c.GetString() : null;
+        if (channel == null || !d.TryGetProperty("classes", out var classes) || classes.ValueKind != JsonValueKind.Array)
+            return;
+        var vm = FindChannel(channel);
+        if (vm == null) return;
+
+        foreach (var entry in classes.EnumerateArray())
+        {
+            var nick = entry.TryGetProperty("nick", out var n) ? n.GetString() : null;
+            var cls = entry.TryGetProperty("actor_class", out var a) ? a.GetString() : null;
+            var member = nick == null ? null : vm.FindMember(nick);
+            if (member == null) continue;
+            // Absent means human, so "human" clears any earlier guess.
+            member.ActorClass = cls is "agent" or "external_agent" ? cls : null;
+        }
+        vm.RefreshMembers();
     }
 
     private void HandleNotice(EventEnvelope e)

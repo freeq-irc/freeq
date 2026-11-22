@@ -24,6 +24,7 @@
 
     <SolidColorBrush x:Key="AccentDimBrush" Color="#22007A66" />
     <SolidColorBrush x:Key="DangerDimBrush" Color="#22C93030" />
+    <SolidColorBrush x:Key="BlueDimBrush" Color="#222A6FD2" />
     <SolidColorBrush x:Key="TransparentBrush" Color="Transparent" />
 
     <x:Double x:Key="HeaderFontSize">18</x:Double>

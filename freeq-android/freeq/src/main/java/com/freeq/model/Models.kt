@@ -93,7 +93,12 @@ data class MemberInfo(
     val activityLabel: String?
         get() {
             if (!isAgent) return null
-            if (!presenceStatus.isNullOrEmpty()) return presenceStatus
+            if (!presenceStatus.isNullOrEmpty()) {
+                // Agents send `key=value` pairs; show what it is doing,
+                // decoded. A status in no known form is shown as it came.
+                val agent = AgentStatus.parse(presenceStatus) ?: return presenceStatus
+                agent.doing?.let { return it }
+            }
             return when (presenceState) {
                 null, "online", "active", "idle" -> null
                 "executing" -> "working"
@@ -109,10 +114,33 @@ data class MemberInfo(
     val isAway: Boolean
         get() = awayMsg != null
 
+    /** An agent at work: it says so in presence, or its AWAY is an agent
+     *  status rather than a person's away message. Such an agent is not
+     *  "Away" — rows show it in the accent colour, with no Away pill. */
+    val isWorking: Boolean
+        get() {
+            if (!isAgent) return false
+            if (presenceState == "executing") return true
+            return presenceState == null && AgentStatus.parse(awayMsg) != null
+        }
+
     /** The line under the name: the activity label wins, the away text
-     *  shows only when there is no label. Same as the macOS member row. */
+     *  shows only when there is no label — an agent's decoded ("Working ·
+     *  answering chad"), anyone else's as is. Same as the macOS member row. */
     val awayText: String?
-        get() = if (activityLabel == null) awayMsg else null
+        get() = if (activityLabel == null) AgentStatus.displayAway(awayMsg) else null
+
+    /** This member's agent status, decoded: from live presence when it
+     *  publishes one, else from its AWAY reason. Null for a person. */
+    val agentStatus: AgentStatus?
+        get() {
+            if (isAgent) {
+                AgentStatus.parse(presenceStatus)?.let { s ->
+                    return if (s.state == null) s.copy(state = presenceState) else s
+                }
+            }
+            return AgentStatus.parse(awayMsg)
+        }
 }
 
 // ── Channel state ──
@@ -1484,6 +1512,18 @@ class AppState(application: Application) : AndroidViewModel(application) {
             key in whoisNoSuchNick -> com.freeq.ffi.PersonLookup.NO_SUCH_NICK
             else -> com.freeq.ffi.PersonLookup.NOT_ASKED
         }
+    }
+
+    /** The member record for [key] (a nick, or a DM thread's peer DID) in
+     *  any channel we share, if any. */
+    fun memberInfo(key: String): MemberInfo? {
+        val byDid = DidDisplay.isDid(key)
+        for (ch in channels) {
+            ch.members.firstOrNull {
+                if (byDid) it.did == key else it.nick.equals(key, ignoreCase = true)
+            }?.let { return it }
+        }
+        return null
     }
 
     fun awayMessage(nick: String): String? {

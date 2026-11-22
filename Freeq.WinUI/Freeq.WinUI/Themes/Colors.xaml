@@ -26,6 +26,7 @@
     <!-- Accent dim (20% opacity) -->
     <SolidColorBrush x:Key="AccentDimBrush" Color="#3300D4AA" />
     <SolidColorBrush x:Key="DangerDimBrush" Color="#33FF5C5C" />
+    <SolidColorBrush x:Key="BlueDimBrush" Color="#245C9EFF" />
 
     <!-- Transparent for hover states -->
     <SolidColorBrush x:Key="TransparentBrush" Color="Transparent" />

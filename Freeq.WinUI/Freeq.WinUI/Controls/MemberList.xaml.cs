@@ -20,6 +20,7 @@ public sealed partial class MemberList : UserControl
         OpsList.ItemsSource = vm.Operators;
         VoicedList.ItemsSource = vm.Voiced;
         MembersList.ItemsSource = vm.Members;
+        AgentsList.ItemsSource = vm.Agents;
 
         vm.Operators.CollectionChanged += (s, e) =>
         {
@@ -37,6 +38,12 @@ public sealed partial class MemberList : UserControl
         {
             MembersHeader.Text = $"MEMBERS — {vm.Members.Count}";
         };
+
+        vm.Agents.CollectionChanged += (s, e) =>
+        {
+            AgentsSection.Visibility = vm.Agents.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+            AgentsHeader.Text = $"AGENTS — {vm.Agents.Count}";
+        };
     }
 
     private async void OnMemberClick(object sender, ItemClickEventArgs e)
@@ -46,6 +53,21 @@ public sealed partial class MemberList : UserControl
         var profile = _vm.GetUserProfile(member.Nick);
         var panel = new StackPanel { Spacing = 6, MinWidth = 220 };
         panel.Children.Add(new TextBlock { Text = profile.Nick, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, FontSize = 14 });
+        if (profile.ActorLabel is { } actorLabel)
+            panel.Children.Add(new TextBlock { Text = actorLabel, FontSize = 12, Foreground = ThemeBrush("BlueBrush") });
+
+        // Status: "Working" for an agent at work (never "Away"), "Away: …" for a person.
+        panel.Children.Add(new TextBlock
+        {
+            Text = profile.StatusText,
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = ThemeBrush(
+                profile.IsAgent && !Models.AgentStatus.ShowsAway(true, profile.PresenceState, profile.AwayMessage, profile.IsAway)
+                    ? "BlueBrush"
+                    : profile.IsAway ? "WarningBrush" : "SuccessBrush"),
+        });
+        if (profile.Agent is { } agent)
+            panel.Children.Add(BuildActivity(agent));
         panel.Children.Add(new TextBlock { Text = $"DID: {profile.DisplayDid}", TextWrapping = TextWrapping.Wrap });
         panel.Children.Add(new TextBlock { Text = $"Bluesky: {profile.DisplayHandle}", TextWrapping = TextWrapping.Wrap });
         panel.Children.Add(new TextBlock { Text = $"Safety number: {_vm.GetSafetyNumber(profile.Nick)}", TextWrapping = TextWrapping.Wrap });
@@ -86,6 +108,70 @@ public sealed partial class MemberList : UserControl
         };
 
         await dialog.ShowAsync();
+    }
+
+    /// <summary>
+    /// What an agent is doing, as a sentence, then where — wrapped, never cut
+    /// off, each value selectable so a long branch can be copied.
+    /// </summary>
+    private static UIElement BuildActivity(Models.AgentStatus agent)
+    {
+        var card = new StackPanel { Spacing = 4 };
+        card.Children.Add(new TextBlock
+        {
+            Text = "ACTIVITY",
+            FontSize = 10,
+            FontWeight = Microsoft.UI.Text.FontWeights.Bold,
+            CharacterSpacing = 120,
+            Foreground = ThemeBrush("FgDimBrush"),
+        });
+        if (agent.Doing is { } doing)
+            card.Children.Add(new TextBlock { Text = doing, TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true });
+
+        var facts = agent.Facts;
+        if (facts.Count > 0)
+        {
+            var grid = new Grid { ColumnSpacing = 10, RowSpacing = 2 };
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            for (var i = 0; i < facts.Count; i++)
+            {
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                var label = new TextBlock { Text = facts[i].Label, FontSize = 12, Foreground = ThemeBrush("FgDimBrush") };
+                var value = new TextBlock
+                {
+                    Text = facts[i].Value,
+                    FontSize = 12,
+                    FontFamily = new Microsoft.UI.Xaml.Media.FontFamily("Consolas"),
+                    TextWrapping = TextWrapping.Wrap,
+                    IsTextSelectionEnabled = true,
+                };
+                Grid.SetRow(label, i);
+                Grid.SetRow(value, i);
+                Grid.SetColumn(value, 1);
+                grid.Children.Add(label);
+                grid.Children.Add(value);
+            }
+            card.Children.Add(grid);
+        }
+
+        return new Border
+        {
+            Padding = new Thickness(10),
+            CornerRadius = new CornerRadius(8),
+            Background = ThemeBrush("BlueDimBrush"),
+            Child = card,
+        };
+    }
+
+    private static Microsoft.UI.Xaml.Media.Brush ThemeBrush(string key)
+    {
+        try
+        {
+            if (Application.Current.Resources[key] is Microsoft.UI.Xaml.Media.Brush brush) return brush;
+        }
+        catch { /* missing key */ }
+        return new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.Gray);
     }
 
     public static Visibility BoolToVis(bool value) =>

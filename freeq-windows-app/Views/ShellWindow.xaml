@@ -633,39 +633,95 @@
                                 </Setter>
                             </Style>
                         </ListBox.ItemContainerStyle>
+                        <!-- People first, then a separate "Agents" group (grouping set
+                             up in ChannelViewModel). The people's group needs no header:
+                             the panel title above already says "Members". -->
+                        <ListBox.GroupStyle>
+                            <GroupStyle>
+                                <GroupStyle.HeaderTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="AGENTS" FontSize="11" FontWeight="Bold"
+                                                   Foreground="{StaticResource FgDim}" Margin="12,10,12,4">
+                                            <TextBlock.Style>
+                                                <Style TargetType="TextBlock">
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding Name}" Value="Members">
+                                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </TextBlock.Style>
+                                        </TextBlock>
+                                    </DataTemplate>
+                                </GroupStyle.HeaderTemplate>
+                            </GroupStyle>
+                        </ListBox.GroupStyle>
                         <ListBox.ItemTemplate>
                             <DataTemplate>
                                 <DockPanel>
-                                    <!-- Online/away indicator -->
+                                    <!-- Presence: blue = agent working, yellow = away, green = online -->
                                     <Ellipse DockPanel.Dock="Left" Width="8" Height="8"
                                              Margin="0,0,8,0" VerticalAlignment="Center">
                                         <Ellipse.Style>
                                             <Style TargetType="Ellipse">
                                                 <Setter Property="Fill" Value="{StaticResource AccentGreen}"/>
                                                 <Style.Triggers>
-                                                    <DataTrigger Binding="{Binding AwayMsg, Converter={StaticResource NullToVis}}" Value="Visible">
+                                                    <DataTrigger Binding="{Binding ShowsAway}" Value="True">
                                                         <Setter Property="Fill" Value="{StaticResource AccentYellow}"/>
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding IsWorking}" Value="True">
+                                                        <Setter Property="Fill" Value="{StaticResource AccentBlue}"/>
                                                     </DataTrigger>
                                                 </Style.Triggers>
                                             </Style>
                                         </Ellipse.Style>
                                     </Ellipse>
-                                    <TextBlock Text="{Binding PrefixedNick}" FontSize="12"
-                                               TextTrimming="CharacterEllipsis">
-                                        <TextBlock.Style>
-                                            <Style TargetType="TextBlock">
-                                                <Setter Property="Foreground" Value="{StaticResource FgSubtext}"/>
-                                                <Style.Triggers>
-                                                    <DataTrigger Binding="{Binding IsOp}" Value="True">
-                                                        <Setter Property="Foreground" Value="{StaticResource AccentPeach}"/>
-                                                    </DataTrigger>
-                                                    <DataTrigger Binding="{Binding IsVoiced}" Value="True">
-                                                        <Setter Property="Foreground" Value="{StaticResource AccentGreen}"/>
-                                                    </DataTrigger>
-                                                </Style.Triggers>
-                                            </Style>
-                                        </TextBlock.Style>
-                                    </TextBlock>
+                                    <StackPanel>
+                                        <DockPanel>
+                                            <!-- Agent badge: only when the server said so. -->
+                                            <Border DockPanel.Dock="Right" Margin="4,0,0,0" Padding="4,0"
+                                                    CornerRadius="3" VerticalAlignment="Center"
+                                                    Background="#2489b4fa"
+                                                    ToolTip="{Binding AgentBadgeTooltip}"
+                                                    AutomationProperties.Name="{Binding AgentBadgeTooltip}"
+                                                    Visibility="{Binding IsAgent, Converter={StaticResource BoolToVis}}">
+                                                <TextBlock Text="{Binding AgentBadge}" FontSize="9" FontWeight="Bold"
+                                                           Foreground="{StaticResource AccentBlue}"/>
+                                            </Border>
+                                            <TextBlock Text="{Binding PrefixedNick}" FontSize="12"
+                                                       TextTrimming="CharacterEllipsis">
+                                                <TextBlock.Style>
+                                                    <Style TargetType="TextBlock">
+                                                        <Setter Property="Foreground" Value="{StaticResource FgSubtext}"/>
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsOp}" Value="True">
+                                                                <Setter Property="Foreground" Value="{StaticResource AccentPeach}"/>
+                                                            </DataTrigger>
+                                                            <DataTrigger Binding="{Binding IsVoiced}" Value="True">
+                                                                <Setter Property="Foreground" Value="{StaticResource AccentGreen}"/>
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </TextBlock.Style>
+                                            </TextBlock>
+                                        </DockPanel>
+                                        <!-- "Working · answering chad in #phoenix" — one line, full text on hover -->
+                                        <TextBlock Text="{Binding StatusLine}" FontSize="10"
+                                                   TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"
+                                                   ToolTip="{Binding StatusLine}"
+                                                   Visibility="{Binding StatusLine, Converter={StaticResource NullToVis}}">
+                                            <TextBlock.Style>
+                                                <Style TargetType="TextBlock">
+                                                    <Setter Property="Foreground" Value="{StaticResource FgDim}"/>
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding IsAgent}" Value="True">
+                                                            <Setter Property="Foreground" Value="{StaticResource AccentBlue}"/>
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </TextBlock.Style>
+                                        </TextBlock>
+                                    </StackPanel>
                                 </DockPanel>
                             </DataTemplate>
                         </ListBox.ItemTemplate>

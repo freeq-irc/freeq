@@ -64,6 +64,8 @@ public partial class MainViewModel : ObservableObject
     public ObservableCollection<MemberModel> Operators { get; } = [];
     public ObservableCollection<MemberModel> Voiced { get; } = [];
     public ObservableCollection<MemberModel> Members { get; } = [];
+    /// <summary>Regular-rank agents, listed after the people so a room's bots are never mixed in with them.</summary>
+    public ObservableCollection<MemberModel> Agents { get; } = [];
     public ObservableCollection<ChannelListEntry> ServerChannels { get; } = [];
     public ObservableCollection<PinEntry> PinnedMessages { get; } = [];
     public ObservableCollection<MessageSearchResult> SearchResults { get; } = [];
@@ -128,6 +130,7 @@ public partial class MainViewModel : ObservableObject
         _irc.NamesReceived += OnNamesReceived;
         _irc.NickChanged += OnNickChanged;
         _irc.AccountChanged += OnAccountChanged;
+        _irc.ActorInfoChanged += OnActorInfoChanged;
         _irc.ListEntryReceived += OnListEntryReceived;
         _irc.PinEntryReceived += OnPinEntryReceived;
         _irc.MotdReceived += OnMotdReceived;
@@ -190,6 +193,7 @@ public partial class MainViewModel : ObservableObject
         Operators.Clear();
         Voiced.Clear();
         Members.Clear();
+        Agents.Clear();
         _messagesByChannel.Clear();
         _presenceRuns.Clear();
         _membersByChannel.Clear();
@@ -369,6 +373,8 @@ public partial class MainViewModel : ObservableObject
     public UserProfileInfo GetUserProfile(string nick)
     {
         var did = _irc.GetAccount(nick);
+        var presence = _irc.GetPresence(nick);
+        var isAway = _awayByNick.TryGetValue(nick, out var awayMessage);
         string? handle = null;
         if (!string.IsNullOrWhiteSpace(did) && did!.Contains('.') && !did.StartsWith("did:", StringComparison.OrdinalIgnoreCase))
             handle = did;
@@ -379,6 +385,11 @@ public partial class MainViewModel : ObservableObject
             Did = did,
             BlueskyHandle = handle,
             CanModerate = IsCurrentUserOperator(),
+            ActorClass = _irc.GetActorClass(nick),
+            IsAway = isAway,
+            AwayMessage = awayMessage,
+            PresenceState = presence?.State,
+            PresenceText = presence?.Status,
         };
     }
 
@@ -453,7 +464,8 @@ public partial class MainViewModel : ObservableObject
     {
         return Operators.Select(m => m.Nick)
             .Concat(Voiced.Select(m => m.Nick))
-            .Concat(Members.Select(m => m.Nick));
+            .Concat(Members.Select(m => m.Nick))
+            .Concat(Agents.Select(m => m.Nick));
     }
 
     /// <summary>Returns the last message sent by the current user in the active channel.</summary>
@@ -1042,6 +1054,8 @@ public partial class MainViewModel : ObservableObject
             {
                 kvp.Value.RemoveAll(n => n.TrimStart('@', '%', '+').Equals(nick, StringComparison.OrdinalIgnoreCase));
             }
+            // Gone from the network: whoever takes the nick next is not away.
+            _awayByNick.Remove(nick);
             if (SelectedChannel != null)
                 RefreshMemberList(SelectedChannel.Name);
         });
@@ -1220,12 +1234,27 @@ public partial class MainViewModel : ObservableObject
         });
     }
 
+    private void OnActorInfoChanged(string nick)
+    {
+        _dispatcher.TryEnqueue(() =>
+        {
+            if (SelectedChannel != null)
+                RefreshMemberList(SelectedChannel.Name);
+        });
+    }
+
     private void OnNickChanged(string oldNick, string newNick)
     {
         _dispatcher.TryEnqueue(() =>
         {
             if (oldNick.Equals(Nickname, StringComparison.OrdinalIgnoreCase))
                 Nickname = newNick;
+
+            // Carry the away reason across the rename. Member rows are rebuilt
+            // from these side maps, so leaving it on the old nick silently
+            // drops an agent's status (and a person's away) on every NICK.
+            if (_awayByNick.Remove(oldNick, out var away))
+                _awayByNick[newNick] = away;
 
             foreach (var kvp in _membersByChannel)
             {
@@ -1391,13 +1420,26 @@ public partial class MainViewModel : ObservableObject
         Operators.Clear();
         Voiced.Clear();
         Members.Clear();
+        Agents.Clear();
 
         if (!_membersByChannel.TryGetValue(channel, out var nicks)) return;
 
         foreach (var raw in nicks.OrderBy(n => n.TrimStart('@', '%', '+')))
         {
             var (role, nick) = ParseMemberPrefix(raw);
-            var member = new MemberModel { Nick = nick, Role = role, Did = _irc.GetAccount(nick) };
+            // Rebuilt from scratch on every refresh (mode, nick, NAMES, away…),
+            // so everything a row shows must come from the keyed side state —
+            // the actor class and presence included, or agents lose their badge.
+            var presence = _irc.GetPresence(nick);
+            var member = new MemberModel
+            {
+                Nick = nick,
+                Role = role,
+                Did = _irc.GetAccount(nick),
+                ActorClass = _irc.GetActorClass(nick),
+                PresenceState = presence?.State,
+                PresenceText = presence?.Status,
+            };
             if (_awayByNick.TryGetValue(nick, out var awayMessage))
             {
                 member.Status = PresenceStatus.Away;
@@ -1414,13 +1456,14 @@ public partial class MainViewModel : ObservableObject
                     Voiced.Add(member);
                     break;
                 default:
-                    Members.Add(member);
+                    // Ops and voiced keep their rank; regular agents get their own group.
+                    (member.IsAgent ? Agents : Members).Add(member);
                     break;
             }
         }
     }
 
-    public int TotalMemberCount => Operators.Count + Voiced.Count + Members.Count;
+    public int TotalMemberCount => Operators.Count + Voiced.Count + Members.Count + Agents.Count;
 
     private void PersistBookmarks()
     {

@@ -9,13 +9,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.freeq.model.AvatarCache
@@ -32,6 +32,11 @@ fun MemberListSheet(
     val ops = members.filter { it.isOp }
     val voiced = members.filter { it.isVoiced && !it.isOp }
     val regular = members.filter { !it.isOp && !it.isVoiced }
+    // Agents get their own section after the people, so a room's people and
+    // its bots are never one undifferentiated list. Ops and voiced keep
+    // their rank (same as macOS/iOS/web).
+    val people = regular.filter { !it.isAgent }
+    val agents = regular.filter { it.isAgent }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -77,11 +82,20 @@ fun MemberListSheet(
                     }
                 }
 
-                if (regular.isNotEmpty()) {
+                if (people.isNotEmpty()) {
                     item {
-                        SheetSectionHeader("Members", regular.size)
+                        SheetSectionHeader("Members", people.size)
                     }
-                    items(regular, key = { "m-${it.nick}" }) { member ->
+                    items(people, key = { "m-${it.nick}" }) { member ->
+                        SheetMemberRow(member, onMemberClick)
+                    }
+                }
+
+                if (agents.isNotEmpty()) {
+                    item {
+                        SheetSectionHeader("Agents", agents.size)
+                    }
+                    items(agents, key = { "a-${it.nick}" }) { member ->
                         SheetMemberRow(member, onMemberClick)
                     }
                 }
@@ -112,7 +126,9 @@ private fun SheetMemberRow(member: MemberInfo, onMemberClick: (String) -> Unit) 
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        val isAway = member.isAway
+        // An agent whose AWAY is its work is working, not away.
+        val isWorking = member.isWorking
+        val isAway = member.isAway && !isWorking
         val awayText = member.awayText
 
         // Presence dot
@@ -120,7 +136,13 @@ private fun SheetMemberRow(member: MemberInfo, onMemberClick: (String) -> Unit) 
             modifier = Modifier
                 .size(8.dp)
                 .clip(CircleShape)
-                .background(if (isAway) FreeqColors.warning else FreeqColors.success)
+                .background(
+                    when {
+                        isWorking -> FreeqColors.accent
+                        isAway -> FreeqColors.warning
+                        else -> FreeqColors.success
+                    }
+                )
         )
 
         UserAvatar(nick = member.nick, size = 36.dp)
@@ -140,6 +162,9 @@ private fun SheetMemberRow(member: MemberInfo, onMemberClick: (String) -> Unit) 
                 }
                 Text(
                     text = member.nick,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
                     fontSize = 15.sp,
                     fontWeight = FontWeight.Medium,
                     color = if (isAway) MaterialTheme.colorScheme.onSurfaceVariant
@@ -155,12 +180,7 @@ private fun SheetMemberRow(member: MemberInfo, onMemberClick: (String) -> Unit) 
                 }
                 // Only when the server said so; unlabelled stays a person.
                 if (member.isAgent) {
-                    Icon(
-                        Icons.Outlined.Memory,
-                        contentDescription = "Agent",
-                        tint = FreeqColors.accent,
-                        modifier = Modifier.size(13.dp)
-                    )
+                    AgentBadge(member.actorClass)
                 }
                 if (isAway) {
                     Surface(
@@ -183,15 +203,18 @@ private fun SheetMemberRow(member: MemberInfo, onMemberClick: (String) -> Unit) 
                     text = it,
                     fontSize = 12.sp,
                     color = FreeqColors.accent,
-                    maxLines = 1
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
             if (!awayText.isNullOrEmpty()) {
                 Text(
                     text = awayText,
                     fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
-                    maxLines = 1
+                    color = if (isWorking) FreeqColors.accent
+                        else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
         }

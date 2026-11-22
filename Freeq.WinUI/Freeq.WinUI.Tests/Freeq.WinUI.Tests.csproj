@@ -21,6 +21,7 @@
     <!-- Link source files directly to avoid WinExe reference complexity -->
     <Compile Include="..\Freeq.WinUI\Services\IrcClient.cs" Link="Services\IrcClient.cs" />
     <Compile Include="..\Freeq.WinUI\Services\OAuthCallbackServer.cs" Link="Services\OAuthCallbackServer.cs" />
+    <Compile Include="..\Freeq.WinUI\Models\AgentStatus.cs" Link="Models\AgentStatus.cs" />
   </ItemGroup>
 
   <ItemGroup>

@@ -21,6 +21,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.freeq.model.AgentStatus
 import com.freeq.model.DidDisplay
 import com.freeq.model.ChatMessage
 import com.freeq.model.AppState
@@ -121,6 +122,9 @@ fun UserProfileSheet(
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onBackground
                 )
+                if (appState.memberInfo(nick)?.isAgent == true) {
+                    AgentBadge(appState.memberInfo(nick)?.actorClass)
+                }
                 // The mark follows the identifier, not the avatar fetch, and
                 // it is the same rule the message row applies.
                 if (claim.showsMark) {
@@ -170,8 +174,35 @@ fun UserProfileSheet(
                 }
             }
 
-            // Away status
-            appState.awayMessage(nick)?.let { awayMsg ->
+            // Status. An agent's status (live presence, or an AWAY reason in
+            // its `key=value` form) is its work, decoded — "Working", then
+            // what it is doing and where — never "Away: executing: project=…".
+            val member = appState.memberInfo(nick)
+            val awayMsg = appState.awayMessage(nick)
+            val agentStatus = member?.agentStatus ?: AgentStatus.parse(awayMsg)
+            if (agentStatus != null) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .background(FreeqColors.accent, CircleShape)
+                    )
+                    Text(
+                        text = AgentStatus.label(agentStatus.state) ?: "Working",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = FreeqColors.accent
+                    )
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                AgentActivityCard(
+                    agentStatus,
+                    modifier = Modifier.padding(horizontal = 24.dp)
+                )
+            } else if (awayMsg != null) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -192,7 +223,9 @@ fun UserProfileSheet(
                     Text(
                         text = awayMsg,
                         fontSize = 13.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 32.dp)
                     )
                 }
             }

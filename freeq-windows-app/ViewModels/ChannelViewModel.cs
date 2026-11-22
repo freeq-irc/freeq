@@ -53,6 +53,20 @@ public partial class ChannelViewModel : ObservableObject
     public ObservableCollection<IrcMessage> Messages { get; } = new();
     public ObservableCollection<IrcMember> Members { get; } = new();
 
+    public ChannelViewModel()
+    {
+        // People first, then a separate "Agents" group. Live grouping, so a
+        // member regroups the moment its actor class arrives (674 / JOIN tag
+        // land after NAMES / the join itself).
+        var view = System.Windows.Data.CollectionViewSource.GetDefaultView(Members);
+        view.GroupDescriptions.Add(new System.Windows.Data.PropertyGroupDescription(nameof(IrcMember.Group)));
+        if (view is System.ComponentModel.ICollectionViewLiveShaping live && live.CanChangeLiveGrouping)
+        {
+            live.LiveGroupingProperties.Add(nameof(IrcMember.Group));
+            live.IsLiveGrouping = true;
+        }
+    }
+
     public string DisplayName => IsServerChannel ? "Server" : Name.StartsWith('#') ? Name : $"@ {Name}";
     public bool IsChannel => Name.StartsWith('#');
 
@@ -168,7 +182,8 @@ public partial class ChannelViewModel : ObservableObject
             return string.Compare(a.Nick, b.Nick, StringComparison.OrdinalIgnoreCase);
         }
 
+        // Regular agents after regular people, matching the "Agents" group.
         private static int GetRank(IrcMember m) =>
-            m.IsOp ? 0 : m.IsHalfOp ? 1 : m.IsVoiced ? 2 : 3;
+            m.IsOp ? 0 : m.IsHalfOp ? 1 : m.IsVoiced ? 2 : m.IsAgent ? 4 : 3;
     }
 }
