@@ -34,7 +34,9 @@ export const FREEQ_TOOL_DESCRIPTION =
   "'status' publishes a short present-tense phrase describing what you are " +
   "doing right now ('checking why reconnect drops channels') — watchers " +
   "see it in presence and rosters; set it at the start of a run, keep it " +
-  "under ~6 words, never include paths or secrets. Never send secrets, " +
+  "under ~6 words, never include paths or secrets. " +
+  "'rename' changes your own nick on freeq to 'nick' — use it when your operator asks " +
+  "you to change your name; your DID stays the same. Never send secrets, " +
   "credentials, or absolute filesystem paths.";
 
 const str = (description: string) => ({ type: "string", description });
@@ -60,6 +62,7 @@ export const FREEQ_TOOL_PARAMETERS = {
         "decline",
         "decision",
         "status",
+        "rename",
       ].map((a) => ({ type: "string", const: a })),
       description: "What to do",
     },
@@ -70,6 +73,7 @@ export const FREEQ_TOOL_PARAMETERS = {
     title: str("Short title of the work, for handoff"),
     brief: str("Full context the other agent needs, for handoff"),
     taskId: str("Task id, for complete/cancel/claim"),
+    nick: str("Your new nick, for 'rename': letters, digits, - and _, at most 30"),
     rationale: str("Why, for 'decision' — the part worth keeping"),
     alternatives: str("What was rejected, for 'decision'"),
     evidence: str("Commit, task id, file or URL backing a 'decision'"),
@@ -94,7 +98,8 @@ export type FreeqToolAction =
   | "accept"
   | "decline"
   | "decision"
-  | "status";
+  | "status"
+  | "rename";
 
 /** Arguments to the `freeq` tool. */
 export interface FreeqToolParams {
@@ -106,6 +111,7 @@ export interface FreeqToolParams {
   title?: string;
   brief?: string;
   taskId?: string;
+  nick?: string;
   rationale?: string;
   alternatives?: string;
   evidence?: string;

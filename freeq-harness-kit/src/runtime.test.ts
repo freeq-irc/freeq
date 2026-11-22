@@ -1,5 +1,5 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentRuntime, httpOriginFor, type RuntimeOptions } from "./runtime.js";
@@ -326,6 +326,25 @@ describe("AgentRuntime: replies", () => {
 });
 
 describe("AgentRuntime: presence", () => {
+  it("publishes what it is doing and since when, never a frozen elapsed count", async () => {
+    vi.useFakeTimers();
+    try {
+      const { rt, bot } = await started();
+      rt.onUserPrompt("look at the reconnect bug");
+      const first = bot.states.at(-1)!;
+      expect(first.state).toBe("executing");
+      expect(first.status).toContain("doing=look+at+the+reconnect+bug");
+      expect(first.status).toMatch(/since=\d{10}/);
+      expect(first.status).not.toMatch(/·\+\d+[smhd]\b/);
+      // Nothing to refresh: a quiet ten minutes publishes nothing new.
+      const before = bot.states.length;
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(bot.states.length).toBe(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("names the step from a typed prompt and clears it when settled", async () => {
     const { rt, bot } = await started();
     rt.onUserPrompt("look at the reconnect bug");
@@ -574,6 +593,167 @@ describe("AgentRuntime: handoffs", () => {
     expect(h.delivered).toHaveLength(1);
     expect(h.delivered[0]!.content).toContain("- 22:40 parser half done");
     expect(await rt.resumeAssigned(rt.config!, "01JE")).toBe("freeq: 01JE is already in flight here");
+  });
+});
+
+describe("AgentRuntime: an acknowledgement is not the answer", () => {
+  // The provenance line ("⚙ ran: …") is the turn's log, not a reply.
+  const replies = (bot: FakeBot) => bot.messages().filter((m) => !m.includes("⚙"));
+
+  it("still sends the closing text when the agent said 'on it' over freeq and then worked", async () => {
+    const { bot, rt } = await started();
+    bot.emit("message", "nap", { from: "nap", text: "why is CI red?", isSelf: false, tags: { account: OWNER } });
+    await tick();
+    rt.onTurnStart();
+    rt.onToolCall("freeq", { action: "send" });
+    await rt.runTool({ action: "send", to: "nap", message: "on it, looking now" });
+    rt.onToolCall("bash", { command: "gh run view" });
+    rt.onTurnEnd("CI is red: the lockfile is stale.", false);
+    await rt.onSettled();
+    expect(replies(bot)).toEqual(["nap on it, looking now", "nap CI is red: the lockfile is stale."]);
+  });
+
+  it("sends no closing text when the freeq reply was the last thing it did", async () => {
+    const { bot, rt } = await started();
+    bot.emit("message", "nap", { from: "nap", text: "why is CI red?", isSelf: false, tags: { account: OWNER } });
+    await tick();
+    rt.onTurnStart();
+    rt.onToolCall("bash", { command: "gh run view" });
+    rt.onToolCall("freeq", { action: "send" });
+    await rt.runTool({ action: "send", to: "nap", message: "the lockfile is stale" });
+    rt.onTurnEnd("Replied to nap on freeq.", false);
+    await rt.onSettled();
+    expect(replies(bot)).toEqual(["nap the lockfile is stale"]);
+  });
+
+  it("treats a channel 'say' the same way", async () => {
+    const { bot, rt } = await started({ trust: { [PEER]: "message" } });
+    bot.emit("message", "#work", { from: "peer", text: "pi-test1234-proj: is main green?", isSelf: false, tags: { account: PEER } });
+    await tick();
+    rt.onTurnStart();
+    await rt.runTool({ action: "say", channel: "#work", message: "checking" });
+    rt.onToolCall("bash", { command: "gh run list" });
+    rt.onTurnEnd("main is green.", false);
+    await rt.onSettled();
+    expect(replies(bot)).toEqual(["#work @peer checking", "#work @peer main is green."]);
+  });
+});
+
+describe("AgentRuntime: no answer is never silent", () => {
+  it("tells the terminal when a person owed a reply got none", async () => {
+    const { bot, rt, notices } = await started();
+    bot.emit("message", "nap", { from: "nap", text: "rename yourself", isSelf: false, tags: { account: OWNER } });
+    await tick();
+    rt.onTurnStart();
+    rt.onToolCall("bash", { command: "ls" });
+    rt.onTurnEnd("", true);
+    await rt.onSettled();
+    expect(bot.messages().filter((m) => !m.includes("⚙"))).toEqual([]);
+    expect(notices.at(-1)).toEqual({
+      text: "freeq: nap got no answer — the response ended without text and nothing was sent over freeq",
+      level: "warning",
+    });
+  });
+
+  it("posts no progress line into the room while it works", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    try {
+      const { bot } = await started({ trust: { [PEER]: "message" } });
+      bot.emit("message", "#work", { from: "peer", text: "pi-test1234-proj: big question", isSelf: false, tags: { account: PEER } });
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(bot.messages().filter((m) => m.includes("answering"))).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("AgentRuntime: a message delivered mid-run", () => {
+  it("is held for the run that carries it, not answered with this run's wrap-up", async () => {
+    const { bot, rt } = await started();
+    rt.onTurnStart(); // the person's own task, typed in the terminal
+    bot.emit("message", "nap", { from: "nap", text: "are you around?", isSelf: false, tags: { account: OWNER } });
+    await tick();
+    rt.onTurnEnd("Refactor finished; 12 files changed.", false);
+    await rt.onSettled({ holdUnseen: true });
+    expect(bot.messages()).toEqual([]);
+    expect(rt.hasHeldReplies()).toBe(true);
+    rt.onTurnStart(); // the next run, which the queued message started
+    rt.onTurnEnd("Yes, here.", false);
+    expect(bot.messages()).toEqual(["nap Yes, here."]);
+  });
+
+  it("is answered with the run's text when no new run takes it", async () => {
+    const { bot, rt } = await started();
+    rt.onTurnStart();
+    bot.emit("message", "nap", { from: "nap", text: "status?", isSelf: false, tags: { account: OWNER } });
+    await tick();
+    rt.onTurnEnd("Done: tests pass.", false);
+    await rt.onSettled({ holdUnseen: true });
+    rt.answerHeld();
+    expect(bot.messages()).toEqual(["nap Done: tests pass."]);
+  });
+
+  it("knows the operator is on freeq until they type in the terminal", async () => {
+    const { bot, rt } = await started();
+    expect(rt.operatorOnFreeq).toBe(false);
+    bot.emit("message", "nap", { from: "nap", text: "hi", isSelf: false, tags: { account: OWNER } });
+    await tick();
+    expect(rt.operatorOnFreeq).toBe(true);
+    rt.onUserPrompt("back at the desk");
+    expect(rt.operatorOnFreeq).toBe(false);
+  });
+});
+
+describe("AgentRuntime: renaming the agent", () => {
+  function answersNick(bot: FakeBot, taken: string[] = []): void {
+    bot.client.raw = (line: string) => {
+      bot.sent.push({ kind: "raw", target: "", payload: line });
+      const m = /^NICK (\S+)$/.exec(line);
+      if (!m) return;
+      if (taken.includes(m[1]!)) return bot.emit("nickInUse", m[1]);
+      bot.nickValue = m[1]!;
+      bot.emit("nickChanged", m[1]);
+    };
+  }
+
+  it("renames live with the tool, keeps the DID, and registers as the new name next time", async () => {
+    const { bot, rt, agentDir, harness } = await started();
+    answersNick(bot);
+    const out = await rt.runTool({ action: "rename", nick: "claude" });
+    expect(out).toBe("freeq: this agent is now claude (was pi-test1234-proj). Same DID; mention it as claude.");
+    expect(bot.sent.some((s) => s.payload === "NICK claude")).toBe(true);
+    const saved = JSON.parse(readFileSync(join(agentDir, "freeq.json"), "utf8"));
+    expect(saved.projects.proj).toEqual({ channels: ["#work"], nick: "claude" });
+
+    // A later session in the same project asks the server for the name.
+    await rt.stop();
+    let nick: string | undefined;
+    const again = new AgentRuntime(harness, {
+      botFactory: async (o) => {
+        nick = o.nick;
+        return new FakeBot();
+      },
+    });
+    await again.start();
+    expect(nick).toBe("claude");
+  });
+
+  it("keeps the old name, and the config, when the new one is taken", async () => {
+    const { bot, rt, agentDir } = await started();
+    answersNick(bot, ["claude"]);
+    const out = await rt.runTool({ action: "rename", nick: "claude" });
+    expect(out).toBe("freeq: still pi-test1234-proj — could not rename to claude: claude is already in use on this server.");
+    expect(bot.nickValue).toBe("pi-test1234-proj");
+    const saved = JSON.parse(readFileSync(join(agentDir, "freeq.json"), "utf8"));
+    expect(saved.projects.proj.nick).toBeUndefined();
+  });
+
+  it("refuses a name that cannot be a nick, and /freeq nick says the current one", async () => {
+    const { rt, notices } = await started();
+    expect(await rt.runTool({ action: "rename", nick: "my agent" })).toMatch(/cannot rename to "my agent"/);
+    await rt.runCommand("nick");
+    expect(notices.at(-1)!.text).toContain("this agent is pi-test1234-proj");
   });
 });
 
@@ -1216,7 +1396,9 @@ describe("AgentRuntime: harness names", () => {
       },
     });
     await rt.start();
-    expect(created).toEqual({ name: "cc-test1234-proj", nick: "cc-test1234-proj" });
+    // The identity keeps its install-scoped name (that is the DID); only the
+    // nick lost the hash nobody could type.
+    expect(created).toEqual({ name: "cc-test1234-proj", nick: "cc-proj" });
 
     bot.emit("channelJoined", "#work");
     const hello = bot.sent.find((s) => s.kind === "tagmsg")!;

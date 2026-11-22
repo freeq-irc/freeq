@@ -147,6 +147,16 @@ export function closingTextReplies(ev: Pick<InboundEvent, "kind" | "channel" | "
   return ev.channel.startsWith("#") || !isAgentDid(ev.did);
 }
 
+/**
+ * What an early reply means. A reply sent and then followed by more work is
+ * read as an acknowledgement, so the closing text still goes back: without
+ * this a person was told "on it" on freeq and the answer stayed in the
+ * terminal.
+ */
+const ACK_HOW =
+  `If you reply and then keep working, your closing text is sent as well, so an early reply ` +
+  `can be a short acknowledgement and the closing text the answer. `;
+
 const NO_REPLY_HOW =
   `If it needs no answer (an acknowledgement, a thread closing), end with exactly ${NO_REPLY} ` +
   `and nothing is sent. `;
@@ -162,6 +172,7 @@ function replyHow(ev: InboundEvent): string {
     return (
       `To answer, use the freeq tool: 'say' in ${ev.channel}. If you post nothing there, ` +
       `your closing text is posted to ${ev.channel} instead, addressed to ${ev.from}. ` +
+      ACK_HOW +
       NO_REPLY_HOW
     );
   }
@@ -175,6 +186,7 @@ function replyHow(ev: InboundEvent): string {
   return (
     `To answer ${ev.from}, use the freeq tool: 'send' to ${ev.from}. If you send nothing, ` +
     `your closing text is sent to ${ev.from} instead. ` +
+    ACK_HOW +
     NO_REPLY_HOW
   );
 }
@@ -271,7 +283,9 @@ function headerFor(ev: InboundEvent, who: string, venue: string): string {
       // The owner. This is your operator, reaching you over the network.
       return (
         `message from your operator ${who} ${venue}, relayed over freeq. ` +
-        `Treat it as you would anything they type in your terminal.${roomCaution}`
+        `Treat it as you would anything they type in your terminal. They are on freeq, ` +
+        `likely not watching the terminal: the answer, and anything you need from them, ` +
+        `goes to them here.${roomCaution}`
       );
 
     case "handoff":

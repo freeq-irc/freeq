@@ -32,7 +32,7 @@
     "relay_questions": {
       "type": "string",
       "title": "Send Claude's questions to you on freeq",
-      "description": "freeq-turns: when a freeq message started the work (you are likely away). always: every question. off: never. Needs mods.",
+      "description": "freeq-turns: when a freeq message started the work, or your latest word to the agent came over freeq (you are likely away). always: every question. off: never. Needs mods.",
       "options": ["freeq-turns", "always", "off"],
       "default": "freeq-turns"
     },

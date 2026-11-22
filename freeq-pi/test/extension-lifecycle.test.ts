@@ -51,7 +51,7 @@ describe("session lifecycle", () => {
         ],
         "initialStatus": "project=proj model=test-model",
         "name": "pi-test1234-proj",
-        "nick": "pi-test1234-proj",
+        "nick": "pi-proj",
         "ownerDid": "did:plc:owner",
         "url": "ws://test.invalid/irc",
       }
@@ -156,7 +156,7 @@ describe("presence and provenance from pi's events", () => {
         },
         {
           "state": "executing",
-          "status": "project=proj model=test-model doing=look+at+why+reconnect+drops+channels+·+0s",
+          "status": "project=proj model=test-model doing=look+at+why+reconnect+drops+channels since=1790769600",
           "task": undefined,
         },
         {

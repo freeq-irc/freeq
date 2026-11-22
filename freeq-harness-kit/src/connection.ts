@@ -22,7 +22,7 @@ import { join } from "node:path";
 function defaultBotsRoot(): string {
   return join(homedir(), ".freeq", "bots");
 }
-import { defaultNick, projectNick, resolveBotName } from "./identity.js";
+import { agentNick, defaultNick, nickProblem, projectNick, resolveBotName } from "./identity.js";
 import { describeMeta, formatStatus, parseStatus, type SessionMeta } from "./presence.js";
 import {
   buildHello,
@@ -148,7 +148,13 @@ export interface ConnectionOptions {
   creatorKeyPath?: string;
   server: string;
   slug: string;
+  /** The installation's base nick (`chad-bot`); the project is appended. */
   nick?: string;
+  /**
+   * The name this project's agent was given (`/freeq nick`, the tool's
+   * `rename`), registered exactly as it is: no project appended.
+   */
+  exactNick?: string;
   channels: string[];
   meta: SessionMeta;
   /** Where bot-kit stores identity/delegation. Tests override this. */
@@ -347,11 +353,7 @@ export class FreeqConnection {
         ),
         ownerDid: this.#opts.ownerDid,
         creatorKeyPath: this.#opts.creatorKeyPath,
-        nick: projectNick(
-          this.#opts.nick ?? defaultNick(this.#opts.slug, this.#names.name),
-          this.#meta.project,
-          this.#names.name,
-        ),
+        nick: this.#wantedNick(),
         url: this.#opts.server,
         root: this.#opts.root,
         channels: this.#opts.channels,
@@ -689,15 +691,26 @@ export class FreeqConnection {
     return !!this.#bot?.client.signing.getPublicKey();
   }
 
+  /** The nick to register as: the name it was given, else the generated one. */
+  #wantedNick(): string {
+    return (
+      this.#opts.exactNick ??
+      agentNick(this.#opts.nick, this.#opts.slug, this.#meta.project, this.#names.name)
+    );
+  }
+
   /** Match a mention of the live nick OR the nick we asked the server for. */
   #matchNames(text: string, liveNick: string): string | null {
     const names = new Set<string>();
     if (liveNick) names.add(liveNick);
+    names.add(this.#wantedNick());
     const desired = this.#opts.nick;
     if (desired) names.add(desired);
     // The project nick is what we actually registered as; the base nick is
     // what teammates were told. "chad-bot" in a room where only
-    // "chad-bot-freeq" is present should still get an answer.
+    // "chad-bot-freeq" is present should still get an answer. That long
+    // form was also the generated name before `agentNick` shortened it, so
+    // it keeps answering to the name people already knew.
     const base = this.#opts.nick ?? defaultNick(this.#opts.slug, this.#names.name);
     names.add(projectNick(base, this.#meta.project, this.#names.name));
     for (const name of names) {
@@ -705,6 +718,52 @@ export class FreeqConnection {
       if (hit) return hit.stripped;
     }
     return null;
+  }
+
+  /**
+   * Change this agent's nick on the live connection, and register as it on
+   * every reconnect after. Resolves once the server has answered: renamed,
+   * refused (taken, or not allowed), or silent for `timeoutMs`.
+   *
+   * The DID does not change. A nick is a display name on freeq; trust,
+   * handoffs and signatures are keyed by the DID.
+   */
+  async rename(nick: string, timeoutMs = 5_000): Promise<{ ok: boolean; nick: string | undefined; reason?: string }> {
+    const problem = nickProblem(nick);
+    if (problem) return { ok: false, nick: this.nick, reason: problem };
+    const bot = this.#bot;
+    if (!bot || this.#state !== "online") {
+      return { ok: false, nick: this.nick, reason: `not online (${this.#state})` };
+    }
+    if (bot.client.nick === nick) {
+      this.#opts.exactNick = nick;
+      return { ok: true, nick };
+    }
+    const outcome = await new Promise<{ ok: boolean; reason?: string }>((resolve) => {
+      let done = false;
+      const finish = (r: { ok: boolean; reason?: string }): void => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        bot.off?.("nickChanged", onChanged as (...a: never[]) => void);
+        bot.off?.("nickInUse", onInUse as (...a: never[]) => void);
+        resolve(r);
+      };
+      const onChanged = (now: string): void => {
+        if (now.toLowerCase() === nick.toLowerCase()) finish({ ok: true });
+      };
+      const onInUse = (): void => finish({ ok: false, reason: `${nick} is already in use on this server` });
+      const timer = setTimeout(
+        () => finish(bot.client.nick === nick ? { ok: true } : { ok: false, reason: "the server did not answer the rename" }),
+        timeoutMs,
+      );
+      timer.unref?.();
+      bot.on("nickChanged", onChanged as (...a: never[]) => void);
+      bot.on("nickInUse", onInUse as (...a: never[]) => void);
+      bot.client.raw(`NICK ${nick}`);
+    });
+    if (outcome.ok) this.#opts.exactNick = nick;
+    return { ok: outcome.ok, nick: this.nick, reason: outcome.reason };
   }
 
   /** Broadcast our hello (or an ack) into a channel. */
@@ -811,7 +870,7 @@ export class FreeqConnection {
    * `task` is an act task id, so a channel can tie a working agent to the
    * handoff it accepted.
    */
-  setWorkState(state: string, status?: string, task?: string): void {
+  setWorkState(state: string, status?: string, task?: string, since?: number): void {
     if (!this.#bot || this.#state !== "online") return;
     try {
       // One presence slot, two things that wanted it: the session metadata
@@ -820,7 +879,13 @@ export class FreeqConnection {
       // last and the metadata fields went missing the moment work started.
       // Compose instead: the label rides as 'doing=' inside the same k=v
       // string, so a peer gets both and neither is lost.
-      const composed = formatStatus({ ...this.#meta, doing: status });
+      // 'since' (epoch seconds) lets a client show a live "for 3m" without
+      // this side re-publishing presence just to move a clock.
+      const composed = formatStatus({
+        ...this.#meta,
+        doing: status,
+        since: status && since ? String(Math.floor(since / 1000)) : undefined,
+      });
       this.#bot.setState(state, composed, task);
     } catch {
       /* presence is best-effort and must never break a turn */

@@ -70,6 +70,22 @@ export function toolDetail(name: string, input: Record<string, unknown> | undefi
  * elapsed time never goes, because "12m" is the difference between watching
  * a thinking agent and watching a stuck one.
  */
+/**
+ * The presence `doing` text: `phrase · tool`, with no elapsed time.
+ *
+ * Elapsed time baked into presence is wrong the moment it is sent: a peer
+ * read "answering chad · 0s" for as long as the step lasted, because the
+ * label was only refreshed every 45s and a client shows whatever it last
+ * got. The start time rides as its own `since` field instead (see
+ * formatStatus), and each client counts up from it live.
+ */
+export function renderDoing(s: StepStatus, budget = STATUS_BUDGET): string {
+  const full = s.tool ? `${s.phrase} · ${s.tool}` : s.phrase;
+  if (full.length <= budget) return full;
+  if (s.phrase.length <= budget) return s.phrase;
+  return gistOf(s.phrase, budget);
+}
+
 export function renderStatus(s: StepStatus, now: number, budget = STATUS_BUDGET): string {
   const elapsed = formatAge(Math.max(0, now - s.since));
   const tool = s.tool ? ` · ${s.tool}` : "";

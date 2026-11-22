@@ -45,6 +45,12 @@ export const DEFAULT_TIER: Tier = "observe";
  */
 export interface ProjectSettings {
   channels?: string[];
+  /**
+   * The name this project's agent was given (`/freeq nick`, or the model
+   * asked to rename itself). Registered as it is, instead of the generated
+   * `<prefix>-<project>`.
+   */
+  nick?: string;
 }
 
 export interface FreeqConfig {
@@ -101,12 +107,10 @@ export interface FreeqConfig {
   /** How often an in-flight task emits a `progress` heartbeat. */
   progressIntervalSecs: number;
   /**
-   * How often a turn that came from freeq posts a live progress line back
-   * into the channel that asked. 0 turns it off.
-   *
-   * Distinct from `progressIntervalSecs`, which is the heartbeat on a formal
-   * task. This one covers the ordinary case: somebody asked a question in a
-   * room and the answer takes ten minutes.
+   * No longer read. It set how often a turn that came from freeq posted a
+   * "⋯ answering … · 1m" line into the channel that asked; that line read as
+   * a promise of an answer and is gone (presence carries the step). Still
+   * parsed so existing freeq.json files load unchanged.
    */
   updateIntervalSecs: number;
   /** How long an in-flight task may go without model activity before it fails. */
@@ -210,10 +214,13 @@ export function normalizeConfig(raw: unknown): FreeqConfig {
     const out: Record<string, ProjectSettings> = {};
     for (const [slug, v] of Object.entries(o.projects as Record<string, unknown>)) {
       if (!slug || !v || typeof v !== "object") continue;
-      const chans = normalizeChannels((v as Record<string, unknown>).channels);
+      const raw = v as Record<string, unknown>;
+      const entry: ProjectSettings = {};
       // An entry with an empty list is meaningful: "this project joins
       // nothing". Keep it; only drop entries that say nothing at all.
-      if (Array.isArray((v as Record<string, unknown>).channels)) out[slug] = { channels: chans };
+      if (Array.isArray(raw.channels)) entry.channels = normalizeChannels(raw.channels);
+      if (typeof raw.nick === "string" && raw.nick.trim()) entry.nick = raw.nick.trim();
+      if (entry.channels || entry.nick) out[slug] = entry;
     }
     if (Object.keys(out).length) base.projects = out;
   }
@@ -341,7 +348,26 @@ export function withProjectChannels(
   channels: string[],
 ): FreeqConfig {
   const projects = { ...(config.projects ?? {}) };
-  projects[project] = { channels: [...new Set(channels.map((c) => c.trim()).filter(Boolean))] };
+  projects[project] = {
+    ...projects[project],
+    channels: [...new Set(channels.map((c) => c.trim()).filter(Boolean))],
+  };
+  return { ...config, projects };
+}
+
+/** The name `project`'s agent was given, if it was given one. */
+export function nickForProject(config: FreeqConfig, project?: string): string | undefined {
+  return project ? config.projects?.[project]?.nick : undefined;
+}
+
+/** Return a config in which `project`'s agent is named `nick` (undefined: the generated name). */
+export function withProjectNick(config: FreeqConfig, project: string, nick: string | undefined): FreeqConfig {
+  const projects = { ...(config.projects ?? {}) };
+  const entry: ProjectSettings = { ...projects[project] };
+  if (nick) entry.nick = nick;
+  else delete entry.nick;
+  if (entry.channels || entry.nick) projects[project] = entry;
+  else delete projects[project];
   return { ...config, projects };
 }
 

@@ -166,6 +166,48 @@ export function projectNick(
 }
 
 /**
+ * The nick an agent registers with when nobody has named it.
+ *
+ * A base the person chose (`chad-bot`) keeps the `<base>-<project>` form. The
+ * generated base, `<prefix>-<8 hex>`, is dropped when there is a project:
+ * `cc-6302f17c-freeq` was the name people had to type to mention their own
+ * agent, and the hex in it tells nobody anything. `cc-freeq` says the same
+ * and can be typed. A collision with someone else's `cc-freeq` is settled by
+ * the server's collision policy, and the agent can be renamed.
+ *
+ * Only the nick changes: the identity's key is named by `resolveBotName`,
+ * never by the nick, so the DID everyone trusts stays the same.
+ */
+export function agentNick(
+  base: string | undefined,
+  slug: string,
+  project: string | undefined,
+  prefix = INSTALL_PREFIX,
+): string {
+  const generated = defaultNick(slug, prefix);
+  if (base && base !== generated) return projectNick(base, project, prefix);
+  const ps = projectSlug(project);
+  return ps ? sanitizeNick(`${prefix}-${ps}`, 30, prefix) : generated;
+}
+
+/** The longest nick a rename accepts; what `sanitizeNick` caps a project nick at. */
+export const NICK_MAX = 30;
+
+/**
+ * Why `nick` cannot be an agent's name, or undefined when it can. Checked
+ * rather than coerced: a person who asked for `my agent` should be told, not
+ * handed `my-agent` without a word.
+ */
+export function nickProblem(nick: string): string | undefined {
+  if (!nick) return "a nick cannot be empty";
+  if (nick.length > NICK_MAX) return `a nick is at most ${NICK_MAX} characters`;
+  if (!/^[A-Za-z[\]{}\\^`|_][A-Za-z0-9[\]{}\\^`|_-]*$/.test(nick)) {
+    return "a nick starts with a letter and holds only letters, digits, - and _";
+  }
+  return undefined;
+}
+
+/**
  * Default nick. IRC nicks are length-limited and charset-limited, so keep it
  * short and conservative: `pi-<8 hex>`.
  */

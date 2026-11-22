@@ -102,6 +102,64 @@ describe("freeq-cc: replies", () => {
   });
 });
 
+describe("freeq-cc: answers reach the person who asked on freeq", () => {
+  const replies = (h: { bot: { messages(): string[] } }) => h.bot.messages().filter((m) => !m.includes("⚙"));
+
+  it("sends the closing text after an 'on it' that more work followed", async () => {
+    const h = await startChannel({ config: baseConfig() });
+    await h.dm("nap", OWNER, "why is CI red?");
+    await h.hook({ hook_event_name: "UserPromptSubmit", prompt: '<channel source="plugin:freeq:freeq">why is CI red?</channel>' });
+    await h.hook({ hook_event_name: "PreToolUse", tool_name: "mcp__plugin_freeq_freeq__freeq", action: "send", to: "nap" });
+    await h.tool({ action: "send", to: "nap", message: "on it" });
+    await h.hook({ hook_event_name: "PreToolUse", tool_name: "Bash", command: "gh run view" });
+    await h.hook({ hook_event_name: "Stop", last_assistant_message: "The lockfile is stale." });
+    expect(replies(h)).toEqual(["nap on it", "nap The lockfile is stale."]);
+    await h.close();
+  });
+
+  it("does not answer a message that arrived mid-response with that response's wrap-up", async () => {
+    const h = await startChannel({ config: baseConfig() });
+    await h.hook({ hook_event_name: "UserPromptSubmit", prompt: "refactor the parser" });
+    await h.hook({ hook_event_name: "PreToolUse", tool_name: "Bash", command: "npm test" });
+    await h.dm("nap", OWNER, "are you around?");
+    await h.hook({ hook_event_name: "Stop", last_assistant_message: "Parser refactored; tests pass." });
+    expect(replies(h)).toEqual([]);
+    // Claude Code hands the queued message over as the next prompt.
+    await h.hook({ hook_event_name: "UserPromptSubmit", prompt: '<channel source="plugin:freeq:freeq">are you around?</channel>' });
+    await h.hook({ hook_event_name: "Stop", last_assistant_message: "Yes, here." });
+    expect(replies(h)).toEqual(["nap Yes, here."]);
+    await h.close();
+  });
+
+  it("answers a held message with the last text when new typed work starts instead", async () => {
+    const h = await startChannel({ config: baseConfig() });
+    await h.hook({ hook_event_name: "UserPromptSubmit", prompt: "run the tests" });
+    await h.dm("nap", OWNER, "status?");
+    await h.hook({ hook_event_name: "Stop", last_assistant_message: "All 62 tests pass." });
+    await h.hook({ hook_event_name: "UserPromptSubmit", prompt: "now lint" });
+    expect(replies(h)).toEqual(["nap All 62 tests pass."]);
+    await h.close();
+  });
+});
+
+describe("freeq-cc: renaming the agent", () => {
+  it("/freeq:nick renames it on the live connection", async () => {
+    const h = await startChannel({ config: baseConfig() });
+    h.bot.client.raw = (line: string) => {
+      h.bot.sent.push({ kind: "raw", target: "", payload: line });
+      const m = /^NICK (\S+)$/.exec(line);
+      if (m) {
+        h.bot.nickValue = m[1]!;
+        h.bot.emit("nickChanged", m[1]);
+      }
+    };
+    const text = await h.command("/freeq:nick claude");
+    expect(text).toContain("this agent is now claude (was cc-test1234-proj)");
+    expect(h.channel.runtime.conn?.nick).toBe("claude");
+    await h.close();
+  });
+});
+
 describe("freeq-cc: the freeq tool", () => {
   it("serves the kit's tool and runs it", async () => {
     const h = await startChannel({ config: baseConfig() });

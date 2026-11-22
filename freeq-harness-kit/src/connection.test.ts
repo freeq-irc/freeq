@@ -875,6 +875,18 @@ describe("work status", () => {
     expect(last.status).toContain("doing=answering+chad");
   });
 
+  it("publishes when the work began, not a frozen elapsed count", async () => {
+    const { conn, bot } = mk();
+    await conn.start();
+    conn.setWorkState("executing", "answering chad", undefined, 1_700_000_123_456);
+    const status = bot.states.at(-1)!.status ?? "";
+    expect(status).toContain("since=1700000123");
+    expect(status).not.toMatch(/·\+\d+s/);
+    // Back to available: no stale start time left behind.
+    conn.setWorkState("active");
+    expect(bot.states.at(-1)!.status ?? "").not.toContain("since=");
+  });
+
   it("is a no-op when offline rather than throwing", async () => {
     const { conn } = mk();
     expect(() => conn.setWorkState("executing", "x")).not.toThrow();

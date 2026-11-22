@@ -28,7 +28,7 @@ describe("/freeq doctor", () => {
         ✓ owner: did:plc:owner
         ✓ config: <root>/agent/freeq.json
         ✓ server: ws://test.invalid/irc (test 0.9.0)
-        ✓ connection: online: pi-test1234-proj (did:key:zSelf) · proj · test-model
+        ✓ connection: online: pi-proj (did:key:zSelf) · proj · test-model
         ✓ channels: joined #work
         ✓ this window: holds the connection
 

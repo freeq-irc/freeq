@@ -55,6 +55,11 @@ export const COMMANDS: Command[] = [
     description: "freeq: leave a channel (for this project)",
     args: [{ name: "channel", description: "#channel", required: true }],
   },
+  {
+    name: "nick",
+    description: "freeq: show or change this agent's nick (same DID); 'reset' goes back to the generated one",
+    args: [{ name: "name", description: "the new nick, or reset" }],
+  },
   { name: "peers", description: "freeq: reachable agents, what they are working on, their tier", args: [] },
   {
     name: "mode",

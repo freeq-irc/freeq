@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { gistOf, renderStatus, toolDetail, STATUS_BUDGET, type StepStatus } from "./status.js";
+import { gistOf, renderDoing, renderStatus, toolDetail, STATUS_BUDGET, type StepStatus } from "./status.js";
 
 describe("gistOf", () => {
   it("flattens whitespace and leaves short text alone", () => {
@@ -31,6 +31,19 @@ describe("toolDetail", () => {
     expect(toolDetail("think", undefined)).toBe("think");
     const d = toolDetail("bash", { command: "x".repeat(200) }, 18);
     expect(d.length).toBeLessThanOrEqual(18);
+  });
+});
+
+describe("renderDoing", () => {
+  it("is the phrase and tool with no elapsed time, which would go stale on the wire", () => {
+    expect(renderDoing({ phrase: "answering chad in #freeq-dev", since: 0, tool: "bash: npm test" })).toBe(
+      "answering chad in #freeq-dev · bash: npm test",
+    );
+    expect(renderDoing({ phrase: "thinking", since: 0 })).toBe("thinking");
+  });
+  it("drops the tool, then shortens the phrase, to fit", () => {
+    expect(renderDoing({ phrase: "a".repeat(40), since: 0, tool: "bash: npm test" }, 50)).toBe("a".repeat(40));
+    expect(renderDoing({ phrase: "p".repeat(80), since: 0 }, 30).length).toBeLessThanOrEqual(30);
   });
 });
 

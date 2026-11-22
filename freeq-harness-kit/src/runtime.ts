@@ -23,7 +23,9 @@ import {
   loadConfig,
   saveConfig,
   channelsForProject,
+  nickForProject,
   withProjectChannels,
+  withProjectNick,
   modeFor,
   tierFor,
   tierAtLeast,
@@ -33,7 +35,7 @@ import {
   type Mode,
   type Tier,
 } from "./config.js";
-import { defaultNick, deriveInstallSlug, isDid, resolveBotName } from "./identity.js";
+import { agentNick, defaultNick, deriveInstallSlug, isDid, nickProblem, resolveBotName } from "./identity.js";
 import { isTerminal, loadOrCreateIdentity } from "@freeq/bot-kit";
 import {
   agentInstructions,
@@ -45,8 +47,7 @@ import {
 } from "./owner-key.js";
 import { parseVerbositySteer } from "./steer.js";
 import { scrubSeverity } from "./scrub.js";
-import { nextUpdate, type ProgressState } from "./progress.js";
-import { gistOf, renderStatus, toolDetail } from "./status.js";
+import { gistOf, renderDoing, renderStatus, toolDetail } from "./status.js";
 import { rosterLines, type RoomLineInput } from "./ui.js";
 import { WithheldBuffer, withheldSummary } from "./withheld.js";
 import { resumePreamble, summarizeTurn, type TaskNote } from "./journal.js";
@@ -93,7 +94,7 @@ import {
   type InboundEvent,
 } from "./inbound.js";
 import type { Harness, InboundCard, NoticeLevel } from "./harness.js";
-import type { FreeqRoomToolParams, FreeqToolParams } from "./tool.js";
+import { FREEQ_ROOM_TOOL_NAME, FREEQ_TOOL_NAME, type FreeqRoomToolParams, type FreeqToolParams } from "./tool.js";
 import { formatDoctor, runDoctor, type DoctorLine } from "./doctor.js";
 import type { HarnessNames } from "./names.js";
 
@@ -144,7 +145,20 @@ export interface RuntimeOptions {
  */
 type PendingReply =
   | { kind: "ask"; ask: InboundAsk; seq: number }
-  | { kind: "channel"; channel: string; from: string; seq: number };
+  | {
+      kind: "channel";
+      channel: string;
+      from: string;
+      seq: number;
+      /**
+       * Set when the agent answered with the freeq tool: the run's work
+       * count at that moment, and what it sent. If the run did more work
+       * after it, what it sent was an acknowledgement ("on it"), not the
+       * answer, and the closing text still goes back.
+       */
+      answeredAt?: number;
+      answeredWith?: string;
+    };
 
 /**
  * Whether a send to `to` reaches the person a DM reply is owed to: their
@@ -192,6 +206,19 @@ export class AgentRuntime {
   readonly #pendingReplies: PendingReply[] = [];
   /** Monotonic across runs; incremented at every turn start. */
   #turnSeq = 0;
+  /**
+   * Tool calls other than freeq's own, monotonic. Work after a reply makes
+   * that reply an acknowledgement rather than the answer (`answeredAt`).
+   */
+  #workSeq = 0;
+  /** The closing text a held settle answers with (`onSettled({ holdUnseen })`). */
+  #heldText = "";
+  /**
+   * Where the operator last spoke to this agent over freeq, while they have
+   * not typed in the terminal since. Undefined: they are at the terminal (or
+   * have not used freeq this session).
+   */
+  #operatorVenue: { channel: string; from: string } | undefined;
   /** Text of the most recent assistant turn, used to form replies. */
   #lastAssistantText = "";
 
@@ -208,21 +235,8 @@ export class AgentRuntime {
    * own `status` action), cleared when the run settles.
    */
   step: { phrase: string; since: number; tool?: string } | undefined;
-  /** Keeps the elapsed part of the label honest during long, quiet steps. */
-  #stepTimer: NodeJS.Timeout | undefined;
   /** Task id we're working, if this turn came from a handoff. */
   workTask: string | undefined;
-  /**
-   * The channel that asked for what we are doing now, if a room asked at all.
-   *
-   * A turn started by someone typing in the terminal has no such channel and
-   * must stay silent: nobody in a room asked, so nobody in a room is owed a
-   * progress report.
-   */
-  #askingChannel: string | undefined;
-  /** Timer and memory for the live progress line. See progress.ts. */
-  #updateTimer: NodeJS.Timeout | undefined;
-  #updateState: ProgressState = {};
   /** Coalesce rapid tool-call updates — presence is not a debug log. */
   #lastStatusPush = 0;
 
@@ -332,44 +346,6 @@ export class AgentRuntime {
 
   // ── presence ────────────────────────────────────────────────────────────
 
-  /**
-   * Post a progress line into the room that asked, if there is one and if
-   * there is anything new to say. Silence is the default; `nextUpdate` owns
-   * the rules.
-   */
-  #tickUpdate(cfg: FreeqConfig): void {
-    const conn = this.conn;
-    if (!this.#askingChannel || !conn || conn.state !== "online") return;
-    if (cfg.muted || !cfg.enabled) return;
-    const intervalMs = (cfg.updateIntervalSecs ?? 0) * 1000;
-    if (intervalMs <= 0) return;
-    const out = nextUpdate(this.#updateState, this.step, Date.now(), { intervalMs });
-    if (!out) return;
-    this.#updateState = out.state;
-    try {
-      conn.send(this.#askingChannel, out.text);
-    } catch {
-      /* a progress line is a courtesy; never let it disturb the turn */
-    }
-  }
-
-  #startUpdates(cfg: FreeqConfig, channel: string): void {
-    this.#askingChannel = channel;
-    this.#updateState = {};
-    const intervalMs = (cfg.updateIntervalSecs ?? 0) * 1000;
-    if (this.#updateTimer || intervalMs <= 0) return;
-    this.#updateTimer = setInterval(() => this.#tickUpdate(cfg), intervalMs);
-    this.#updateTimer.unref?.();
-  }
-
-  #stopUpdates(): void {
-    this.#askingChannel = undefined;
-    this.#updateState = {};
-    if (!this.#updateTimer) return;
-    clearInterval(this.#updateTimer);
-    this.#updateTimer = undefined;
-  }
-
   /** The label a watcher sees right now, or undefined when idle. */
   currentLabel(): string | undefined {
     return this.step ? renderStatus(this.step, Date.now()) : undefined;
@@ -378,29 +354,25 @@ export class AgentRuntime {
   /**
    * Begin a named step. The phrase is the watcher-facing truth of the
    * moment, so it is force-pushed immediately (bypassing the coalescing
-   * throttle) and then kept fresh on a slow timer for the elapsed counter.
+   * throttle). Presence carries the phrase and when it began, not an
+   * elapsed count, so there is nothing to keep refreshing: clients count up.
    */
   beginStep(phrase: string): void {
     // The phrase is advertised to the whole room in presence: run it
     // through the same scrubber that keeps paths and secrets out of chat.
     const clean = this.conn ? this.conn.scrubForWire(phrase, "presence") : phrase;
     this.step = { phrase: clean, since: Date.now() };
-    this.pushStatus("executing", this.currentLabel(), this.workTask, true);
-    if (!this.#stepTimer) {
-      this.#stepTimer = setInterval(() => {
-        if (this.step) this.pushStatus("executing", this.currentLabel(), this.workTask);
-      }, 45_000);
-      this.#stepTimer.unref?.();
-    }
+    this.pushStatus("executing", this.#doing(), this.workTask, true);
     this.harness.stepBegan?.(phrase);
   }
 
   endStep(): void {
     this.step = undefined;
-    if (this.#stepTimer) {
-      clearInterval(this.#stepTimer);
-      this.#stepTimer = undefined;
-    }
+  }
+
+  /** What presence says the agent is doing: the label without elapsed time. */
+  #doing(): string | undefined {
+    return this.step ? renderDoing(this.step) : undefined;
   }
 
   pushStatus(state: string, label?: string, task?: string, force = false): void {
@@ -412,7 +384,12 @@ export class AgentRuntime {
     this.stateChanged();
     // The label is derived from prompts and message text, so it goes through
     // the same secret redaction as everything else on the wire.
-    conn.setWorkState(state, label ? conn.scrubForWire(label, "presence") : label, task);
+    conn.setWorkState(
+      state,
+      label ? conn.scrubForWire(label, "presence") : label,
+      task,
+      state === "executing" ? this.step?.since : undefined,
+    );
   }
 
   /** Ask the harness to repaint whatever it shows of this session. */
@@ -987,7 +964,7 @@ export class AgentRuntime {
             return `Not sent: no member has sealed the key for ${ch} to you yet, so nothing can be encrypted for it. Try 'read' in a moment (it re-fetches the key), then say it again.`;
           }
           if (!conn.send(ch, params.message)) return `Could not post to ${ch}.`;
-          this.#answered((item) => item.channel.toLowerCase() === ch);
+          this.#answered((item) => item.channel.toLowerCase() === ch, params.message);
           return `Posted to ${ch}, end-to-end encrypted.`;
         }
 
@@ -1099,7 +1076,7 @@ export class AgentRuntime {
       case "send": {
         if (!params.to || !params.message) return text("send requires 'to' and 'message'.");
         if (!conn.send(params.to, params.message)) return text(`Could not send to ${params.to}.`);
-        this.#answered((item) => !item.channel.startsWith("#") && sameName(params.to!, item));
+        this.#answered((item) => !item.channel.startsWith("#") && sameName(params.to!, item), params.message);
         return text(`Sent to ${params.to}.`);
       }
 
@@ -1118,8 +1095,15 @@ export class AgentRuntime {
         }
         this.#answered(
           (item) => item.channel.toLowerCase() === params.channel!.toLowerCase(),
+          message,
         );
         return text(`Posted to ${params.channel}.`);
+      }
+
+      case "rename": {
+        const wanted = (params.nick ?? params.message ?? "").trim();
+        if (!wanted) return text("rename requires 'nick', the new name.");
+        return text(await this.rename(wanted));
       }
 
       case "handoff": {
@@ -1659,7 +1643,7 @@ export class AgentRuntime {
               // be, and where the server says we ARE. Print both, and only
               // remark on the difference when there is one.
               const eff = channelsForProject(cfg, this.currentProject);
-              const pinned = this.currentProject ? cfg.projects?.[this.currentProject] !== undefined : false;
+              const pinned = this.currentProject ? cfg.projects?.[this.currentProject]?.channels !== undefined : false;
               const live = this.conn?.joinedChannels() ?? [];
               const refused = this.conn?.refusedChannels() ?? [];
               const lines = [
@@ -1677,6 +1661,22 @@ export class AgentRuntime {
           ].join("\n"),
           "info",
         );
+        return;
+      }
+
+      case "nick":
+      case "rename": {
+        const [wanted] = rest;
+        if (!wanted) {
+          this.notify(
+            `freeq: this agent is ${this.conn?.nick ?? "(not connected)"}. ` +
+              `${this.names.hint("nick")} <name> renames it; ${this.names.hint("nick")} reset goes back to the generated name.`,
+            "info",
+          );
+          return;
+        }
+        const message = await this.rename(wanted === "reset" ? undefined : wanted);
+        this.notify(message, message.includes("cannot") || message.includes("could not") ? "warning" : "info");
         return;
       }
 
@@ -2175,7 +2175,7 @@ export class AgentRuntime {
       default:
         this.notify(
           [
-            "/freeq [status | doctor | login <did> [server] | join #c | leave #c |",
+            "/freeq [status | doctor | login <did> [server] | nick <name> | join #c | leave #c |",
             "        peers | handoffs | mode #c <silent|addressed|participant> |",
             "        trust <did> <tier> | provenance <tier> | mute | unmute |",
             "        takeover | on | off]",
@@ -2403,13 +2403,15 @@ export class AgentRuntime {
     if (expectsReply) {
       const venue = ev.channel.startsWith("#") ? ` in ${ev.channel}` : "";
       this.beginStep(`answering ${ev.from}${venue}`);
-      // Somebody in a room is now waiting. The terminal narrates every step
-      // of this; without this the room gets one line, whenever the turn
-      // happens to end. A DM answers to the sender, a channel to the channel.
-      // If we somehow got here before config loaded there is no interval to
-      // honour, so stay quiet rather than crash the host.
-      // Not to an agent's DM, for the same reason as above.
-      if (this.config && autoReply) this.#startUpdates(this.config, ev.channel);
+      // No "⋯ answering … · 1m" line goes into the room while this runs.
+      // Presence already shows that step to anyone looking, and a line in
+      // the conversation reads as a promise: when the answer then went
+      // astray, the room was left holding a promise and nothing else.
+    }
+    // The operator reaching us over freeq is away from the terminal until
+    // they type there again.
+    if (ev.tier === "control" && ev.did && ev.did === this.config?.ownerDid) {
+      this.#operatorVenue = { channel: ev.channel, from: ev.from };
     }
     const framed = frameInbound(ev, { expectsReply });
 
@@ -2558,6 +2560,7 @@ export class AgentRuntime {
       slug: cfg.install ?? deriveInstallSlug(),
       root: BOTS_ROOT,
       nick: cfg.nick,
+      exactNick: nickForProject(cfg, meta.project),
       creatorKeyPath: await existingCreatorKey(cfg),
       // Per-project: a music repo and a work repo are different agents and
       // belong in different rooms. Falls back to the global list.
@@ -2863,7 +2866,7 @@ export class AgentRuntime {
   /** A run began. A run also counts as life, which is what the stall timeout measures. */
   onRunStart(): void {
     this.watchdog?.touch();
-    this.pushStatus("executing", this.currentLabel() ?? "working", this.workTask, true);
+    this.pushStatus("executing", this.#doing() ?? "working", this.workTask, true);
   }
 
   /** A turn began. */
@@ -2872,7 +2875,7 @@ export class AgentRuntime {
     // Presence liveness: tool calls already push state, but a long thinking
     // stretch makes none. A turn boundary is the other heartbeat — throttled
     // inside pushStatus, so this costs at most one presence line per 2.5s.
-    this.pushStatus("executing", this.currentLabel() ?? "working", this.workTask);
+    this.pushStatus("executing", this.#doing() ?? "working", this.workTask);
   }
 
   /**
@@ -2883,6 +2886,8 @@ export class AgentRuntime {
    */
   onUserPrompt(text: string): void {
     if (!text.trim() || text.startsWith("[freeq —")) return;
+    // They typed: they are at the terminal, whatever they did on freeq before.
+    this.#operatorVenue = undefined;
     // The first prompt of a run names the step. A steer mid-run must not
     // reset the phrase (and its elapsed clock) that the watcher follows —
     // and a handoff brief must not overwrite the task title as the phrase.
@@ -2898,11 +2903,12 @@ export class AgentRuntime {
     // stall timer needs to hear about — otherwise long, quiet work looks
     // stalled and gets failed out from under itself.
     this.watchdog?.touch();
+    if (toolName !== FREEQ_TOOL_NAME && toolName !== FREEQ_ROOM_TOOL_NAME) this.#workSeq++;
     if (!toolName) return;
     // The tool is a suffix on the current phrase, never the headline —
     // "bash" alone is exactly the contentless status this replaces.
     if (this.step) this.step.tool = toolDetail(toolName, input);
-    this.pushStatus("executing", this.currentLabel() ?? toolName, this.workTask);
+    this.pushStatus("executing", this.#doing() ?? toolName, this.workTask);
     const config = this.config;
     if (config?.provenance) {
       this.turn.record({ name: toolName, input }, config.provenance);
@@ -2958,11 +2964,14 @@ export class AgentRuntime {
    * mentions `matches` picks are answered, so no closing text follows for
    * them. Asks are never answered this way; they keep the automatic answer.
    */
-  #answered(matches: (item: { channel: string; from: string }) => boolean): void {
-    const pending = this.#pendingReplies;
-    for (let i = pending.length - 1; i >= 0; i--) {
-      const item = pending[i]!;
-      if (item.kind === "channel" && matches(item)) pending.splice(i, 1);
+  #answered(matches: (item: { channel: string; from: string }) => boolean, sent: string): void {
+    // Marked, not removed: whether this was the answer or an acknowledgement
+    // is only known once the run shows whether it kept working (#flushReplies).
+    for (const item of this.#pendingReplies) {
+      if (item.kind === "channel" && matches(item)) {
+        item.answeredAt = this.#workSeq;
+        item.answeredWith = sent;
+      }
     }
   }
 
@@ -3012,7 +3021,29 @@ export class AgentRuntime {
       // Channel replies are collected and sent once per channel below. A
       // turn produces ONE answer; if four messages queued while we worked,
       // that answer used to go out four times, once per queued item.
-      if (!text) continue;
+      if (!text) {
+        // The response ended without words (its last step was a tool call)
+        // and nothing was sent with the freeq tool. Say so where someone
+        // will see it: this used to drop the reply without a trace, and the
+        // person on freeq simply never heard back.
+        if (settled && item.answeredAt === undefined) {
+          this.notify(
+            `freeq: ${item.from}${item.channel.startsWith("#") ? ` in ${item.channel}` : ""} got no answer — ` +
+              `the response ended without text and nothing was sent over freeq`,
+            "warning",
+          );
+        }
+        continue;
+      }
+      // Answered with the freeq tool, and nothing done since: that was the
+      // answer, and the closing text is the terminal's wrap-up. With work
+      // after it, it was "on it" — the answer is this text, and keeping it
+      // in the terminal is how a person on freeq was told an answer was
+      // coming and never got it.
+      if (item.answeredAt !== undefined) {
+        if (item.answeredAt >= this.#workSeq) continue;
+        if (item.answeredWith?.trim() === text.trim()) continue;
+      }
       channelReplies.set(item.channel, item.from);
     }
     // Sent whole: the SDK splits long text into a draft/multiline BATCH, so a
@@ -3039,11 +3070,24 @@ export class AgentRuntime {
   }
 
   /** The run settled: the model is idle again. */
-  async onSettled(): Promise<void> {
+  async onSettled(opts?: { holdUnseen?: boolean }): Promise<void> {
     // Pay back whatever this run was triggered by and hasn't been answered
     // yet — normally nothing, since onTurnEnd answers live. What is left here
     // is a run that ended without ever producing text.
-    this.#flushReplies(this.#lastAssistantText, true);
+    //
+    // `holdUnseen`: a harness that cannot tell whether the model saw a
+    // message delivered mid-run (Claude Code queues it, and may hand it over
+    // as the NEXT prompt) keeps those back. Answering them with this run's
+    // text sent a person the wrap-up of unrelated work while their actual
+    // answer stayed in the terminal. The harness then calls
+    // `answerHeld()` if no new run picks them up.
+    if (opts?.holdUnseen) {
+      this.#flushReplies(this.#lastAssistantText, true, this.#turnSeq);
+      this.#heldText = this.hasHeldReplies() ? this.#lastAssistantText : "";
+    } else {
+      this.#flushReplies(this.#lastAssistantText, true);
+      this.#heldText = "";
+    }
     this.#lastAssistantText = "";
 
     // Mirror what this turn actually changed. Before the offline early-return
@@ -3057,7 +3101,6 @@ export class AgentRuntime {
     // Back to available. Clearing the step matters: a stale "working on X"
     // is worse than no status at all.
     this.endStep();
-    this.#stopUpdates();
     this.workTask = undefined;
     this.pushStatus("active", undefined, undefined, true);
 
@@ -3065,6 +3108,60 @@ export class AgentRuntime {
     if (model === this.#lastModel) return;
     this.#lastModel = model;
     conn.updateMeta({ ...conn.meta, model });
+  }
+
+  /** Whether replies are owed to messages delivered during the current run. */
+  hasHeldReplies(): boolean {
+    return this.#pendingReplies.some((p) => p.seq >= this.#turnSeq);
+  }
+
+  /**
+   * No new run took the held messages: the model saw them mid-run, and the
+   * run's closing text is their answer.
+   */
+  answerHeld(): void {
+    const text = this.#heldText;
+    this.#heldText = "";
+    this.#flushReplies(text, true);
+  }
+
+  /**
+   * Whether the operator's latest word to this agent came over freeq rather
+   * than the terminal: they are likely away from the screen, and what they
+   * need to see should reach them there.
+   */
+  get operatorOnFreeq(): boolean {
+    return this.#operatorVenue !== undefined;
+  }
+
+  /**
+   * Rename this project's agent: on the live connection when online, and in
+   * the config so every later connect registers as it. `undefined` goes
+   * back to the generated name. Returns what to tell the person.
+   */
+  async rename(nick: string | undefined): Promise<string> {
+    const cfg = await this.ensureConfig();
+    const project =
+      this.currentProject ?? (await collectSessionMeta({ cwd: this.harness.cwd(), model: this.harness.modelId() })).project;
+    if (!project) return "freeq: cannot rename — this session has no project to name the agent for.";
+    const target = nick ?? agentNick(cfg.nick, cfg.install ?? deriveInstallSlug(), project, this.names.name);
+    const problem = nickProblem(target);
+    if (problem) return `freeq: cannot rename to ${JSON.stringify(target)} — ${problem}.`;
+    const before = this.conn?.nick;
+    let live = "";
+    if (this.conn?.state === "online") {
+      const r = await this.conn.rename(target);
+      if (!r.ok) return `freeq: still ${before ?? "unnamed"} — could not rename to ${target}: ${r.reason}.`;
+      live = before && before !== target ? ` (was ${before})` : "";
+      this.conn.announceAll();
+    }
+    const next = withProjectNick(cfg, project, nick);
+    await saveConfig(this.agentDir, next);
+    this.config = next;
+    this.stateChanged();
+    return this.conn?.state === "online"
+      ? `freeq: this agent is now ${target}${live}. Same DID; mention it as ${target}.`
+      : `freeq: this agent will be ${target} when it next connects.`;
   }
 
   /**

@@ -74,6 +74,8 @@ describe("task events", () => {
   });
 
   it("accepts an auto-accept DID's offer even while busy, and delivers the brief", async () => {
+    // Presence carries the step's start time; a frozen clock keeps it exact.
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-09-30T12:00:00Z") });
     const h = await startPi({ config: baseConfig({ trust: { [BOSS]: "handoff" }, autoAccept: [BOSS] }), idle: false });
     await h.act(actEvent({ verb: "offer", taskId: "01JAUTO0000000000000000000", did: BOSS, from: "boss", fields: { "act-to": SELF, "act-title": "rebase onto main" } }));
     expect(acts(h)).toMatchInlineSnapshot(`
@@ -98,7 +100,7 @@ describe("task events", () => {
     expect(h.bot.states.at(-1)).toMatchInlineSnapshot(`
       {
         "state": "executing",
-        "status": "project=proj model=test-model doing=handoff:+rebase+onto+main+·+0s",
+        "status": "project=proj model=test-model doing=handoff:+rebase+onto+main since=1790769600",
         "task": "01JAUTO0000000000000000000",
       }
     `);

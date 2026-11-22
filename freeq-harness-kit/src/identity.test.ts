@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { botName, defaultNick, projectBotName, projectNick, projectSlug,
+import { agentNick, botName, defaultNick, nickProblem, projectBotName, projectNick, projectSlug,
   legacyProjectSlug,
   resolveBotName,
   SLUG_MAX,
@@ -86,5 +86,24 @@ describe("identity prefix", () => {
     expect(defaultNick("abcd1234", "cc")).toBe("cc-abcd1234");
     expect(projectBotName("abcd1234", "freeq", "cc")).toBe("cc-abcd1234-freeq");
     expect(resolveBotName("abcd1234", "freeq", () => false, "cc")).toBe("cc-abcd1234-freeq");
+  });
+});
+
+describe("agent nicks people can type", () => {
+  it("drops the install hash from the generated name, keeps a chosen base", () => {
+    expect(agentNick(undefined, "6302f17c", "freeq", "cc")).toBe("cc-freeq");
+    // What login writes is the generated base; it is not a choice.
+    expect(agentNick("cc-6302f17c", "6302f17c", "freeq", "cc")).toBe("cc-freeq");
+    expect(agentNick("chad-bot", "6302f17c", "freeq", "cc")).toBe("chad-bot-freeq");
+    expect(agentNick(undefined, "6302f17c", undefined, "cc")).toBe("cc-6302f17c");
+  });
+
+  it("says why a name cannot be a nick instead of mangling it", () => {
+    expect(nickProblem("claude")).toBeUndefined();
+    expect(nickProblem("fq_2-b")).toBeUndefined();
+    expect(nickProblem("my agent")).toMatch(/letters, digits/);
+    expect(nickProblem("9lives")).toMatch(/starts with a letter/);
+    expect(nickProblem("x".repeat(31))).toMatch(/at most 30/);
+    expect(nickProblem("")).toMatch(/empty/);
   });
 });

@@ -39,6 +39,12 @@ export interface SessionMeta {
    * the status format is space-separated k=v; see formatStatus.
    */
   doing?: string;
+  /**
+   * When the current `doing` began, as epoch seconds. Clients count elapsed
+   * time up from it themselves; a baked-in "· 3m" goes stale the moment it
+   * is sent.
+   */
+  since?: string;
 }
 
 async function git(cwd: string, args: string[]): Promise<string | undefined> {
@@ -149,7 +155,7 @@ export function parseStatus(status: string | undefined): SessionMeta {
     const k = tok.slice(0, eq);
     const v = tok.slice(eq + 1);
     if (!v) continue;
-    if (k === "session" || k === "project" || k === "repo" || k === "branch" || k === "model") {
+    if (k === "session" || k === "project" || k === "repo" || k === "branch" || k === "model" || k === "since") {
       meta[k] = v;
     } else if (k === "doing") {
       meta.doing = v.replace(/\+/g, " ");

@@ -707,6 +707,7 @@ export default function (pi: ExtensionAPI): void {
           Type.Literal("decline"),
           Type.Literal("decision"),
           Type.Literal("status"),
+          Type.Literal("rename"),
         ],
         { description: "What to do" },
       ),
@@ -728,6 +729,9 @@ export default function (pi: ExtensionAPI): void {
       ),
       taskId: Type.Optional(
         Type.String({ description: "Task id, for complete/cancel/claim" }),
+      ),
+      nick: Type.Optional(
+        Type.String({ description: "Your new nick, for 'rename': letters, digits, - and _, at most 30" }),
       ),
       rationale: Type.Optional(
         Type.String({ description: "Why, for 'decision' — the part worth keeping" }),
