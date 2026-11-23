@@ -129,7 +129,7 @@ pub fn tools() -> Value {
                 },
                 "required": ["channels"]
             },
-            "annotations": {"readOnlyHint": true, "openWorldHint": false}
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false}
         },
         {
             "name": "freeq_history",
@@ -167,7 +167,7 @@ pub fn tools() -> Value {
                 },
                 "required": ["messages"]
             },
-            "annotations": {"readOnlyHint": true, "openWorldHint": false}
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false}
         },
         {
             "name": "freeq_search",
@@ -204,7 +204,7 @@ pub fn tools() -> Value {
                 },
                 "required": ["messages"]
             },
-            "annotations": {"readOnlyHint": true, "openWorldHint": false}
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false}
         },
         {
             "name": "freeq_verify",
@@ -231,7 +231,7 @@ pub fn tools() -> Value {
                 },
                 "required": ["verified"]
             },
-            "annotations": {"readOnlyHint": true, "openWorldHint": false}
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false}
         },
         {
             "name": "freeq_pins",
@@ -264,7 +264,7 @@ pub fn tools() -> Value {
                 },
                 "required": ["pins"]
             },
-            "annotations": {"readOnlyHint": true, "openWorldHint": false}
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false}
         }
     ])
 }
@@ -604,6 +604,18 @@ mod tests {
             assert!(
                 t["annotations"]["readOnlyHint"].as_bool() == Some(true),
                 "{name}: everything here is a read"
+            );
+            // The spec defaults destructiveHint and openWorldHint to true, and
+            // some clients and directories read each hint on its own.
+            assert_eq!(
+                t["annotations"]["destructiveHint"].as_bool(),
+                Some(false),
+                "{name}: a read is never destructive; say so explicitly"
+            );
+            assert_eq!(
+                t["annotations"]["openWorldHint"].as_bool(),
+                Some(false),
+                "{name}: these tools only read this server's own channels"
             );
         }
     }
